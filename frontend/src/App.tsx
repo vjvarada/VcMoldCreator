@@ -12,6 +12,7 @@ import FileUpload from './components/FileUpload';
 import type { VisibilityPaintData } from './utils/partingDirection';
 import type { InflatedHullResult, ManifoldValidationResult, CsgSubtractionResult } from './utils/inflatedBoundingVolume';
 import type { MeshRepairResult, MeshDiagnostics } from './utils/meshRepairManifold';
+import type { TetMeshData, TetrahedralizeProgress, TetMeshVisualization } from './utils/tetrahedralViewer';
 
 // ============================================================================
 // COMPONENT
@@ -27,6 +28,11 @@ interface CsgStats {
   vertexCount: number;
   faceCount: number;
   manifoldValidation: ManifoldValidationResult;
+}
+
+interface TetStats {
+  vertexCount: number;
+  tetrahedraCount: number;
 }
 
 function App() {
@@ -49,6 +55,19 @@ function App() {
     wasRepaired: boolean;
     repairMethod: string;
   } | null>(null);
+  
+  // Tetrahedralization state
+  const [showTetMesh, setShowTetMesh] = useState(false);
+  const [tetStats, setTetStats] = useState<TetStats | null>(null);
+  const [tetProgress, setTetProgress] = useState<TetrahedralizeProgress | null>(null);
+  const [tetError, setTetError] = useState<string | null>(null);
+  const [isTetrahedralizing, setIsTetrahedralizing] = useState(false);
+  const [hideCsgMesh, setHideCsgMesh] = useState(false);
+  const [tetVisualization, setTetVisualization] = useState<TetMeshVisualization | null>(null);
+  
+  // Section plane state
+  const [sectionPlaneEnabled, setSectionPlaneEnabled] = useState(false);
+  const [sectionPlanePosition, setSectionPlanePosition] = useState(0.5);
 
   // Handlers
   const handleFileLoad = useCallback((url: string, _fileName: string) => {
@@ -66,6 +85,17 @@ function App() {
     setHideOriginalMesh(false);
     setHideHull(false);
     setMeshRepairResult(null);
+    // Reset tetrahedralization state
+    setShowTetMesh(false);
+    setTetStats(null);
+    setTetProgress(null);
+    setTetError(null);
+    setIsTetrahedralizing(false);
+    setHideCsgMesh(false);
+    setTetVisualization(null);
+    // Reset section plane
+    setSectionPlaneEnabled(false);
+    setSectionPlanePosition(0.5);
   }, [stlUrl]);
 
   const handleMeshLoaded = useCallback(() => setMeshLoaded(true), []);
@@ -124,6 +154,44 @@ function App() {
     });
   }, []);
 
+  // Tetrahedralization handlers
+  const handleTetrahedralize = useCallback(() => {
+    if (isTetrahedralizing) return;
+    setShowTetMesh(prev => !prev);
+    if (!showTetMesh) {
+      // Starting tetrahedralization
+      setTetError(null);
+      setTetProgress(null);
+      setTetStats(null);
+      setTetVisualization(null);
+      setIsTetrahedralizing(true);
+    }
+  }, [isTetrahedralizing, showTetMesh]);
+
+  const handleTetProgress = useCallback((progress: TetrahedralizeProgress) => {
+    setTetProgress(progress);
+  }, []);
+
+  const handleTetComplete = useCallback((data: TetMeshData) => {
+    setIsTetrahedralizing(false);
+    setTetStats({
+      vertexCount: data.vertices.length / 3,
+      tetrahedraCount: data.tetrahedra.length / 4,
+    });
+    setTetProgress(null);
+  }, []);
+
+  const handleTetError = useCallback((error: string) => {
+    setIsTetrahedralizing(false);
+    setTetError(error);
+    setShowTetMesh(false);
+    setTetProgress(null);
+  }, []);
+
+  const handleTetVisualizationReady = useCallback((visualization: TetMeshVisualization | null) => {
+    setTetVisualization(visualization);
+  }, []);
+
   // ============================================================================
   // RENDER
   // ============================================================================
@@ -141,11 +209,19 @@ function App() {
         showCsgResult={showCsgResult}
         hideOriginalMesh={hideOriginalMesh}
         hideHull={hideHull}
+        hideCsgMesh={hideCsgMesh}
+        showTetMesh={showTetMesh}
+        sectionPlaneEnabled={sectionPlaneEnabled}
+        sectionPlanePosition={sectionPlanePosition}
         onMeshLoaded={handleMeshLoaded}
         onMeshRepaired={handleMeshRepaired}
         onVisibilityDataReady={handleVisibilityDataReady}
         onInflatedHullReady={handleInflatedHullReady}
         onCsgResultReady={handleCsgResultReady}
+        onTetProgress={handleTetProgress}
+        onTetComplete={handleTetComplete}
+        onTetError={handleTetError}
+        onTetVisualizationReady={handleTetVisualizationReady}
       />
 
       {/* File Upload */}
@@ -408,6 +484,161 @@ function App() {
                   {/* Legend */}
                   <div style={styles.legend}>
                     <div>🩵 Teal = Mold cavity (Hull - Base)</div>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+
+          {/* Tetrahedralization Section - only available after CSG is created */}
+          {csgStats && (
+            <>
+              {/* Separator */}
+              <div style={{ borderTop: '1px solid #444', margin: '16px 0 12px 0' }} />
+
+              {/* Tetrahedralization Section */}
+              <div style={styles.title}>🔺 Tetrahedralize Mold Cavity</div>
+              
+              <button
+                onClick={handleTetrahedralize}
+                disabled={isTetrahedralizing}
+                style={{
+                  ...styles.button,
+                  backgroundColor: isTetrahedralizing 
+                    ? '#666' 
+                    : (showTetMesh && tetVisualization) 
+                      ? '#ff6600' 
+                      : '#00aaff',
+                  cursor: isTetrahedralizing ? 'wait' : 'pointer',
+                }}
+              >
+                {isTetrahedralizing 
+                  ? '⏳ Processing...' 
+                  : (showTetMesh && tetVisualization) 
+                    ? '✓ Tetrahedral Mesh ON' 
+                    : 'Tetrahedralize Cavity'}
+              </button>
+
+              {/* Hide CSG Mesh Checkbox - show when tet process started */}
+              {showTetMesh && (
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px', cursor: 'pointer', fontSize: '12px' }}>
+                  <input
+                    type="checkbox"
+                    checked={hideCsgMesh}
+                    onChange={(e) => setHideCsgMesh(e.target.checked)}
+                    style={{ cursor: 'pointer' }}
+                  />
+                  Hide Mold Cavity (show only tet mesh)
+                </label>
+              )}
+
+              {/* Progress Bar */}
+              {isTetrahedralizing && tetProgress && (
+                <div style={{ marginTop: '12px' }}>
+                  <div style={{ 
+                    display: 'flex', 
+                    justifyContent: 'space-between', 
+                    fontSize: '10px', 
+                    marginBottom: '4px' 
+                  }}>
+                    <span>Step {tetProgress.step}/{tetProgress.total}</span>
+                    <span>{Math.round((tetProgress.step / tetProgress.total) * 100)}%</span>
+                  </div>
+                  <div style={{ 
+                    width: '100%', 
+                    height: '6px', 
+                    backgroundColor: '#333', 
+                    borderRadius: '3px',
+                    overflow: 'hidden'
+                  }}>
+                    <div style={{ 
+                      width: `${(tetProgress.step / tetProgress.total) * 100}%`, 
+                      height: '100%', 
+                      backgroundColor: '#ff6600',
+                      transition: 'width 0.3s ease'
+                    }} />
+                  </div>
+                  {tetProgress.message && (
+                    <div style={{ fontSize: '9px', opacity: 0.7, marginTop: '4px' }}>
+                      {tetProgress.message}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Error Display */}
+              {tetError && (
+                <div style={{ 
+                  marginTop: '10px', 
+                  padding: '8px', 
+                  backgroundColor: 'rgba(255, 50, 50, 0.2)',
+                  borderRadius: '4px',
+                  fontSize: '10px',
+                  color: '#ff6666'
+                }}>
+                  <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>❌ Error</div>
+                  <div>{tetError}</div>
+                </div>
+              )}
+
+              {/* Tet Stats */}
+              {tetStats && tetVisualization && (
+                <div style={{ marginTop: '12px' }}>
+                  <div style={{ fontSize: '10px', opacity: 0.7 }}>
+                    <div>Vertices: {tetStats.vertexCount.toLocaleString()}</div>
+                    <div>Tetrahedra: {tetStats.tetrahedraCount.toLocaleString()}</div>
+                  </div>
+
+                  {/* Success indicator */}
+                  <div style={{ 
+                    marginTop: '10px', 
+                    padding: '8px', 
+                    backgroundColor: 'rgba(255, 102, 0, 0.15)',
+                    borderRadius: '4px',
+                    fontSize: '10px'
+                  }}>
+                    <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>
+                      ✅ Tetrahedralization Complete
+                    </div>
+                    <div>Edge length ratio: 0.0065 (TetWild default)</div>
+                  </div>
+
+                  {/* Section View Controls */}
+                  <div style={{ marginTop: '12px' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '12px' }}>
+                      <input
+                        type="checkbox"
+                        checked={sectionPlaneEnabled}
+                        onChange={(e) => setSectionPlaneEnabled(e.target.checked)}
+                        style={{ cursor: 'pointer' }}
+                      />
+                      ✂️ Section View (slice model)
+                    </label>
+                    
+                    {sectionPlaneEnabled && (
+                      <div style={{ marginTop: '8px' }}>
+                        <div style={{ fontSize: '10px', opacity: 0.7, marginBottom: '4px' }}>
+                          Slice Height: {Math.round(sectionPlanePosition * 100)}%
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          value={sectionPlanePosition * 100}
+                          onChange={(e) => setSectionPlanePosition(Number(e.target.value) / 100)}
+                          style={{
+                            width: '100%',
+                            cursor: 'pointer',
+                          }}
+                        />
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Legend */}
+                  <div style={styles.legend}>
+                    <div>🟠 Orange wireframe = Tet mesh edges</div>
+                    <div>🟧 Semi-transparent = Tet surface</div>
                   </div>
                 </div>
               )}

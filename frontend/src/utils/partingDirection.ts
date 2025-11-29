@@ -317,7 +317,7 @@ export async function findPartingDirectionsParallel(
 function findBestPair(
   scores: Map<number, DirectionScore>,
   areas: Float32Array,
-  totalArea: number
+  _totalArea: number
 ): { bestD1: DirectionScore; bestD2: DirectionScore } {
   const sortedScores = Array.from(scores.values()).sort((a, b) => b.visibleArea - a.visibleArea);
   
@@ -551,7 +551,7 @@ export function applyVisibilityPaint(
     }
     
     // Determine color
-    let color = PAINT_COLORS.NEUTRAL;
+    let color: { readonly r: number; readonly g: number; readonly b: number } = PAINT_COLORS.NEUTRAL;
     if (isD1Visible && isD2Visible) {
       color = PAINT_COLORS.OVERLAP;
       overlapCount++;

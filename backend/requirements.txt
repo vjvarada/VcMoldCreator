@@ -5,3 +5,5 @@ pyvista==0.43.0
 meshio==5.3.4
 networkx==3.2.1
 numpy==1.26.2
+tetgen==0.7.0
+python-multipart==0.0.6
