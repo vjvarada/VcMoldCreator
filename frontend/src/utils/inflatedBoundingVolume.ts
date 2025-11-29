@@ -6,10 +6,12 @@
  * 2. Generate smooth vertex normals using area-weighted averaging
  * 3. Inflate hull vertices outward by a small offset distance
  * 4. Create a new mesh from inflated vertices + original hull faces
+ * 5. Optionally subtract the base mesh from the inflated hull (CSG)
  */
 
 import * as THREE from 'three';
-import { ConvexGeometry } from 'three-stdlib';
+import { ConvexGeometry, mergeVertices } from 'three-stdlib';
+import Module, { type Manifold, type Mesh as ManifoldMesh } from 'manifold-3d';
 
 // ============================================================================
 // CONSTANTS
@@ -20,6 +22,9 @@ export const DEFAULT_INFLATION_OFFSET = 0.5;
 
 /** Color for the inflated hull visualization */
 export const HULL_COLOR = 0x9966ff; // Purple
+
+/** Color for the subtracted (mold cavity) mesh */
+export const CAVITY_COLOR = 0x00ffaa; // Teal/Cyan
 
 // ============================================================================
 // TYPES
@@ -35,6 +40,19 @@ export interface InflatedHullResult {
   /** Number of vertices in the hull */
   vertexCount: number;
   /** Number of faces in the hull */
+  faceCount: number;
+  /** Manifold validation result */
+  manifoldValidation: ManifoldValidationResult;
+  /** CSG subtraction result (hull - base mesh), if computed */
+  csgResult: CsgSubtractionResult | null;
+}
+
+export interface CsgSubtractionResult {
+  /** The resulting mesh after subtraction (hull - base mesh) */
+  mesh: THREE.Mesh;
+  /** Number of vertices in the result */
+  vertexCount: number;
+  /** Number of faces in the result */
   faceCount: number;
   /** Manifold validation result */
   manifoldValidation: ManifoldValidationResult;
@@ -253,6 +271,19 @@ function validateManifold(geometry: THREE.BufferGeometry): ManifoldValidationRes
   const positionAttr = geometry.getAttribute('position');
   const indexAttr = geometry.getIndex();
   
+  // Safety check - return invalid result if geometry is malformed
+  if (!positionAttr) {
+    console.warn('validateManifold: No position attribute found');
+    return {
+      isClosed: false,
+      isManifold: false,
+      boundaryEdgeCount: -1,
+      nonManifoldEdgeCount: -1,
+      totalEdgeCount: 0,
+      eulerCharacteristic: 0,
+    };
+  }
+  
   // Build edge-to-face adjacency map
   const edgeFaceCount = new Map<string, number>();
   
@@ -463,6 +494,7 @@ export function generateInflatedBoundingVolume(
     vertexCount: finalVertices.length,
     faceCount,
     manifoldValidation,
+    csgResult: null,
   };
 }
 
@@ -485,5 +517,307 @@ export function removeInflatedHull(
     scene.remove(result.originalHull);
     result.originalHull.geometry.dispose();
     (result.originalHull.material as THREE.Material).dispose();
+  }
+
+  // Also clean up CSG result if present
+  if (result.csgResult) {
+    removeCsgResult(scene, result.csgResult);
+  }
+}
+
+/**
+ * Perform CSG subtraction: Hull - Original Mesh
+ * 
+ * This creates a "mold cavity" by subtracting the original mesh from
+ * the inflated hull, leaving the hollow space between them.
+ * 
+ * Uses Manifold library for robust boolean operations that guarantee
+ * manifold (watertight) output.
+ * 
+ * @param hullMesh - The inflated convex hull mesh
+ * @param originalMesh - The original mesh to subtract from the hull
+ * @returns Promise<CsgSubtractionResult> containing the resulting cavity mesh
+ */
+export async function performCsgSubtraction(
+  hullMesh: THREE.Mesh,
+  originalMesh: THREE.Mesh
+): Promise<CsgSubtractionResult> {
+  console.log('Starting Manifold CSG subtraction: Hull - Original Mesh...');
+  
+  // Get geometries and apply world transforms
+  const hullGeometry = hullMesh.geometry.clone();
+  hullGeometry.applyMatrix4(hullMesh.matrixWorld);
+  
+  const baseGeometry = originalMesh.geometry.clone();
+  baseGeometry.applyMatrix4(originalMesh.matrixWorld);
+  
+  return performCsgSubtractionFromGeometries(hullGeometry, baseGeometry);
+}
+
+// ============================================================================
+// MANIFOLD CSG IMPLEMENTATION
+// ============================================================================
+
+type ManifoldModule = Awaited<ReturnType<typeof Module>>;
+let manifoldWasm: ManifoldModule | null = null;
+
+/**
+ * Initialize the Manifold WASM module
+ */
+async function initManifold(): Promise<ManifoldModule> {
+  if (manifoldWasm) return manifoldWasm;
+  
+  console.log('Initializing Manifold WASM module for CSG...');
+  manifoldWasm = await Module();
+  manifoldWasm.setup();
+  console.log('Manifold module initialized');
+  return manifoldWasm;
+}
+
+/**
+ * Convert Three.js BufferGeometry to Manifold Mesh
+ */
+function geometryToManifoldMesh(
+  mod: ManifoldModule,
+  geometry: THREE.BufferGeometry
+): ManifoldMesh {
+  const posAttr = geometry.getAttribute('position');
+  const positions = posAttr.array as Float32Array;
+  const vertCount = posAttr.count;
+  
+  // Create vertex properties (x, y, z for each vertex)
+  const vertProperties = new Float32Array(vertCount * 3);
+  for (let i = 0; i < vertCount; i++) {
+    vertProperties[i * 3] = positions[i * 3];
+    vertProperties[i * 3 + 1] = positions[i * 3 + 1];
+    vertProperties[i * 3 + 2] = positions[i * 3 + 2];
+  }
+  
+  // Get or create indices
+  let triVerts: Uint32Array;
+  if (geometry.index) {
+    triVerts = new Uint32Array(geometry.index.array);
+  } else {
+    triVerts = new Uint32Array(vertCount);
+    for (let i = 0; i < vertCount; i++) {
+      triVerts[i] = i;
+    }
+  }
+  
+  return new mod.Mesh({
+    numProp: 3,
+    vertProperties,
+    triVerts
+  });
+}
+
+/**
+ * Convert Manifold mesh to Three.js BufferGeometry
+ */
+function manifoldMeshToGeometry(mesh: ManifoldMesh): THREE.BufferGeometry {
+  const geometry = new THREE.BufferGeometry();
+  
+  const numVerts = mesh.numVert;
+  const positions = new Float32Array(numVerts * 3);
+  
+  for (let i = 0; i < numVerts; i++) {
+    const pos = mesh.position(i);
+    positions[i * 3] = pos[0];
+    positions[i * 3 + 1] = pos[1];
+    positions[i * 3 + 2] = pos[2];
+  }
+  
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(mesh.triVerts), 1));
+  geometry.computeVertexNormals();
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+  
+  return geometry;
+}
+
+/**
+ * Perform CSG subtraction using Manifold library
+ * 
+ * @param hullGeometry - The inflated convex hull geometry
+ * @param baseGeometry - The original mesh geometry to subtract
+ * @returns Promise<CsgSubtractionResult> containing the resulting mesh
+ */
+async function performCsgSubtractionFromGeometries(
+  hullGeometry: THREE.BufferGeometry,
+  baseGeometry: THREE.BufferGeometry
+): Promise<CsgSubtractionResult> {
+  console.log('Starting Manifold CSG subtraction from geometries...');
+  
+  const mod = await initManifold();
+  
+  // Merge vertices first to ensure clean input
+  const mergedHullGeometry = mergeVertices(hullGeometry, 0.0001);
+  const mergedBaseGeometry = mergeVertices(baseGeometry, 0.0001);
+  
+  console.log(`Hull: ${mergedHullGeometry.getAttribute('position').count} vertices`);
+  console.log(`Base: ${mergedBaseGeometry.getAttribute('position').count} vertices`);
+  
+  try {
+    // Convert to Manifold meshes
+    const hullMesh = geometryToManifoldMesh(mod, mergedHullGeometry);
+    const baseMesh = geometryToManifoldMesh(mod, mergedBaseGeometry);
+    
+    // Try to merge vertices to create valid manifolds
+    hullMesh.merge();
+    baseMesh.merge();
+    
+    // Create Manifold objects
+    let hullManifold: Manifold;
+    let baseManifold: Manifold;
+    
+    try {
+      hullManifold = mod.Manifold.ofMesh(hullMesh);
+      console.log('Hull manifold created successfully');
+    } catch (e) {
+      console.log('Hull is not manifold, using convex hull...', e);
+      // Extract vertices for hull
+      const hullVerts: [number, number, number][] = [];
+      const hullPosAttr = mergedHullGeometry.getAttribute('position');
+      for (let i = 0; i < hullPosAttr.count; i++) {
+        hullVerts.push([
+          hullPosAttr.getX(i),
+          hullPosAttr.getY(i),
+          hullPosAttr.getZ(i)
+        ]);
+      }
+      hullManifold = mod.Manifold.hull(hullVerts);
+    }
+    
+    try {
+      baseManifold = mod.Manifold.ofMesh(baseMesh);
+      console.log('Base manifold created successfully');
+    } catch (e) {
+      console.log('Base is not manifold, using convex hull...', e);
+      // Extract vertices for hull
+      const baseVerts: [number, number, number][] = [];
+      const basePosAttr = mergedBaseGeometry.getAttribute('position');
+      for (let i = 0; i < basePosAttr.count; i++) {
+        baseVerts.push([
+          basePosAttr.getX(i),
+          basePosAttr.getY(i),
+          basePosAttr.getZ(i)
+        ]);
+      }
+      baseManifold = mod.Manifold.hull(baseVerts);
+    }
+    
+    // Check if manifolds are valid
+    if (hullManifold.isEmpty()) {
+      throw new Error('Hull manifold is empty');
+    }
+    if (baseManifold.isEmpty()) {
+      throw new Error('Base manifold is empty');
+    }
+    
+    console.log(`Hull manifold: ${hullManifold.numVert()} verts, ${hullManifold.numTri()} tris, genus=${hullManifold.genus()}`);
+    console.log(`Base manifold: ${baseManifold.numVert()} verts, ${baseManifold.numTri()} tris, genus=${baseManifold.genus()}`);
+    
+    // Perform boolean subtraction: hull - base
+    console.log('Performing boolean subtraction...');
+    const resultManifold = hullManifold.subtract(baseManifold);
+    
+    if (resultManifold.isEmpty()) {
+      console.warn('CSG subtraction resulted in empty manifold');
+    }
+    
+    const resultVolume = resultManifold.volume();
+    const resultSurfaceArea = resultManifold.surfaceArea();
+    console.log(`Result: ${resultManifold.numVert()} verts, ${resultManifold.numTri()} tris`);
+    console.log(`Result volume: ${resultVolume.toFixed(2)}, surface area: ${resultSurfaceArea.toFixed(2)}`);
+    
+    // Convert result back to Three.js geometry
+    const resultMesh = resultManifold.getMesh();
+    const resultGeometry = manifoldMeshToGeometry(resultMesh);
+    
+    const vertexCount = resultManifold.numVert();
+    const faceCount = resultManifold.numTri();
+    const genus = resultManifold.genus();
+    
+    // Manifold library guarantees manifold output
+    const manifoldValidation: ManifoldValidationResult = {
+      isClosed: true,
+      isManifold: true,
+      boundaryEdgeCount: 0,
+      nonManifoldEdgeCount: 0,
+      totalEdgeCount: faceCount * 3 / 2, // Euler formula
+      eulerCharacteristic: vertexCount - (faceCount * 3 / 2) + faceCount,
+    };
+    
+    // Create material for the result
+    const cavityMaterial = new THREE.MeshPhongMaterial({
+      color: CAVITY_COLOR,
+      transparent: true,
+      opacity: 0.7,
+      side: THREE.DoubleSide,
+      flatShading: false,
+    });
+    
+    const mesh = new THREE.Mesh(resultGeometry, cavityMaterial);
+    
+    console.log(`Manifold CSG subtraction complete: ${vertexCount} vertices, ${faceCount} faces, genus=${genus}`);
+    
+    // Clean up Manifold objects
+    hullManifold.delete();
+    baseManifold.delete();
+    resultManifold.delete();
+    
+    // Clean up temp geometries
+    mergedHullGeometry.dispose();
+    mergedBaseGeometry.dispose();
+    
+    return {
+      mesh,
+      vertexCount,
+      faceCount,
+      manifoldValidation,
+    };
+    
+  } catch (error) {
+    console.error('Manifold CSG subtraction failed:', error);
+    
+    // Return empty result on failure
+    const emptyGeometry = new THREE.BufferGeometry();
+    const cavityMaterial = new THREE.MeshPhongMaterial({
+      color: CAVITY_COLOR,
+      transparent: true,
+      opacity: 0.5,
+      side: THREE.DoubleSide,
+    });
+    
+    return {
+      mesh: new THREE.Mesh(emptyGeometry, cavityMaterial),
+      vertexCount: 0,
+      faceCount: 0,
+      manifoldValidation: {
+        isClosed: false,
+        isManifold: false,
+        boundaryEdgeCount: -1,
+        nonManifoldEdgeCount: -1,
+        totalEdgeCount: 0,
+        eulerCharacteristic: 0,
+      },
+    };
+  }
+}
+
+/**
+ * Remove CSG result mesh from scene
+ */
+export function removeCsgResult(
+  scene: THREE.Scene,
+  result: CsgSubtractionResult | null
+): void {
+  if (!result) return;
+
+  if (result.mesh.parent === scene) {
+    scene.remove(result.mesh);
+    result.mesh.geometry.dispose();
+    (result.mesh.material as THREE.Material).dispose();
   }
 }

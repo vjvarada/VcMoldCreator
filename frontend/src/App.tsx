@@ -10,13 +10,20 @@ import './App.css';
 import ThreeViewer from './components/ThreeViewer';
 import FileUpload from './components/FileUpload';
 import type { VisibilityPaintData } from './utils/partingDirection';
-import type { InflatedHullResult, ManifoldValidationResult } from './utils/inflatedBoundingVolume';
+import type { InflatedHullResult, ManifoldValidationResult, CsgSubtractionResult } from './utils/inflatedBoundingVolume';
+import type { MeshRepairResult, MeshDiagnostics } from './utils/meshRepairManifold';
 
 // ============================================================================
 // COMPONENT
 // ============================================================================
 
 interface HullStats {
+  vertexCount: number;
+  faceCount: number;
+  manifoldValidation: ManifoldValidationResult;
+}
+
+interface CsgStats {
   vertexCount: number;
   faceCount: number;
   manifoldValidation: ManifoldValidationResult;
@@ -33,6 +40,15 @@ function App() {
   const [showInflatedHull, setShowInflatedHull] = useState(false);
   const [inflationOffset, setInflationOffset] = useState(0.5);
   const [hullStats, setHullStats] = useState<HullStats | null>(null);
+  const [showCsgResult, setShowCsgResult] = useState(false);
+  const [csgStats, setCsgStats] = useState<CsgStats | null>(null);
+  const [hideOriginalMesh, setHideOriginalMesh] = useState(false);
+  const [hideHull, setHideHull] = useState(false);
+  const [meshRepairResult, setMeshRepairResult] = useState<{
+    diagnostics: MeshDiagnostics;
+    wasRepaired: boolean;
+    repairMethod: string;
+  } | null>(null);
 
   // Handlers
   const handleFileLoad = useCallback((url: string, _fileName: string) => {
@@ -45,9 +61,25 @@ function App() {
     setVisibilityDataReady(false);
     setShowInflatedHull(false);
     setHullStats(null);
+    setShowCsgResult(false);
+    setCsgStats(null);
+    setHideOriginalMesh(false);
+    setHideHull(false);
+    setMeshRepairResult(null);
   }, [stlUrl]);
 
   const handleMeshLoaded = useCallback(() => setMeshLoaded(true), []);
+
+  const handleMeshRepaired = useCallback(
+    (result: MeshRepairResult) => {
+      setMeshRepairResult({
+        diagnostics: result.diagnostics,
+        wasRepaired: result.wasRepaired,
+        repairMethod: result.repairMethod,
+      });
+    },
+    []
+  );
 
   const handleVisibilityDataReady = useCallback(
     (data: VisibilityPaintData | null) => setVisibilityDataReady(data !== null),
@@ -57,6 +89,22 @@ function App() {
   const handleInflatedHullReady = useCallback(
     (result: InflatedHullResult | null) => {
       setHullStats(result ? {
+        vertexCount: result.vertexCount,
+        faceCount: result.faceCount,
+        manifoldValidation: result.manifoldValidation,
+      } : null);
+      // Reset CSG when hull changes
+      if (!result) {
+        setShowCsgResult(false);
+        setCsgStats(null);
+      }
+    },
+    []
+  );
+
+  const handleCsgResultReady = useCallback(
+    (result: CsgSubtractionResult | null) => {
+      setCsgStats(result ? {
         vertexCount: result.vertexCount,
         faceCount: result.faceCount,
         manifoldValidation: result.manifoldValidation,
@@ -90,9 +138,14 @@ function App() {
         showD2Paint={showD2Paint}
         showInflatedHull={showInflatedHull}
         inflationOffset={inflationOffset}
+        showCsgResult={showCsgResult}
+        hideOriginalMesh={hideOriginalMesh}
+        hideHull={hideHull}
         onMeshLoaded={handleMeshLoaded}
+        onMeshRepaired={handleMeshRepaired}
         onVisibilityDataReady={handleVisibilityDataReady}
         onInflatedHullReady={handleInflatedHullReady}
+        onCsgResultReady={handleCsgResultReady}
       />
 
       {/* File Upload */}
@@ -102,6 +155,56 @@ function App() {
       {meshLoaded && (
         <div style={styles.controlPanel}>
           <div style={styles.title}>🔧 Mold Analysis</div>
+          
+          {/* Mesh Health Status */}
+          {meshRepairResult && (
+            <div style={{ 
+              marginBottom: '12px', 
+              padding: '8px', 
+              backgroundColor: meshRepairResult.diagnostics.isManifold 
+                ? 'rgba(0, 255, 0, 0.15)' 
+                : 'rgba(255, 165, 0, 0.15)',
+              borderRadius: '4px',
+              fontSize: '10px'
+            }}>
+              <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>
+                {meshRepairResult.diagnostics.isManifold 
+                  ? '✅ Mesh: Valid Manifold' 
+                  : '⚠️ Mesh: Invalid'}
+              </div>
+              <div>Vertices: {meshRepairResult.diagnostics.vertexCount}</div>
+              <div>Faces: {meshRepairResult.diagnostics.faceCount}</div>
+              {meshRepairResult.diagnostics.genus >= 0 && (
+                <div>Genus: {meshRepairResult.diagnostics.genus}</div>
+              )}
+              {meshRepairResult.diagnostics.volume > 0 && (
+                <div>Volume: {meshRepairResult.diagnostics.volume.toFixed(1)}</div>
+              )}
+              {meshRepairResult.wasRepaired && (
+                <div style={{ marginTop: '4px', color: '#aaf' }}>
+                  Repaired: {meshRepairResult.repairMethod}
+                </div>
+              )}
+              {meshRepairResult.diagnostics.issues.length > 0 && (
+                <div style={{ marginTop: '4px', color: '#ffa' }}>
+                  {meshRepairResult.diagnostics.issues.map((issue, i) => (
+                    <div key={i}>• {issue}</div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          
+          {/* Hide Original Mesh Checkbox */}
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px', cursor: 'pointer', fontSize: '12px' }}>
+            <input
+              type="checkbox"
+              checked={hideOriginalMesh}
+              onChange={(e) => setHideOriginalMesh(e.target.checked)}
+              style={{ cursor: 'pointer' }}
+            />
+            Hide Original Mesh
+          </label>
           
           {/* Parting Direction Toggle */}
           <button
@@ -168,21 +271,39 @@ function App() {
             </div>
           )}
 
-          {/* Separator */}
-          <div style={{ borderTop: '1px solid #444', margin: '16px 0 12px 0' }} />
+          {/* Inflated Hull Section - only available after parting directions are calculated */}
+          {visibilityDataReady && (
+            <>
+              {/* Separator */}
+              <div style={{ borderTop: '1px solid #444', margin: '16px 0 12px 0' }} />
 
-          {/* Inflated Hull Section */}
-          <div style={styles.title}>📦 Bounding Volume</div>
-          
-          <button
-            onClick={() => setShowInflatedHull(prev => !prev)}
-            style={{
-              ...styles.button,
-              backgroundColor: showInflatedHull ? '#9966ff' : '#00aaff',
-            }}
-          >
-            {showInflatedHull ? '✓ Inflated Hull ON' : 'Show Inflated Hull'}
-          </button>
+              {/* Inflated Hull Section */}
+              <div style={styles.title}>📦 Bounding Volume</div>
+              
+              <button
+                onClick={() => setShowInflatedHull(prev => !prev)}
+                style={{
+                  ...styles.button,
+                  backgroundColor: showInflatedHull ? '#9966ff' : '#00aaff',
+                }}
+              >
+                {showInflatedHull ? '✓ Inflated Hull ON' : 'Show Inflated Hull'}
+              </button>
+              
+              {/* Hide Hull Checkbox */}
+              {showInflatedHull && (
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px', cursor: 'pointer', fontSize: '12px' }}>
+                  <input
+                    type="checkbox"
+                    checked={hideHull}
+                    onChange={(e) => setHideHull(e.target.checked)}
+                    style={{ cursor: 'pointer' }}
+                  />
+                  Hide Hull (show only cavity)
+                </label>
+              )}
+            </>
+          )}
 
           {/* Inflation Offset Input */}
           {showInflatedHull && (
@@ -241,6 +362,56 @@ function App() {
                 <div>🟣 Purple = Inflated hull</div>
               </div>
             </div>
+          )}
+
+          {/* CSG Subtraction Section - only available after hull is created */}
+          {hullStats && (
+            <>
+              {/* Separator */}
+              <div style={{ borderTop: '1px solid #444', margin: '16px 0 12px 0' }} />
+
+              {/* CSG Section */}
+              <div style={styles.title}>✂️ Mold Cavity</div>
+              
+              <button
+                onClick={() => setShowCsgResult(prev => !prev)}
+                style={{
+                  ...styles.button,
+                  backgroundColor: showCsgResult ? '#00ffaa' : '#00aaff',
+                }}
+              >
+                {showCsgResult ? '✓ Cavity ON' : 'Subtract Base Mesh'}
+              </button>
+
+              {/* CSG Stats */}
+              {showCsgResult && csgStats && (
+                <div style={{ marginTop: '12px' }}>
+                  <div style={{ fontSize: '10px', opacity: 0.7 }}>
+                    <div>Cavity vertices: {csgStats.vertexCount}</div>
+                    <div>Cavity faces: {csgStats.faceCount}</div>
+                  </div>
+
+                  {/* CSG Manifold Validation */}
+                  <div style={{ 
+                    marginTop: '10px', 
+                    padding: '8px', 
+                    backgroundColor: csgStats.manifoldValidation.isManifold ? 'rgba(0, 255, 0, 0.15)' : 'rgba(255, 100, 0, 0.15)',
+                    borderRadius: '4px',
+                    fontSize: '10px'
+                  }}>
+                    <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>
+                      {csgStats.manifoldValidation.isManifold ? '✅ Valid Manifold' : '⚠️ Not Manifold'}
+                    </div>
+                    <div>Closed: {csgStats.manifoldValidation.isClosed ? '✓ Yes' : `✗ No (${csgStats.manifoldValidation.boundaryEdgeCount} boundary edges)`}</div>
+                  </div>
+
+                  {/* Legend */}
+                  <div style={styles.legend}>
+                    <div>🩵 Teal = Mold cavity (Hull - Base)</div>
+                  </div>
+                </div>
+              )}
+            </>
           )}
         </div>
       )}

@@ -22,8 +22,16 @@ import {
 import {
   generateInflatedBoundingVolume,
   removeInflatedHull,
-  type InflatedHullResult
+  performCsgSubtraction,
+  removeCsgResult,
+  type InflatedHullResult,
+  type CsgSubtractionResult
 } from '../utils/inflatedBoundingVolume';
+import {
+  repairMeshWithManifold,
+  formatDiagnostics,
+  type MeshRepairResult
+} from '../utils/meshRepairManifold';
 
 // ============================================================================
 // TYPES
@@ -36,9 +44,14 @@ interface ThreeViewerProps {
   showD2Paint?: boolean;
   showInflatedHull?: boolean;
   inflationOffset?: number;
+  showCsgResult?: boolean;
+  hideOriginalMesh?: boolean;
+  hideHull?: boolean;
   onMeshLoaded?: (mesh: THREE.Mesh) => void;
+  onMeshRepaired?: (result: MeshRepairResult) => void;
   onVisibilityDataReady?: (data: VisibilityPaintData | null) => void;
   onInflatedHullReady?: (result: InflatedHullResult | null) => void;
+  onCsgResultReady?: (result: CsgSubtractionResult | null) => void;
 }
 
 // ============================================================================
@@ -61,9 +74,14 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   showD2Paint = false,
   showInflatedHull = false,
   inflationOffset = 0.05,
+  showCsgResult = false,
+  hideOriginalMesh = false,
+  hideHull = false,
   onMeshLoaded,
+  onMeshRepaired,
   onVisibilityDataReady,
-  onInflatedHullReady
+  onInflatedHullReady,
+  onCsgResultReady
 }) => {
   // Refs for Three.js objects
   const containerRef = useRef<HTMLDivElement>(null);
@@ -76,6 +94,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const partingArrowsRef = useRef<THREE.ArrowHelper[]>([]);
   const visibilityDataRef = useRef<VisibilityPaintData | null>(null);
   const inflatedHullRef = useRef<InflatedHullResult | null>(null);
+  const csgResultRef = useRef<CsgSubtractionResult | null>(null);
 
   // ============================================================================
   // SCENE SETUP
@@ -197,9 +216,20 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
     fetch(stlUrl)
       .then(response => response.arrayBuffer())
-      .then(buffer => {
-        const geometry = new STLLoader().parse(buffer);
-        geometry.computeVertexNormals();
+      .then(async buffer => {
+        let geometry = new STLLoader().parse(buffer);
+        
+        // Repair mesh using Manifold library
+        console.log('Repairing mesh with Manifold...');
+        const repairResult = await repairMeshWithManifold(geometry);
+        geometry = repairResult.geometry;
+        
+        console.log('Mesh repair result:', repairResult.repairMethod);
+        console.log('Mesh diagnostics:\n' + formatDiagnostics(repairResult.diagnostics));
+        
+        // Notify parent of repair result
+        onMeshRepaired?.(repairResult);
+        
         geometry.computeBoundingBox();
         
         if (!geometry.boundingBox) return;
@@ -240,7 +270,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
         controls.update();
       })
       .catch(error => console.error('Error loading STL:', error));
-  }, [stlUrl, onMeshLoaded]);
+  }, [stlUrl, onMeshLoaded, onMeshRepaired]);
 
   // ============================================================================
   // PARTING DIRECTIONS
@@ -260,12 +290,12 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
     if (showPartingDirections && meshRef.current) {
       computeAndShowPartingDirectionsParallel(meshRef.current, 128)
-        .then(result => {
+        .then((result: { arrows: THREE.ArrowHelper[]; visibilityData: VisibilityPaintData }) => {
           partingArrowsRef.current = result.arrows;
           visibilityDataRef.current = result.visibilityData;
           onVisibilityDataReady?.(result.visibilityData);
         })
-        .catch(error => console.error('Error computing parting directions:', error));
+        .catch((error: unknown) => console.error('Error computing parting directions:', error));
     }
   }, [showPartingDirections, stlUrl, onVisibilityDataReady]);
 
@@ -284,19 +314,62 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       inflatedHullRef.current = null;
       onInflatedHullReady?.(null);
     }
+    
+    // Remove existing CSG result when hull changes
+    if (csgResultRef.current) {
+      removeCsgResult(scene, csgResultRef.current);
+      csgResultRef.current = null;
+      onCsgResultReady?.(null);
+    }
 
     if (showInflatedHull && meshRef.current) {
       try {
         const result = generateInflatedBoundingVolume(meshRef.current, inflationOffset);
         scene.add(result.mesh);
-        // Note: result.originalHull is available but not added to scene
         inflatedHullRef.current = result;
         onInflatedHullReady?.(result);
       } catch (error) {
         console.error('Error generating inflated hull:', error);
       }
     }
-  }, [showInflatedHull, inflationOffset, stlUrl, onInflatedHullReady]);
+  }, [showInflatedHull, inflationOffset, stlUrl, onInflatedHullReady, onCsgResultReady]);
+
+  // ============================================================================
+  // CSG SUBTRACTION
+  // ============================================================================
+
+  useEffect(() => {
+    if (!sceneRef.current) return;
+    
+    const scene = sceneRef.current;
+
+    // Remove existing CSG result
+    if (csgResultRef.current) {
+      removeCsgResult(scene, csgResultRef.current);
+      csgResultRef.current = null;
+      onCsgResultReady?.(null);
+    }
+
+    // Perform CSG if requested and hull exists
+    if (showCsgResult && inflatedHullRef.current && meshRef.current) {
+      const performCsg = async () => {
+        try {
+          console.log('Performing CSG: Hull - Original Mesh');
+          const result = await performCsgSubtraction(
+            inflatedHullRef.current!.mesh,
+            meshRef.current!
+          );
+          scene.add(result.mesh);
+          csgResultRef.current = result;
+          onCsgResultReady?.(result);
+          console.log('CSG result added to scene');
+        } catch (error) {
+          console.error('Error performing CSG subtraction:', error);
+        }
+      };
+      performCsg();
+    }
+  }, [showCsgResult, onCsgResultReady]);
 
   // ============================================================================
   // VISIBILITY PAINTING
@@ -315,7 +388,25 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
     }
   }, [showD1Paint, showD2Paint]);
 
-  // Cleanup arrows and hull on unmount
+  // ============================================================================
+  // ORIGINAL MESH VISIBILITY
+  // ============================================================================
+
+  useEffect(() => {
+    if (!meshRef.current) return;
+    meshRef.current.visible = !hideOriginalMesh;
+  }, [hideOriginalMesh]);
+
+  // ============================================================================
+  // HULL VISIBILITY
+  // ============================================================================
+
+  useEffect(() => {
+    if (!inflatedHullRef.current) return;
+    inflatedHullRef.current.mesh.visible = !hideHull;
+  }, [hideHull]);
+
+  // Cleanup arrows, hull, and CSG result on unmount
   useEffect(() => {
     return () => {
       if (partingArrowsRef.current.length > 0) {
@@ -323,6 +414,9 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       }
       if (inflatedHullRef.current && sceneRef.current) {
         removeInflatedHull(sceneRef.current, inflatedHullRef.current);
+      }
+      if (csgResultRef.current && sceneRef.current) {
+        removeCsgResult(sceneRef.current, csgResultRef.current);
       }
     };
   }, []);
