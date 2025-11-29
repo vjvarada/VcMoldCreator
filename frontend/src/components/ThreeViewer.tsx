@@ -19,6 +19,11 @@ import {
   COLORS,
   type VisibilityPaintData
 } from '../utils/partingDirection';
+import {
+  generateInflatedBoundingVolume,
+  removeInflatedHull,
+  type InflatedHullResult
+} from '../utils/inflatedBoundingVolume';
 
 // ============================================================================
 // TYPES
@@ -29,8 +34,11 @@ interface ThreeViewerProps {
   showPartingDirections?: boolean;
   showD1Paint?: boolean;
   showD2Paint?: boolean;
+  showInflatedHull?: boolean;
+  inflationOffset?: number;
   onMeshLoaded?: (mesh: THREE.Mesh) => void;
   onVisibilityDataReady?: (data: VisibilityPaintData | null) => void;
+  onInflatedHullReady?: (result: InflatedHullResult | null) => void;
 }
 
 // ============================================================================
@@ -51,8 +59,11 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   showPartingDirections = false,
   showD1Paint = false,
   showD2Paint = false,
+  showInflatedHull = false,
+  inflationOffset = 0.05,
   onMeshLoaded,
-  onVisibilityDataReady
+  onVisibilityDataReady,
+  onInflatedHullReady
 }) => {
   // Refs for Three.js objects
   const containerRef = useRef<HTMLDivElement>(null);
@@ -64,6 +75,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const animationIdRef = useRef<number | null>(null);
   const partingArrowsRef = useRef<THREE.ArrowHelper[]>([]);
   const visibilityDataRef = useRef<VisibilityPaintData | null>(null);
+  const inflatedHullRef = useRef<InflatedHullResult | null>(null);
 
   // ============================================================================
   // SCENE SETUP
@@ -258,6 +270,35 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   }, [showPartingDirections, stlUrl, onVisibilityDataReady]);
 
   // ============================================================================
+  // INFLATED BOUNDING VOLUME
+  // ============================================================================
+
+  useEffect(() => {
+    if (!meshRef.current || !sceneRef.current) return;
+
+    const scene = sceneRef.current;
+
+    // Remove existing inflated hull
+    if (inflatedHullRef.current) {
+      removeInflatedHull(scene, inflatedHullRef.current);
+      inflatedHullRef.current = null;
+      onInflatedHullReady?.(null);
+    }
+
+    if (showInflatedHull && meshRef.current) {
+      try {
+        const result = generateInflatedBoundingVolume(meshRef.current, inflationOffset);
+        scene.add(result.mesh);
+        // Note: result.originalHull is available but not added to scene
+        inflatedHullRef.current = result;
+        onInflatedHullReady?.(result);
+      } catch (error) {
+        console.error('Error generating inflated hull:', error);
+      }
+    }
+  }, [showInflatedHull, inflationOffset, stlUrl, onInflatedHullReady]);
+
+  // ============================================================================
   // VISIBILITY PAINTING
   // ============================================================================
 
@@ -274,11 +315,14 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
     }
   }, [showD1Paint, showD2Paint]);
 
-  // Cleanup arrows on unmount
+  // Cleanup arrows and hull on unmount
   useEffect(() => {
     return () => {
       if (partingArrowsRef.current.length > 0) {
         removePartingDirectionArrows(partingArrowsRef.current);
+      }
+      if (inflatedHullRef.current && sceneRef.current) {
+        removeInflatedHull(sceneRef.current, inflatedHullRef.current);
       }
     };
   }, []);

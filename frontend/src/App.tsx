@@ -10,10 +10,17 @@ import './App.css';
 import ThreeViewer from './components/ThreeViewer';
 import FileUpload from './components/FileUpload';
 import type { VisibilityPaintData } from './utils/partingDirection';
+import type { InflatedHullResult, ManifoldValidationResult } from './utils/inflatedBoundingVolume';
 
 // ============================================================================
 // COMPONENT
 // ============================================================================
+
+interface HullStats {
+  vertexCount: number;
+  faceCount: number;
+  manifoldValidation: ManifoldValidationResult;
+}
 
 function App() {
   // State
@@ -23,6 +30,9 @@ function App() {
   const [showD2Paint, setShowD2Paint] = useState(false);
   const [meshLoaded, setMeshLoaded] = useState(false);
   const [visibilityDataReady, setVisibilityDataReady] = useState(false);
+  const [showInflatedHull, setShowInflatedHull] = useState(false);
+  const [inflationOffset, setInflationOffset] = useState(0.5);
+  const [hullStats, setHullStats] = useState<HullStats | null>(null);
 
   // Handlers
   const handleFileLoad = useCallback((url: string, _fileName: string) => {
@@ -33,12 +43,25 @@ function App() {
     setShowD2Paint(false);
     setMeshLoaded(false);
     setVisibilityDataReady(false);
+    setShowInflatedHull(false);
+    setHullStats(null);
   }, [stlUrl]);
 
   const handleMeshLoaded = useCallback(() => setMeshLoaded(true), []);
 
   const handleVisibilityDataReady = useCallback(
     (data: VisibilityPaintData | null) => setVisibilityDataReady(data !== null),
+    []
+  );
+
+  const handleInflatedHullReady = useCallback(
+    (result: InflatedHullResult | null) => {
+      setHullStats(result ? {
+        vertexCount: result.vertexCount,
+        faceCount: result.faceCount,
+        manifoldValidation: result.manifoldValidation,
+      } : null);
+    },
     []
   );
 
@@ -65,8 +88,11 @@ function App() {
         showPartingDirections={showPartingDirections}
         showD1Paint={showD1Paint}
         showD2Paint={showD2Paint}
+        showInflatedHull={showInflatedHull}
+        inflationOffset={inflationOffset}
         onMeshLoaded={handleMeshLoaded}
         onVisibilityDataReady={handleVisibilityDataReady}
+        onInflatedHullReady={handleInflatedHullReady}
       />
 
       {/* File Upload */}
@@ -139,6 +165,81 @@ function App() {
             <div style={{ marginTop: '10px', fontSize: '11px', opacity: 0.8 }}>
               <div>🟢 Green arrow: Primary direction</div>
               <div>🟠 Orange arrow: Secondary direction</div>
+            </div>
+          )}
+
+          {/* Separator */}
+          <div style={{ borderTop: '1px solid #444', margin: '16px 0 12px 0' }} />
+
+          {/* Inflated Hull Section */}
+          <div style={styles.title}>📦 Bounding Volume</div>
+          
+          <button
+            onClick={() => setShowInflatedHull(prev => !prev)}
+            style={{
+              ...styles.button,
+              backgroundColor: showInflatedHull ? '#9966ff' : '#00aaff',
+            }}
+          >
+            {showInflatedHull ? '✓ Inflated Hull ON' : 'Show Inflated Hull'}
+          </button>
+
+          {/* Inflation Offset Input */}
+          {showInflatedHull && (
+            <div style={{ marginTop: '12px' }}>
+              <div style={styles.sectionLabel}>
+                Inflation Offset (mm):
+              </div>
+              <input
+                type="number"
+                min="0"
+                step="0.1"
+                value={inflationOffset}
+                onChange={(e) => setInflationOffset(Math.max(0, parseFloat(e.target.value) || 0))}
+                style={{
+                  width: '100%',
+                  padding: '6px 10px',
+                  backgroundColor: '#222',
+                  border: '1px solid #555',
+                  borderRadius: '4px',
+                  color: '#fff',
+                  fontSize: '13px',
+                }}
+              />
+              
+              {/* Hull Stats */}
+              {hullStats && (
+                <div style={{ marginTop: '8px', fontSize: '10px', opacity: 0.7 }}>
+                  <div>Hull vertices: {hullStats.vertexCount}</div>
+                  <div>Hull faces: {hullStats.faceCount}</div>
+                  <div>Edges: {hullStats.manifoldValidation.totalEdgeCount}</div>
+                  <div>Euler (V-E+F): {hullStats.manifoldValidation.eulerCharacteristic}</div>
+                </div>
+              )}
+
+              {/* Manifold Validation */}
+              {hullStats && (
+                <div style={{ 
+                  marginTop: '10px', 
+                  padding: '8px', 
+                  backgroundColor: hullStats.manifoldValidation.isManifold ? 'rgba(0, 255, 0, 0.15)' : 'rgba(255, 100, 0, 0.15)',
+                  borderRadius: '4px',
+                  fontSize: '10px'
+                }}>
+                  <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>
+                    {hullStats.manifoldValidation.isManifold ? '✅ Valid Manifold' : '⚠️ Not Manifold'}
+                  </div>
+                  <div>Closed: {hullStats.manifoldValidation.isClosed ? '✓ Yes' : `✗ No (${hullStats.manifoldValidation.boundaryEdgeCount} boundary edges)`}</div>
+                  {hullStats.manifoldValidation.nonManifoldEdgeCount > 0 && (
+                    <div>Non-manifold edges: {hullStats.manifoldValidation.nonManifoldEdgeCount}</div>
+                  )}
+                </div>
+              )}
+
+              {/* Legend */}
+              <div style={styles.legend}>
+                <div>🟣 Purple = Inflated hull</div>
+              </div>
             </div>
           )}
         </div>
