@@ -7,11 +7,12 @@
 
 import { useState, useCallback } from 'react';
 import './App.css';
-import ThreeViewer from './components/ThreeViewer';
+import ThreeViewer, { type GridVisualizationMode } from './components/ThreeViewer';
 import FileUpload from './components/FileUpload';
 import type { VisibilityPaintData } from './utils/partingDirection';
 import type { InflatedHullResult, ManifoldValidationResult, CsgSubtractionResult } from './utils/inflatedBoundingVolume';
 import type { MeshRepairResult, MeshDiagnostics } from './utils/meshRepairManifold';
+import type { VolumetricGridResult } from './utils/volumetricGrid';
 
 // ============================================================================
 // COMPONENT
@@ -29,6 +30,15 @@ interface CsgStats {
   manifoldValidation: ManifoldValidationResult;
 }
 
+interface VolumetricGridStats {
+  resolution: { x: number; y: number; z: number };
+  totalCellCount: number;
+  moldVolumeCellCount: number;
+  moldVolume: number;
+  fillRatio: number;
+  computeTimeMs: number;
+}
+
 function App() {
   // State
   const [stlUrl, setStlUrl] = useState<string>();
@@ -44,11 +54,16 @@ function App() {
   const [csgStats, setCsgStats] = useState<CsgStats | null>(null);
   const [hideOriginalMesh, setHideOriginalMesh] = useState(false);
   const [hideHull, setHideHull] = useState(false);
+  const [hideCavity, setHideCavity] = useState(false);
   const [meshRepairResult, setMeshRepairResult] = useState<{
     diagnostics: MeshDiagnostics;
     wasRepaired: boolean;
     repairMethod: string;
   } | null>(null);
+  const [showVolumetricGrid, setShowVolumetricGrid] = useState(false);
+  const [gridResolution, setGridResolution] = useState(64);
+  const [gridVisualizationMode, setGridVisualizationMode] = useState<GridVisualizationMode>('points');
+  const [volumetricGridStats, setVolumetricGridStats] = useState<VolumetricGridStats | null>(null);
 
   // Handlers
   const handleFileLoad = useCallback((url: string, _fileName: string) => {
@@ -65,7 +80,10 @@ function App() {
     setCsgStats(null);
     setHideOriginalMesh(false);
     setHideHull(false);
+    setHideCavity(false);
     setMeshRepairResult(null);
+    setShowVolumetricGrid(false);
+    setVolumetricGridStats(null);
   }, [stlUrl]);
 
   const handleMeshLoaded = useCallback(() => setMeshLoaded(true), []);
@@ -109,6 +127,25 @@ function App() {
         faceCount: result.faceCount,
         manifoldValidation: result.manifoldValidation,
       } : null);
+      // Reset volumetric grid when CSG changes
+      if (!result) {
+        setShowVolumetricGrid(false);
+        setVolumetricGridStats(null);
+      }
+    },
+    []
+  );
+
+  const handleVolumetricGridReady = useCallback(
+    (result: VolumetricGridResult | null) => {
+      setVolumetricGridStats(result ? {
+        resolution: { x: result.resolution.x, y: result.resolution.y, z: result.resolution.z },
+        totalCellCount: result.totalCellCount,
+        moldVolumeCellCount: result.moldVolumeCellCount,
+        moldVolume: result.stats.moldVolume,
+        fillRatio: result.stats.fillRatio,
+        computeTimeMs: result.stats.computeTimeMs,
+      } : null);
     },
     []
   );
@@ -141,11 +178,16 @@ function App() {
         showCsgResult={showCsgResult}
         hideOriginalMesh={hideOriginalMesh}
         hideHull={hideHull}
+        hideCavity={hideCavity}
+        showVolumetricGrid={showVolumetricGrid}
+        gridResolution={gridResolution}
+        gridVisualizationMode={gridVisualizationMode}
         onMeshLoaded={handleMeshLoaded}
         onMeshRepaired={handleMeshRepaired}
         onVisibilityDataReady={handleVisibilityDataReady}
         onInflatedHullReady={handleInflatedHullReady}
         onCsgResultReady={handleCsgResultReady}
+        onVolumetricGridReady={handleVolumetricGridReady}
       />
 
       {/* File Upload */}
@@ -383,6 +425,19 @@ function App() {
                 {showCsgResult ? '✓ Cavity ON' : 'Subtract Base Mesh'}
               </button>
 
+              {/* Hide Cavity Checkbox */}
+              {showCsgResult && (
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px', cursor: 'pointer', fontSize: '12px' }}>
+                  <input
+                    type="checkbox"
+                    checked={hideCavity}
+                    onChange={(e) => setHideCavity(e.target.checked)}
+                    style={{ cursor: 'pointer' }}
+                  />
+                  Hide Cavity (show grid only)
+                </label>
+              )}
+
               {/* CSG Stats */}
               {showCsgResult && csgStats && (
                 <div style={{ marginTop: '12px' }}>
@@ -409,6 +464,124 @@ function App() {
                   <div style={styles.legend}>
                     <div>🩵 Teal = Mold cavity (Hull - Base)</div>
                   </div>
+                </div>
+              )}
+            </>
+          )}
+
+          {/* Volumetric Grid Section - only available after cavity is created */}
+          {csgStats && (
+            <>
+              {/* Separator */}
+              <div style={{ borderTop: '1px solid #444', margin: '16px 0 12px 0' }} />
+
+              {/* Volumetric Grid Section */}
+              <div style={styles.title}>🧊 Volume Grid</div>
+              
+              <button
+                onClick={() => setShowVolumetricGrid(prev => !prev)}
+                style={{
+                  ...styles.button,
+                  backgroundColor: showVolumetricGrid ? '#00ffff' : '#00aaff',
+                }}
+              >
+                {showVolumetricGrid ? '✓ Volume Grid ON' : 'Generate Volume Grid'}
+              </button>
+
+              {/* Grid Options */}
+              {showVolumetricGrid && (
+                <div style={{ marginTop: '12px' }}>
+                  {/* Resolution Input */}
+                  <div style={styles.sectionLabel}>
+                    Grid Resolution (per axis):
+                  </div>
+                  <input
+                    type="number"
+                    min="8"
+                    max="128"
+                    step="8"
+                    value={gridResolution}
+                    onChange={(e) => setGridResolution(Math.max(8, Math.min(128, parseInt(e.target.value) || 64)))}
+                    style={{
+                      width: '100%',
+                      padding: '6px 10px',
+                      backgroundColor: '#222',
+                      border: '1px solid #555',
+                      borderRadius: '4px',
+                      color: '#fff',
+                      fontSize: '13px',
+                    }}
+                  />
+
+                  {/* Visualization Mode */}
+                  <div style={{ ...styles.sectionLabel, marginTop: '10px' }}>
+                    Visualization Mode:
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button
+                      onClick={() => setGridVisualizationMode('points')}
+                      style={{
+                        ...styles.toggleButton,
+                        backgroundColor: gridVisualizationMode === 'points' ? '#00ffff' : '#333',
+                        borderColor: gridVisualizationMode === 'points' ? '#00ffff' : '#555',
+                        color: gridVisualizationMode === 'points' ? '#000' : '#fff',
+                        fontWeight: gridVisualizationMode === 'points' ? 'bold' : 'normal',
+                      }}
+                    >
+                      Points
+                    </button>
+                    <button
+                      onClick={() => setGridVisualizationMode('voxels')}
+                      style={{
+                        ...styles.toggleButton,
+                        backgroundColor: gridVisualizationMode === 'voxels' ? '#00ffff' : '#333',
+                        borderColor: gridVisualizationMode === 'voxels' ? '#00ffff' : '#555',
+                        color: gridVisualizationMode === 'voxels' ? '#000' : '#fff',
+                        fontWeight: gridVisualizationMode === 'voxels' ? 'bold' : 'normal',
+                      }}
+                    >
+                      Voxels
+                    </button>
+                  </div>
+
+                  {/* Grid Stats */}
+                  {volumetricGridStats && (
+                    <div style={{ marginTop: '12px' }}>
+                      <div style={{ fontSize: '10px', opacity: 0.7 }}>
+                        <div>Resolution: {volumetricGridStats.resolution.x}×{volumetricGridStats.resolution.y}×{volumetricGridStats.resolution.z}</div>
+                        <div>Mold cells: {volumetricGridStats.moldVolumeCellCount.toLocaleString()} / {volumetricGridStats.totalCellCount.toLocaleString()}</div>
+                        <div>Fill ratio: {(volumetricGridStats.fillRatio * 100).toFixed(1)}%</div>
+                        <div>Approx volume: {volumetricGridStats.moldVolume.toFixed(4)}</div>
+                        <div>Compute time: {volumetricGridStats.computeTimeMs.toFixed(0)} ms</div>
+                      </div>
+
+                      {/* Grid Status */}
+                      <div style={{ 
+                        marginTop: '10px', 
+                        padding: '8px', 
+                        backgroundColor: 'rgba(0, 255, 255, 0.15)',
+                        borderRadius: '4px',
+                        fontSize: '10px'
+                      }}>
+                        <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>
+                          ✅ Volume Grid Generated
+                        </div>
+                        <div>Cells represent mold silicone volume</div>
+                        <div>(inside shell, outside part)</div>
+                      </div>
+
+                      {/* Legend */}
+                      <div style={styles.legend}>
+                        <div>🔵 Cyan = Mold volume nodes</div>
+                        <div>🟨 Yellow = Grid bounding box</div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Loading indicator */}
+                  {!volumetricGridStats && (
+                    <div style={styles.loading}>Generating grid...</div>
+                  )}
                 </div>
               )}
             </>

@@ -32,10 +32,22 @@ import {
   formatDiagnostics,
   type MeshRepairResult
 } from '../utils/meshRepairManifold';
+import {
+  generateVolumetricGrid,
+  createMoldVolumePointCloud,
+  createMoldVolumeVoxels,
+  createGridBoundingBoxHelper,
+  removeGridVisualization,
+  type VolumetricGridResult,
+  type VolumetricGridOptions
+} from '../utils/volumetricGrid';
 
 // ============================================================================
 // TYPES
 // ============================================================================
+
+/** Visualization mode for volumetric grid */
+export type GridVisualizationMode = 'points' | 'voxels' | 'none';
 
 interface ThreeViewerProps {
   stlUrl?: string;
@@ -47,11 +59,20 @@ interface ThreeViewerProps {
   showCsgResult?: boolean;
   hideOriginalMesh?: boolean;
   hideHull?: boolean;
+  /** Hide the mold cavity visualization */
+  hideCavity?: boolean;
+  /** Show volumetric grid visualization */
+  showVolumetricGrid?: boolean;
+  /** Grid resolution (cells per dimension) */
+  gridResolution?: number;
+  /** Grid visualization mode: 'points', 'voxels', or 'none' */
+  gridVisualizationMode?: GridVisualizationMode;
   onMeshLoaded?: (mesh: THREE.Mesh) => void;
   onMeshRepaired?: (result: MeshRepairResult) => void;
   onVisibilityDataReady?: (data: VisibilityPaintData | null) => void;
   onInflatedHullReady?: (result: InflatedHullResult | null) => void;
   onCsgResultReady?: (result: CsgSubtractionResult | null) => void;
+  onVolumetricGridReady?: (result: VolumetricGridResult | null) => void;
 }
 
 // ============================================================================
@@ -77,11 +98,16 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   showCsgResult = false,
   hideOriginalMesh = false,
   hideHull = false,
+  hideCavity = false,
+  showVolumetricGrid = false,
+  gridResolution = 64,
+  gridVisualizationMode = 'points',
   onMeshLoaded,
   onMeshRepaired,
   onVisibilityDataReady,
   onInflatedHullReady,
-  onCsgResultReady
+  onCsgResultReady,
+  onVolumetricGridReady
 }) => {
   // Refs for Three.js objects
   const containerRef = useRef<HTMLDivElement>(null);
@@ -95,6 +121,9 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const visibilityDataRef = useRef<VisibilityPaintData | null>(null);
   const inflatedHullRef = useRef<InflatedHullResult | null>(null);
   const csgResultRef = useRef<CsgSubtractionResult | null>(null);
+  const volumetricGridRef = useRef<VolumetricGridResult | null>(null);
+  const gridVisualizationRef = useRef<THREE.Points | THREE.InstancedMesh | null>(null);
+  const gridBoundingBoxRef = useRef<THREE.LineSegments | null>(null);
 
   // ============================================================================
   // SCENE SETUP
@@ -372,6 +401,85 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   }, [showCsgResult, onCsgResultReady]);
 
   // ============================================================================
+  // VOLUMETRIC GRID
+  // ============================================================================
+
+  useEffect(() => {
+    if (!sceneRef.current) return;
+    
+    const scene = sceneRef.current;
+
+    // Clean up existing grid visualization
+    if (gridVisualizationRef.current) {
+      removeGridVisualization(scene, gridVisualizationRef.current);
+      gridVisualizationRef.current = null;
+    }
+    if (gridBoundingBoxRef.current) {
+      removeGridVisualization(scene, gridBoundingBoxRef.current);
+      gridBoundingBoxRef.current = null;
+    }
+    volumetricGridRef.current = null;
+    onVolumetricGridReady?.(null);
+
+    // Generate volumetric grid if requested and we have both hull and mesh
+    if (showVolumetricGrid && inflatedHullRef.current && meshRef.current) {
+      try {
+        console.log('Generating volumetric grid...');
+        
+        // Get geometries in world space
+        const shellGeometry = inflatedHullRef.current.mesh.geometry.clone();
+        shellGeometry.applyMatrix4(inflatedHullRef.current.mesh.matrixWorld);
+        
+        const partGeometry = meshRef.current.geometry.clone();
+        partGeometry.applyMatrix4(meshRef.current.matrixWorld);
+        
+        const options: VolumetricGridOptions = {
+          resolution: gridResolution,
+          storeAllCells: false,
+          marginPercent: 0.02,
+          computeDistances: false,
+        };
+        
+        const gridResult = generateVolumetricGrid(shellGeometry, partGeometry, options);
+        
+        console.log(`Volumetric grid generated:`);
+        console.log(`  Resolution: ${gridResult.resolution.x}×${gridResult.resolution.y}×${gridResult.resolution.z}`);
+        console.log(`  Mold volume cells: ${gridResult.moldVolumeCellCount} / ${gridResult.totalCellCount}`);
+        console.log(`  Fill ratio: ${(gridResult.stats.fillRatio * 100).toFixed(1)}%`);
+        console.log(`  Approx mold volume: ${gridResult.stats.moldVolume.toFixed(4)}`);
+        console.log(`  Compute time: ${gridResult.stats.computeTimeMs.toFixed(1)} ms`);
+        
+        volumetricGridRef.current = gridResult;
+        onVolumetricGridReady?.(gridResult);
+        
+        // Create visualization based on mode
+        if (gridVisualizationMode !== 'none' && gridResult.moldVolumeCellCount > 0) {
+          if (gridVisualizationMode === 'points') {
+            gridVisualizationRef.current = createMoldVolumePointCloud(gridResult, 0x00ffff, 3);
+          } else if (gridVisualizationMode === 'voxels') {
+            gridVisualizationRef.current = createMoldVolumeVoxels(gridResult, 0x00ffff, 0.2);
+          }
+          
+          if (gridVisualizationRef.current) {
+            scene.add(gridVisualizationRef.current);
+          }
+          
+          // Add bounding box helper
+          gridBoundingBoxRef.current = createGridBoundingBoxHelper(gridResult, 0xffff00);
+          scene.add(gridBoundingBoxRef.current);
+        }
+        
+        // Clean up temporary geometries
+        shellGeometry.dispose();
+        partGeometry.dispose();
+        
+      } catch (error) {
+        console.error('Error generating volumetric grid:', error);
+      }
+    }
+  }, [showVolumetricGrid, gridResolution, gridVisualizationMode, onVolumetricGridReady]);
+
+  // ============================================================================
   // VISIBILITY PAINTING
   // ============================================================================
 
@@ -406,7 +514,16 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
     inflatedHullRef.current.mesh.visible = !hideHull;
   }, [hideHull]);
 
-  // Cleanup arrows, hull, and CSG result on unmount
+  // ============================================================================
+  // CAVITY VISIBILITY
+  // ============================================================================
+
+  useEffect(() => {
+    if (!csgResultRef.current) return;
+    csgResultRef.current.mesh.visible = !hideCavity;
+  }, [hideCavity]);
+
+  // Cleanup arrows, hull, CSG result, and grid on unmount
   useEffect(() => {
     return () => {
       if (partingArrowsRef.current.length > 0) {
@@ -417,6 +534,12 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       }
       if (csgResultRef.current && sceneRef.current) {
         removeCsgResult(sceneRef.current, csgResultRef.current);
+      }
+      if (gridVisualizationRef.current && sceneRef.current) {
+        removeGridVisualization(sceneRef.current, gridVisualizationRef.current);
+      }
+      if (gridBoundingBoxRef.current && sceneRef.current) {
+        removeGridVisualization(sceneRef.current, gridBoundingBoxRef.current);
       }
     };
   }, []);
