@@ -341,6 +341,8 @@ class MultiRayVisibilityComputer {
  *    - Compute visibility for each direction and immediately evaluate pairs
  *    - Early terminate when 100% coverage with optimal angle is found
  *    - Skip remaining directions that can't improve the result
+ *    - Prioritize opposite pairs first (more likely to give good coverage)
+ *    - Skip pairs that can't possibly improve current best
  */
 export function findPartingDirections(
   geometry: THREE.BufferGeometry,
@@ -348,11 +350,11 @@ export function findPartingDirections(
   _rayCount: number = 2048
 ): { d1: THREE.Vector3; d2: THREE.Vector3; scores: DirectionScore[] } {
   console.log('═══════════════════════════════════════════════════════');
-  console.log('SEQUENTIAL VISIBILITY ALGORITHM (Optimized)');
+  console.log('OPTIMIZED SEQUENTIAL VISIBILITY ALGORITHM');
   console.log('═══════════════════════════════════════════════════════');
   console.log(`  Direction samples: ${k}`);
   console.log(`  Valid pairs: angle > 135°`);
-  console.log(`  Strategy: Compute & evaluate incrementally with early termination`);
+  console.log(`  Strategy: Opposite-first sampling with early termination`);
   
   const startTime = performance.now();
   
@@ -364,6 +366,24 @@ export function findPartingDirections(
   
   // Sample directions uniformly on the sphere
   const directions = fibonacciSphere(k);
+  
+  // OPTIMIZATION: Create order that prioritizes opposite pairs
+  // Interleave indices: 0, k/2, 1, k/2+1, 2, k/2+2, ... 
+  // This way opposite directions are processed close together
+  const processingOrder: number[] = [];
+  const half = Math.floor(k / 2);
+  for (let i = 0; i < half; i++) {
+    processingOrder.push(i);
+    if (i + half < k) {
+      processingOrder.push(i + half);
+    }
+  }
+  // Add any remaining indices
+  for (let i = 0; i < k; i++) {
+    if (!processingOrder.includes(i)) {
+      processingOrder.push(i);
+    }
+  }
   
   // Minimum angle constraint: 135 degrees
   const minAngleDeg = 135;
@@ -378,27 +398,53 @@ export function findPartingDirections(
   let bestDotProduct = 1;
   let foundPerfectPair = false;
   
-  // Store computed scores for directions we've processed
-  const computedScores: DirectionScore[] = [];
+  // Store computed scores indexed by original direction index
+  const computedScores: Map<number, DirectionScore> = new Map();
+  const allScores: DirectionScore[] = [];
   
-  console.log('\nProcessing directions sequentially...');
+  console.log('\nProcessing directions (opposite-first ordering)...');
+  
+  let pairsEvaluated = 0;
+  let pairsSkipped = 0;
   
   // Process each direction and immediately evaluate pairs
-  for (let i = 0; i < directions.length && !foundPerfectPair; i++) {
+  for (let idx = 0; idx < processingOrder.length && !foundPerfectPair; idx++) {
+    const i = processingOrder[idx];
+    
     // Compute visibility for current direction
     const currentScore = visComputer.getDirectionScore(directions[i]);
-    computedScores.push(currentScore);
+    computedScores.set(i, currentScore);
+    allScores.push(currentScore);
     
     const currentArea = currentScore.visibleArea;
     const currentTriangles = currentScore.visibleTriangles;
     
-    // Evaluate pairs: current direction as d1 with all previous directions as d2
-    for (let j = 0; j < i; j++) {
-      const prevScore = computedScores[j];
+    // OPTIMIZATION: Skip if this direction alone can't possibly improve
+    // Max possible = currentArea + (totalArea - currentArea) = totalArea
+    // But if currentArea + best possible complement < bestCoverage, skip
+    // This is always possible, so we skip this check
+    
+    // Evaluate pairs with all previously computed directions
+    for (const [j, prevScore] of computedScores) {
+      if (i === j) continue;
       
       // Check angle constraint
       const dotProduct = currentScore.direction.dot(prevScore.direction);
-      if (dotProduct > minAngleCos) continue;
+      if (dotProduct > minAngleCos) {
+        pairsSkipped++;
+        continue;
+      }
+      
+      // OPTIMIZATION: Quick upper bound check
+      // Max possible coverage = min(currentArea + prevArea, totalSurfaceArea)
+      const maxPossible = Math.min(currentArea + prevScore.visibleArea, totalSurfaceArea);
+      if (maxPossible <= bestCombinedCoverage + 0.0001) {
+        // This pair can't beat current best, skip detailed computation
+        pairsSkipped++;
+        continue;
+      }
+      
+      pairsEvaluated++;
       
       // Try current as d1, previous as d2
       let d2UniqueArea = 0;
@@ -418,51 +464,54 @@ export function findPartingDirections(
         bestD2UniqueArea = d2UniqueArea;
         bestDotProduct = dotProduct;
         
-        // Check for perfect pair (100% coverage at 180°)
+        // Check for perfect pair (100% coverage at ~180°)
         if (Math.abs(combinedCoverage - totalSurfaceArea) < 0.0001 && dotProduct <= -0.9999) {
           foundPerfectPair = true;
-          console.log(`  Found perfect pair at direction ${i + 1}/${k} - early termination!`);
+          console.log(`  ✓ Perfect pair found at step ${idx + 1}/${k} - early termination!`);
           break;
         }
       }
       
-      // Try previous as d1, current as d2
+      // Try previous as d1, current as d2 (only if different result possible)
       const prevArea = prevScore.visibleArea;
-      const prevTriangles = prevScore.visibleTriangles;
-      
-      d2UniqueArea = 0;
-      for (const tri of currentTriangles) {
-        if (!prevTriangles.has(tri)) {
-          d2UniqueArea += areas[tri];
-        }
-      }
-      combinedCoverage = prevArea + d2UniqueArea;
-      
-      if (combinedCoverage > bestCombinedCoverage + 0.0001 ||
-          (Math.abs(combinedCoverage - bestCombinedCoverage) < 0.0001 && dotProduct < bestDotProduct)) {
-        bestCombinedCoverage = combinedCoverage;
-        bestD1 = prevScore;
-        bestD2 = currentScore;
-        bestD1UniqueArea = prevArea;
-        bestD2UniqueArea = d2UniqueArea;
-        bestDotProduct = dotProduct;
+      if (Math.abs(prevArea - currentArea) > 0.0001) {
+        const prevTriangles = prevScore.visibleTriangles;
         
-        // Check for perfect pair
-        if (Math.abs(combinedCoverage - totalSurfaceArea) < 0.0001 && dotProduct <= -0.9999) {
-          foundPerfectPair = true;
-          console.log(`  Found perfect pair at direction ${i + 1}/${k} - early termination!`);
-          break;
+        d2UniqueArea = 0;
+        for (const tri of currentTriangles) {
+          if (!prevTriangles.has(tri)) {
+            d2UniqueArea += areas[tri];
+          }
+        }
+        combinedCoverage = prevArea + d2UniqueArea;
+        
+        if (combinedCoverage > bestCombinedCoverage + 0.0001 ||
+            (Math.abs(combinedCoverage - bestCombinedCoverage) < 0.0001 && dotProduct < bestDotProduct)) {
+          bestCombinedCoverage = combinedCoverage;
+          bestD1 = prevScore;
+          bestD2 = currentScore;
+          bestD1UniqueArea = prevArea;
+          bestD2UniqueArea = d2UniqueArea;
+          bestDotProduct = dotProduct;
+          
+          if (Math.abs(combinedCoverage - totalSurfaceArea) < 0.0001 && dotProduct <= -0.9999) {
+            foundPerfectPair = true;
+            console.log(`  ✓ Perfect pair found at step ${idx + 1}/${k} - early termination!`);
+            break;
+          }
         }
       }
     }
     
     // Progress update every 25%
-    if ((i + 1) % Math.floor(k / 4) === 0 || i === k - 1) {
+    if ((idx + 1) % Math.max(1, Math.floor(k / 4)) === 0 || idx === processingOrder.length - 1 || foundPerfectPair) {
       const elapsed = performance.now() - startTime;
       const coverage = bestCombinedCoverage / totalSurfaceArea * 100;
-      console.log(`  Progress: ${Math.round(((i + 1) / k) * 100)}% | Best coverage: ${coverage.toFixed(1)}% | Time: ${(elapsed/1000).toFixed(1)}s`);
+      console.log(`  Progress: ${Math.round(((idx + 1) / k) * 100)}% | Coverage: ${coverage.toFixed(1)}% | Time: ${(elapsed/1000).toFixed(2)}s`);
     }
   }
+  
+  console.log(`  Pairs evaluated: ${pairsEvaluated}, skipped: ${pairsSkipped}`);
   
   // Clean up resources
   visComputer.dispose();
@@ -470,7 +519,7 @@ export function findPartingDirections(
   if (!bestD1 || !bestD2) {
     // Fallback: use best individual direction and its opposite
     console.warn('No valid direction pair found with angle > 135°, using fallback');
-    const bestSingle = computedScores.reduce((a, b) => a.visibleArea > b.visibleArea ? a : b);
+    const bestSingle = allScores.reduce((a, b) => a.visibleArea > b.visibleArea ? a : b);
     bestD1 = bestSingle;
     bestD2 = {
       direction: bestSingle.direction.clone().negate(),
@@ -534,7 +583,7 @@ export function findPartingDirections(
   console.log(`    Computation time: ${(elapsed / 1000).toFixed(2)}s`);
   console.log('═══════════════════════════════════════════════════════');
   
-  return { d1, d2, scores: computedScores };
+  return { d1, d2, scores: Array.from(computedScores.values()) };
 }
 
 /**
