@@ -586,6 +586,386 @@ export function findPartingDirections(
   return { d1, d2, scores: Array.from(computedScores.values()) };
 }
 
+// ============================================================================
+// PARALLEL WEB WORKER VERSION
+// ============================================================================
+
+interface WorkerResult {
+  directionIndex: number;
+  visibleTriangles: number[];
+  visibleArea: number;
+}
+
+interface WorkerMessage {
+  type: 'init' | 'compute' | 'result' | 'ready';
+  workerId?: number;
+  positionArray?: Float32Array;
+  indexArray?: Uint32Array | null;
+  directions?: Float32Array;
+  directionIndices?: number[];
+  results?: WorkerResult[];
+  triangleCount?: number;
+  totalArea?: number;
+}
+
+/**
+ * Find parting directions using parallel Web Workers
+ * 
+ * This version distributes visibility computation across multiple workers,
+ * significantly speeding up the algorithm on multi-core systems.
+ */
+export async function findPartingDirectionsParallel(
+  geometry: THREE.BufferGeometry,
+  k: number = 64,
+  numWorkers: number = navigator.hardwareConcurrency || 4
+): Promise<{ d1: THREE.Vector3; d2: THREE.Vector3; scores: DirectionScore[] }> {
+  console.log('═══════════════════════════════════════════════════════');
+  console.log('PARALLEL VISIBILITY ALGORITHM (Web Workers)');
+  console.log('═══════════════════════════════════════════════════════');
+  console.log(`  Direction samples: ${k}`);
+  console.log(`  Worker threads: ${numWorkers}`);
+  console.log(`  Valid pairs: angle > 135°`);
+  
+  const startTime = performance.now();
+  
+  // Prepare geometry data for transfer to workers
+  const geomClone = geometry.clone();
+  if (!geomClone.index) {
+    const positions = geomClone.getAttribute('position');
+    const indices: number[] = [];
+    for (let i = 0; i < positions.count; i++) {
+      indices.push(i);
+    }
+    geomClone.setIndex(indices);
+  }
+  
+  const positionAttr = geomClone.getAttribute('position');
+  const positionArray = new Float32Array(positionAttr.array);
+  const indexAttr = geomClone.getIndex();
+  const indexArray = indexAttr ? new Uint32Array(indexAttr.array) : null;
+  
+  // Extract triangle data for pair evaluation (main thread)
+  const triangles = extractTriangleData(geomClone);
+  const areas = new Float32Array(triangles.length);
+  let totalSurfaceArea = 0;
+  for (let i = 0; i < triangles.length; i++) {
+    areas[i] = triangles[i].area;
+    totalSurfaceArea += triangles[i].area;
+  }
+  
+  console.log(`  Total triangles: ${triangles.length}`);
+  console.log(`  Total surface area: ${totalSurfaceArea.toFixed(4)}`);
+  
+  // Generate directions
+  const directions = fibonacciSphere(k);
+  
+  // Create workers using Vite's worker import
+  const workers: Worker[] = [];
+  const workerReadyPromises: Promise<void>[] = [];
+  
+  console.log('\nInitializing workers...');
+  
+  for (let i = 0; i < numWorkers; i++) {
+    const worker = new Worker(
+      new URL('./visibilityWorker.ts', import.meta.url),
+      { type: 'module' }
+    );
+    workers.push(worker);
+    
+    // Wait for worker to be ready
+    workerReadyPromises.push(new Promise<void>((resolve) => {
+      const handler = (event: MessageEvent<WorkerMessage>) => {
+        if (event.data.type === 'ready') {
+          console.log(`  Worker ${i} ready (${event.data.triangleCount} triangles, area: ${event.data.totalArea?.toFixed(4)})`);
+          // Verify triangle count matches
+          if (event.data.triangleCount !== triangles.length) {
+            console.error(`  ⚠️ Triangle count mismatch! Worker: ${event.data.triangleCount}, Main: ${triangles.length}`);
+          }
+          worker.removeEventListener('message', handler);
+          resolve();
+        }
+      };
+      worker.addEventListener('message', handler);
+    }));
+    
+    // Send init message with geometry data
+    const initMsg: WorkerMessage = {
+      type: 'init',
+      workerId: i,
+      positionArray: positionArray.slice(), // Clone for each worker
+      indexArray: indexArray ? indexArray.slice() : null
+    };
+    
+    // Build transfer list - transfer both buffers for efficiency
+    const transferList: Transferable[] = [initMsg.positionArray!.buffer as ArrayBuffer];
+    if (initMsg.indexArray) {
+      transferList.push(initMsg.indexArray.buffer as ArrayBuffer);
+    }
+    worker.postMessage(initMsg, transferList);
+  }
+  
+  // Wait for all workers to initialize
+  await Promise.all(workerReadyPromises);
+  console.log('All workers initialized!');
+  
+  // Distribute directions across workers
+  const directionsPerWorker = Math.ceil(k / numWorkers);
+  const workerPromises: Promise<WorkerResult[]>[] = [];
+  
+  console.log('\nComputing visibility in parallel...');
+  const computeStart = performance.now();
+  
+  for (let w = 0; w < numWorkers; w++) {
+    const startIdx = w * directionsPerWorker;
+    const endIdx = Math.min(startIdx + directionsPerWorker, k);
+    const count = endIdx - startIdx;
+    
+    if (count <= 0) continue;
+    
+    const dirArray = new Float32Array(count * 3);
+    const dirIndices: number[] = [];
+    
+    for (let i = 0; i < count; i++) {
+      const globalIdx = startIdx + i;
+      const d = directions[globalIdx];
+      dirArray[i * 3] = d.x;
+      dirArray[i * 3 + 1] = d.y;
+      dirArray[i * 3 + 2] = d.z;
+      dirIndices.push(globalIdx);
+    }
+    
+    // Create promise for this worker's results
+    const promise = new Promise<WorkerResult[]>((resolve) => {
+      const handler = (event: MessageEvent<WorkerMessage>) => {
+        if (event.data.type === 'result' && event.data.workerId === w) {
+          workers[w].removeEventListener('message', handler);
+          resolve(event.data.results!);
+        }
+      };
+      workers[w].addEventListener('message', handler);
+    });
+    workerPromises.push(promise);
+    
+    // Send compute message
+    const computeMsg: WorkerMessage = {
+      type: 'compute',
+      directions: dirArray,
+      directionIndices: dirIndices
+    };
+    workers[w].postMessage(computeMsg, [dirArray.buffer]);
+  }
+  
+  // Wait for all workers to complete
+  const allResults = await Promise.all(workerPromises);
+  
+  const computeTime = performance.now() - computeStart;
+  console.log(`  Visibility computed in ${(computeTime / 1000).toFixed(2)}s`);
+  
+  // Terminate workers
+  for (const worker of workers) {
+    worker.terminate();
+  }
+  
+  // Collect and organize results
+  // IMPORTANT: Compute areas from main thread's areas array for consistency
+  const directionScores: Map<number, DirectionScore> = new Map();
+  let totalVisibleTriangles = 0;
+  let maxVisibleTriangles = 0;
+  
+  for (const workerResults of allResults) {
+    for (const result of workerResults) {
+      const d = directions[result.directionIndex];
+      const visibleTriangles = new Set(result.visibleTriangles);
+      
+      totalVisibleTriangles += visibleTriangles.size;
+      maxVisibleTriangles = Math.max(maxVisibleTriangles, visibleTriangles.size);
+      
+      // Compute visible area using main thread's area values
+      let visibleArea = 0;
+      for (const tri of visibleTriangles) {
+        visibleArea += areas[tri];
+      }
+      
+      directionScores.set(result.directionIndex, {
+        direction: d.clone(),
+        visibleArea,
+        nonVisibleArea: totalSurfaceArea - visibleArea,
+        score: visibleArea,
+        visibleTriangles
+      });
+    }
+  }
+  
+  // Log diagnostic info
+  const avgVisible = totalVisibleTriangles / k;
+  console.log(`  Avg visible triangles/direction: ${avgVisible.toFixed(0)}, max: ${maxVisibleTriangles}`);
+  
+  // Now find the best pair (this is fast - just Set operations)
+  console.log('\nFinding optimal direction pair...');
+  const pairStart = performance.now();
+  
+  const minAngleDeg = 135;
+  const minAngleCos = Math.cos(minAngleDeg * Math.PI / 180);
+  
+  let bestD1: DirectionScore | null = null;
+  let bestD2: DirectionScore | null = null;
+  let bestCombinedCoverage = 0;
+  let bestD1UniqueArea = 0;
+  let bestD2UniqueArea = 0;
+  let bestDotProduct = 1;
+  
+  let pairsEvaluated = 0;
+  let pairsSkipped = 0;
+  
+  // Sort scores by area for better pruning
+  const sortedScores = Array.from(directionScores.values())
+    .sort((a, b) => b.visibleArea - a.visibleArea);
+  
+  for (let i = 0; i < sortedScores.length; i++) {
+    const score1 = sortedScores[i];
+    
+    // Early termination: if best possible < current best, stop
+    if (score1.visibleArea + (totalSurfaceArea - score1.visibleArea) < bestCombinedCoverage - 0.0001) {
+      break;
+    }
+    
+    for (let j = i + 1; j < sortedScores.length; j++) {
+      const score2 = sortedScores[j];
+      
+      // Check angle constraint
+      const dotProduct = score1.direction.dot(score2.direction);
+      if (dotProduct > minAngleCos) {
+        pairsSkipped++;
+        continue;
+      }
+      
+      // Quick upper bound check
+      const maxPossible = Math.min(score1.visibleArea + score2.visibleArea, totalSurfaceArea);
+      if (maxPossible <= bestCombinedCoverage + 0.0001) {
+        pairsSkipped++;
+        continue;
+      }
+      
+      pairsEvaluated++;
+      
+      // Compute d2's unique area (not covered by d1)
+      let d2UniqueArea = 0;
+      for (const tri of score2.visibleTriangles) {
+        if (!score1.visibleTriangles.has(tri)) {
+          d2UniqueArea += areas[tri];
+        }
+      }
+      
+      const combinedCoverage = score1.visibleArea + d2UniqueArea;
+      
+      if (combinedCoverage > bestCombinedCoverage + 0.0001 ||
+          (Math.abs(combinedCoverage - bestCombinedCoverage) < 0.0001 && dotProduct < bestDotProduct)) {
+        bestCombinedCoverage = combinedCoverage;
+        bestD1 = score1;
+        bestD2 = score2;
+        bestD1UniqueArea = score1.visibleArea;
+        bestD2UniqueArea = d2UniqueArea;
+        bestDotProduct = dotProduct;
+      }
+      
+      // Also try the reverse assignment
+      let d1UniqueArea = 0;
+      for (const tri of score1.visibleTriangles) {
+        if (!score2.visibleTriangles.has(tri)) {
+          d1UniqueArea += areas[tri];
+        }
+      }
+      
+      const reverseCoverage = score2.visibleArea + d1UniqueArea;
+      
+      if (reverseCoverage > bestCombinedCoverage + 0.0001 ||
+          (Math.abs(reverseCoverage - bestCombinedCoverage) < 0.0001 && dotProduct < bestDotProduct)) {
+        bestCombinedCoverage = reverseCoverage;
+        bestD1 = score2;
+        bestD2 = score1;
+        bestD1UniqueArea = score2.visibleArea;
+        bestD2UniqueArea = d1UniqueArea;
+        bestDotProduct = dotProduct;
+      }
+    }
+  }
+  
+  const pairTime = performance.now() - pairStart;
+  console.log(`  Pairs evaluated: ${pairsEvaluated}, skipped: ${pairsSkipped}`);
+  console.log(`  Pair finding took ${pairTime.toFixed(0)}ms`);
+  
+  if (!bestD1 || !bestD2) {
+    // Fallback
+    console.warn('No valid direction pair found, using fallback');
+    const bestSingle = sortedScores[0];
+    bestD1 = bestSingle;
+    bestD2 = {
+      direction: bestSingle.direction.clone().negate(),
+      visibleArea: 0,
+      nonVisibleArea: totalSurfaceArea,
+      score: 0,
+      visibleTriangles: new Set()
+    };
+    bestD1UniqueArea = bestD1.visibleArea;
+    bestD2UniqueArea = 0;
+    bestCombinedCoverage = bestD1.visibleArea;
+  }
+  
+  const d1 = bestD1.direction;
+  const d2 = bestD2.direction;
+  
+  // Calculate final statistics
+  const d1Owned = bestD1.visibleTriangles;
+  const d2Owned = new Set<number>();
+  for (const tri of bestD2.visibleTriangles) {
+    if (!d1Owned.has(tri)) {
+      d2Owned.add(tri);
+    }
+  }
+  
+  const combinedOwned = new Set([...d1Owned, ...d2Owned]);
+  const nonVisibleTriangles = new Set<number>();
+  for (let i = 0; i < triangles.length; i++) {
+    if (!combinedOwned.has(i)) {
+      nonVisibleTriangles.add(i);
+    }
+  }
+  
+  const combinedVisibleArea = computeAreaFromTriangles(triangles, combinedOwned);
+  const nonVisibleArea = computeAreaFromTriangles(triangles, nonVisibleTriangles);
+  const angleDeg = Math.acos(Math.max(-1, Math.min(1, d1.dot(d2)))) * (180 / Math.PI);
+  
+  const elapsed = performance.now() - startTime;
+  
+  // Report results
+  console.log('\n═══════════════════════════════════════════════════════');
+  console.log('PARTING DIRECTION ANALYSIS COMPLETE (Parallel)');
+  console.log('═══════════════════════════════════════════════════════');
+  console.log(`\n  d1 (Primary): [${d1.toArray().map(v => v.toFixed(3)).join(', ')}]`);
+  console.log(`    Owned triangles: ${d1Owned.size}`);
+  console.log(`    Owned area: ${((bestD1UniqueArea / totalSurfaceArea) * 100).toFixed(1)}%`);
+  
+  console.log(`\n  d2 (Secondary): [${d2.toArray().map(v => v.toFixed(3)).join(', ')}]`);
+  console.log(`    Owned triangles: ${d2Owned.size} (exclusive)`);
+  console.log(`    Owned area: ${((bestD2UniqueArea / totalSurfaceArea) * 100).toFixed(1)}%`);
+  
+  console.log('\n───────────────────────────────────────────────────────');
+  console.log('  COMBINED STATISTICS (Mutually Exclusive Ownership):');
+  console.log(`    Total visible: ${((combinedVisibleArea / totalSurfaceArea) * 100).toFixed(1)}%`);
+  console.log(`    Total triangles covered: ${combinedOwned.size}/${triangles.length}`);
+  console.log(`    Non-visible area: ${((nonVisibleArea / totalSurfaceArea) * 100).toFixed(1)}%`);
+  console.log(`    Non-visible triangles: ${nonVisibleTriangles.size}`);
+  console.log(`    Angle between d1 & d2: ${angleDeg.toFixed(1)}°`);
+  console.log(`    Total time: ${(elapsed / 1000).toFixed(2)}s`);
+  console.log(`    Speedup from ${numWorkers} workers`);
+  console.log('═══════════════════════════════════════════════════════');
+  
+  // Clean up
+  geomClone.dispose();
+  
+  return { d1, d2, scores: Array.from(directionScores.values()) };
+}
+
 /**
  * Create arrow helpers to visualize parting directions
  */
@@ -664,4 +1044,54 @@ export function removePartingDirectionArrows(arrows: THREE.ArrowHelper[]): void 
     }
     arrow.dispose();
   }
+}
+
+/**
+ * Main function to compute and visualize parting directions using parallel workers
+ * This is the recommended function for larger meshes.
+ */
+export async function computeAndShowPartingDirectionsParallel(
+  partMesh: THREE.Mesh,
+  k: number = 64,
+  numWorkers?: number
+): Promise<{ d1: THREE.Vector3; d2: THREE.Vector3; arrows: THREE.ArrowHelper[] }> {
+  const geometry = partMesh.geometry as THREE.BufferGeometry;
+  
+  if (!geometry) {
+    throw new Error('Mesh must have a BufferGeometry');
+  }
+  
+  // Clone and apply mesh transforms for accurate analysis
+  const worldGeometry = geometry.clone();
+  partMesh.updateMatrixWorld(true);
+  worldGeometry.applyMatrix4(partMesh.matrixWorld);
+  
+  // Find optimal parting directions using parallel workers
+  const { d1, d2 } = await findPartingDirectionsParallel(worldGeometry, k, numWorkers);
+  
+  // Compute bounding box center for arrow origin
+  worldGeometry.computeBoundingBox();
+  const center = new THREE.Vector3();
+  worldGeometry.boundingBox?.getCenter(center);
+  
+  // Compute arrow length based on bounding box size
+  const size = new THREE.Vector3();
+  worldGeometry.boundingBox?.getSize(size);
+  const arrowLength = Math.max(size.x, size.y, size.z) * 1.2;
+  
+  // Create arrow helpers
+  const arrow1 = createDirectionArrow(d1, center, 0x00ff00, arrowLength); // Green for d1
+  const arrow2 = createDirectionArrow(d2, center, 0xff6600, arrowLength); // Orange for d2
+  
+  // Add arrows to scene
+  const scene = partMesh.parent;
+  if (scene) {
+    scene.add(arrow1);
+    scene.add(arrow2);
+  }
+  
+  // Clean up
+  worldGeometry.dispose();
+  
+  return { d1, d2, arrows: [arrow1, arrow2] };
 }

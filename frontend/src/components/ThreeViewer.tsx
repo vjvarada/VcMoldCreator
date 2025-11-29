@@ -11,7 +11,7 @@ import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three-stdlib';
 import { STLLoader } from 'three-stdlib';
-import { computeAndShowPartingDirections, removePartingDirectionArrows } from '../utils/partingDirection';
+import { computeAndShowPartingDirectionsParallel, removePartingDirectionArrows } from '../utils/partingDirection';
 
 interface ThreeViewerProps {
   stlUrl?: string;
@@ -230,14 +230,17 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({ stlUrl, showPartingDirections
       partingArrowsRef.current = [];
     }
 
-    // Compute and show new arrows if enabled
+    // Compute and show new arrows if enabled (async)
     if (showPartingDirections && meshRef.current) {
-      try {
-        const result = computeAndShowPartingDirections(meshRef.current, 128);
-        partingArrowsRef.current = result.arrows;
-      } catch (error) {
-        console.error('Error computing parting directions:', error);
-      }
+      const mesh = meshRef.current;
+      
+      computeAndShowPartingDirectionsParallel(mesh, 128)
+        .then((result: { arrows: THREE.ArrowHelper[] }) => {
+          partingArrowsRef.current = result.arrows;
+        })
+        .catch((error: Error) => {
+          console.error('Error computing parting directions:', error);
+        });
     }
   }, [showPartingDirections, stlUrl]);
 
