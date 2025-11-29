@@ -54,7 +54,7 @@ function fibonacciSphere(k: number): THREE.Vector3[] {
 }
 
 /**
- * Extract triangle data from geometry
+ * Extract triangle data from geometry into optimized typed arrays
  */
 function extractTriangleData(geometry: THREE.BufferGeometry): TriangleData[] {
   const position = geometry.getAttribute('position');
@@ -110,6 +110,52 @@ function extractTriangleData(geometry: THREE.BufferGeometry): TriangleData[] {
 }
 
 /**
+ * Optimized data structure for fast visibility computation
+ * Uses typed arrays for cache-friendly memory access
+ */
+interface OptimizedTriangleData {
+  normals: Float32Array;    // nx, ny, nz for each triangle (length = triangleCount * 3)
+  centroids: Float32Array;  // cx, cy, cz for each triangle (length = triangleCount * 3)
+  areas: Float32Array;      // area for each triangle (length = triangleCount)
+  count: number;
+}
+
+function createOptimizedData(triangles: TriangleData[]): OptimizedTriangleData {
+  const count = triangles.length;
+  const normals = new Float32Array(count * 3);
+  const centroids = new Float32Array(count * 3);
+  const areas = new Float32Array(count);
+  
+  for (let i = 0; i < count; i++) {
+    const t = triangles[i];
+    const i3 = i * 3;
+    
+    normals[i3] = t.normal.x;
+    normals[i3 + 1] = t.normal.y;
+    normals[i3 + 2] = t.normal.z;
+    
+    centroids[i3] = t.centroid.x;
+    centroids[i3 + 1] = t.centroid.y;
+    centroids[i3 + 2] = t.centroid.z;
+    
+    areas[i] = t.area;
+  }
+  
+  return { normals, centroids, areas, count };
+}
+
+/**
+ * Compute total area from a set of triangle indices using typed array
+ */
+function computeAreaFromIndices(areas: Float32Array, indices: Set<number>): number {
+  let total = 0;
+  for (const idx of indices) {
+    total += areas[idx];
+  }
+  return total;
+}
+
+/**
  * Compute total area from a set of triangle indices
  */
 function computeAreaFromTriangles(
@@ -124,24 +170,31 @@ function computeAreaFromTriangles(
 }
 
 /**
- * Triangle-centric visibility computer with BVH acceleration
+ * Optimized triangle-centric visibility computer with BVH acceleration
  * 
- * For each triangle, checks if it's visible from a direction by:
- * 1. Normal check: triangle must face toward the viewing direction
- * 2. Occlusion check: ray from far away toward triangle centroid must hit this triangle first
- * 
- * This approach guarantees we check EVERY triangle, unlike ray flooding which can miss small triangles.
+ * Optimizations applied:
+ * 1. Typed arrays for cache-friendly memory access
+ * 2. Reused Ray object to avoid allocations
+ * 3. Pre-computed ray direction (negated once)
+ * 4. Inlined dot product calculation
+ * 5. Direct array access instead of object property access
  */
 class MultiRayVisibilityComputer {
   private geometry: THREE.BufferGeometry;
   private triangles: TriangleData[];
+  private optimized: OptimizedTriangleData;
   private totalSurfaceArea: number;
   private bvh: MeshBVH;
-  private boundingBox: THREE.Box3;
   private rayOffset: number;
+  
+  // Reusable objects to avoid allocations during computation
+  private readonly ray: THREE.Ray = new THREE.Ray();
+  private readonly rayDirection: THREE.Vector3 = new THREE.Vector3();
 
   constructor(geometry: THREE.BufferGeometry, _rayCount: number = 2048) {
-    console.log('Initializing Triangle-Centric Visibility Computer with BVH...');
+    console.log('Initializing Optimized Visibility Computer with BVH...');
+    const initStart = performance.now();
+    
     this.geometry = geometry.clone();
     
     // Ensure geometry has index for BVH
@@ -158,65 +211,66 @@ class MultiRayVisibilityComputer {
     this.bvh = new MeshBVH(this.geometry);
     this.geometry.boundsTree = this.bvh;
     
-    // Extract triangle data
+    // Extract triangle data and create optimized typed arrays
     this.triangles = extractTriangleData(this.geometry);
-    this.totalSurfaceArea = this.triangles.reduce((sum, t) => sum + t.area, 0);
+    this.optimized = createOptimizedData(this.triangles);
+    this.totalSurfaceArea = this.optimized.areas.reduce((sum, a) => sum + a, 0);
     
-    // Compute bounding box and ray offset
+    // Compute ray offset from bounding box
     this.geometry.computeBoundingBox();
-    this.boundingBox = this.geometry.boundingBox!.clone();
-    
     const size = new THREE.Vector3();
-    this.boundingBox.getSize(size);
+    this.geometry.boundingBox!.getSize(size);
     this.rayOffset = Math.max(size.x, size.y, size.z) * 2;
     
-    console.log(`  BVH built for ${this.triangles.length} triangles`);
+    const initTime = performance.now() - initStart;
+    console.log(`  BVH built for ${this.triangles.length} triangles in ${initTime.toFixed(0)}ms`);
     console.log(`  Total surface area: ${this.totalSurfaceArea.toFixed(4)}`);
   }
 
   /**
-   * Compute visible triangles from a direction using per-triangle occlusion testing
-   * 
-   * Algorithm:
-   * For each triangle:
-   * 1. Check if normal faces toward viewing direction (normal · direction > 0)
-   * 2. Cast ray from far away toward triangle centroid
-   * 3. If the first hit triangle index matches this triangle, it's visible
-   * 
-   * This checks every triangle and correctly handles self-occlusion.
+   * Optimized visible triangle computation
+   * Uses typed arrays and minimizes object allocations
    */
   computeVisibleTriangles(direction: THREE.Vector3): Set<number> {
     const visible = new Set<number>();
-    const rayDirection = direction.clone().negate(); // Ray travels opposite to viewing direction
-    const rayOrigin = new THREE.Vector3();
+    const { normals, centroids, count } = this.optimized;
     
-    // Use BVH's raycastFirst for maximum performance
-    const ray = new THREE.Ray();
+    // Pre-compute direction components and negated direction
+    const dx = direction.x;
+    const dy = direction.y;
+    const dz = direction.z;
     
-    for (let i = 0; i < this.triangles.length; i++) {
-      const triangle = this.triangles[i];
+    // Set up reusable ray direction (negated)
+    this.rayDirection.set(-dx, -dy, -dz);
+    this.ray.direction.copy(this.rayDirection);
+    
+    const offset = this.rayOffset;
+    
+    for (let i = 0; i < count; i++) {
+      const i3 = i * 3;
       
-      // Step 1: Normal must face toward the viewing direction
-      if (triangle.normal.dot(direction) <= 0) {
-        continue;
-      }
+      // Inlined dot product: normal · direction
+      const dot = normals[i3] * dx + normals[i3 + 1] * dy + normals[i3 + 2] * dz;
       
-      // Step 2: Cast ray from far away toward this triangle's centroid
-      // Origin = centroid + direction * offset (far away in the viewing direction)
-      rayOrigin.copy(triangle.centroid).addScaledVector(direction, this.rayOffset);
-      ray.origin.copy(rayOrigin);
-      ray.direction.copy(rayDirection);
+      // Skip back-facing triangles
+      if (dot <= 0) continue;
       
-      // Step 3: Find first intersection using BVH
-      const hit = this.bvh.raycastFirst(ray);
+      // Set ray origin: centroid + direction * offset
+      const cx = centroids[i3];
+      const cy = centroids[i3 + 1];
+      const cz = centroids[i3 + 2];
       
-      if (hit) {
-        // Check if the hit triangle is THIS triangle (by comparing face index)
-        if (hit.faceIndex === i) {
-          // This triangle is the first thing hit - it's visible!
-          visible.add(i);
-        }
-        // If hit.faceIndex !== i, another triangle is blocking this one
+      this.ray.origin.set(
+        cx + dx * offset,
+        cy + dy * offset,
+        cz + dz * offset
+      );
+      
+      // Find first intersection using BVH
+      const hit = this.bvh.raycastFirst(this.ray);
+      
+      if (hit && hit.faceIndex === i) {
+        visible.add(i);
       }
     }
     
@@ -228,7 +282,7 @@ class MultiRayVisibilityComputer {
    */
   getDirectionScore(direction: THREE.Vector3): DirectionScore {
     const visibleTriangles = this.computeVisibleTriangles(direction);
-    const visibleArea = computeAreaFromTriangles(this.triangles, visibleTriangles);
+    const visibleArea = computeAreaFromIndices(this.optimized.areas, visibleTriangles);
     const nonVisibleArea = this.totalSurfaceArea - visibleArea;
     
     return {
@@ -246,6 +300,10 @@ class MultiRayVisibilityComputer {
 
   getTriangles(): TriangleData[] {
     return this.triangles;
+  }
+
+  getOptimizedData(): OptimizedTriangleData {
+    return this.optimized;
   }
 
   dispose(): void {
@@ -278,117 +336,144 @@ class MultiRayVisibilityComputer {
  * 4. Direction Pair Constraint:
  *    - Only consider pairs with angle > 135°
  *    - Prune search space by discarding narrow-angle candidates
+ * 
+ * OPTIMIZATION: Sequential processing with early termination
+ *    - Compute visibility for each direction and immediately evaluate pairs
+ *    - Early terminate when 100% coverage with optimal angle is found
+ *    - Skip remaining directions that can't improve the result
  */
 export function findPartingDirections(
   geometry: THREE.BufferGeometry,
   k: number = 64,
-  rayCount: number = 2048
+  _rayCount: number = 2048
 ): { d1: THREE.Vector3; d2: THREE.Vector3; scores: DirectionScore[] } {
   console.log('═══════════════════════════════════════════════════════');
-  console.log('SDF-BIASED MULTI-RAY VISIBILITY ALGORITHM');
+  console.log('SEQUENTIAL VISIBILITY ALGORITHM (Optimized)');
   console.log('═══════════════════════════════════════════════════════');
   console.log(`  Direction samples: ${k}`);
-  console.log(`  Rays per direction: ${rayCount}`);
-  console.log(`  Valid pairs to evaluate: angle > 135°`);
+  console.log(`  Valid pairs: angle > 135°`);
+  console.log(`  Strategy: Compute & evaluate incrementally with early termination`);
   
   const startTime = performance.now();
   
   // Create visibility computer
-  const visComputer = new MultiRayVisibilityComputer(geometry, rayCount);
+  const visComputer = new MultiRayVisibilityComputer(geometry, _rayCount);
   const totalSurfaceArea = visComputer.getTotalSurfaceArea();
   const triangles = visComputer.getTriangles();
+  const areas = visComputer.getOptimizedData().areas;
   
   // Sample directions uniformly on the sphere
   const directions = fibonacciSphere(k);
   
-  // Phase 1: Compute visibility for each direction
-  console.log('\nPhase 1: Computing visibility for each direction...');
-  const scores: DirectionScore[] = [];
+  // Minimum angle constraint: 135 degrees
+  const minAngleDeg = 135;
+  const minAngleCos = Math.cos(minAngleDeg * Math.PI / 180);
   
-  for (let i = 0; i < directions.length; i++) {
-    const score = visComputer.getDirectionScore(directions[i]);
-    scores.push(score);
+  // Tracking best result
+  let bestD1: DirectionScore | null = null;
+  let bestD2: DirectionScore | null = null;
+  let bestCombinedCoverage = 0;
+  let bestD1UniqueArea = 0;
+  let bestD2UniqueArea = 0;
+  let bestDotProduct = 1;
+  let foundPerfectPair = false;
+  
+  // Store computed scores for directions we've processed
+  const computedScores: DirectionScore[] = [];
+  
+  console.log('\nProcessing directions sequentially...');
+  
+  // Process each direction and immediately evaluate pairs
+  for (let i = 0; i < directions.length && !foundPerfectPair; i++) {
+    // Compute visibility for current direction
+    const currentScore = visComputer.getDirectionScore(directions[i]);
+    computedScores.push(currentScore);
     
+    const currentArea = currentScore.visibleArea;
+    const currentTriangles = currentScore.visibleTriangles;
+    
+    // Evaluate pairs: current direction as d1 with all previous directions as d2
+    for (let j = 0; j < i; j++) {
+      const prevScore = computedScores[j];
+      
+      // Check angle constraint
+      const dotProduct = currentScore.direction.dot(prevScore.direction);
+      if (dotProduct > minAngleCos) continue;
+      
+      // Try current as d1, previous as d2
+      let d2UniqueArea = 0;
+      for (const tri of prevScore.visibleTriangles) {
+        if (!currentTriangles.has(tri)) {
+          d2UniqueArea += areas[tri];
+        }
+      }
+      let combinedCoverage = currentArea + d2UniqueArea;
+      
+      if (combinedCoverage > bestCombinedCoverage + 0.0001 ||
+          (Math.abs(combinedCoverage - bestCombinedCoverage) < 0.0001 && dotProduct < bestDotProduct)) {
+        bestCombinedCoverage = combinedCoverage;
+        bestD1 = currentScore;
+        bestD2 = prevScore;
+        bestD1UniqueArea = currentArea;
+        bestD2UniqueArea = d2UniqueArea;
+        bestDotProduct = dotProduct;
+        
+        // Check for perfect pair (100% coverage at 180°)
+        if (Math.abs(combinedCoverage - totalSurfaceArea) < 0.0001 && dotProduct <= -0.9999) {
+          foundPerfectPair = true;
+          console.log(`  Found perfect pair at direction ${i + 1}/${k} - early termination!`);
+          break;
+        }
+      }
+      
+      // Try previous as d1, current as d2
+      const prevArea = prevScore.visibleArea;
+      const prevTriangles = prevScore.visibleTriangles;
+      
+      d2UniqueArea = 0;
+      for (const tri of currentTriangles) {
+        if (!prevTriangles.has(tri)) {
+          d2UniqueArea += areas[tri];
+        }
+      }
+      combinedCoverage = prevArea + d2UniqueArea;
+      
+      if (combinedCoverage > bestCombinedCoverage + 0.0001 ||
+          (Math.abs(combinedCoverage - bestCombinedCoverage) < 0.0001 && dotProduct < bestDotProduct)) {
+        bestCombinedCoverage = combinedCoverage;
+        bestD1 = prevScore;
+        bestD2 = currentScore;
+        bestD1UniqueArea = prevArea;
+        bestD2UniqueArea = d2UniqueArea;
+        bestDotProduct = dotProduct;
+        
+        // Check for perfect pair
+        if (Math.abs(combinedCoverage - totalSurfaceArea) < 0.0001 && dotProduct <= -0.9999) {
+          foundPerfectPair = true;
+          console.log(`  Found perfect pair at direction ${i + 1}/${k} - early termination!`);
+          break;
+        }
+      }
+    }
+    
+    // Progress update every 25%
     if ((i + 1) % Math.floor(k / 4) === 0 || i === k - 1) {
-      console.log(`  Progress: ${Math.round(((i + 1) / k) * 100)}%`);
+      const elapsed = performance.now() - startTime;
+      const coverage = bestCombinedCoverage / totalSurfaceArea * 100;
+      console.log(`  Progress: ${Math.round(((i + 1) / k) * 100)}% | Best coverage: ${coverage.toFixed(1)}% | Time: ${(elapsed/1000).toFixed(1)}s`);
     }
   }
   
   // Clean up resources
   visComputer.dispose();
   
-  // Sort by visible area (descending) to find best individual directions
-  const sortedScores = [...scores].sort((a, b) => b.visibleArea - a.visibleArea);
-  
-  // Minimum angle constraint: 135 degrees
-  const minAngleDeg = 135;
-  const minAngleCos = Math.cos(minAngleDeg * Math.PI / 180);
-  
-  // Phase 2: Find best direction pair with angle > 135° and maximum combined coverage
-  // Tie-breaker: If multiple pairs have same coverage, prefer the pair closest to 180°
-  console.log('\nPhase 2: Finding optimal direction pair with global ownership...');
-  
-  let bestD1: DirectionScore | null = null;
-  let bestD2: DirectionScore | null = null;
-  let bestCombinedCoverage = 0;
-  let bestD1UniqueArea = 0;
-  let bestD2UniqueArea = 0;
-  let bestDotProduct = 1; // Track dot product; lower (more negative) = closer to 180°
-  
-  // Strategy: Iterate through top candidates for d1, find best matching d2
-  // Using ownership model: d2 only gets credit for triangles NOT in d1's set
-  
-  for (let i = 0; i < sortedScores.length; i++) {
-    const d1Candidate = sortedScores[i];
-    const d1Owned = d1Candidate.visibleTriangles;
-    
-    // Find best d2 that satisfies angle constraint
-    for (let j = 0; j < sortedScores.length; j++) {
-      if (i === j) continue;
-      
-      const d2Candidate = sortedScores[j];
-      
-      // Check angle constraint: dot product < cos(135°) means angle > 135°
-      const dotProduct = d1Candidate.direction.dot(d2Candidate.direction);
-      if (dotProduct > minAngleCos) continue;
-      
-      // Compute d2's UNIQUE contribution (triangles not owned by d1)
-      const d2Unique = new Set<number>();
-      for (const tri of d2Candidate.visibleTriangles) {
-        if (!d1Owned.has(tri)) {
-          d2Unique.add(tri);
-        }
-      }
-      
-      // Combined coverage = d1's area + d2's unique area
-      const d1Area = computeAreaFromTriangles(triangles, d1Owned);
-      const d2UniqueArea = computeAreaFromTriangles(triangles, d2Unique);
-      const combinedCoverage = d1Area + d2UniqueArea;
-      
-      // Update best if:
-      // 1. Higher coverage, OR
-      // 2. Same coverage but angle closer to 180° (lower dot product)
-      const isBetterCoverage = combinedCoverage > bestCombinedCoverage;
-      const isSameCoverageButCloserTo180 = 
-        Math.abs(combinedCoverage - bestCombinedCoverage) < 0.0001 && dotProduct < bestDotProduct;
-      
-      if (isBetterCoverage || isSameCoverageButCloserTo180) {
-        bestCombinedCoverage = combinedCoverage;
-        bestD1 = d1Candidate;
-        bestD2 = d2Candidate;
-        bestD1UniqueArea = d1Area;
-        bestD2UniqueArea = d2UniqueArea;
-        bestDotProduct = dotProduct;
-      }
-    }
-  }
-  
   if (!bestD1 || !bestD2) {
     // Fallback: use best individual direction and its opposite
     console.warn('No valid direction pair found with angle > 135°, using fallback');
-    bestD1 = sortedScores[0];
+    const bestSingle = computedScores.reduce((a, b) => a.visibleArea > b.visibleArea ? a : b);
+    bestD1 = bestSingle;
     bestD2 = {
-      direction: sortedScores[0].direction.clone().negate(),
+      direction: bestSingle.direction.clone().negate(),
       visibleArea: 0,
       nonVisibleArea: totalSurfaceArea,
       score: 0,
@@ -449,7 +534,7 @@ export function findPartingDirections(
   console.log(`    Computation time: ${(elapsed / 1000).toFixed(2)}s`);
   console.log('═══════════════════════════════════════════════════════');
   
-  return { d1, d2, scores };
+  return { d1, d2, scores: computedScores };
 }
 
 /**
