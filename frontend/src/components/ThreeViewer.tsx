@@ -5,24 +5,29 @@
 // - center and scale the mesh
 // - add OrbitControls (pan, tilt, orbit, zoom)
 // - handle window resize
+// - compute and display parting directions
 
 import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three-stdlib';
 import { STLLoader } from 'three-stdlib';
+import { computeAndShowPartingDirections, removePartingDirectionArrows } from '../utils/partingDirection';
 
 interface ThreeViewerProps {
   stlUrl?: string;
+  showPartingDirections?: boolean;
+  onMeshLoaded?: (mesh: THREE.Mesh) => void;
 }
 
-const ThreeViewer: React.FC<ThreeViewerProps> = ({ stlUrl }) => {
+const ThreeViewer: React.FC<ThreeViewerProps> = ({ stlUrl, showPartingDirections = false, onMeshLoaded }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
-  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const cameraRef = useRef<THREE.OrthographicCamera | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
   const meshRef = useRef<THREE.Mesh | null>(null);
   const animationIdRef = useRef<number | null>(null);
+  const partingArrowsRef = useRef<THREE.ArrowHelper[]>([]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -38,10 +43,14 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({ stlUrl }) => {
     const gridHelper = new THREE.GridHelper(10, 10, 0x444444, 0x333333);
     scene.add(gridHelper);
 
-    // Create camera
-    const camera = new THREE.PerspectiveCamera(
-      75,
-      container.clientWidth / container.clientHeight,
+    // Create orthographic camera
+    const aspect = container.clientWidth / container.clientHeight;
+    const frustumSize = 10;
+    const camera = new THREE.OrthographicCamera(
+      -frustumSize * aspect / 2,
+      frustumSize * aspect / 2,
+      frustumSize / 2,
+      -frustumSize / 2,
       0.1,
       1000
     );
@@ -85,7 +94,12 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({ stlUrl }) => {
     const handleResize = () => {
       if (!container || !cameraRef.current || !rendererRef.current) return;
       
-      cameraRef.current.aspect = container.clientWidth / container.clientHeight;
+      const aspect = container.clientWidth / container.clientHeight;
+      const frustumSize = 10;
+      cameraRef.current.left = -frustumSize * aspect / 2;
+      cameraRef.current.right = frustumSize * aspect / 2;
+      cameraRef.current.top = frustumSize / 2;
+      cameraRef.current.bottom = -frustumSize / 2;
       cameraRef.current.updateProjectionMatrix();
       rendererRef.current.setSize(container.clientWidth, container.clientHeight);
     };
@@ -189,6 +203,11 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({ stlUrl }) => {
 
         console.log('STL loaded successfully, vertices:', geometry.attributes.position.count);
 
+        // Notify parent component that mesh is loaded
+        if (onMeshLoaded) {
+          onMeshLoaded(mesh);
+        }
+
         // Adjust camera to see the whole object
         const scaledHeight = size.z * scale; // Z becomes Y after rotation
         const distance = 8;
@@ -199,7 +218,37 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({ stlUrl }) => {
       .catch(error => {
         console.error('Error loading STL:', error);
       });
-  }, [stlUrl]);
+  }, [stlUrl, onMeshLoaded]);
+
+  // Handle parting directions visualization
+  useEffect(() => {
+    if (!meshRef.current || !sceneRef.current) return;
+
+    // Remove existing arrows
+    if (partingArrowsRef.current.length > 0) {
+      removePartingDirectionArrows(partingArrowsRef.current);
+      partingArrowsRef.current = [];
+    }
+
+    // Compute and show new arrows if enabled
+    if (showPartingDirections && meshRef.current) {
+      try {
+        const result = computeAndShowPartingDirections(meshRef.current, 128);
+        partingArrowsRef.current = result.arrows;
+      } catch (error) {
+        console.error('Error computing parting directions:', error);
+      }
+    }
+  }, [showPartingDirections, stlUrl]);
+
+  // Cleanup arrows on unmount
+  useEffect(() => {
+    return () => {
+      if (partingArrowsRef.current.length > 0) {
+        removePartingDirectionArrows(partingArrowsRef.current);
+      }
+    };
+  }, []);
 
   return (
     <div 
