@@ -34,6 +34,8 @@ import {
 } from '../utils/meshRepairManifold';
 import {
   generateVolumetricGrid,
+  generateVolumetricGridGPU,
+  isWebGPUAvailable,
   createMoldVolumePointCloud,
   createMoldVolumeVoxels,
   createGridBoundingBoxHelper,
@@ -67,6 +69,8 @@ interface ThreeViewerProps {
   gridResolution?: number;
   /** Grid visualization mode: 'points', 'voxels', or 'none' */
   gridVisualizationMode?: GridVisualizationMode;
+  /** Use GPU acceleration for grid generation (WebGPU if available) */
+  useGPUGrid?: boolean;
   onMeshLoaded?: (mesh: THREE.Mesh) => void;
   onMeshRepaired?: (result: MeshRepairResult) => void;
   onVisibilityDataReady?: (data: VisibilityPaintData | null) => void;
@@ -102,6 +106,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   showVolumetricGrid = false,
   gridResolution = 64,
   gridVisualizationMode = 'points',
+  useGPUGrid = true,
   onMeshLoaded,
   onMeshRepaired,
   onVisibilityDataReady,
@@ -423,61 +428,75 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
     // Generate volumetric grid if requested and we have both hull and mesh
     if (showVolumetricGrid && inflatedHullRef.current && meshRef.current) {
-      try {
-        console.log('Generating volumetric grid...');
-        
-        // Get geometries in world space
-        const shellGeometry = inflatedHullRef.current.mesh.geometry.clone();
-        shellGeometry.applyMatrix4(inflatedHullRef.current.mesh.matrixWorld);
-        
-        const partGeometry = meshRef.current.geometry.clone();
-        partGeometry.applyMatrix4(meshRef.current.matrixWorld);
-        
-        const options: VolumetricGridOptions = {
-          resolution: gridResolution,
-          storeAllCells: false,
-          marginPercent: 0.02,
-          computeDistances: false,
-        };
-        
-        const gridResult = generateVolumetricGrid(shellGeometry, partGeometry, options);
-        
-        console.log(`Volumetric grid generated:`);
-        console.log(`  Resolution: ${gridResult.resolution.x}×${gridResult.resolution.y}×${gridResult.resolution.z}`);
-        console.log(`  Mold volume cells: ${gridResult.moldVolumeCellCount} / ${gridResult.totalCellCount}`);
-        console.log(`  Fill ratio: ${(gridResult.stats.fillRatio * 100).toFixed(1)}%`);
-        console.log(`  Approx mold volume: ${gridResult.stats.moldVolume.toFixed(4)}`);
-        console.log(`  Compute time: ${gridResult.stats.computeTimeMs.toFixed(1)} ms`);
-        
-        volumetricGridRef.current = gridResult;
-        onVolumetricGridReady?.(gridResult);
-        
-        // Create visualization based on mode
-        if (gridVisualizationMode !== 'none' && gridResult.moldVolumeCellCount > 0) {
-          if (gridVisualizationMode === 'points') {
-            gridVisualizationRef.current = createMoldVolumePointCloud(gridResult, 0x00ffff, 3);
-          } else if (gridVisualizationMode === 'voxels') {
-            gridVisualizationRef.current = createMoldVolumeVoxels(gridResult, 0x00ffff, 0.2);
+      // Use async IIFE for GPU version
+      (async () => {
+        try {
+          // Check WebGPU availability
+          const gpuAvailable = isWebGPUAvailable();
+          const useGPU = useGPUGrid && gpuAvailable;
+          
+          console.log('Generating volumetric grid...');
+          console.log(`  Using: ${useGPU ? 'WebGPU (GPU)' : 'CPU'}`);
+          if (useGPUGrid && !gpuAvailable) {
+            console.log('  Note: WebGPU not available, falling back to CPU');
           }
           
-          if (gridVisualizationRef.current) {
-            scene.add(gridVisualizationRef.current);
+          // Get geometries in world space
+          const shellGeometry = inflatedHullRef.current!.mesh.geometry.clone();
+          shellGeometry.applyMatrix4(inflatedHullRef.current!.mesh.matrixWorld);
+          
+          const partGeometry = meshRef.current!.geometry.clone();
+          partGeometry.applyMatrix4(meshRef.current!.matrixWorld);
+          
+          const options: VolumetricGridOptions = {
+            resolution: gridResolution,
+            storeAllCells: false,
+            marginPercent: 0.02,
+            computeDistances: false,
+          };
+          
+          // Use GPU or CPU version based on availability and preference
+          const gridResult = useGPU
+            ? await generateVolumetricGridGPU(shellGeometry, partGeometry, options)
+            : generateVolumetricGrid(shellGeometry, partGeometry, options);
+          
+          console.log(`Volumetric grid generated:`);
+          console.log(`  Resolution: ${gridResult.resolution.x}×${gridResult.resolution.y}×${gridResult.resolution.z}`);
+          console.log(`  Mold volume cells: ${gridResult.moldVolumeCellCount} / ${gridResult.totalCellCount}`);
+          console.log(`  Fill ratio: ${(gridResult.stats.fillRatio * 100).toFixed(1)}%`);
+          console.log(`  Approx mold volume: ${gridResult.stats.moldVolume.toFixed(4)}`);
+          console.log(`  Compute time: ${gridResult.stats.computeTimeMs.toFixed(1)} ms`);
+          
+          volumetricGridRef.current = gridResult;
+          onVolumetricGridReady?.(gridResult);
+          
+          // Create visualization based on mode
+          if (gridVisualizationMode !== 'none' && gridResult.moldVolumeCellCount > 0) {
+            if (gridVisualizationMode === 'points') {
+              gridVisualizationRef.current = createMoldVolumePointCloud(gridResult, 0x00ffff, 3);
+            } else if (gridVisualizationMode === 'voxels') {
+              gridVisualizationRef.current = createMoldVolumeVoxels(gridResult, 0x00ffff, 0.2);
+            }
+            
+            if (gridVisualizationRef.current) {
+              scene.add(gridVisualizationRef.current);
+            }
+            
+            // Add bounding box helper
+            gridBoundingBoxRef.current = createGridBoundingBoxHelper(gridResult, 0xffff00);
+            scene.add(gridBoundingBoxRef.current);
           }
           
-          // Add bounding box helper
-          gridBoundingBoxRef.current = createGridBoundingBoxHelper(gridResult, 0xffff00);
-          scene.add(gridBoundingBoxRef.current);
+          // Clean up temporary geometries
+          shellGeometry.dispose();
+          partGeometry.dispose();
+          
+        } catch (error) {
+          console.error('Error generating volumetric grid:', error);
         }
-        
-        // Clean up temporary geometries
-        shellGeometry.dispose();
-        partGeometry.dispose();
-        
-      } catch (error) {
-        console.error('Error generating volumetric grid:', error);
-      }
+      })();
     }
-  }, [showVolumetricGrid, gridResolution, gridVisualizationMode, onVolumetricGridReady]);
+  }, [showVolumetricGrid, gridResolution, gridVisualizationMode, useGPUGrid, onVolumetricGridReady]);
 
   // ============================================================================
   // VISIBILITY PAINTING

@@ -81,6 +81,8 @@ export interface VolumetricGridOptions {
   marginPercent?: number;
   /** Whether to compute signed distances (more expensive but useful for visualization) */
   computeDistances?: boolean;
+  /** Whether to use GPU acceleration (WebGPU if available, otherwise falls back to CPU) */
+  useGPU?: boolean;
 }
 
 // ============================================================================
@@ -386,6 +388,415 @@ export function generateVolumetricGrid(
     cellSize,
     stats,
   };
+}
+
+// ============================================================================
+// GPU-ACCELERATED GENERATION
+// ============================================================================
+
+/**
+ * Check if WebGPU is available in the browser
+ */
+export function isWebGPUAvailable(): boolean {
+  return 'gpu' in navigator;
+}
+
+/**
+ * GPU-accelerated volumetric grid generator using WebGPU compute shaders
+ * Falls back to CPU if WebGPU is not available
+ */
+export async function generateVolumetricGridGPU(
+  outerShellGeometry: THREE.BufferGeometry,
+  partGeometry: THREE.BufferGeometry,
+  options: VolumetricGridOptions = {}
+): Promise<VolumetricGridResult> {
+  // Check for WebGPU support
+  if (!isWebGPUAvailable()) {
+    console.log('WebGPU not available, falling back to CPU');
+    return generateVolumetricGrid(outerShellGeometry, partGeometry, options);
+  }
+  
+  const startTime = performance.now();
+  
+  // Parse options
+  const resolution = typeof options.resolution === 'number' 
+    ? options.resolution 
+    : options.resolution?.x ?? DEFAULT_GRID_RESOLUTION;
+  const marginPercent = options.marginPercent ?? 0.05;
+  const storeAllCells = options.storeAllCells ?? false;
+  
+  console.log('═══════════════════════════════════════════════════════');
+  console.log('GPU VOLUMETRIC GRID GENERATION (WebGPU)');
+  console.log('═══════════════════════════════════════════════════════');
+  console.log(`  Resolution: ${resolution}³`);
+  
+  try {
+    // Initialize WebGPU
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      console.warn('No WebGPU adapter found, falling back to CPU');
+      return generateVolumetricGrid(outerShellGeometry, partGeometry, options);
+    }
+    
+    const device = await adapter.requestDevice();
+    
+    // Clone and prepare geometries
+    const shellGeom = outerShellGeometry.clone();
+    const partGeom = partGeometry.clone();
+    shellGeom.computeBoundingBox();
+    
+    // Get bounding box with margin
+    const boundingBox = shellGeom.boundingBox!.clone();
+    const boxSize = new THREE.Vector3();
+    boundingBox.getSize(boxSize);
+    const margin = boxSize.clone().multiplyScalar(marginPercent);
+    boundingBox.min.sub(margin);
+    boundingBox.max.add(margin);
+    boundingBox.getSize(boxSize);
+    
+    const cellSize = new THREE.Vector3(
+      boxSize.x / resolution,
+      boxSize.y / resolution,
+      boxSize.z / resolution
+    );
+    
+    // Extract triangles
+    const shellTriangles = extractTrianglesForGPU(shellGeom);
+    const partTriangles = extractTrianglesForGPU(partGeom);
+    
+    console.log(`  Shell triangles: ${shellTriangles.length / 9}`);
+    console.log(`  Part triangles: ${partTriangles.length / 9}`);
+    
+    const totalCells = resolution ** 3;
+    
+    // Create GPU buffers
+    const paramsData = new Float32Array([
+      boundingBox.min.x, boundingBox.min.y, boundingBox.min.z, resolution,
+      cellSize.x, cellSize.y, cellSize.z, 0,
+    ]);
+    
+    const paramsBuffer = device.createBuffer({
+      size: paramsData.byteLength,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(paramsBuffer, 0, paramsData);
+    
+    // Triangle count buffer
+    const triCountData = new Uint32Array([shellTriangles.length / 9, partTriangles.length / 9]);
+    const triCountBuffer = device.createBuffer({
+      size: triCountData.byteLength,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(triCountBuffer, 0, triCountData);
+    
+    // Shell triangles buffer
+    const shellBuffer = device.createBuffer({
+      size: shellTriangles.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(shellBuffer, 0, shellTriangles.buffer);
+    
+    // Part triangles buffer
+    const partBuffer = device.createBuffer({
+      size: partTriangles.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(partBuffer, 0, partTriangles.buffer);
+    
+    // Results buffer
+    const resultBuffer = device.createBuffer({
+      size: totalCells * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+    
+    // Staging buffer for reading results
+    const stagingBuffer = device.createBuffer({
+      size: totalCells * 4,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+    
+    // Create compute shader
+    const shaderCode = getWebGPUComputeShader();
+    const shaderModule = device.createShaderModule({ code: shaderCode });
+    
+    // Create compute pipeline
+    const pipeline = device.createComputePipeline({
+      layout: 'auto',
+      compute: {
+        module: shaderModule,
+        entryPoint: 'main',
+      },
+    });
+    
+    // Create bind group
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: paramsBuffer } },
+        { binding: 1, resource: { buffer: triCountBuffer } },
+        { binding: 2, resource: { buffer: shellBuffer } },
+        { binding: 3, resource: { buffer: partBuffer } },
+        { binding: 4, resource: { buffer: resultBuffer } },
+      ],
+    });
+    
+    // Dispatch compute shader
+    const commandEncoder = device.createCommandEncoder();
+    const passEncoder = commandEncoder.beginComputePass();
+    passEncoder.setPipeline(pipeline);
+    passEncoder.setBindGroup(0, bindGroup);
+    
+    const workgroupSize = 64;
+    const numWorkgroups = Math.ceil(totalCells / workgroupSize);
+    passEncoder.dispatchWorkgroups(numWorkgroups);
+    passEncoder.end();
+    
+    // Copy results to staging buffer
+    commandEncoder.copyBufferToBuffer(resultBuffer, 0, stagingBuffer, 0, totalCells * 4);
+    
+    // Submit and wait
+    device.queue.submit([commandEncoder.finish()]);
+    await stagingBuffer.mapAsync(GPUMapMode.READ);
+    
+    const resultData = new Uint32Array(stagingBuffer.getMappedRange().slice(0));
+    stagingBuffer.unmap();
+    
+    // Extract mold volume cells
+    const moldVolumeCells: GridCell[] = [];
+    const allCells: GridCell[] = [];
+    
+    for (let idx = 0; idx < totalCells; idx++) {
+      const i = idx % resolution;
+      const j = Math.floor(idx / resolution) % resolution;
+      const k = Math.floor(idx / (resolution * resolution));
+      
+      const center = new THREE.Vector3(
+        boundingBox.min.x + (i + 0.5) * cellSize.x,
+        boundingBox.min.y + (j + 0.5) * cellSize.y,
+        boundingBox.min.z + (k + 0.5) * cellSize.z
+      );
+      
+      const isMoldVolume = resultData[idx] === 1;
+      
+      if (isMoldVolume) {
+        moldVolumeCells.push({
+          index: new THREE.Vector3(i, j, k),
+          center,
+          size: cellSize.clone(),
+          isMoldVolume: true,
+        });
+      }
+      
+      if (storeAllCells) {
+        allCells.push({
+          index: new THREE.Vector3(i, j, k),
+          center: isMoldVolume ? center : center.clone(),
+          size: cellSize.clone(),
+          isMoldVolume,
+        });
+      }
+    }
+    
+    // Clean up GPU resources
+    paramsBuffer.destroy();
+    triCountBuffer.destroy();
+    shellBuffer.destroy();
+    partBuffer.destroy();
+    resultBuffer.destroy();
+    stagingBuffer.destroy();
+    shellGeom.dispose();
+    partGeom.dispose();
+    
+    const endTime = performance.now();
+    
+    const cellVolume = cellSize.x * cellSize.y * cellSize.z;
+    const moldVolume = moldVolumeCells.length * cellVolume;
+    const totalVolume = totalCells * cellVolume;
+    
+    const stats: VolumetricGridStats = {
+      moldVolume,
+      totalVolume,
+      fillRatio: moldVolume / totalVolume,
+      computeTimeMs: endTime - startTime,
+    };
+    
+    console.log(`GPU Grid Generation Complete:`);
+    console.log(`  Mold volume cells: ${moldVolumeCells.length} / ${totalCells}`);
+    console.log(`  Fill ratio: ${(stats.fillRatio * 100).toFixed(1)}%`);
+    console.log(`  Compute time: ${stats.computeTimeMs.toFixed(1)} ms`);
+    
+    return {
+      allCells: storeAllCells ? allCells : [],
+      moldVolumeCells,
+      resolution: new THREE.Vector3(resolution, resolution, resolution),
+      totalCellCount: totalCells,
+      moldVolumeCellCount: moldVolumeCells.length,
+      boundingBox,
+      cellSize,
+      stats,
+    };
+    
+  } catch (error) {
+    console.error('GPU generation failed, falling back to CPU:', error);
+    return generateVolumetricGrid(outerShellGeometry, partGeometry, options);
+  }
+}
+
+/**
+ * Extract triangles from geometry as flat Float32Array for GPU
+ */
+function extractTrianglesForGPU(geometry: THREE.BufferGeometry): Float32Array {
+  const position = geometry.getAttribute('position');
+  const index = geometry.getIndex();
+  
+  const triangleCount = index ? index.count / 3 : position.count / 3;
+  const triangles = new Float32Array(triangleCount * 9);
+  
+  for (let i = 0; i < triangleCount; i++) {
+    const [a, b, c] = index
+      ? [index.getX(i * 3), index.getX(i * 3 + 1), index.getX(i * 3 + 2)]
+      : [i * 3, i * 3 + 1, i * 3 + 2];
+    
+    triangles[i * 9 + 0] = position.getX(a);
+    triangles[i * 9 + 1] = position.getY(a);
+    triangles[i * 9 + 2] = position.getZ(a);
+    triangles[i * 9 + 3] = position.getX(b);
+    triangles[i * 9 + 4] = position.getY(b);
+    triangles[i * 9 + 5] = position.getZ(b);
+    triangles[i * 9 + 6] = position.getX(c);
+    triangles[i * 9 + 7] = position.getY(c);
+    triangles[i * 9 + 8] = position.getZ(c);
+  }
+  
+  return triangles;
+}
+
+/**
+ * Generate WebGPU compute shader for volumetric grid
+ */
+function getWebGPUComputeShader(): string {
+  return /* wgsl */`
+    struct Params {
+      boundsMin: vec3f,
+      resolution: f32,
+      cellSize: vec3f,
+      _padding: f32,
+    }
+    
+    struct TriCounts {
+      shellCount: u32,
+      partCount: u32,
+    }
+    
+    @group(0) @binding(0) var<uniform> params: Params;
+    @group(0) @binding(1) var<uniform> triCounts: TriCounts;
+    @group(0) @binding(2) var<storage, read> shellTriangles: array<f32>;
+    @group(0) @binding(3) var<storage, read> partTriangles: array<f32>;
+    @group(0) @binding(4) var<storage, read_write> results: array<u32>;
+    
+    // Möller–Trumbore ray-triangle intersection
+    fn rayTriangleIntersect(origin: vec3f, dir: vec3f, v0: vec3f, v1: vec3f, v2: vec3f) -> bool {
+      let edge1 = v1 - v0;
+      let edge2 = v2 - v0;
+      let h = cross(dir, edge2);
+      let a = dot(edge1, h);
+      
+      if (abs(a) < 0.000001) {
+        return false;
+      }
+      
+      let f = 1.0 / a;
+      let s = origin - v0;
+      let u = f * dot(s, h);
+      
+      if (u < 0.0 || u > 1.0) {
+        return false;
+      }
+      
+      let q = cross(s, edge1);
+      let v = f * dot(dir, q);
+      
+      if (v < 0.0 || u + v > 1.0) {
+        return false;
+      }
+      
+      let t = f * dot(edge2, q);
+      return t > 0.000001;
+    }
+    
+    // Count intersections with shell mesh
+    fn countShellIntersections(point: vec3f) -> u32 {
+      let rayDir = vec3f(1.0, 0.0, 0.0);
+      var count: u32 = 0u;
+      
+      for (var i: u32 = 0u; i < triCounts.shellCount; i = i + 1u) {
+        let idx = i * 9u;
+        let v0 = vec3f(shellTriangles[idx], shellTriangles[idx + 1u], shellTriangles[idx + 2u]);
+        let v1 = vec3f(shellTriangles[idx + 3u], shellTriangles[idx + 4u], shellTriangles[idx + 5u]);
+        let v2 = vec3f(shellTriangles[idx + 6u], shellTriangles[idx + 7u], shellTriangles[idx + 8u]);
+        
+        if (rayTriangleIntersect(point, rayDir, v0, v1, v2)) {
+          count = count + 1u;
+        }
+      }
+      
+      return count;
+    }
+    
+    // Count intersections with part mesh
+    fn countPartIntersections(point: vec3f) -> u32 {
+      let rayDir = vec3f(1.0, 0.0, 0.0);
+      var count: u32 = 0u;
+      
+      for (var i: u32 = 0u; i < triCounts.partCount; i = i + 1u) {
+        let idx = i * 9u;
+        let v0 = vec3f(partTriangles[idx], partTriangles[idx + 1u], partTriangles[idx + 2u]);
+        let v1 = vec3f(partTriangles[idx + 3u], partTriangles[idx + 4u], partTriangles[idx + 5u]);
+        let v2 = vec3f(partTriangles[idx + 6u], partTriangles[idx + 7u], partTriangles[idx + 8u]);
+        
+        if (rayTriangleIntersect(point, rayDir, v0, v1, v2)) {
+          count = count + 1u;
+        }
+      }
+      
+      return count;
+    }
+    
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) id: vec3u) {
+      let resolution = u32(params.resolution);
+      let totalCells = resolution * resolution * resolution;
+      let cellIdx = id.x;
+      
+      if (cellIdx >= totalCells) {
+        return;
+      }
+      
+      // Convert linear index to 3D grid coordinates
+      let i = cellIdx % resolution;
+      let j = (cellIdx / resolution) % resolution;
+      let k = cellIdx / (resolution * resolution);
+      
+      // Calculate cell center
+      let center = params.boundsMin + params.cellSize * (vec3f(f32(i), f32(j), f32(k)) + 0.5);
+      
+      // Check inside shell (odd intersections = inside)
+      let shellHits = countShellIntersections(center);
+      let insideShell = (shellHits % 2u) == 1u;
+      
+      if (!insideShell) {
+        results[cellIdx] = 0u;
+        return;
+      }
+      
+      // Check outside part (even intersections = outside)
+      let partHits = countPartIntersections(center);
+      let insidePart = (partHits % 2u) == 1u;
+      
+      // Mold volume = inside shell AND outside part
+      results[cellIdx] = select(0u, 1u, !insidePart);
+    }
+  `;
 }
 
 // ============================================================================

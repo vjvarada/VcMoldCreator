@@ -64,6 +64,7 @@ function App() {
   const [gridResolution, setGridResolution] = useState(64);
   const [gridVisualizationMode, setGridVisualizationMode] = useState<GridVisualizationMode>('points');
   const [volumetricGridStats, setVolumetricGridStats] = useState<VolumetricGridStats | null>(null);
+  const [useGPUGrid, setUseGPUGrid] = useState(true);
 
   // Handlers
   const handleFileLoad = useCallback((url: string, _fileName: string) => {
@@ -182,6 +183,7 @@ function App() {
         showVolumetricGrid={showVolumetricGrid}
         gridResolution={gridResolution}
         gridVisualizationMode={gridVisualizationMode}
+        useGPUGrid={useGPUGrid}
         onMeshLoaded={handleMeshLoaded}
         onMeshRepaired={handleMeshRepaired}
         onVisibilityDataReady={handleVisibilityDataReady}
@@ -542,6 +544,22 @@ function App() {
                     >
                       Voxels
                     </button>
+                  </div>
+
+                  {/* GPU Acceleration Toggle */}
+                  <div style={{ marginTop: '10px' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={useGPUGrid}
+                        onChange={(e) => setUseGPUGrid(e.target.checked)}
+                        style={{ cursor: 'pointer' }}
+                      />
+                      <span>Use GPU (WebGPU)</span>
+                      <span style={{ opacity: 0.6, fontSize: '10px' }}>
+                        {typeof navigator !== 'undefined' && 'gpu' in navigator ? '✅ Available' : '❌ Not available'}
+                      </span>
+                    </label>
                   </div>
 
                   {/* Grid Stats */}
