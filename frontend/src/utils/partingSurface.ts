@@ -535,7 +535,7 @@ export function computeEscapeLabelingDijkstra(
   // TEMPORARY: Skip Dijkstra and return boundary-only results for debugging
   // ========================================================================
   
-  const SKIP_DIJKSTRA = true;  // Set to false to re-enable Dijkstra
+  const SKIP_DIJKSTRA = false;  // Set to true to disable Dijkstra for debugging
   
   if (SKIP_DIJKSTRA) {
     console.log('DIJKSTRA DISABLED - returning boundary labels only');
@@ -583,31 +583,47 @@ export function computeEscapeLabelingDijkstra(
   }
   
   // ========================================================================
-  // STEP 2: Seed from INNER SURFACE voxels (single layer near part)
+  // STEP 2: Run Dijkstra FROM BOUNDARY VOXELS inward
+  // 
+  // Instead of flooding outward from seeds, we flood INWARD from boundaries.
+  // This way, each voxel directly knows which boundary it's closest to.
+  // 
+  // Multi-source Dijkstra:
+  // - Seed H₁ boundary voxels with label=1, cost=0
+  // - Seed H₂ boundary voxels with label=2, cost=0
+  // - Each voxel inherits the label of its nearest boundary
   // ========================================================================
   
-  // Initialize data structures for outward flood
-  const voxelCost = new Float32Array(voxelCount).fill(Infinity);  // Cost to reach from seeds
-  const parent = new Int32Array(voxelCount).fill(-1);  // Parent in shortest path tree
-  const seedMask = innerSurfaceMask;  // Use inner surface as seeds (already computed)
+  // Initialize data structures
+  const voxelCost = new Float32Array(voxelCount).fill(Infinity);
+  const voxelLabel = new Int8Array(voxelCount).fill(-1);
   const pq = new MinHeap();
   
-  // Seed from inner surface voxels (single layer near part mesh)
-  let seedCount = 0;
+  // Seed from boundary voxels
+  let h1Seeds = 0, h2Seeds = 0;
   for (let i = 0; i < voxelCount; i++) {
-    if (innerSurfaceMask[i]) {
+    if (boundaryLabel[i] === 1) {
       voxelCost[i] = 0;
+      voxelLabel[i] = 1;
       pq.push(i, 0);
-      seedCount++;
+      h1Seeds++;
+    } else if (boundaryLabel[i] === 2) {
+      voxelCost[i] = 0;
+      voxelLabel[i] = 2;
+      pq.push(i, 0);
+      h2Seeds++;
     }
   }
-  console.log(`  Seeds (inner surface): ${seedCount}`);
+  console.log(`  Boundary seeds: H₁=${h1Seeds}, H₂=${h2Seeds}`);
   
   // ========================================================================
-  // STEP 3: Dijkstra flood OUTWARD from part toward boundary
+  // STEP 3: Dijkstra flood INWARD from boundaries
+  // 
+  // Edge cost: thickness-weighted to prefer paths through thick regions
   // ========================================================================
   
-  console.log('Running outward Dijkstra flood...');
+  console.log('Running inward Dijkstra flood from boundaries...');
+  
   let iterations = 0;
   
   while (pq.size > 0) {
@@ -624,6 +640,8 @@ export function computeEscapeLabelingDijkstra(
     const gj = Math.round(cell.index.y);
     const gk = Math.round(cell.index.z);
     
+    const di_current = voxelDist[i];  // Current voxel's distance to part
+    
     // Visit all neighbors
     for (let n = 0; n < neighborOffsets.length; n++) {
       const [di, dj, dk] = neighborOffsets[n];
@@ -635,9 +653,13 @@ export function computeEscapeLabelingDijkstra(
       const j = getVoxelIndex(ni, nj, nk, spatialIndex);
       if (j < 0) continue; // Not a silicone voxel
       
-      // Compute edge cost: L / (d_mid² + eps)
+      const dj_neighbor = voxelDist[j];
       const L = neighborDistances[n];
-      const d_mid = 0.5 * (voxelDist[i] + voxelDist[j]);
+      
+      // Edge cost: thickness-weighted
+      // Lower cost in thick regions (high voxelDist) 
+      // Higher cost in thin regions (low voxelDist)
+      const d_mid = 0.5 * (di_current + dj_neighbor);
       const edgeCost = L / (d_mid * d_mid + eps);
       
       // Candidate cost to reach j through i
@@ -646,7 +668,7 @@ export function computeEscapeLabelingDijkstra(
       // If this is a better path, update
       if (candidateCost < voxelCost[j]) {
         voxelCost[j] = candidateCost;
-        parent[j] = i;  // Track parent for path reconstruction
+        voxelLabel[j] = voxelLabel[i];  // Inherit label from source
         pq.decreaseKey(j, candidateCost);
       }
     }
@@ -657,68 +679,16 @@ export function computeEscapeLabelingDijkstra(
   console.log(`  Dijkstra iterations: ${iterations}`);
   
   // ========================================================================
-  // STEP 4: Assign labels based on which boundary each path reaches
-  // 
-  // The parent tree structure is: parent[j] = i means "j was reached FROM i"
-  // i.e., i is closer to the part (seed), j is further toward boundary.
-  // 
-  // To find which boundary a voxel escapes to, we trace FORWARD from the voxel
-  // toward the boundary by following the reverse of parent (i.e., find who has
-  // this voxel as parent = the voxel's children, which are further from part).
-  // 
-  // Strategy:
-  // 1. Boundary voxels get their fixed labels (H₁ or H₂)
-  // 2. For each boundary voxel, trace BACKWARD through parent pointers
-  //    toward the part, propagating the boundary's label
+  // STEP 4: Handle any voxels that weren't reached by Dijkstra
   // ========================================================================
   
-  console.log('Assigning labels based on escape paths...');
-  const voxelLabel = new Int8Array(voxelCount).fill(-1);
-  
-  // First: fix boundary voxel labels based on which mold half they're adjacent to
-  for (let i = 0; i < voxelCount; i++) {
-    if (boundaryLabel[i] !== 0) {
-      voxelLabel[i] = boundaryLabel[i];
-    }
-  }
-  
-  // BFS from boundary voxels, propagating labels BACKWARD through parent pointers
-  // parent[i] points toward the part (the voxel that i was reached from)
-  // So following parent[i] moves us from boundary toward part
-  const queue: number[] = [];
-  const inQueue = new Uint8Array(voxelCount);
-  
-  // Start from all boundary-adjacent voxels
-  for (let i = 0; i < voxelCount; i++) {
-    if (boundaryLabel[i] !== 0) {
-      queue.push(i);
-      inQueue[i] = 1;
-    }
-  }
-  
-  // BFS: propagate labels from boundary toward part through parent pointers
-  let head = 0;
-  while (head < queue.length) {
-    const i = queue[head++];
-    const label = voxelLabel[i];
-    
-    // Follow parent pointer toward part
-    const p = parent[i];
-    if (p >= 0 && voxelLabel[p] === -1) {
-      // Parent is unlabeled - it escapes through us, so give it our label
-      voxelLabel[p] = label;
-      if (!inQueue[p]) {
-        queue.push(p);
-        inQueue[p] = 1;
-      }
-    }
-  }
-  
-  // Handle any remaining unlabeled voxels (seeds that might not have parents)
-  // These are at the part surface - find which boundary they're closest to
+  // Handle any remaining unlabeled voxels (disconnected regions)
+  let stillUnlabeled = 0;
   for (let i = 0; i < voxelCount; i++) {
     if (voxelLabel[i] === -1) {
-      // This is likely a seed voxel - find its nearest labeled neighbor
+      stillUnlabeled++;
+      
+      // Find nearest labeled neighbor
       const cell = cells[i];
       const gi = Math.round(cell.index.x);
       const gj = Math.round(cell.index.y);
@@ -741,6 +711,10 @@ export function computeEscapeLabelingDijkstra(
     }
   }
   
+  if (stillUnlabeled > 0) {
+    console.log(`  Unreached voxels: ${stillUnlabeled} (fixed via neighbor lookup)`);
+  }
+  
   // ========================================================================
   // COUNT RESULTS
   // ========================================================================
@@ -756,36 +730,6 @@ export function computeEscapeLabelingDijkstra(
     else unlabeledCount++;
   }
   
-  // ========================================================================
-  // FIND INTERFACE VOXELS (where neighbors have different labels)
-  // ========================================================================
-  
-  let interfaceCount = 0;
-  
-  for (let i = 0; i < voxelCount; i++) {
-    const label = voxelLabel[i];
-    if (label === -1) continue;
-    
-    const cell = cells[i];
-    const gi = Math.round(cell.index.x);
-    const gj = Math.round(cell.index.y);
-    const gk = Math.round(cell.index.z);
-    
-    // Check if any neighbor has a different label
-    let isInterface = false;
-    for (const [di, dj, dk] of neighborOffsets) {
-      const j = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
-      if (j >= 0 && voxelLabel[j] !== -1 && voxelLabel[j] !== label) {
-        isInterface = true;
-        break;
-      }
-    }
-    
-    if (isInterface) {
-      interfaceCount++;
-    }
-  }
-  
   const computeTimeMs = performance.now() - startTime;
   
   console.log('───────────────────────────────────────────────────────');
@@ -793,7 +737,6 @@ export function computeEscapeLabelingDijkstra(
   console.log(`  H₁ (side 1): ${d1Count} (${(d1Count / voxelCount * 100).toFixed(1)}%)`);
   console.log(`  H₂ (side 2): ${d2Count} (${(d2Count / voxelCount * 100).toFixed(1)}%)`);
   console.log(`  Unlabeled:   ${unlabeledCount} (${(unlabeledCount / voxelCount * 100).toFixed(1)}%)`);
-  console.log(`  Interface:   ${interfaceCount} voxels`);
   console.log(`  Time: ${computeTimeMs.toFixed(1)}ms`);
   console.log('═══════════════════════════════════════════════════════');
   
@@ -814,12 +757,12 @@ export function computeEscapeLabelingDijkstra(
     escapeCost: voxelCost,
     d1Count,
     d2Count,
-    interfaceCount,
+    interfaceCount: 0,
     unlabeledCount,
     computeTimeMs,
     // DEBUG fields
     boundaryLabels: boundaryLabel,
-    seedMask: seedMask,
+    seedMask: innerSurfaceMask,
   };
 }
 
@@ -939,60 +882,61 @@ export function createEscapeLabelingPointCloud(
 }
 
 /**
- * Create a point cloud showing only the parting surface interface voxels
- * Interface = voxels that have neighbors with different labels
+ * Create a point cloud showing boundary voxels and seed voxels
+ * This is useful for debugging the escape labeling algorithm.
+ * 
+ * Colors:
+ * - Bright Green: Boundary voxels adjacent to H₁ (outer surface)
+ * - Bright Orange: Boundary voxels adjacent to H₂ (outer surface)
+ * - Cyan: Seed voxels (inner surface near part mesh)
  */
 export function createPartingSurfaceInterfaceCloud(
   gridResult: VolumetricGridResult,
   labeling: EscapeLabelingResult,
-  adjacency: AdjacencyType = 6,
+  _adjacency: AdjacencyType = 6,
   pointSize: number = 4
 ): THREE.Points {
   const voxelCount = gridResult.moldVolumeCellCount;
   const cells = gridResult.moldVolumeCells;
-  const neighborOffsets = getNeighborOffsets(adjacency);
+  const boundaryLabels = labeling.boundaryLabels;
+  const seedMask = labeling.seedMask;
   
-  // Build spatial index for neighbor lookups
-  const spatialIndex = buildVoxelSpatialIndex(gridResult);
-  
-  // Find interface voxels
-  const interfaceIndices: number[] = [];
-  
+  // Count how many voxels we'll show
+  let count = 0;
   for (let i = 0; i < voxelCount; i++) {
-    const label = labeling.labels[i];
-    if (label === -1) continue;
-    
-    const cell = cells[i];
-    const gi = Math.round(cell.index.x);
-    const gj = Math.round(cell.index.y);
-    const gk = Math.round(cell.index.z);
-    
-    // Check if any neighbor has a different label
-    for (const [di, dj, dk] of neighborOffsets) {
-      const j = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
-      if (j >= 0 && labeling.labels[j] !== -1 && labeling.labels[j] !== label) {
-        interfaceIndices.push(i);
-        break;
-      }
-    }
+    if (boundaryLabels && boundaryLabels[i] !== 0) count++;
+    else if (seedMask && seedMask[i]) count++;
   }
   
-  const count = interfaceIndices.length;
   const positions = new Float32Array(count * 3);
   const colors = new Float32Array(count * 3);
   
-  const interfaceColor = new THREE.Color(0xffff00); // Yellow
+  const colorH1 = new THREE.Color(0x00ff00);    // Green for H₁ boundary
+  const colorH2 = new THREE.Color(0xff6600);    // Orange for H₂ boundary
+  const colorSeed = new THREE.Color(0x00ffff);  // Cyan for seeds
   
-  for (let i = 0; i < count; i++) {
-    const voxelIdx = interfaceIndices[i];
-    const cell = cells[voxelIdx];
-    positions[i * 3] = cell.center.x;
-    positions[i * 3 + 1] = cell.center.y;
-    positions[i * 3 + 2] = cell.center.z;
+  let idx = 0;
+  for (let i = 0; i < voxelCount; i++) {
+    let color: THREE.Color | null = null;
     
-    colors[i * 3] = interfaceColor.r;
-    colors[i * 3 + 1] = interfaceColor.g;
-    colors[i * 3 + 2] = interfaceColor.b;
+    if (boundaryLabels && boundaryLabels[i] === 1) {
+      color = colorH1;
+    } else if (boundaryLabels && boundaryLabels[i] === 2) {
+      color = colorH2;
+    } else if (seedMask && seedMask[i]) {
+      color = colorSeed;
+    }
+    
+    if (color) {
+      const cell = cells[i];
+      positions[idx * 3] = cell.center.x;
+      positions[idx * 3 + 1] = cell.center.y;
+      positions[idx * 3 + 2] = cell.center.z;
+      colors[idx * 3] = color.r;
+      colors[idx * 3 + 1] = color.g;
+      colors[idx * 3 + 2] = color.b;
+      idx++;
+    }
   }
   
   const geometry = new THREE.BufferGeometry();
@@ -1007,7 +951,7 @@ export function createPartingSurfaceInterfaceCloud(
     vertexColors: true,
   });
   
-  console.log(`Interface cloud: ${count} voxels`);
+  console.log(`Boundary/Seed cloud: ${count} voxels (H₁: boundary, H₂: boundary, Cyan: seeds)`);
   
   return new THREE.Points(geometry, material);
 }

@@ -704,7 +704,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
         // - Orange: Boundary voxels adjacent to H₂
         // - Blue: Seed voxels (near part mesh)
         // - Dark gray: Everything else
-        const DEBUG_BOUNDARY_VISUALIZATION = true;
+        const DEBUG_BOUNDARY_VISUALIZATION = false;  // Set to true to debug boundary detection
         
         // Create visualization
         if (DEBUG_BOUNDARY_VISUALIZATION) {
