@@ -59,6 +59,12 @@ export interface VolumetricGridResult {
   cellSize: THREE.Vector3;
   /** Volume statistics */
   stats: VolumetricGridStats;
+  /** 
+   * Distance field: distance from each mold volume voxel center to part mesh M.
+   * Indexed by voxel ID (same order as moldVolumeCells array).
+   * Uses BVH-accelerated nearest-point queries for efficiency.
+   */
+  voxelDist: Float32Array;
 }
 
 export interface VolumetricGridStats {
@@ -70,6 +76,10 @@ export interface VolumetricGridStats {
   fillRatio: number;
   /** Time taken to compute (ms) */
   computeTimeMs: number;
+  /** Minimum distance from any voxel to part mesh */
+  minDist: number;
+  /** Maximum distance from any voxel to part mesh */
+  maxDist: number;
 }
 
 export interface VolumetricGridOptions {
@@ -203,6 +213,26 @@ class MeshInsideOutsideTester {
   }
   
   /**
+   * Get unsigned (absolute) distance to mesh surface
+   * Always positive - measures distance to nearest point on surface
+   * 
+   * Uses closest point query with BVH for efficiency
+   */
+  getDistance(point: THREE.Vector3): number {
+    const closestPoint = new THREE.Vector3();
+    const target = { 
+      point: closestPoint, 
+      distance: Infinity,
+      faceIndex: 0
+    };
+    
+    // Use BVH to find closest point on surface
+    this.bvh.closestPointToPoint(point, target);
+    
+    return target.distance;
+  }
+  
+  /**
    * Debug: test a single point and log results
    */
   debugPoint(point: THREE.Vector3): { insideVotes: number; intersectionCounts: number[] } {
@@ -307,6 +337,9 @@ export function generateVolumetricGrid(
   const allCells: GridCell[] = [];
   const moldVolumeCells: GridCell[] = [];
   
+  // Temporary storage for distances (will be converted to Float32Array after we know the count)
+  const distanceList: number[] = [];
+  
   const totalCellCount = resX * resY * resZ;
   const cellCenter = new THREE.Vector3();
   const cellIndex = new THREE.Vector3();
@@ -348,6 +381,9 @@ export function generateVolumetricGrid(
           
           if (isMoldVolume) {
             moldVolumeCells.push(cell);
+            // Compute distance to part mesh for distance field using BVH
+            const dist = partTester.getDistance(cellCenter);
+            distanceList.push(dist);
           }
           
           if (storeAllCells) {
@@ -356,6 +392,24 @@ export function generateVolumetricGrid(
         }
       }
     }
+  }
+  
+  // Convert distance list to Float32Array (indexed by voxel ID)
+  const voxelDist = new Float32Array(distanceList);
+  
+  // Compute min/max distances for validation
+  let minDist = Infinity;
+  let maxDist = -Infinity;
+  for (let i = 0; i < voxelDist.length; i++) {
+    const d = voxelDist[i];
+    if (d < minDist) minDist = d;
+    if (d > maxDist) maxDist = d;
+  }
+  
+  // Handle edge case of no mold volume cells
+  if (voxelDist.length === 0) {
+    minDist = 0;
+    maxDist = 0;
   }
   
   // Clean up BVH resources
@@ -376,7 +430,12 @@ export function generateVolumetricGrid(
     totalVolume,
     fillRatio: moldVolume / totalVolume,
     computeTimeMs: endTime - startTime,
+    minDist,
+    maxDist,
   };
+  
+  // Log distance field validation
+  console.log(`Distance field computed: min=${minDist.toFixed(6)}, max=${maxDist.toFixed(6)}`);
   
   return {
     allCells: storeAllCells ? allCells : [],
@@ -387,6 +446,7 @@ export function generateVolumetricGrid(
     boundingBox,
     cellSize,
     stats,
+    voxelDist,
   };
 }
 
@@ -597,6 +657,30 @@ export async function generateVolumetricGridGPU(
       }
     }
     
+    // Compute distance field using BVH on CPU (GPU path determines which cells, CPU computes distances)
+    // Create a BVH tester for the part mesh to compute distances
+    const partTester = new MeshInsideOutsideTester(partGeom, 'part');
+    const voxelDist = new Float32Array(moldVolumeCells.length);
+    
+    let minDist = Infinity;
+    let maxDist = -Infinity;
+    
+    for (let i = 0; i < moldVolumeCells.length; i++) {
+      const dist = partTester.getDistance(moldVolumeCells[i].center);
+      voxelDist[i] = dist;
+      if (dist < minDist) minDist = dist;
+      if (dist > maxDist) maxDist = dist;
+    }
+    
+    // Handle edge case of no mold volume cells
+    if (voxelDist.length === 0) {
+      minDist = 0;
+      maxDist = 0;
+    }
+    
+    // Clean up distance tester
+    partTester.dispose();
+    
     // Clean up GPU resources
     paramsBuffer.destroy();
     triCountBuffer.destroy();
@@ -618,7 +702,12 @@ export async function generateVolumetricGridGPU(
       totalVolume,
       fillRatio: moldVolume / totalVolume,
       computeTimeMs: endTime - startTime,
+      minDist,
+      maxDist,
     };
+    
+    // Log distance field validation
+    console.log(`Distance field computed: min=${minDist.toFixed(6)}, max=${maxDist.toFixed(6)}`);
     
     console.log(`GPU Grid Generation Complete:`);
     console.log(`  Mold volume cells: ${moldVolumeCells.length} / ${totalCells}`);
@@ -634,6 +723,7 @@ export async function generateVolumetricGridGPU(
       boundingBox,
       cellSize,
       stats,
+      voxelDist,
     };
     
   } catch (error) {
@@ -804,36 +894,69 @@ function getWebGPUComputeShader(): string {
 // ============================================================================
 
 /**
+ * Interpolate between two colors based on a normalized value (0-1)
+ * Red (close to part) → Teal (far from part)
+ */
+function interpolateDistanceColor(t: number): { r: number; g: number; b: number } {
+  // Clamp t to [0, 1]
+  t = Math.max(0, Math.min(1, t));
+  
+  // Red: RGB(255, 0, 0) → Teal: RGB(0, 255, 255)
+  const r = Math.round(255 * (1 - t));
+  const g = Math.round(255 * t);
+  const b = Math.round(255 * t);
+  
+  return { r, g, b };
+}
+
+/**
  * Create a point cloud visualization of the mold volume cells
+ * Colors points based on distance to part mesh: red (close) → teal (far)
  * 
- * @param gridResult - The volumetric grid result
- * @param color - Color for the points (default: cyan)
+ * @param gridResult - The volumetric grid result (must include voxelDist)
+ * @param _color - Deprecated, colors are now computed from distance field
  * @param pointSize - Size of each point (default: 2)
  * @returns THREE.Points object for adding to scene
  */
 export function createMoldVolumePointCloud(
   gridResult: VolumetricGridResult,
-  color: THREE.ColorRepresentation = 0x00ffff,
+  _color: THREE.ColorRepresentation = 0x00ffff,
   pointSize: number = 2
 ): THREE.Points {
-  const positions = new Float32Array(gridResult.moldVolumeCells.length * 3);
+  const cellCount = gridResult.moldVolumeCells.length;
+  const positions = new Float32Array(cellCount * 3);
+  const colors = new Float32Array(cellCount * 3);
   
-  for (let i = 0; i < gridResult.moldVolumeCells.length; i++) {
+  const { minDist, maxDist } = gridResult.stats;
+  const distRange = maxDist - minDist;
+  
+  for (let i = 0; i < cellCount; i++) {
     const cell = gridResult.moldVolumeCells[i];
     positions[i * 3] = cell.center.x;
     positions[i * 3 + 1] = cell.center.y;
     positions[i * 3 + 2] = cell.center.z;
+    
+    // Normalize distance to [0, 1] range
+    const dist = gridResult.voxelDist[i];
+    const t = distRange > 0 ? (dist - minDist) / distRange : 0.5;
+    
+    // Get interpolated color (red → teal)
+    const color = interpolateDistanceColor(t);
+    colors[i * 3] = color.r / 255;
+    colors[i * 3 + 1] = color.g / 255;
+    colors[i * 3 + 2] = color.b / 255;
   }
   
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   
   const material = new THREE.PointsMaterial({
-    color,
     size: pointSize,
     sizeAttenuation: true,
     transparent: true,
     opacity: 0.6,
+    vertexColors: true,
   });
   
   return new THREE.Points(geometry, material);
@@ -842,43 +965,59 @@ export function createMoldVolumePointCloud(
 /**
  * Create a voxel box visualization of the mold volume cells
  * Uses instanced mesh for efficient rendering of many boxes
+ * Colors voxels based on distance to part mesh: red (close) → teal (far)
  * 
- * @param gridResult - The volumetric grid result
- * @param color - Color for the boxes (default: cyan)
+ * @param gridResult - The volumetric grid result (must include voxelDist)
+ * @param _color - Deprecated, colors are now computed from distance field
  * @param opacity - Opacity of boxes (default: 0.3)
  * @returns THREE.InstancedMesh for adding to scene
  */
 export function createMoldVolumeVoxels(
   gridResult: VolumetricGridResult,
-  color: THREE.ColorRepresentation = 0x00ffff,
+  _color: THREE.ColorRepresentation = 0x00ffff,
   opacity: number = 0.3
 ): THREE.InstancedMesh {
   const cellCount = gridResult.moldVolumeCells.length;
   const { cellSize } = gridResult;
+  const { minDist, maxDist } = gridResult.stats;
+  const distRange = maxDist - minDist;
   
   // Create box geometry for a single cell
   const boxGeometry = new THREE.BoxGeometry(cellSize.x, cellSize.y, cellSize.z);
   
   const material = new THREE.MeshPhongMaterial({
-    color,
     transparent: true,
     opacity,
     side: THREE.DoubleSide,
+    vertexColors: false,
   });
   
-  // Create instanced mesh
+  // Create instanced mesh with per-instance colors
   const instancedMesh = new THREE.InstancedMesh(boxGeometry, material, cellCount);
   
-  // Set transforms for each instance
+  // Set transforms and colors for each instance
   const matrix = new THREE.Matrix4();
+  const color = new THREE.Color();
   
   for (let i = 0; i < cellCount; i++) {
     const cell = gridResult.moldVolumeCells[i];
     matrix.setPosition(cell.center);
     instancedMesh.setMatrixAt(i, matrix);
+    
+    // Normalize distance to [0, 1] range
+    const dist = gridResult.voxelDist[i];
+    const t = distRange > 0 ? (dist - minDist) / distRange : 0.5;
+    
+    // Get interpolated color (red → teal)
+    const colorRGB = interpolateDistanceColor(t);
+    color.setRGB(colorRGB.r / 255, colorRGB.g / 255, colorRGB.b / 255);
+    instancedMesh.setColorAt(i, color);
   }
   
   instancedMesh.instanceMatrix.needsUpdate = true;
+  if (instancedMesh.instanceColor) {
+    instancedMesh.instanceColor.needsUpdate = true;
+  }
   
   return instancedMesh;
 }
@@ -1253,7 +1392,28 @@ export async function generateVolumetricGridParallel(
     });
   }
   
+  // Compute distance field using BVH on CPU (workers determine which cells, main thread computes distances)
+  const partTester = new MeshInsideOutsideTester(partGeom, 'part');
+  const voxelDist = new Float32Array(moldVolumeCells.length);
+  
+  let minDist = Infinity;
+  let maxDist = -Infinity;
+  
+  for (let i = 0; i < moldVolumeCells.length; i++) {
+    const dist = partTester.getDistance(moldVolumeCells[i].center);
+    voxelDist[i] = dist;
+    if (dist < minDist) minDist = dist;
+    if (dist > maxDist) maxDist = dist;
+  }
+  
+  // Handle edge case of no mold volume cells
+  if (voxelDist.length === 0) {
+    minDist = 0;
+    maxDist = 0;
+  }
+  
   // Clean up
+  partTester.dispose();
   shellGeom.dispose();
   partGeom.dispose();
   
@@ -1269,7 +1429,12 @@ export async function generateVolumetricGridParallel(
     totalVolume,
     fillRatio: moldVolume / totalVolume,
     computeTimeMs: endTime - startTime,
+    minDist,
+    maxDist,
   };
+  
+  // Log distance field validation
+  console.log(`Distance field computed: min=${minDist.toFixed(6)}, max=${maxDist.toFixed(6)}`);
   
   return {
     allCells: [],
@@ -1280,5 +1445,6 @@ export async function generateVolumetricGridParallel(
     boundingBox,
     cellSize,
     stats,
+    voxelDist,
   };
 }
