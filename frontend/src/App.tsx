@@ -5,18 +5,34 @@
  * Computes optimal parting directions and visualizes surface visibility.
  */
 
-import { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import './App.css';
 import ThreeViewer, { type GridVisualizationMode } from './components/ThreeViewer';
-import FileUpload from './components/FileUpload';
 import type { VisibilityPaintData } from './utils/partingDirection';
 import type { InflatedHullResult, ManifoldValidationResult, CsgSubtractionResult } from './utils/inflatedBoundingVolume';
 import type { MeshRepairResult, MeshDiagnostics } from './utils/meshRepairManifold';
 import type { VolumetricGridResult } from './utils/volumetricGrid';
 
 // ============================================================================
-// COMPONENT
+// TYPES
 // ============================================================================
+
+type Step = 'import' | 'parting' | 'hull' | 'cavity' | 'voxel';
+
+interface StepInfo {
+  id: Step;
+  icon: string;
+  title: string;
+  description: string;
+}
+
+const STEPS: StepInfo[] = [
+  { id: 'import', icon: '📁', title: 'Import STL', description: 'Load a 3D model file in STL format for mold analysis' },
+  { id: 'parting', icon: '🔀', title: 'Parting Direction', description: 'Compute optimal parting directions for mold separation' },
+  { id: 'hull', icon: '📦', title: 'Bounding Hull', description: 'Generate inflated convex hull around the mesh' },
+  { id: 'cavity', icon: '✂️', title: 'Mold Cavity', description: 'Subtract base mesh from hull to create cavity' },
+  { id: 'voxel', icon: '🧊', title: 'Voxel Grid', description: 'Generate volumetric grid for mold analysis' },
+];
 
 interface HullStats {
   vertexCount: number;
@@ -65,11 +81,79 @@ function App() {
   const [gridVisualizationMode, setGridVisualizationMode] = useState<GridVisualizationMode>('points');
   const [volumetricGridStats, setVolumetricGridStats] = useState<VolumetricGridStats | null>(null);
   const [useGPUGrid, setUseGPUGrid] = useState(true);
+  const [hideVoxelGrid, setHideVoxelGrid] = useState(false);
+
+  // Track parameters used for last computation (to detect changes)
+  const [lastComputedInflationOffset, setLastComputedInflationOffset] = useState<number | null>(null);
+  const [lastComputedGridResolution, setLastComputedGridResolution] = useState<number | null>(null);
+
+  // Helper to clear downstream steps
+  const clearFromStep = useCallback((step: Step) => {
+    switch (step) {
+      case 'parting':
+        setShowPartingDirections(false);
+        setVisibilityDataReady(false);
+        setShowD1Paint(false);
+        setShowD2Paint(false);
+        // Fall through to clear hull and beyond
+        setShowInflatedHull(false);
+        setHullStats(null);
+        setLastComputedInflationOffset(null);
+        setShowCsgResult(false);
+        setCsgStats(null);
+        setShowVolumetricGrid(false);
+        setVolumetricGridStats(null);
+        setLastComputedGridResolution(null);
+        break;
+      case 'hull':
+        setShowInflatedHull(false);
+        setHullStats(null);
+        setLastComputedInflationOffset(null);
+        // Fall through to clear cavity and beyond
+        setShowCsgResult(false);
+        setCsgStats(null);
+        setShowVolumetricGrid(false);
+        setVolumetricGridStats(null);
+        setLastComputedGridResolution(null);
+        break;
+      case 'cavity':
+        setShowCsgResult(false);
+        setCsgStats(null);
+        // Fall through to clear voxel
+        setShowVolumetricGrid(false);
+        setVolumetricGridStats(null);
+        setLastComputedGridResolution(null);
+        break;
+      case 'voxel':
+        setShowVolumetricGrid(false);
+        setVolumetricGridStats(null);
+        setLastComputedGridResolution(null);
+        break;
+    }
+  }, []);
+
+  // Handle parameter changes - clear downstream when parameters change
+  const handleInflationOffsetChange = useCallback((value: number) => {
+    setInflationOffset(value);
+    // If hull was computed with different offset, clear hull and downstream
+    if (hullStats && lastComputedInflationOffset !== null && value !== lastComputedInflationOffset) {
+      clearFromStep('hull');
+    }
+  }, [hullStats, lastComputedInflationOffset, clearFromStep]);
+
+  const handleGridResolutionChange = useCallback((value: number) => {
+    setGridResolution(value);
+    // If grid was computed with different resolution, clear grid
+    if (volumetricGridStats && lastComputedGridResolution !== null && value !== lastComputedGridResolution) {
+      clearFromStep('voxel');
+    }
+  }, [volumetricGridStats, lastComputedGridResolution, clearFromStep]);
 
   // Handlers
-  const handleFileLoad = useCallback((url: string, _fileName: string) => {
+  const handleFileLoad = useCallback((url: string, fileName: string) => {
     if (stlUrl) URL.revokeObjectURL(stlUrl);
     setStlUrl(url);
+    setLoadedFileName(fileName);
     setShowPartingDirections(false);
     setShowD1Paint(false);
     setShowD2Paint(false);
@@ -85,6 +169,8 @@ function App() {
     setMeshRepairResult(null);
     setShowVolumetricGrid(false);
     setVolumetricGridStats(null);
+    // Move to parting step after loading
+    setActiveStep('parting');
   }, [stlUrl]);
 
   const handleMeshLoaded = useCallback(() => setMeshLoaded(true), []);
@@ -112,13 +198,17 @@ function App() {
         faceCount: result.faceCount,
         manifoldValidation: result.manifoldValidation,
       } : null);
+      // Track the parameters used for this computation
+      if (result) {
+        setLastComputedInflationOffset(inflationOffset);
+      }
       // Reset CSG when hull changes
       if (!result) {
         setShowCsgResult(false);
         setCsgStats(null);
       }
     },
-    []
+    [inflationOffset]
   );
 
   const handleCsgResultReady = useCallback(
@@ -147,472 +237,524 @@ function App() {
         fillRatio: result.stats.fillRatio,
         computeTimeMs: result.stats.computeTimeMs,
       } : null);
+      // Track the parameters used for this computation
+      if (result) {
+        setLastComputedGridResolution(gridResolution);
+      }
     },
-    []
+    [gridResolution]
   );
 
-  const togglePartingDirections = useCallback(() => {
-    setShowPartingDirections(prev => {
-      if (prev) {
-        setShowD1Paint(false);
-        setShowD2Paint(false);
-        setVisibilityDataReady(false);
+  // Active step for context menu
+  const [activeStep, setActiveStep] = useState<Step>('import');
+  const [isCalculating, setIsCalculating] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [loadedFileName, setLoadedFileName] = useState<string | null>(null);
+
+  // Determine which steps are available/completed
+  // Returns 'needs-recalc' if parameters changed since last computation
+  const getStepStatus = (step: Step): 'locked' | 'available' | 'completed' | 'needs-recalc' => {
+    switch (step) {
+      case 'import':
+        if (meshLoaded) return 'completed';
+        return 'available';
+      case 'parting':
+        if (visibilityDataReady) return 'completed';
+        return meshLoaded ? 'available' : 'locked';
+      case 'hull':
+        if (hullStats) {
+          // Check if parameters changed
+          if (lastComputedInflationOffset !== null && inflationOffset !== lastComputedInflationOffset) {
+            return 'needs-recalc';
+          }
+          return 'completed';
+        }
+        return visibilityDataReady ? 'available' : 'locked';
+      case 'cavity':
+        // Cavity depends on hull - if hull needs recalc, cavity is locked
+        if (getStepStatus('hull') === 'needs-recalc') return 'locked';
+        if (csgStats) return 'completed';
+        return hullStats ? 'available' : 'locked';
+      case 'voxel':
+        // Voxel depends on cavity - if cavity is locked, voxel is locked
+        if (getStepStatus('cavity') === 'locked') return 'locked';
+        if (volumetricGridStats) {
+          // Check if parameters changed
+          if (lastComputedGridResolution !== null && gridResolution !== lastComputedGridResolution) {
+            return 'needs-recalc';
+          }
+          return 'completed';
+        }
+        return csgStats ? 'available' : 'locked';
+    }
+  };
+
+  // Handle calculate button for each step
+  const handleCalculate = useCallback(() => {
+    setIsCalculating(true);
+    setProgress(0);
+    
+    // Simulate progress (actual progress comes from callbacks)
+    const interval = setInterval(() => {
+      setProgress(p => Math.min(p + 10, 90));
+    }, 100);
+    
+    // Clear current step's results and downstream when recalculating
+    switch (activeStep) {
+      case 'parting':
+        clearFromStep('parting');
+        setShowPartingDirections(true);
+        break;
+      case 'hull':
+        clearFromStep('hull');
+        setShowInflatedHull(true);
+        break;
+      case 'cavity':
+        clearFromStep('cavity');
+        setShowCsgResult(true);
+        break;
+      case 'voxel':
+        clearFromStep('voxel');
+        setShowVolumetricGrid(true);
+        break;
+    }
+    
+    // Complete after a delay (will be set properly when data is ready)
+    setTimeout(() => {
+      clearInterval(interval);
+      setProgress(100);
+      setTimeout(() => {
+        setIsCalculating(false);
+        setProgress(0);
+      }, 300);
+    }, 1500);
+  }, [activeStep, clearFromStep]);
+
+  // ============================================================================
+  // RENDER CONTEXT MENU CONTENT
+  // ============================================================================
+
+  // File input ref for import step
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isDragging, setIsDragging] = useState(false);
+
+  const handleFileDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const file = e.dataTransfer.files[0];
+    if (file) {
+      if (!file.name.toLowerCase().endsWith('.stl')) {
+        alert('Please upload an STL file');
+        return;
       }
-      return !prev;
-    });
-  }, []);
+      const url = URL.createObjectURL(file);
+      handleFileLoad(url, file.name);
+    }
+  }, [handleFileLoad]);
+
+  const handleFileInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      if (!file.name.toLowerCase().endsWith('.stl')) {
+        alert('Please upload an STL file');
+        return;
+      }
+      const url = URL.createObjectURL(file);
+      handleFileLoad(url, file.name);
+    }
+  }, [handleFileLoad]);
+
+  const renderContextMenu = () => {
+    const status = getStepStatus(activeStep);
+    const stepInfo = STEPS.find(s => s.id === activeStep)!;
+
+    return (
+      <div style={styles.contextContent}>
+        <div style={styles.contextTitle}>{stepInfo.icon} {stepInfo.title}</div>
+        <div style={styles.contextDescription}>{stepInfo.description}</div>
+
+        {status === 'locked' && (
+          <div style={styles.lockedMessage}>
+            ⚠️ Complete previous steps first
+          </div>
+        )}
+
+        {/* Import step - file upload UI */}
+        {activeStep === 'import' && (
+          <div style={styles.optionsSection}>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".stl"
+              onChange={handleFileInputChange}
+              style={{ display: 'none' }}
+            />
+            
+            <div
+              onClick={() => fileInputRef.current?.click()}
+              onDrop={handleFileDrop}
+              onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+              onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
+              style={{
+                padding: '24px 16px',
+                backgroundColor: isDragging ? 'rgba(0, 170, 255, 0.2)' : 'rgba(255, 255, 255, 0.05)',
+                border: `2px dashed ${isDragging ? '#00aaff' : '#444'}`,
+                borderRadius: '8px',
+                cursor: 'pointer',
+                textAlign: 'center',
+                transition: 'all 0.2s',
+              }}
+            >
+              {loadedFileName ? (
+                <>
+                  <div style={{ fontSize: '24px', marginBottom: '8px' }}>✅</div>
+                  <div style={{ fontSize: '12px', fontWeight: 'bold', marginBottom: '4px' }}>Loaded:</div>
+                  <div style={{ fontSize: '11px', opacity: 0.8, wordBreak: 'break-all' }}>{loadedFileName}</div>
+                  <div style={{ fontSize: '10px', opacity: 0.5, marginTop: '8px' }}>Click to replace</div>
+                </>
+              ) : (
+                <>
+                  <div style={{ fontSize: '32px', marginBottom: '8px' }}>📁</div>
+                  <div style={{ fontSize: '13px', fontWeight: 'bold' }}>Upload STL File</div>
+                  <div style={{ fontSize: '11px', opacity: 0.6, marginTop: '4px' }}>Click or drag & drop</div>
+                </>
+              )}
+            </div>
+
+            {/* Mesh info after loading */}
+            {meshLoaded && meshRepairResult && (
+              <div style={{ ...styles.statsBox, marginTop: '16px' }}>
+                <div style={{ fontWeight: 'bold', marginBottom: '6px' }}>
+                  {meshRepairResult.diagnostics.isManifold ? '✅ Mesh Valid' : '⚠️ Mesh Issues'}
+                </div>
+                <div>Vertices: {meshRepairResult.diagnostics.vertexCount.toLocaleString()}</div>
+                <div>Faces: {meshRepairResult.diagnostics.faceCount.toLocaleString()}</div>
+                {meshRepairResult.diagnostics.genus >= 0 && (
+                  <div>Genus: {meshRepairResult.diagnostics.genus}</div>
+                )}
+                {meshRepairResult.wasRepaired && (
+                  <div style={{ color: '#aaf', marginTop: '4px' }}>Repaired: {meshRepairResult.repairMethod}</div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Step-specific options */}
+        {activeStep === 'parting' && status !== 'locked' && (
+          <div style={styles.optionsSection}>
+            {visibilityDataReady && (
+              <div style={styles.statsBox}>
+                <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>✅ Parting Directions Computed</div>
+                <div style={styles.legend}>
+                  <div>🟢 Green arrow: Primary direction (D1)</div>
+                  <div>🟠 Orange arrow: Secondary direction (D2)</div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeStep === 'hull' && status !== 'locked' && (
+          <div style={styles.optionsSection}>
+            <div style={styles.optionLabel}>Inflation Offset (mm):</div>
+            <input
+              type="number"
+              min="0"
+              step="0.1"
+              defaultValue={inflationOffset}
+              key={`inflation-${lastComputedInflationOffset}`}
+              onBlur={(e) => {
+                const val = e.target.value;
+                const num = parseFloat(val) || 0;
+                const clamped = Math.max(0, num);
+                e.target.value = String(clamped);
+                handleInflationOffsetChange(clamped);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  (e.target as HTMLInputElement).blur();
+                }
+              }}
+              style={styles.input}
+            />
+
+            {hullStats && (
+              <div style={styles.statsBox}>
+                <div>Vertices: {hullStats.vertexCount}</div>
+                <div>Faces: {hullStats.faceCount}</div>
+                <div style={{ color: hullStats.manifoldValidation.isManifold ? '#0f0' : '#f90' }}>
+                  {hullStats.manifoldValidation.isManifold ? '✅ Valid Manifold' : '⚠️ Not Manifold'}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeStep === 'cavity' && status !== 'locked' && (
+          <div style={styles.optionsSection}>
+            {csgStats && (
+              <div style={styles.statsBox}>
+                <div>Cavity vertices: {csgStats.vertexCount}</div>
+                <div>Cavity faces: {csgStats.faceCount}</div>
+                <div style={{ color: csgStats.manifoldValidation.isManifold ? '#0f0' : '#f90' }}>
+                  {csgStats.manifoldValidation.isManifold ? '✅ Valid Manifold' : '⚠️ Not Manifold'}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeStep === 'voxel' && status !== 'locked' && (
+          <div style={styles.optionsSection}>
+            <div style={styles.optionLabel}>Grid Resolution:</div>
+            <input
+              type="number"
+              min="8"
+              max="128"
+              step="8"
+              defaultValue={gridResolution}
+              key={`grid-res-${lastComputedGridResolution}`}
+              onBlur={(e) => {
+                const val = e.target.value;
+                const num = parseInt(val) || 64;
+                const clamped = Math.max(8, Math.min(128, num));
+                e.target.value = String(clamped);
+                handleGridResolutionChange(clamped);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  (e.target as HTMLInputElement).blur();
+                }
+              }}
+              style={styles.input}
+            />
+
+            <div style={{ ...styles.optionLabel, marginTop: '12px' }}>Visualization:</div>
+            <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+              <button
+                onClick={() => setGridVisualizationMode('points')}
+                style={{
+                  ...styles.toggleButton,
+                  backgroundColor: gridVisualizationMode === 'points' ? '#00ffff' : '#333',
+                  borderColor: gridVisualizationMode === 'points' ? '#00ffff' : '#555',
+                  color: gridVisualizationMode === 'points' ? '#000' : '#fff',
+                }}
+              >
+                Points
+              </button>
+              <button
+                onClick={() => setGridVisualizationMode('voxels')}
+                style={{
+                  ...styles.toggleButton,
+                  backgroundColor: gridVisualizationMode === 'voxels' ? '#00ffff' : '#333',
+                  borderColor: gridVisualizationMode === 'voxels' ? '#00ffff' : '#555',
+                  color: gridVisualizationMode === 'voxels' ? '#000' : '#fff',
+                }}
+              >
+                Voxels
+              </button>
+            </div>
+
+            <label style={styles.checkbox}>
+              <input
+                type="checkbox"
+                checked={useGPUGrid}
+                onChange={(e) => setUseGPUGrid(e.target.checked)}
+              />
+              Use GPU (WebGPU)
+              <span style={{ opacity: 0.6, fontSize: '10px', marginLeft: '4px' }}>
+                {typeof navigator !== 'undefined' && 'gpu' in navigator ? '✅' : '❌'}
+              </span>
+            </label>
+
+            {volumetricGridStats && (
+              <div style={styles.statsBox}>
+                <div>Resolution: {volumetricGridStats.resolution.x}×{volumetricGridStats.resolution.y}×{volumetricGridStats.resolution.z}</div>
+                <div>Mold cells: {volumetricGridStats.moldVolumeCellCount.toLocaleString()}</div>
+                <div>Fill ratio: {(volumetricGridStats.fillRatio * 100).toFixed(1)}%</div>
+                <div>Compute: {volumetricGridStats.computeTimeMs.toFixed(0)} ms</div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Calculate Button and Progress Bar - not shown for import step */}
+        {activeStep !== 'import' && status !== 'locked' && (
+          <div style={styles.calculateSection}>
+            <button
+              onClick={handleCalculate}
+              disabled={isCalculating || status === 'completed'}
+              style={{
+                ...styles.calculateButton,
+                backgroundColor: status === 'completed' ? '#00aa00' : status === 'needs-recalc' ? '#ff8800' : isCalculating ? '#666' : '#00aaff',
+                cursor: isCalculating || status === 'completed' ? 'default' : 'pointer',
+              }}
+            >
+              {status === 'completed' ? '✓ Completed' : status === 'needs-recalc' ? '⟳ Recalculate' : isCalculating ? 'Calculating...' : 'Calculate'}
+            </button>
+            
+            {isCalculating && (
+              <div style={styles.progressContainer}>
+                <div style={{ ...styles.progressBar, width: `${progress}%` }} />
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Display Options - shows toggles for all completed steps */}
+        {meshLoaded && activeStep !== 'import' && (
+          <div style={{ marginTop: '16px', borderTop: '1px solid #444', paddingTop: '12px' }}>
+            <div style={styles.optionLabel}>Display Options:</div>
+            
+            {/* Original Mesh - always available when loaded */}
+            <label style={styles.checkbox}>
+              <input
+                type="checkbox"
+                checked={hideOriginalMesh}
+                onChange={(e) => setHideOriginalMesh(e.target.checked)}
+              />
+              Hide Original Mesh
+            </label>
+
+            {/* Parting Direction visibility options */}
+            {visibilityDataReady && (
+              <>
+                <label style={styles.checkbox}>
+                  <input
+                    type="checkbox"
+                    checked={showD1Paint}
+                    onChange={(e) => setShowD1Paint(e.target.checked)}
+                  />
+                  Show D1 Visibility 🟢
+                </label>
+                <label style={styles.checkbox}>
+                  <input
+                    type="checkbox"
+                    checked={showD2Paint}
+                    onChange={(e) => setShowD2Paint(e.target.checked)}
+                  />
+                  Show D2 Visibility 🟠
+                </label>
+              </>
+            )}
+
+            {/* Hull visibility - available after hull is computed */}
+            {hullStats && (
+              <label style={styles.checkbox}>
+                <input
+                  type="checkbox"
+                  checked={hideHull}
+                  onChange={(e) => setHideHull(e.target.checked)}
+                />
+                Hide Hull 🟣
+              </label>
+            )}
+
+            {/* Cavity visibility - available after cavity is computed */}
+            {csgStats && (
+              <label style={styles.checkbox}>
+                <input
+                  type="checkbox"
+                  checked={hideCavity}
+                  onChange={(e) => setHideCavity(e.target.checked)}
+                />
+                Hide Cavity 🩵
+              </label>
+            )}
+
+            {/* Voxel grid visibility - available after voxel is computed */}
+            {volumetricGridStats && (
+              <label style={styles.checkbox}>
+                <input
+                  type="checkbox"
+                  checked={hideVoxelGrid}
+                  onChange={(e) => setHideVoxelGrid(e.target.checked)}
+                />
+                Hide Voxel Grid 🧊
+              </label>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   // ============================================================================
   // RENDER
   // ============================================================================
 
   return (
-    <div style={{ width: '100vw', height: '100vh', margin: 0, padding: 0, position: 'relative' }}>
-      {/* 3D Viewer */}
-      <ThreeViewer
-        stlUrl={stlUrl}
-        showPartingDirections={showPartingDirections}
-        showD1Paint={showD1Paint}
-        showD2Paint={showD2Paint}
-        showInflatedHull={showInflatedHull}
-        inflationOffset={inflationOffset}
-        showCsgResult={showCsgResult}
-        hideOriginalMesh={hideOriginalMesh}
-        hideHull={hideHull}
-        hideCavity={hideCavity}
-        showVolumetricGrid={showVolumetricGrid}
-        gridResolution={gridResolution}
-        gridVisualizationMode={gridVisualizationMode}
-        useGPUGrid={useGPUGrid}
-        onMeshLoaded={handleMeshLoaded}
-        onMeshRepaired={handleMeshRepaired}
-        onVisibilityDataReady={handleVisibilityDataReady}
-        onInflatedHullReady={handleInflatedHullReady}
-        onCsgResultReady={handleCsgResultReady}
-        onVolumetricGridReady={handleVolumetricGridReady}
-      />
-
-      {/* File Upload */}
-      <FileUpload onFileLoad={handleFileLoad} />
-
-      {/* Analysis Controls */}
-      {meshLoaded && (
-        <div style={styles.controlPanel}>
-          <div style={styles.title}>🔧 Mold Analysis</div>
-          
-          {/* Mesh Health Status */}
-          {meshRepairResult && (
-            <div style={{ 
-              marginBottom: '12px', 
-              padding: '8px', 
-              backgroundColor: meshRepairResult.diagnostics.isManifold 
-                ? 'rgba(0, 255, 0, 0.15)' 
-                : 'rgba(255, 165, 0, 0.15)',
-              borderRadius: '4px',
-              fontSize: '10px'
-            }}>
-              <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>
-                {meshRepairResult.diagnostics.isManifold 
-                  ? '✅ Mesh: Valid Manifold' 
-                  : '⚠️ Mesh: Invalid'}
-              </div>
-              <div>Vertices: {meshRepairResult.diagnostics.vertexCount}</div>
-              <div>Faces: {meshRepairResult.diagnostics.faceCount}</div>
-              {meshRepairResult.diagnostics.genus >= 0 && (
-                <div>Genus: {meshRepairResult.diagnostics.genus}</div>
-              )}
-              {meshRepairResult.diagnostics.volume > 0 && (
-                <div>Volume: {meshRepairResult.diagnostics.volume.toFixed(1)}</div>
-              )}
-              {meshRepairResult.wasRepaired && (
-                <div style={{ marginTop: '4px', color: '#aaf' }}>
-                  Repaired: {meshRepairResult.repairMethod}
-                </div>
-              )}
-              {meshRepairResult.diagnostics.issues.length > 0 && (
-                <div style={{ marginTop: '4px', color: '#ffa' }}>
-                  {meshRepairResult.diagnostics.issues.map((issue, i) => (
-                    <div key={i}>• {issue}</div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
-          
-          {/* Hide Original Mesh Checkbox */}
-          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px', cursor: 'pointer', fontSize: '12px' }}>
-            <input
-              type="checkbox"
-              checked={hideOriginalMesh}
-              onChange={(e) => setHideOriginalMesh(e.target.checked)}
-              style={{ cursor: 'pointer' }}
-            />
-            Hide Original Mesh
-          </label>
-          
-          {/* Parting Direction Toggle */}
-          <button
-            onClick={togglePartingDirections}
-            style={{
-              ...styles.button,
-              backgroundColor: showPartingDirections ? '#00aa00' : '#00aaff',
-            }}
-          >
-            {showPartingDirections ? '✓ Parting Directions ON' : 'Show Parting Directions'}
-          </button>
-
-          {/* Visibility Paint Toggles */}
-          {showPartingDirections && visibilityDataReady && (
-            <div style={{ marginTop: '12px' }}>
-              <div style={styles.sectionLabel}>Visibility Painting:</div>
-              <div style={{ display: 'flex', gap: '8px' }}>
-                <button
-                  onClick={() => setShowD1Paint(prev => !prev)}
-                  style={{
-                    ...styles.toggleButton,
-                    backgroundColor: showD1Paint ? '#00ff00' : '#333',
-                    borderColor: showD1Paint ? '#00ff00' : '#555',
-                    color: showD1Paint ? '#000' : '#fff',
-                    fontWeight: showD1Paint ? 'bold' : 'normal',
-                  }}
-                >
-                  🟢 D1
-                </button>
-                <button
-                  onClick={() => setShowD2Paint(prev => !prev)}
-                  style={{
-                    ...styles.toggleButton,
-                    backgroundColor: showD2Paint ? '#ff6600' : '#333',
-                    borderColor: showD2Paint ? '#ff6600' : '#555',
-                    color: showD2Paint ? '#000' : '#fff',
-                    fontWeight: showD2Paint ? 'bold' : 'normal',
-                  }}
-                >
-                  🟠 D2
-                </button>
-              </div>
-              
-              {/* Legend */}
-              {(showD1Paint || showD2Paint) && (
-                <div style={styles.legend}>
-                  {showD1Paint && showD2Paint && <div>🟡 Yellow = visible from both</div>}
-                  <div>⬜ Gray = not visible</div>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Loading indicator */}
-          {showPartingDirections && !visibilityDataReady && (
-            <div style={styles.loading}>Computing visibility...</div>
-          )}
-
-          {/* Arrow legend */}
-          {showPartingDirections && visibilityDataReady && !showD1Paint && !showD2Paint && (
-            <div style={{ marginTop: '10px', fontSize: '11px', opacity: 0.8 }}>
-              <div>🟢 Green arrow: Primary direction</div>
-              <div>🟠 Orange arrow: Secondary direction</div>
-            </div>
-          )}
-
-          {/* Inflated Hull Section - only available after parting directions are calculated */}
-          {visibilityDataReady && (
-            <>
-              {/* Separator */}
-              <div style={{ borderTop: '1px solid #444', margin: '16px 0 12px 0' }} />
-
-              {/* Inflated Hull Section */}
-              <div style={styles.title}>📦 Bounding Volume</div>
-              
-              <button
-                onClick={() => setShowInflatedHull(prev => !prev)}
-                style={{
-                  ...styles.button,
-                  backgroundColor: showInflatedHull ? '#9966ff' : '#00aaff',
-                }}
-              >
-                {showInflatedHull ? '✓ Inflated Hull ON' : 'Show Inflated Hull'}
-              </button>
-              
-              {/* Hide Hull Checkbox */}
-              {showInflatedHull && (
-                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px', cursor: 'pointer', fontSize: '12px' }}>
-                  <input
-                    type="checkbox"
-                    checked={hideHull}
-                    onChange={(e) => setHideHull(e.target.checked)}
-                    style={{ cursor: 'pointer' }}
-                  />
-                  Hide Hull (show only cavity)
-                </label>
-              )}
-            </>
-          )}
-
-          {/* Inflation Offset Input */}
-          {showInflatedHull && (
-            <div style={{ marginTop: '12px' }}>
-              <div style={styles.sectionLabel}>
-                Inflation Offset (mm):
-              </div>
-              <input
-                type="number"
-                min="0"
-                step="0.1"
-                value={inflationOffset}
-                onChange={(e) => setInflationOffset(Math.max(0, parseFloat(e.target.value) || 0))}
-                style={{
-                  width: '100%',
-                  padding: '6px 10px',
-                  backgroundColor: '#222',
-                  border: '1px solid #555',
-                  borderRadius: '4px',
-                  color: '#fff',
-                  fontSize: '13px',
-                }}
-              />
-              
-              {/* Hull Stats */}
-              {hullStats && (
-                <div style={{ marginTop: '8px', fontSize: '10px', opacity: 0.7 }}>
-                  <div>Hull vertices: {hullStats.vertexCount}</div>
-                  <div>Hull faces: {hullStats.faceCount}</div>
-                  <div>Edges: {hullStats.manifoldValidation.totalEdgeCount}</div>
-                  <div>Euler (V-E+F): {hullStats.manifoldValidation.eulerCharacteristic}</div>
-                </div>
-              )}
-
-              {/* Manifold Validation */}
-              {hullStats && (
-                <div style={{ 
-                  marginTop: '10px', 
-                  padding: '8px', 
-                  backgroundColor: hullStats.manifoldValidation.isManifold ? 'rgba(0, 255, 0, 0.15)' : 'rgba(255, 100, 0, 0.15)',
-                  borderRadius: '4px',
-                  fontSize: '10px'
-                }}>
-                  <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>
-                    {hullStats.manifoldValidation.isManifold ? '✅ Valid Manifold' : '⚠️ Not Manifold'}
-                  </div>
-                  <div>Closed: {hullStats.manifoldValidation.isClosed ? '✓ Yes' : `✗ No (${hullStats.manifoldValidation.boundaryEdgeCount} boundary edges)`}</div>
-                  {hullStats.manifoldValidation.nonManifoldEdgeCount > 0 && (
-                    <div>Non-manifold edges: {hullStats.manifoldValidation.nonManifoldEdgeCount}</div>
-                  )}
-                </div>
-              )}
-
-              {/* Legend */}
-              <div style={styles.legend}>
-                <div>🟣 Purple = Inflated hull</div>
-              </div>
-            </div>
-          )}
-
-          {/* CSG Subtraction Section - only available after hull is created */}
-          {hullStats && (
-            <>
-              {/* Separator */}
-              <div style={{ borderTop: '1px solid #444', margin: '16px 0 12px 0' }} />
-
-              {/* CSG Section */}
-              <div style={styles.title}>✂️ Mold Cavity</div>
-              
-              <button
-                onClick={() => setShowCsgResult(prev => !prev)}
-                style={{
-                  ...styles.button,
-                  backgroundColor: showCsgResult ? '#00ffaa' : '#00aaff',
-                }}
-              >
-                {showCsgResult ? '✓ Cavity ON' : 'Subtract Base Mesh'}
-              </button>
-
-              {/* Hide Cavity Checkbox */}
-              {showCsgResult && (
-                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px', cursor: 'pointer', fontSize: '12px' }}>
-                  <input
-                    type="checkbox"
-                    checked={hideCavity}
-                    onChange={(e) => setHideCavity(e.target.checked)}
-                    style={{ cursor: 'pointer' }}
-                  />
-                  Hide Cavity (show grid only)
-                </label>
-              )}
-
-              {/* CSG Stats */}
-              {showCsgResult && csgStats && (
-                <div style={{ marginTop: '12px' }}>
-                  <div style={{ fontSize: '10px', opacity: 0.7 }}>
-                    <div>Cavity vertices: {csgStats.vertexCount}</div>
-                    <div>Cavity faces: {csgStats.faceCount}</div>
-                  </div>
-
-                  {/* CSG Manifold Validation */}
-                  <div style={{ 
-                    marginTop: '10px', 
-                    padding: '8px', 
-                    backgroundColor: csgStats.manifoldValidation.isManifold ? 'rgba(0, 255, 0, 0.15)' : 'rgba(255, 100, 0, 0.15)',
-                    borderRadius: '4px',
-                    fontSize: '10px'
-                  }}>
-                    <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>
-                      {csgStats.manifoldValidation.isManifold ? '✅ Valid Manifold' : '⚠️ Not Manifold'}
-                    </div>
-                    <div>Closed: {csgStats.manifoldValidation.isClosed ? '✓ Yes' : `✗ No (${csgStats.manifoldValidation.boundaryEdgeCount} boundary edges)`}</div>
-                  </div>
-
-                  {/* Legend */}
-                  <div style={styles.legend}>
-                    <div>🩵 Teal = Mold cavity (Hull - Base)</div>
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-
-          {/* Volumetric Grid Section - only available after cavity is created */}
-          {csgStats && (
-            <>
-              {/* Separator */}
-              <div style={{ borderTop: '1px solid #444', margin: '16px 0 12px 0' }} />
-
-              {/* Volumetric Grid Section */}
-              <div style={styles.title}>🧊 Volume Grid</div>
-              
-              <button
-                onClick={() => setShowVolumetricGrid(prev => !prev)}
-                style={{
-                  ...styles.button,
-                  backgroundColor: showVolumetricGrid ? '#00ffff' : '#00aaff',
-                }}
-              >
-                {showVolumetricGrid ? '✓ Volume Grid ON' : 'Generate Volume Grid'}
-              </button>
-
-              {/* Grid Options */}
-              {showVolumetricGrid && (
-                <div style={{ marginTop: '12px' }}>
-                  {/* Resolution Input */}
-                  <div style={styles.sectionLabel}>
-                    Grid Resolution (per axis):
-                  </div>
-                  <input
-                    type="number"
-                    min="8"
-                    max="128"
-                    step="8"
-                    value={gridResolution}
-                    onChange={(e) => setGridResolution(Math.max(8, Math.min(128, parseInt(e.target.value) || 64)))}
-                    style={{
-                      width: '100%',
-                      padding: '6px 10px',
-                      backgroundColor: '#222',
-                      border: '1px solid #555',
-                      borderRadius: '4px',
-                      color: '#fff',
-                      fontSize: '13px',
-                    }}
-                  />
-
-                  {/* Visualization Mode */}
-                  <div style={{ ...styles.sectionLabel, marginTop: '10px' }}>
-                    Visualization Mode:
-                  </div>
-                  <div style={{ display: 'flex', gap: '8px' }}>
-                    <button
-                      onClick={() => setGridVisualizationMode('points')}
-                      style={{
-                        ...styles.toggleButton,
-                        backgroundColor: gridVisualizationMode === 'points' ? '#00ffff' : '#333',
-                        borderColor: gridVisualizationMode === 'points' ? '#00ffff' : '#555',
-                        color: gridVisualizationMode === 'points' ? '#000' : '#fff',
-                        fontWeight: gridVisualizationMode === 'points' ? 'bold' : 'normal',
-                      }}
-                    >
-                      Points
-                    </button>
-                    <button
-                      onClick={() => setGridVisualizationMode('voxels')}
-                      style={{
-                        ...styles.toggleButton,
-                        backgroundColor: gridVisualizationMode === 'voxels' ? '#00ffff' : '#333',
-                        borderColor: gridVisualizationMode === 'voxels' ? '#00ffff' : '#555',
-                        color: gridVisualizationMode === 'voxels' ? '#000' : '#fff',
-                        fontWeight: gridVisualizationMode === 'voxels' ? 'bold' : 'normal',
-                      }}
-                    >
-                      Voxels
-                    </button>
-                  </div>
-
-                  {/* GPU Acceleration Toggle */}
-                  <div style={{ marginTop: '10px' }}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', cursor: 'pointer' }}>
-                      <input
-                        type="checkbox"
-                        checked={useGPUGrid}
-                        onChange={(e) => setUseGPUGrid(e.target.checked)}
-                        style={{ cursor: 'pointer' }}
-                      />
-                      <span>Use GPU (WebGPU)</span>
-                      <span style={{ opacity: 0.6, fontSize: '10px' }}>
-                        {typeof navigator !== 'undefined' && 'gpu' in navigator ? '✅ Available' : '❌ Not available'}
-                      </span>
-                    </label>
-                  </div>
-
-                  {/* Grid Stats */}
-                  {volumetricGridStats && (
-                    <div style={{ marginTop: '12px' }}>
-                      <div style={{ fontSize: '10px', opacity: 0.7 }}>
-                        <div>Resolution: {volumetricGridStats.resolution.x}×{volumetricGridStats.resolution.y}×{volumetricGridStats.resolution.z}</div>
-                        <div>Mold cells: {volumetricGridStats.moldVolumeCellCount.toLocaleString()} / {volumetricGridStats.totalCellCount.toLocaleString()}</div>
-                        <div>Fill ratio: {(volumetricGridStats.fillRatio * 100).toFixed(1)}%</div>
-                        <div>Approx volume: {volumetricGridStats.moldVolume.toFixed(4)}</div>
-                        <div>Compute time: {volumetricGridStats.computeTimeMs.toFixed(0)} ms</div>
-                      </div>
-
-                      {/* Grid Status */}
-                      <div style={{ 
-                        marginTop: '10px', 
-                        padding: '8px', 
-                        backgroundColor: 'rgba(0, 255, 255, 0.15)',
-                        borderRadius: '4px',
-                        fontSize: '10px'
-                      }}>
-                        <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>
-                          ✅ Volume Grid Generated
-                        </div>
-                        <div>Cells represent mold silicone volume</div>
-                        <div>(inside shell, outside part)</div>
-                      </div>
-
-                      {/* Legend */}
-                      <div style={styles.legend}>
-                        <div>🔵 Cyan = Mold volume nodes</div>
-                        <div>🟨 Yellow = Grid bounding box</div>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Loading indicator */}
-                  {!volumetricGridStats && (
-                    <div style={styles.loading}>Generating grid...</div>
-                  )}
-                </div>
-              )}
-            </>
-          )}
+    <div style={styles.container}>
+      {/* Column 1: Steps Sidebar (10%) */}
+      <div style={styles.stepsSidebar}>
+        <div style={styles.sidebarHeader}>
+          <span style={{ fontSize: '16px' }}>🔧</span>
         </div>
-      )}
+        {STEPS.map((step) => {
+          const status = getStepStatus(step.id);
+          const isActive = activeStep === step.id;
+          return (
+            <div
+              key={step.id}
+              onClick={() => status !== 'locked' && setActiveStep(step.id)}
+              style={{
+                ...styles.stepIcon,
+                backgroundColor: isActive ? '#00aaff' : status === 'completed' ? '#00aa00' : status === 'needs-recalc' ? '#ff8800' : 'transparent',
+                opacity: status === 'locked' ? 0.3 : 1,
+                cursor: status === 'locked' ? 'not-allowed' : 'pointer',
+                borderLeft: isActive ? '3px solid #fff' : '3px solid transparent',
+              }}
+              title={step.title + '\n' + step.description}
+            >
+              <span style={{ fontSize: '20px' }}>{step.icon}</span>
+              {status === 'completed' && (
+                <span style={styles.checkMark}>✓</span>
+              )}
+              {status === 'needs-recalc' && (
+                <span style={styles.checkMark}>⟳</span>
+              )}
+            </div>
+          );
+        })}
+        
+        {/* Help at bottom */}
+        <div style={styles.helpIcon} title="Controls: Left-click drag = Orbit, Right-click drag = Pan, Scroll = Zoom">
+          ❓
+        </div>
+      </div>
 
-      {/* Controls Help */}
-      <div style={styles.helpPanel}>
-        <div><strong>Controls:</strong></div>
-        <div>🖱️ Left-click + drag → Orbit</div>
-        <div>🖱️ Right-click + drag → Pan</div>
-        <div>🖱️ Scroll → Zoom</div>
+      {/* Column 2: Context Menu (20%) */}
+      <div style={styles.contextPanel}>
+        <div style={styles.contextHeader}>Options</div>
+        {renderContextMenu()}
+      </div>
+
+      {/* Column 3: 3D Viewer (70%) */}
+      <div style={styles.viewerContainer}>
+        <ThreeViewer
+          stlUrl={stlUrl}
+          showPartingDirections={showPartingDirections}
+          showD1Paint={showD1Paint}
+          showD2Paint={showD2Paint}
+          showInflatedHull={showInflatedHull}
+          inflationOffset={inflationOffset}
+          showCsgResult={showCsgResult}
+          hideOriginalMesh={hideOriginalMesh}
+          hideHull={hideHull}
+          hideCavity={hideCavity}
+          showVolumetricGrid={showVolumetricGrid}
+          hideVoxelGrid={hideVoxelGrid}
+          gridResolution={gridResolution}
+          gridVisualizationMode={gridVisualizationMode}
+          useGPUGrid={useGPUGrid}
+          onMeshLoaded={handleMeshLoaded}
+          onMeshRepaired={handleMeshRepaired}
+          onVisibilityDataReady={handleVisibilityDataReady}
+          onInflatedHullReady={handleInflatedHullReady}
+          onCsgResultReady={handleCsgResultReady}
+          onVolumetricGridReady={handleVolumetricGridReady}
+        />
       </div>
     </div>
   );
@@ -623,69 +765,182 @@ function App() {
 // ============================================================================
 
 const styles: Record<string, React.CSSProperties> = {
-  controlPanel: {
-    position: 'absolute',
-    top: '20px',
-    right: '20px',
-    padding: '15px 20px',
-    backgroundColor: 'rgba(0, 0, 0, 0.7)',
-    borderRadius: '8px',
-    color: '#fff',
+  container: {
+    display: 'flex',
+    width: '100vw',
+    height: '100vh',
+    margin: 0,
+    padding: 0,
+    overflow: 'hidden',
     fontFamily: 'system-ui, -apple-system, sans-serif',
-    fontSize: '13px',
-    zIndex: 1000,
-    minWidth: '200px',
   },
-  title: {
-    marginBottom: '12px',
-    fontWeight: 'bold',
+  stepsSidebar: {
+    width: '10%',
+    minWidth: '60px',
+    maxWidth: '80px',
+    height: '100%',
+    backgroundColor: '#1a1a2e',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    paddingTop: '8px',
+    borderRight: '1px solid #333',
   },
-  button: {
-    padding: '8px 16px',
-    border: 'none',
-    borderRadius: '4px',
-    color: '#fff',
-    cursor: 'pointer',
-    fontSize: '12px',
-    width: '100%',
-    transition: 'background-color 0.2s',
-  },
-  sectionLabel: {
+  sidebarHeader: {
+    padding: '12px',
     marginBottom: '8px',
+    borderBottom: '1px solid #333',
+    width: '100%',
+    textAlign: 'center',
+  },
+  stepIcon: {
+    width: '100%',
+    padding: '16px 0',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    justifyContent: 'center',
+    position: 'relative',
+    transition: 'all 0.2s',
+  },
+  checkMark: {
+    position: 'absolute',
+    bottom: '4px',
+    right: '8px',
+    fontSize: '10px',
+    color: '#fff',
+  },
+  helpIcon: {
+    marginTop: 'auto',
+    padding: '16px',
+    fontSize: '18px',
+    cursor: 'help',
+    opacity: 0.6,
+  },
+  contextPanel: {
+    width: '20%',
+    minWidth: '200px',
+    maxWidth: '300px',
+    height: '100%',
+    backgroundColor: '#16213e',
+    borderRight: '1px solid #333',
+    display: 'flex',
+    flexDirection: 'column',
+    overflow: 'hidden',
+  },
+  contextHeader: {
+    padding: '16px',
+    fontSize: '14px',
+    fontWeight: 'bold',
+    color: '#fff',
+    borderBottom: '1px solid #333',
+    backgroundColor: '#1a1a2e',
+  },
+  contextContent: {
+    flex: 1,
+    padding: '16px',
+    overflowY: 'auto',
+    color: '#fff',
+  },
+  contextTitle: {
+    fontSize: '16px',
+    fontWeight: 'bold',
+    marginBottom: '8px',
+  },
+  contextDescription: {
+    fontSize: '12px',
+    opacity: 0.7,
+    marginBottom: '16px',
+    lineHeight: 1.4,
+  },
+  optionsSection: {
+    marginBottom: '16px',
+  },
+  optionLabel: {
     fontSize: '11px',
     opacity: 0.8,
+    marginBottom: '6px',
+  },
+  input: {
+    width: '100%',
+    padding: '8px 12px',
+    backgroundColor: '#222',
+    border: '1px solid #444',
+    borderRadius: '4px',
+    color: '#fff',
+    fontSize: '13px',
+    boxSizing: 'border-box',
+  },
+  checkbox: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    fontSize: '12px',
+    cursor: 'pointer',
+    marginTop: '8px',
   },
   toggleButton: {
     flex: 1,
-    padding: '6px 12px',
+    padding: '8px 12px',
     border: '2px solid',
     borderRadius: '4px',
     cursor: 'pointer',
     fontSize: '11px',
     transition: 'all 0.2s',
   },
+  statsBox: {
+    marginTop: '12px',
+    padding: '10px',
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    borderRadius: '4px',
+    fontSize: '11px',
+    lineHeight: 1.6,
+  },
   legend: {
     marginTop: '8px',
     fontSize: '10px',
     opacity: 0.7,
   },
-  loading: {
-    marginTop: '10px',
-    fontSize: '11px',
-    opacity: 0.6,
+  calculateSection: {
+    marginTop: '20px',
+    paddingTop: '16px',
+    borderTop: '1px solid #333',
   },
-  helpPanel: {
-    position: 'absolute',
-    bottom: '20px',
-    left: '20px',
+  calculateButton: {
+    width: '100%',
     padding: '12px 16px',
-    backgroundColor: 'rgba(0, 0, 0, 0.6)',
-    borderRadius: '8px',
+    border: 'none',
+    borderRadius: '6px',
     color: '#fff',
-    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontSize: '14px',
+    fontWeight: 'bold',
+    transition: 'background-color 0.2s',
+  },
+  progressContainer: {
+    marginTop: '10px',
+    height: '6px',
+    backgroundColor: '#333',
+    borderRadius: '3px',
+    overflow: 'hidden',
+  },
+  progressBar: {
+    height: '100%',
+    backgroundColor: '#00aaff',
+    transition: 'width 0.1s',
+  },
+  lockedMessage: {
+    padding: '16px',
+    backgroundColor: 'rgba(255, 165, 0, 0.1)',
+    borderRadius: '4px',
     fontSize: '12px',
-    lineHeight: '1.6',
-    zIndex: 1000,
+    textAlign: 'center',
+    color: '#f90',
+  },
+  viewerContainer: {
+    flex: 1,
+    height: '100%',
+    position: 'relative',
+    backgroundColor: '#000',
   },
 };
 

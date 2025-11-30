@@ -65,6 +65,8 @@ interface ThreeViewerProps {
   hideCavity?: boolean;
   /** Show volumetric grid visualization */
   showVolumetricGrid?: boolean;
+  /** Hide the volumetric grid visualization (without recomputing) */
+  hideVoxelGrid?: boolean;
   /** Grid resolution (cells per dimension) */
   gridResolution?: number;
   /** Grid visualization mode: 'points', 'voxels', or 'none' */
@@ -104,6 +106,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   hideHull = false,
   hideCavity = false,
   showVolumetricGrid = false,
+  hideVoxelGrid = false,
   gridResolution = 64,
   gridVisualizationMode = 'points',
   useGPUGrid = true,
@@ -406,7 +409,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   }, [showCsgResult, onCsgResultReady]);
 
   // ============================================================================
-  // VOLUMETRIC GRID
+  // VOLUMETRIC GRID COMPUTATION
   // ============================================================================
 
   useEffect(() => {
@@ -470,7 +473,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
           volumetricGridRef.current = gridResult;
           onVolumetricGridReady?.(gridResult);
           
-          // Create visualization based on mode
+          // Create initial visualization based on mode
           if (gridVisualizationMode !== 'none' && gridResult.moldVolumeCellCount > 0) {
             if (gridVisualizationMode === 'points') {
               gridVisualizationRef.current = createMoldVolumePointCloud(gridResult, 0x00ffff, 3);
@@ -496,7 +499,45 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
         }
       })();
     }
-  }, [showVolumetricGrid, gridResolution, gridVisualizationMode, useGPUGrid, onVolumetricGridReady]);
+  }, [showVolumetricGrid, gridResolution, useGPUGrid, onVolumetricGridReady]);
+
+  // ============================================================================
+  // VOLUMETRIC GRID VISUALIZATION MODE UPDATE
+  // ============================================================================
+
+  useEffect(() => {
+    if (!sceneRef.current || !volumetricGridRef.current) return;
+    
+    const scene = sceneRef.current;
+    const gridResult = volumetricGridRef.current;
+
+    // Remove existing visualization (but keep the computed data)
+    if (gridVisualizationRef.current) {
+      removeGridVisualization(scene, gridVisualizationRef.current);
+      gridVisualizationRef.current = null;
+    }
+    if (gridBoundingBoxRef.current) {
+      removeGridVisualization(scene, gridBoundingBoxRef.current);
+      gridBoundingBoxRef.current = null;
+    }
+
+    // Recreate visualization with new mode
+    if (gridVisualizationMode !== 'none' && gridResult.moldVolumeCellCount > 0) {
+      if (gridVisualizationMode === 'points') {
+        gridVisualizationRef.current = createMoldVolumePointCloud(gridResult, 0x00ffff, 3);
+      } else if (gridVisualizationMode === 'voxels') {
+        gridVisualizationRef.current = createMoldVolumeVoxels(gridResult, 0x00ffff, 0.2);
+      }
+      
+      if (gridVisualizationRef.current) {
+        scene.add(gridVisualizationRef.current);
+      }
+      
+      // Add bounding box helper
+      gridBoundingBoxRef.current = createGridBoundingBoxHelper(gridResult, 0xffff00);
+      scene.add(gridBoundingBoxRef.current);
+    }
+  }, [gridVisualizationMode]);
 
   // ============================================================================
   // VISIBILITY PAINTING
@@ -541,6 +582,19 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
     if (!csgResultRef.current) return;
     csgResultRef.current.mesh.visible = !hideCavity;
   }, [hideCavity]);
+
+  // ============================================================================
+  // VOXEL GRID VISIBILITY
+  // ============================================================================
+
+  useEffect(() => {
+    if (gridVisualizationRef.current) {
+      gridVisualizationRef.current.visible = !hideVoxelGrid;
+    }
+    if (gridBoundingBoxRef.current) {
+      gridBoundingBoxRef.current.visible = !hideVoxelGrid;
+    }
+  }, [hideVoxelGrid]);
 
   // Cleanup arrows, hull, CSG result, and grid on unmount
   useEffect(() => {
