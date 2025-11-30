@@ -49,6 +49,15 @@ import {
   removeMoldHalfPaint,
   type MoldHalfClassificationResult
 } from '../utils/moldHalfClassification';
+import {
+  computeEscapeLabeling,
+  computeEscapeLabelingDijkstra,
+  createEscapeLabelingPointCloud,
+  createPartingSurfaceInterfaceCloud,
+  createBoundaryDebugPointCloud,
+  type EscapeLabelingResult,
+  type AdjacencyType
+} from '../utils/partingSurface';
 
 // ============================================================================
 // TYPES
@@ -81,6 +90,12 @@ interface ThreeViewerProps {
   useGPUGrid?: boolean;
   /** Show mold half classification (H₁/H₂ coloring on cavity) */
   showMoldHalfClassification?: boolean;
+  /** Show parting surface escape labeling */
+  showPartingSurface?: boolean;
+  /** Adjacency type for parting surface computation (6 or 26) */
+  partingSurfaceAdjacency?: AdjacencyType;
+  /** Show only the parting surface interface (boundary between H1 and H2) */
+  showPartingSurfaceInterface?: boolean;
   onMeshLoaded?: (mesh: THREE.Mesh) => void;
   onMeshRepaired?: (result: MeshRepairResult) => void;
   onVisibilityDataReady?: (data: VisibilityPaintData | null) => void;
@@ -88,6 +103,7 @@ interface ThreeViewerProps {
   onCsgResultReady?: (result: CsgSubtractionResult | null) => void;
   onVolumetricGridReady?: (result: VolumetricGridResult | null) => void;
   onMoldHalfClassificationReady?: (result: MoldHalfClassificationResult | null) => void;
+  onEscapeLabelingReady?: (result: EscapeLabelingResult | null) => void;
 }
 
 // ============================================================================
@@ -120,13 +136,17 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   gridVisualizationMode = 'points',
   useGPUGrid = true,
   showMoldHalfClassification = false,
+  showPartingSurface = false,
+  partingSurfaceAdjacency = 6,
+  showPartingSurfaceInterface = false,
   onMeshLoaded,
   onMeshRepaired,
   onVisibilityDataReady,
   onInflatedHullReady,
   onCsgResultReady,
   onVolumetricGridReady,
-  onMoldHalfClassificationReady
+  onMoldHalfClassificationReady,
+  onEscapeLabelingReady
 }) => {
   // Refs for Three.js objects
   const containerRef = useRef<HTMLDivElement>(null);
@@ -144,6 +164,8 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const volumetricGridRef = useRef<VolumetricGridResult | null>(null);
   const gridVisualizationRef = useRef<THREE.Points | THREE.InstancedMesh | null>(null);
   const gridBoundingBoxRef = useRef<THREE.LineSegments | null>(null);
+  const escapeLabelingRef = useRef<EscapeLabelingResult | null>(null);
+  const escapeLabelingVisualizationRef = useRef<THREE.Points | null>(null);
 
   // ============================================================================
   // SCENE SETUP
@@ -609,6 +631,125 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   }, [gridVisualizationMode]);
 
   // ============================================================================
+  // PARTING SURFACE COMPUTATION
+  // ============================================================================
+
+  useEffect(() => {
+    if (!sceneRef.current) return;
+    
+    const scene = sceneRef.current;
+
+    // Clean up existing escape labeling visualization
+    if (escapeLabelingVisualizationRef.current) {
+      scene.remove(escapeLabelingVisualizationRef.current);
+      escapeLabelingVisualizationRef.current.geometry.dispose();
+      (escapeLabelingVisualizationRef.current.material as THREE.Material).dispose();
+      escapeLabelingVisualizationRef.current = null;
+    }
+    escapeLabelingRef.current = null;
+    onEscapeLabelingReady?.(null);
+
+    // Compute escape labeling if requested and we have the required data
+    if (showPartingSurface && volumetricGridRef.current && visibilityDataRef.current && meshRef.current) {
+      try {
+        console.log('Computing escape labeling (parting surface)...');
+        
+        let labeling: EscapeLabelingResult;
+        
+        // Check if we have mold half classification and CSG result for Dijkstra-based labeling
+        if (moldHalfClassificationRef.current && csgResultRef.current) {
+          console.log('Using Dijkstra-based escape labeling with mold half classification');
+          
+          // Get CSG cavity geometry in world space (this is the outer shell ∂H)
+          const shellGeometry = csgResultRef.current.mesh.geometry.clone();
+          shellGeometry.applyMatrix4(csgResultRef.current.mesh.matrixWorld);
+          
+          // Compute escape labeling using multi-source Dijkstra
+          labeling = computeEscapeLabelingDijkstra(
+            volumetricGridRef.current,
+            shellGeometry,
+            moldHalfClassificationRef.current,
+            { adjacency: partingSurfaceAdjacency, seedRadius: 1.5 }
+          );
+          
+          shellGeometry.dispose();
+        } else {
+          console.log('Falling back to legacy escape labeling (no mold half classification)');
+          
+          // Get part geometry in world space
+          const partGeometry = meshRef.current.geometry.clone();
+          partGeometry.applyMatrix4(meshRef.current.matrixWorld);
+          
+          // Get d1/d2 directions from visibility data
+          const { d1, d2 } = visibilityDataRef.current;
+          
+          // Compute escape labeling using legacy method
+          labeling = computeEscapeLabeling(
+            volumetricGridRef.current,
+            partGeometry,
+            d1,
+            d2,
+            { adjacency: partingSurfaceAdjacency }
+          );
+          
+          partGeometry.dispose();
+        }
+        
+        escapeLabelingRef.current = labeling;
+        onEscapeLabelingReady?.(labeling);
+        
+        // DEBUG: Use boundary debug visualization to verify boundary labeling
+        // This shows:
+        // - Green: Boundary voxels adjacent to H₁
+        // - Orange: Boundary voxels adjacent to H₂
+        // - Blue: Seed voxels (near part mesh)
+        // - Dark gray: Everything else
+        const DEBUG_BOUNDARY_VISUALIZATION = true;
+        
+        // Create visualization
+        if (DEBUG_BOUNDARY_VISUALIZATION) {
+          console.log('DEBUG MODE: Showing boundary voxel labels only');
+          escapeLabelingVisualizationRef.current = createBoundaryDebugPointCloud(
+            volumetricGridRef.current,
+            labeling,
+            6  // larger point size for visibility
+          );
+        } else if (showPartingSurfaceInterface) {
+          escapeLabelingVisualizationRef.current = createPartingSurfaceInterfaceCloud(
+            volumetricGridRef.current,
+            labeling,
+            partingSurfaceAdjacency,
+            4
+          );
+        } else {
+          escapeLabelingVisualizationRef.current = createEscapeLabelingPointCloud(
+            volumetricGridRef.current,
+            labeling,
+            3
+          );
+        }
+        
+        if (escapeLabelingVisualizationRef.current) {
+          scene.add(escapeLabelingVisualizationRef.current);
+        }
+        
+        // Hide the regular voxel grid visualization when showing escape labeling
+        if (gridVisualizationRef.current) {
+          gridVisualizationRef.current.visible = false;
+        }
+        
+      } catch (error) {
+        console.error('Error computing escape labeling:', error);
+      }
+    } else {
+      // Show regular voxel grid if escape labeling is not shown
+      if (gridVisualizationRef.current) {
+        gridVisualizationRef.current.visible = !hideVoxelGrid;
+      }
+    }
+  }, [showPartingSurface, partingSurfaceAdjacency, showPartingSurfaceInterface, onEscapeLabelingReady, hideVoxelGrid, showMoldHalfClassification, showCsgResult]);
+
+  // ============================================================================
   // VISIBILITY PAINTING
   // ============================================================================
 
@@ -665,7 +806,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
     }
   }, [hideVoxelGrid]);
 
-  // Cleanup arrows, hull, CSG result, and grid on unmount
+  // Cleanup arrows, hull, CSG result, grid, and escape labeling on unmount
   useEffect(() => {
     return () => {
       if (partingArrowsRef.current.length > 0) {
@@ -682,6 +823,11 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       }
       if (gridBoundingBoxRef.current && sceneRef.current) {
         removeGridVisualization(sceneRef.current, gridBoundingBoxRef.current);
+      }
+      if (escapeLabelingVisualizationRef.current && sceneRef.current) {
+        sceneRef.current.remove(escapeLabelingVisualizationRef.current);
+        escapeLabelingVisualizationRef.current.geometry.dispose();
+        (escapeLabelingVisualizationRef.current.material as THREE.Material).dispose();
       }
     };
   }, []);

@@ -13,12 +13,13 @@ import type { InflatedHullResult, ManifoldValidationResult, CsgSubtractionResult
 import type { MeshRepairResult, MeshDiagnostics } from './utils/meshRepairManifold';
 import type { VolumetricGridResult } from './utils/volumetricGrid';
 import type { MoldHalfClassificationResult } from './utils/moldHalfClassification';
+import type { EscapeLabelingResult, AdjacencyType } from './utils/partingSurface';
 
 // ============================================================================
 // TYPES
 // ============================================================================
 
-type Step = 'import' | 'parting' | 'hull' | 'cavity' | 'mold-halves' | 'voxel';
+type Step = 'import' | 'parting' | 'hull' | 'cavity' | 'mold-halves' | 'voxel' | 'parting-surface';
 
 interface StepInfo {
   id: Step;
@@ -34,6 +35,7 @@ const STEPS: StepInfo[] = [
   { id: 'cavity', icon: '✂️', title: 'Mold Cavity', description: 'Subtract base mesh from hull to create cavity' },
   { id: 'mold-halves', icon: '🎨', title: 'Mold Halves', description: 'Classify cavity surface into H₁ and H₂ mold halves' },
   { id: 'voxel', icon: '🧊', title: 'Voxel Grid', description: 'Generate volumetric grid for mold analysis' },
+  { id: 'parting-surface', icon: '✂️', title: 'Parting Surface', description: 'Compute escape labeling via multi-source Dijkstra to define parting surface' },
 ];
 
 interface HullStats {
@@ -95,9 +97,23 @@ function App() {
     innerBoundaryCount: number;
   } | null>(null);
 
+  // Parting Surface state
+  const [showPartingSurface, setShowPartingSurface] = useState(false);
+  const [partingSurfaceAdjacency, setPartingSurfaceAdjacency] = useState<AdjacencyType>(6);
+  const [escapeLabelingStats, setEscapeLabelingStats] = useState<{
+    h1VoxelCount: number;
+    h2VoxelCount: number;
+    unassignedCount: number;
+    computeTimeMs: number;
+    h1Percentage: number;
+    h2Percentage: number;
+  } | null>(null);
+  const [showPartingSurfaceInterface, setShowPartingSurfaceInterface] = useState(false);
+
   // Track parameters used for last computation (to detect changes)
   const [lastComputedInflationOffset, setLastComputedInflationOffset] = useState<number | null>(null);
   const [lastComputedGridResolution, setLastComputedGridResolution] = useState<number | null>(null);
+  const [lastComputedAdjacency, setLastComputedAdjacency] = useState<AdjacencyType | null>(null);
 
   // Helper to clear downstream steps
   const clearFromStep = useCallback((step: Step) => {
@@ -118,6 +134,9 @@ function App() {
         setShowVolumetricGrid(false);
         setVolumetricGridStats(null);
         setLastComputedGridResolution(null);
+        setShowPartingSurface(false);
+        setEscapeLabelingStats(null);
+        setLastComputedAdjacency(null);
         break;
       case 'hull':
         setShowInflatedHull(false);
@@ -131,6 +150,9 @@ function App() {
         setShowVolumetricGrid(false);
         setVolumetricGridStats(null);
         setLastComputedGridResolution(null);
+        setShowPartingSurface(false);
+        setEscapeLabelingStats(null);
+        setLastComputedAdjacency(null);
         break;
       case 'cavity':
         setShowCsgResult(false);
@@ -141,19 +163,34 @@ function App() {
         setShowVolumetricGrid(false);
         setVolumetricGridStats(null);
         setLastComputedGridResolution(null);
+        setShowPartingSurface(false);
+        setEscapeLabelingStats(null);
+        setLastComputedAdjacency(null);
         break;
       case 'mold-halves':
         setShowMoldHalfClassification(false);
         setMoldHalfStats(null);
-        // Fall through to clear voxel
+        // Fall through to clear voxel and parting-surface
         setShowVolumetricGrid(false);
         setVolumetricGridStats(null);
         setLastComputedGridResolution(null);
+        setShowPartingSurface(false);
+        setEscapeLabelingStats(null);
+        setLastComputedAdjacency(null);
         break;
       case 'voxel':
         setShowVolumetricGrid(false);
         setVolumetricGridStats(null);
         setLastComputedGridResolution(null);
+        // Fall through to clear parting-surface
+        setShowPartingSurface(false);
+        setEscapeLabelingStats(null);
+        setLastComputedAdjacency(null);
+        break;
+      case 'parting-surface':
+        setShowPartingSurface(false);
+        setEscapeLabelingStats(null);
+        setLastComputedAdjacency(null);
         break;
     }
   }, []);
@@ -197,6 +234,8 @@ function App() {
     setVolumetricGridStats(null);
     setShowMoldHalfClassification(false);
     setMoldHalfStats(null);
+    setShowPartingSurface(false);
+    setEscapeLabelingStats(null);
     // Move to parting step after loading
     setActiveStep('parting');
   }, [stlUrl]);
@@ -288,6 +327,26 @@ function App() {
     []
   );
 
+  const handleEscapeLabelingReady = useCallback(
+    (result: EscapeLabelingResult | null) => {
+      if (result) {
+        const total = result.d1Count + result.d2Count + result.unlabeledCount;
+        setEscapeLabelingStats({
+          h1VoxelCount: result.d1Count,
+          h2VoxelCount: result.d2Count,
+          unassignedCount: result.unlabeledCount,
+          computeTimeMs: result.computeTimeMs,
+          h1Percentage: total > 0 ? result.d1Count / total * 100 : 0,
+          h2Percentage: total > 0 ? result.d2Count / total * 100 : 0,
+        });
+        setLastComputedAdjacency(partingSurfaceAdjacency);
+      } else {
+        setEscapeLabelingStats(null);
+      }
+    },
+    [partingSurfaceAdjacency]
+  );
+
   // Active step for context menu
   const [activeStep, setActiveStep] = useState<Step>('import');
   const [isCalculating, setIsCalculating] = useState(false);
@@ -334,6 +393,18 @@ function App() {
           return 'completed';
         }
         return csgStats ? 'available' : 'locked';
+      case 'parting-surface':
+        // Parting surface depends on voxel grid AND mold-halves
+        if (getStepStatus('voxel') === 'locked' || getStepStatus('voxel') === 'needs-recalc') return 'locked';
+        if (getStepStatus('mold-halves') === 'locked') return 'locked';
+        if (escapeLabelingStats) {
+          // Check if parameters changed
+          if (lastComputedAdjacency !== null && partingSurfaceAdjacency !== lastComputedAdjacency) {
+            return 'needs-recalc';
+          }
+          return 'completed';
+        }
+        return (volumetricGridStats && moldHalfStats) ? 'available' : 'locked';
     }
   };
 
@@ -368,6 +439,10 @@ function App() {
       case 'voxel':
         clearFromStep('voxel');
         setShowVolumetricGrid(true);
+        break;
+      case 'parting-surface':
+        clearFromStep('parting-surface');
+        setShowPartingSurface(true);
         break;
     }
     
@@ -662,6 +737,74 @@ function App() {
           </div>
         )}
 
+        {activeStep === 'parting-surface' && status !== 'locked' && (
+          <div style={styles.optionsSection}>
+            <div style={styles.optionLabel}>Adjacency Type:</div>
+            <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+              <button
+                onClick={() => setPartingSurfaceAdjacency(6)}
+                style={{
+                  ...styles.toggleButton,
+                  backgroundColor: partingSurfaceAdjacency === 6 ? '#00ffff' : '#333',
+                  borderColor: partingSurfaceAdjacency === 6 ? '#00ffff' : '#555',
+                  color: partingSurfaceAdjacency === 6 ? '#000' : '#fff',
+                }}
+              >
+                6 (Faces)
+              </button>
+              <button
+                onClick={() => setPartingSurfaceAdjacency(26)}
+                style={{
+                  ...styles.toggleButton,
+                  backgroundColor: partingSurfaceAdjacency === 26 ? '#00ffff' : '#333',
+                  borderColor: partingSurfaceAdjacency === 26 ? '#00ffff' : '#555',
+                  color: partingSurfaceAdjacency === 26 ? '#000' : '#fff',
+                }}
+              >
+                26 (Full)
+              </button>
+            </div>
+
+            {escapeLabelingStats && (
+              <>
+                <label style={styles.checkbox}>
+                  <input
+                    type="checkbox"
+                    checked={showPartingSurfaceInterface}
+                    onChange={(e) => setShowPartingSurfaceInterface(e.target.checked)}
+                  />
+                  Show Interface Only
+                </label>
+
+                <div style={styles.statsBox}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#0f0' }}>H₁ voxels:</span>
+                    <span>{escapeLabelingStats.h1VoxelCount.toLocaleString()} ({escapeLabelingStats.h1Percentage.toFixed(1)}%)</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#f60' }}>H₂ voxels:</span>
+                    <span>{escapeLabelingStats.h2VoxelCount.toLocaleString()} ({escapeLabelingStats.h2Percentage.toFixed(1)}%)</span>
+                  </div>
+                  {escapeLabelingStats.unassignedCount > 0 && (
+                    <div style={{ color: '#f00' }}>
+                      Unassigned: {escapeLabelingStats.unassignedCount}
+                    </div>
+                  )}
+                  <div style={{ marginTop: '4px', paddingTop: '4px', borderTop: '1px solid #444', fontSize: '0.85em', color: '#888' }}>
+                    Compute: {escapeLabelingStats.computeTimeMs.toFixed(0)} ms
+                  </div>
+                </div>
+              </>
+            )}
+
+            {!escapeLabelingStats && volumetricGridStats && moldHalfStats && (
+              <div style={{ color: '#888', fontSize: '0.9em' }}>
+                Click "Calculate" to compute escape labeling via multi-source Dijkstra flood.
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Calculate Button and Progress Bar - not shown for import step */}
         {activeStep !== 'import' && status !== 'locked' && (
           <div style={styles.calculateSection}>
@@ -832,6 +975,9 @@ function App() {
           gridVisualizationMode={gridVisualizationMode}
           useGPUGrid={useGPUGrid}
           showMoldHalfClassification={showMoldHalfClassification}
+          showPartingSurface={showPartingSurface}
+          partingSurfaceAdjacency={partingSurfaceAdjacency}
+          showPartingSurfaceInterface={showPartingSurfaceInterface}
           onMeshLoaded={handleMeshLoaded}
           onMeshRepaired={handleMeshRepaired}
           onVisibilityDataReady={handleVisibilityDataReady}
@@ -839,6 +985,7 @@ function App() {
           onCsgResultReady={handleCsgResultReady}
           onVolumetricGridReady={handleVolumetricGridReady}
           onMoldHalfClassificationReady={handleMoldHalfClassificationReady}
+          onEscapeLabelingReady={handleEscapeLabelingReady}
         />
       </div>
     </div>
