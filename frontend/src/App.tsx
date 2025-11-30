@@ -12,12 +12,13 @@ import type { VisibilityPaintData } from './utils/partingDirection';
 import type { InflatedHullResult, ManifoldValidationResult, CsgSubtractionResult } from './utils/inflatedBoundingVolume';
 import type { MeshRepairResult, MeshDiagnostics } from './utils/meshRepairManifold';
 import type { VolumetricGridResult } from './utils/volumetricGrid';
+import type { MoldHalfClassificationResult } from './utils/moldHalfClassification';
 
 // ============================================================================
 // TYPES
 // ============================================================================
 
-type Step = 'import' | 'parting' | 'hull' | 'cavity' | 'voxel';
+type Step = 'import' | 'parting' | 'hull' | 'cavity' | 'mold-halves' | 'voxel';
 
 interface StepInfo {
   id: Step;
@@ -31,6 +32,7 @@ const STEPS: StepInfo[] = [
   { id: 'parting', icon: '🔀', title: 'Parting Direction', description: 'Compute optimal parting directions for mold separation' },
   { id: 'hull', icon: '📦', title: 'Bounding Hull', description: 'Generate inflated convex hull around the mesh' },
   { id: 'cavity', icon: '✂️', title: 'Mold Cavity', description: 'Subtract base mesh from hull to create cavity' },
+  { id: 'mold-halves', icon: '🎨', title: 'Mold Halves', description: 'Classify cavity surface into H₁ and H₂ mold halves' },
   { id: 'voxel', icon: '🧊', title: 'Voxel Grid', description: 'Generate volumetric grid for mold analysis' },
 ];
 
@@ -82,6 +84,16 @@ function App() {
   const [volumetricGridStats, setVolumetricGridStats] = useState<VolumetricGridStats | null>(null);
   const [useGPUGrid, setUseGPUGrid] = useState(true);
   const [hideVoxelGrid, setHideVoxelGrid] = useState(false);
+  const [showMoldHalfClassification, setShowMoldHalfClassification] = useState(false);
+  const [moldHalfStats, setMoldHalfStats] = useState<{
+    h1Count: number;
+    h2Count: number;
+    h1Percentage: number;
+    h2Percentage: number;
+    totalTriangles: number;
+    outerBoundaryCount: number;
+    innerBoundaryCount: number;
+  } | null>(null);
 
   // Track parameters used for last computation (to detect changes)
   const [lastComputedInflationOffset, setLastComputedInflationOffset] = useState<number | null>(null);
@@ -101,6 +113,8 @@ function App() {
         setLastComputedInflationOffset(null);
         setShowCsgResult(false);
         setCsgStats(null);
+        setShowMoldHalfClassification(false);
+        setMoldHalfStats(null);
         setShowVolumetricGrid(false);
         setVolumetricGridStats(null);
         setLastComputedGridResolution(null);
@@ -112,6 +126,8 @@ function App() {
         // Fall through to clear cavity and beyond
         setShowCsgResult(false);
         setCsgStats(null);
+        setShowMoldHalfClassification(false);
+        setMoldHalfStats(null);
         setShowVolumetricGrid(false);
         setVolumetricGridStats(null);
         setLastComputedGridResolution(null);
@@ -119,6 +135,16 @@ function App() {
       case 'cavity':
         setShowCsgResult(false);
         setCsgStats(null);
+        // Fall through to clear mold-halves and beyond
+        setShowMoldHalfClassification(false);
+        setMoldHalfStats(null);
+        setShowVolumetricGrid(false);
+        setVolumetricGridStats(null);
+        setLastComputedGridResolution(null);
+        break;
+      case 'mold-halves':
+        setShowMoldHalfClassification(false);
+        setMoldHalfStats(null);
         // Fall through to clear voxel
         setShowVolumetricGrid(false);
         setVolumetricGridStats(null);
@@ -169,6 +195,8 @@ function App() {
     setMeshRepairResult(null);
     setShowVolumetricGrid(false);
     setVolumetricGridStats(null);
+    setShowMoldHalfClassification(false);
+    setMoldHalfStats(null);
     // Move to parting step after loading
     setActiveStep('parting');
   }, [stlUrl]);
@@ -245,6 +273,21 @@ function App() {
     [gridResolution]
   );
 
+  const handleMoldHalfClassificationReady = useCallback(
+    (result: MoldHalfClassificationResult | null) => {
+      setMoldHalfStats(result ? {
+        h1Count: result.h1Triangles.size,
+        h2Count: result.h2Triangles.size,
+        h1Percentage: result.outerBoundaryCount > 0 ? result.h1Triangles.size / result.outerBoundaryCount * 100 : 0,
+        h2Percentage: result.outerBoundaryCount > 0 ? result.h2Triangles.size / result.outerBoundaryCount * 100 : 0,
+        totalTriangles: result.totalTriangles,
+        outerBoundaryCount: result.outerBoundaryCount,
+        innerBoundaryCount: result.innerBoundaryTriangles.size,
+      } : null);
+    },
+    []
+  );
+
   // Active step for context menu
   const [activeStep, setActiveStep] = useState<Step>('import');
   const [isCalculating, setIsCalculating] = useState(false);
@@ -275,8 +318,13 @@ function App() {
         if (getStepStatus('hull') === 'needs-recalc') return 'locked';
         if (csgStats) return 'completed';
         return hullStats ? 'available' : 'locked';
+      case 'mold-halves':
+        // Mold halves depends on cavity
+        if (getStepStatus('cavity') === 'locked') return 'locked';
+        if (moldHalfStats) return 'completed';
+        return csgStats ? 'available' : 'locked';
       case 'voxel':
-        // Voxel depends on cavity - if cavity is locked, voxel is locked
+        // Voxel depends on mold-halves (or at least cavity)
         if (getStepStatus('cavity') === 'locked') return 'locked';
         if (volumetricGridStats) {
           // Check if parameters changed
@@ -312,6 +360,10 @@ function App() {
       case 'cavity':
         clearFromStep('cavity');
         setShowCsgResult(true);
+        break;
+      case 'mold-halves':
+        clearFromStep('mold-halves');
+        setShowMoldHalfClassification(true);
         break;
       case 'voxel':
         clearFromStep('voxel');
@@ -500,6 +552,37 @@ function App() {
                 <div style={{ color: csgStats.manifoldValidation.isManifold ? '#0f0' : '#f90' }}>
                   {csgStats.manifoldValidation.isManifold ? '✅ Valid Manifold' : '⚠️ Not Manifold'}
                 </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeStep === 'mold-halves' && status !== 'locked' && (
+          <div style={styles.optionsSection}>
+            {/* Mold Half Stats */}
+            {moldHalfStats && (
+              <div style={styles.statsBox}>
+                <div style={{ marginBottom: '4px', fontSize: '0.85em', color: '#aaa' }}>
+                  Outer boundary (hull):
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ color: '#0f0' }}>H₁ (Green):</span>
+                  <span>{moldHalfStats.h1Count} ({moldHalfStats.h1Percentage.toFixed(1)}%)</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ color: '#f60' }}>H₂ (Orange):</span>
+                  <span>{moldHalfStats.h2Count} ({moldHalfStats.h2Percentage.toFixed(1)}%)</span>
+                </div>
+                <div style={{ marginTop: '6px', paddingTop: '4px', borderTop: '1px solid #444', fontSize: '0.85em', color: '#888' }}>
+                  <div>Outer: {moldHalfStats.outerBoundaryCount} tris</div>
+                  <div>Inner (part): {moldHalfStats.innerBoundaryCount} tris</div>
+                </div>
+              </div>
+            )}
+            
+            {!moldHalfStats && csgStats && (
+              <div style={{ color: '#888', fontSize: '0.9em' }}>
+                Click "Calculate" to classify the mold cavity into H₁ and H₂ halves based on parting directions.
               </div>
             )}
           </div>
@@ -748,12 +831,14 @@ function App() {
           gridResolution={gridResolution}
           gridVisualizationMode={gridVisualizationMode}
           useGPUGrid={useGPUGrid}
+          showMoldHalfClassification={showMoldHalfClassification}
           onMeshLoaded={handleMeshLoaded}
           onMeshRepaired={handleMeshRepaired}
           onVisibilityDataReady={handleVisibilityDataReady}
           onInflatedHullReady={handleInflatedHullReady}
           onCsgResultReady={handleCsgResultReady}
           onVolumetricGridReady={handleVolumetricGridReady}
+          onMoldHalfClassificationReady={handleMoldHalfClassificationReady}
         />
       </div>
     </div>

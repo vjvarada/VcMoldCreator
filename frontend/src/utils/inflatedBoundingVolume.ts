@@ -126,13 +126,6 @@ function extractUniqueVerticesWithMap(geometry: THREE.BufferGeometry): {
 }
 
 /**
- * Extract unique vertices from a mesh geometry (handles indexed and non-indexed)
- */
-function extractUniqueVertices(geometry: THREE.BufferGeometry): THREE.Vector3[] {
-  return extractUniqueVerticesWithMap(geometry).vertices;
-}
-
-/**
  * Build face indices from non-indexed ConvexGeometry, mapping to unique vertex indices
  */
 function buildFaceIndices(
@@ -156,67 +149,6 @@ function buildFaceIndices(
   }
 
   return faceIndices;
-}
-
-/**
- * Compute area-weighted smooth vertex normals for unique hull vertices
- * 
- * For each unique vertex, accumulates face normals (weighted by face area)
- * from all faces sharing that vertex, then normalizes.
- */
-function computeAreaWeightedNormalsForUniqueVertices(
-  uniqueVertices: THREE.Vector3[],
-  faceIndices: number[]
-): THREE.Vector3[] {
-  const vertexCount = uniqueVertices.length;
-  
-  // Initialize normal accumulators
-  const normalAccum: THREE.Vector3[] = [];
-  for (let i = 0; i < vertexCount; i++) {
-    normalAccum.push(new THREE.Vector3(0, 0, 0));
-  }
-  
-  // Temporary vectors for calculations
-  const ab = new THREE.Vector3();
-  const ac = new THREE.Vector3();
-  const faceNormal = new THREE.Vector3();
-
-  // Process triangles
-  const triangleCount = faceIndices.length / 3;
-  
-  for (let i = 0; i < triangleCount; i++) {
-    const iA = faceIndices[i * 3];
-    const iB = faceIndices[i * 3 + 1];
-    const iC = faceIndices[i * 3 + 2];
-
-    const vA = uniqueVertices[iA];
-    const vB = uniqueVertices[iB];
-    const vC = uniqueVertices[iC];
-
-    // Compute edge vectors
-    ab.subVectors(vB, vA);
-    ac.subVectors(vC, vA);
-
-    // Cross product gives normal * 2 * area
-    faceNormal.crossVectors(ab, ac);
-    const area = faceNormal.length() / 2;
-    
-    if (area > 1e-10) {
-      faceNormal.normalize();
-      
-      // Weight by area and accumulate to each vertex
-      normalAccum[iA].addScaledVector(faceNormal, area);
-      normalAccum[iB].addScaledVector(faceNormal, area);
-      normalAccum[iC].addScaledVector(faceNormal, area);
-    }
-  }
-
-  // Normalize accumulated normals
-  for (let i = 0; i < vertexCount; i++) {
-    normalAccum[i].normalize();
-  }
-
-  return normalAccum;
 }
 
 /**
@@ -391,18 +323,110 @@ function validateManifold(geometry: THREE.BufferGeometry): ManifoldValidationRes
 // ============================================================================
 
 /**
- * Generate an inflated bounding volume (convex hull) for a mesh
+ * Compute smooth vertex normals for a mesh geometry using area-weighted averaging.
+ * Works with both indexed and non-indexed geometries.
+ */
+function computeSmoothNormalsForGeometry(geometry: THREE.BufferGeometry): THREE.Vector3[] {
+  const positionAttr = geometry.getAttribute('position');
+  const indexAttr = geometry.getIndex();
+  
+  // Build unique vertex map
+  const { vertices: uniqueVertices, positionToIndex } = extractUniqueVerticesWithMap(geometry);
+  const vertexCount = uniqueVertices.length;
+  
+  // Initialize normal accumulators
+  const normalAccum: THREE.Vector3[] = [];
+  for (let i = 0; i < vertexCount; i++) {
+    normalAccum.push(new THREE.Vector3(0, 0, 0));
+  }
+  
+  const vA = new THREE.Vector3();
+  const vB = new THREE.Vector3();
+  const vC = new THREE.Vector3();
+  const ab = new THREE.Vector3();
+  const ac = new THREE.Vector3();
+  const faceNormal = new THREE.Vector3();
+  
+  const getVertexIndex = (bufferIdx: number): number => {
+    const key = `${positionAttr.getX(bufferIdx).toFixed(6)},${positionAttr.getY(bufferIdx).toFixed(6)},${positionAttr.getZ(bufferIdx).toFixed(6)}`;
+    return positionToIndex.get(key) ?? 0;
+  };
+  
+  let triangleCount: number;
+  
+  if (indexAttr) {
+    triangleCount = indexAttr.count / 3;
+    for (let i = 0; i < triangleCount; i++) {
+      const a = indexAttr.getX(i * 3);
+      const b = indexAttr.getX(i * 3 + 1);
+      const c = indexAttr.getX(i * 3 + 2);
+      
+      vA.fromBufferAttribute(positionAttr, a);
+      vB.fromBufferAttribute(positionAttr, b);
+      vC.fromBufferAttribute(positionAttr, c);
+      
+      ab.subVectors(vB, vA);
+      ac.subVectors(vC, vA);
+      faceNormal.crossVectors(ab, ac);
+      const area = faceNormal.length() / 2;
+      
+      if (area > 1e-10) {
+        faceNormal.normalize();
+        const iA = getVertexIndex(a);
+        const iB = getVertexIndex(b);
+        const iC = getVertexIndex(c);
+        normalAccum[iA].addScaledVector(faceNormal, area);
+        normalAccum[iB].addScaledVector(faceNormal, area);
+        normalAccum[iC].addScaledVector(faceNormal, area);
+      }
+    }
+  } else {
+    triangleCount = positionAttr.count / 3;
+    for (let i = 0; i < triangleCount; i++) {
+      const base = i * 3;
+      
+      vA.fromBufferAttribute(positionAttr, base);
+      vB.fromBufferAttribute(positionAttr, base + 1);
+      vC.fromBufferAttribute(positionAttr, base + 2);
+      
+      ab.subVectors(vB, vA);
+      ac.subVectors(vC, vA);
+      faceNormal.crossVectors(ab, ac);
+      const area = faceNormal.length() / 2;
+      
+      if (area > 1e-10) {
+        faceNormal.normalize();
+        const iA = getVertexIndex(base);
+        const iB = getVertexIndex(base + 1);
+        const iC = getVertexIndex(base + 2);
+        normalAccum[iA].addScaledVector(faceNormal, area);
+        normalAccum[iB].addScaledVector(faceNormal, area);
+        normalAccum[iC].addScaledVector(faceNormal, area);
+      }
+    }
+  }
+  
+  // Normalize and return
+  for (let i = 0; i < vertexCount; i++) {
+    normalAccum[i].normalize();
+  }
+  
+  return normalAccum;
+}
+
+/**
+ * Inflate input mesh vertices along their smooth normals, then create convex hull.
  * 
- * Steps:
- * 1. Compute convex hull of the input mesh
- * 2. Extract unique vertices and face indices from the hull
- * 3. Generate smooth vertex normals using area-weighted normal averaging
- * 4. Inflate hull vertices outward by the offset distance
- * 5. Create a new mesh from the inflated vertices + same hull faces
- * 6. Validate if the mesh is closed/manifold
+ * New approach (better triangle density):
+ * 1. Compute smooth vertex normals on the INPUT mesh
+ * 2. Inflate input mesh vertices outward by offset distance  
+ * 3. Compute convex hull from the inflated vertices
+ * 
+ * This produces a denser hull because the input mesh has many more vertices
+ * than a convex hull would, resulting in better triangle distribution.
  * 
  * @param mesh - The input mesh to create hull around
- * @param offset - Distance to inflate outward (default: 1.0)
+ * @param offset - Distance to inflate outward (default: 0.5)
  * @returns InflatedHullResult containing the inflated mesh and metadata
  */
 export function generateInflatedBoundingVolume(
@@ -414,24 +438,16 @@ export function generateInflatedBoundingVolume(
   worldGeometry.applyMatrix4(mesh.matrixWorld);
 
   // Step 1: Extract unique vertices from input mesh
-  const inputVertices = extractUniqueVertices(worldGeometry);
-
-  // Step 2: Generate convex hull
-  const hullGeometry = new ConvexGeometry(inputVertices);
+  const { vertices: inputVertices } = extractUniqueVerticesWithMap(worldGeometry);
   
-  // Step 3: Extract unique hull vertices and build face indices
-  // ConvexGeometry creates non-indexed geometry with duplicated vertices per face
-  // We need to extract unique vertices and build proper face connectivity
-  const { vertices: hullVertices, positionToIndex } = extractUniqueVerticesWithMap(hullGeometry);
-  const hullFaceIndices = buildFaceIndices(hullGeometry, positionToIndex);
+  // Step 2: Compute smooth vertex normals on the INPUT mesh (not hull)
+  const smoothNormals = computeSmoothNormalsForGeometry(worldGeometry);
+  
+  // Step 3: Inflate input vertices outward along their smooth normals
+  const inflatedVertices = inflateVertices(inputVertices, smoothNormals, offset);
 
-  // Step 4: Compute area-weighted smooth vertex normals for unique hull vertices
-  const smoothNormals = computeAreaWeightedNormalsForUniqueVertices(hullVertices, hullFaceIndices);
-
-  // Step 5: Inflate hull vertices outward along their smooth normals
-  const inflatedVertices = inflateVertices(hullVertices, smoothNormals, offset);
-
-  // Step 6: Recompute convex hull from inflated vertices to ensure valid convex geometry
+  // Step 4: Compute convex hull from the inflated input vertices
+  // This creates a hull with more vertices/triangles than hulling first
   const inflatedHullGeometry = new ConvexGeometry(inflatedVertices);
   
   // Extract the final geometry info
@@ -439,10 +455,10 @@ export function generateInflatedBoundingVolume(
   const finalFaceIndices = buildFaceIndices(inflatedHullGeometry, finalPosToIndex);
   const faceCount = finalFaceIndices.length / 3;
   
-  // Create indexed geometry from the new convex hull
+  // Create indexed geometry from the convex hull
   const inflatedGeometry = createMeshFromVerticesAndFaces(finalVertices, finalFaceIndices);
 
-  // Step 7: Validate manifold properties of the inflated geometry
+  // Step 5: Validate manifold properties of the inflated geometry
   const manifoldValidation = validateManifold(inflatedGeometry);
 
   // Create materials
@@ -461,8 +477,11 @@ export function generateInflatedBoundingVolume(
     opacity: 0.2,
   });
 
-  // Create original hull geometry from unique vertices for display
-  const originalHullDisplayGeometry = createMeshFromVerticesAndFaces(hullVertices, hullFaceIndices);
+  // For the "original hull", show the non-inflated convex hull for reference
+  const originalHullGeometry = new ConvexGeometry(inputVertices);
+  const { vertices: origHullVerts, positionToIndex: origPosToIndex } = extractUniqueVerticesWithMap(originalHullGeometry);
+  const origHullFaceIndices = buildFaceIndices(originalHullGeometry, origPosToIndex);
+  const originalHullDisplayGeometry = createMeshFromVerticesAndFaces(origHullVerts, origHullFaceIndices);
 
   // Create meshes
   const inflatedMesh = new THREE.Mesh(inflatedGeometry, hullMaterial);
@@ -475,6 +494,8 @@ export function generateInflatedBoundingVolume(
     smoothNormalsArray[i * 3 + 1] = smoothNormals[i].y;
     smoothNormalsArray[i * 3 + 2] = smoothNormals[i].z;
   }
+
+  console.log(`Inflated Hull: ${inputVertices.length} input vertices → ${finalVertices.length} hull vertices, ${faceCount} faces`);
 
   return {
     mesh: inflatedMesh,

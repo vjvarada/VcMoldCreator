@@ -43,6 +43,12 @@ import {
   type VolumetricGridResult,
   type VolumetricGridOptions
 } from '../utils/volumetricGrid';
+import {
+  classifyMoldHalves,
+  applyMoldHalfPaint,
+  removeMoldHalfPaint,
+  type MoldHalfClassificationResult
+} from '../utils/moldHalfClassification';
 
 // ============================================================================
 // TYPES
@@ -73,12 +79,15 @@ interface ThreeViewerProps {
   gridVisualizationMode?: GridVisualizationMode;
   /** Use GPU acceleration for grid generation (WebGPU if available) */
   useGPUGrid?: boolean;
+  /** Show mold half classification (H₁/H₂ coloring on cavity) */
+  showMoldHalfClassification?: boolean;
   onMeshLoaded?: (mesh: THREE.Mesh) => void;
   onMeshRepaired?: (result: MeshRepairResult) => void;
   onVisibilityDataReady?: (data: VisibilityPaintData | null) => void;
   onInflatedHullReady?: (result: InflatedHullResult | null) => void;
   onCsgResultReady?: (result: CsgSubtractionResult | null) => void;
   onVolumetricGridReady?: (result: VolumetricGridResult | null) => void;
+  onMoldHalfClassificationReady?: (result: MoldHalfClassificationResult | null) => void;
 }
 
 // ============================================================================
@@ -110,12 +119,14 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   gridResolution = 64,
   gridVisualizationMode = 'points',
   useGPUGrid = true,
+  showMoldHalfClassification = false,
   onMeshLoaded,
   onMeshRepaired,
   onVisibilityDataReady,
   onInflatedHullReady,
   onCsgResultReady,
-  onVolumetricGridReady
+  onVolumetricGridReady,
+  onMoldHalfClassificationReady
 }) => {
   // Refs for Three.js objects
   const containerRef = useRef<HTMLDivElement>(null);
@@ -129,6 +140,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const visibilityDataRef = useRef<VisibilityPaintData | null>(null);
   const inflatedHullRef = useRef<InflatedHullResult | null>(null);
   const csgResultRef = useRef<CsgSubtractionResult | null>(null);
+  const moldHalfClassificationRef = useRef<MoldHalfClassificationResult | null>(null);
   const volumetricGridRef = useRef<VolumetricGridResult | null>(null);
   const gridVisualizationRef = useRef<THREE.Points | THREE.InstancedMesh | null>(null);
   const gridBoundingBoxRef = useRef<THREE.LineSegments | null>(null);
@@ -407,6 +419,63 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       performCsg();
     }
   }, [showCsgResult, onCsgResultReady]);
+
+  // ============================================================================
+  // MOLD HALF CLASSIFICATION
+  // ============================================================================
+
+  useEffect(() => {
+    // Clear existing classification when dependencies change
+    moldHalfClassificationRef.current = null;
+    onMoldHalfClassificationReady?.(null);
+    
+    // Only classify if we have CSG result (cavity), hull, and visibility data (parting directions)
+    if (!showMoldHalfClassification || !csgResultRef.current || !inflatedHullRef.current || !visibilityDataRef.current) {
+      // Remove paint if classification is disabled
+      if (csgResultRef.current) {
+        removeMoldHalfPaint(csgResultRef.current.mesh);
+      }
+      return;
+    }
+    
+    const cavityMesh = csgResultRef.current.mesh;
+    const hullMesh = inflatedHullRef.current.mesh;
+    const { d1, d2 } = visibilityDataRef.current;
+    
+    try {
+      // IMPORTANT: Convert cavity mesh to non-indexed FIRST (before classification)
+      // This ensures triangle indices match between classification and painting
+      const cavityGeom = cavityMesh.geometry as THREE.BufferGeometry;
+      if (cavityGeom.index) {
+        const nonIndexedGeom = cavityGeom.toNonIndexed();
+        cavityGeom.dispose();
+        cavityMesh.geometry = nonIndexedGeom;
+      }
+      
+      // Get cavity geometry in world space (already non-indexed)
+      const cavityGeometry = cavityMesh.geometry.clone();
+      cavityGeometry.applyMatrix4(cavityMesh.matrixWorld);
+      
+      // Get hull geometry in world space (needed to identify outer boundary)
+      const hullGeometry = hullMesh.geometry.clone();
+      hullGeometry.applyMatrix4(hullMesh.matrixWorld);
+      
+      // Classify triangles into H₁ and H₂
+      const classification = classifyMoldHalves(cavityGeometry, hullGeometry, d1, d2);
+      moldHalfClassificationRef.current = classification;
+      onMoldHalfClassificationReady?.(classification);
+      
+      // Apply visualization (paint the cavity mesh)
+      applyMoldHalfPaint(cavityMesh, classification);
+      
+      // Clean up temp geometry
+      cavityGeometry.dispose();
+      hullGeometry.dispose();
+      
+    } catch (error) {
+      console.error('Error classifying mold halves:', error);
+    }
+  }, [showMoldHalfClassification, showCsgResult, showPartingDirections, onMoldHalfClassificationReady]);
 
   // ============================================================================
   // VOLUMETRIC GRID COMPUTATION
