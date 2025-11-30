@@ -583,141 +583,147 @@ export function computeEscapeLabelingDijkstra(
   }
   
   // ========================================================================
-  // STEP 2: Run Dijkstra FROM BOUNDARY VOXELS inward
+  // STEP 2: For EACH seed individually, find shortest path to ANY boundary
   // 
-  // Instead of flooding outward from seeds, we flood INWARD from boundaries.
-  // This way, each voxel directly knows which boundary it's closest to.
-  // 
-  // Multi-source Dijkstra:
-  // - Seed H₁ boundary voxels with label=1, cost=0
-  // - Seed H₂ boundary voxels with label=2, cost=0
-  // - Each voxel inherits the label of its nearest boundary
+  // We run a separate Dijkstra from each seed. This guarantees every
+  // seed finds ITS OWN shortest path to a boundary, without competition.
+  //
+  // This is O(seeds × voxels × log(voxels)) but ensures correctness.
   // ========================================================================
   
-  // Initialize data structures
-  const voxelCost = new Float32Array(voxelCount).fill(Infinity);
-  const voxelLabel = new Int8Array(voxelCount).fill(-1);
-  const pq = new MinHeap();
+  console.log('Finding shortest path from each seed to boundary (individual searches)...');
   
-  // Seed from boundary voxels
-  let h1Seeds = 0, h2Seeds = 0;
+  // Collect seed indices
+  const seedIndices: number[] = [];
   for (let i = 0; i < voxelCount; i++) {
-    if (boundaryLabel[i] === 1) {
-      voxelCost[i] = 0;
-      voxelLabel[i] = 1;
-      pq.push(i, 0);
-      h1Seeds++;
-    } else if (boundaryLabel[i] === 2) {
-      voxelCost[i] = 0;
-      voxelLabel[i] = 2;
-      pq.push(i, 0);
-      h2Seeds++;
+    if (innerSurfaceMask[i]) {
+      seedIndices.push(i);
     }
   }
-  console.log(`  Boundary seeds: H₁=${h1Seeds}, H₂=${h2Seeds}`);
+  console.log(`  Total seeds: ${seedIndices.length}`);
   
-  // ========================================================================
-  // STEP 3: Dijkstra flood INWARD from boundaries
-  // 
-  // Edge cost: thickness-weighted to prefer paths through thick regions
-  // ========================================================================
+  // For each seed, run Dijkstra to find closest boundary
+  const seedLabel = new Int8Array(voxelCount).fill(-1);
+  let h1Seeds = 0, h2Seeds = 0, unlabeledSeeds = 0;
   
-  console.log('Running inward Dijkstra flood from boundaries...');
+  // Reusable arrays for Dijkstra (reset for each seed)
+  const tempCost = new Float32Array(voxelCount);
   
-  let iterations = 0;
+  // Process seeds in batches for progress reporting
+  const batchSize = Math.max(100, Math.floor(seedIndices.length / 10));
+  let processedSeeds = 0;
   
-  while (pq.size > 0) {
-    const current = pq.pop()!;
-    const i = current.index;
-    const currentCost = current.cost;
+  for (const seedIdx of seedIndices) {
+    // Reset costs for this seed's search
+    tempCost.fill(Infinity);
+    tempCost[seedIdx] = 0;
     
-    // Skip if we already found a better path
-    if (currentCost > voxelCost[i]) continue;
+    const pq = new MinHeap();
+    pq.push(seedIdx, 0);
     
-    // Get current voxel's grid coordinates
-    const cell = cells[i];
-    const gi = Math.round(cell.index.x);
-    const gj = Math.round(cell.index.y);
-    const gk = Math.round(cell.index.z);
+    let foundBoundary = -1;
     
-    const di_current = voxelDist[i];  // Current voxel's distance to part
-    
-    // Visit all neighbors
-    for (let n = 0; n < neighborOffsets.length; n++) {
-      const [di, dj, dk] = neighborOffsets[n];
-      const ni = gi + di;
-      const nj = gj + dj;
-      const nk = gk + dk;
+    // Dijkstra from this single seed until we hit a boundary
+    while (pq.size > 0 && foundBoundary === -1) {
+      const current = pq.pop()!;
+      const i = current.index;
+      const currentCost = current.cost;
       
-      // Find neighbor voxel index
-      const j = getVoxelIndex(ni, nj, nk, spatialIndex);
-      if (j < 0) continue; // Not a silicone voxel
+      if (currentCost > tempCost[i]) continue;
       
-      const dj_neighbor = voxelDist[j];
-      const L = neighborDistances[n];
-      
-      // Edge cost: thickness-weighted
-      // Lower cost in thick regions (high voxelDist) 
-      // Higher cost in thin regions (low voxelDist)
-      const d_mid = 0.5 * (di_current + dj_neighbor);
-      const edgeCost = L / (d_mid * d_mid + eps);
-      
-      // Candidate cost to reach j through i
-      const candidateCost = voxelCost[i] + edgeCost;
-      
-      // If this is a better path, update
-      if (candidateCost < voxelCost[j]) {
-        voxelCost[j] = candidateCost;
-        voxelLabel[j] = voxelLabel[i];  // Inherit label from source
-        pq.decreaseKey(j, candidateCost);
+      // Check if we've reached a boundary - STOP here, this is our answer
+      if (boundaryLabel[i] !== 0) {
+        foundBoundary = boundaryLabel[i];
+        break;
       }
-    }
-    
-    iterations++;
-  }
-  
-  console.log(`  Dijkstra iterations: ${iterations}`);
-  
-  // ========================================================================
-  // STEP 4: Handle any voxels that weren't reached by Dijkstra
-  // ========================================================================
-  
-  // Handle any remaining unlabeled voxels (disconnected regions)
-  let stillUnlabeled = 0;
-  for (let i = 0; i < voxelCount; i++) {
-    if (voxelLabel[i] === -1) {
-      stillUnlabeled++;
       
-      // Find nearest labeled neighbor
+      // Get current voxel's grid coordinates
       const cell = cells[i];
       const gi = Math.round(cell.index.x);
       const gj = Math.round(cell.index.y);
       const gk = Math.round(cell.index.z);
       
-      let bestLabel = -1;
-      let bestCost = Infinity;
+      const di_current = voxelDist[i];
       
-      for (const [di, dj, dk] of neighborOffsets) {
+      // Expand to neighbors
+      for (let n = 0; n < neighborOffsets.length; n++) {
+        const [di, dj, dk] = neighborOffsets[n];
         const j = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
-        if (j >= 0 && voxelLabel[j] !== -1 && voxelCost[j] < bestCost) {
-          bestCost = voxelCost[j];
-          bestLabel = voxelLabel[j];
+        if (j < 0) continue;
+        
+        const dj_neighbor = voxelDist[j];
+        const L = neighborDistances[n];
+        const d_mid = 0.5 * (di_current + dj_neighbor);
+        const edgeCost = L / (d_mid * d_mid + eps);
+        
+        const candidateCost = tempCost[i] + edgeCost;
+        
+        if (candidateCost < tempCost[j]) {
+          tempCost[j] = candidateCost;
+          pq.decreaseKey(j, candidateCost);
         }
       }
-      
-      if (bestLabel !== -1) {
-        voxelLabel[i] = bestLabel;
-      }
+    }
+    
+    // Label this seed
+    seedLabel[seedIdx] = foundBoundary;
+    
+    if (foundBoundary === 1) h1Seeds++;
+    else if (foundBoundary === 2) h2Seeds++;
+    else unlabeledSeeds++;
+    
+    processedSeeds++;
+    if (processedSeeds % batchSize === 0) {
+      console.log(`  Processed ${processedSeeds}/${seedIndices.length} seeds...`);
     }
   }
   
-  if (stillUnlabeled > 0) {
-    console.log(`  Unreached voxels: ${stillUnlabeled} (fixed via neighbor lookup)`);
+  console.log(`  Seeds labeled: H₁=${h1Seeds}, H₂=${h2Seeds}, unlabeled=${unlabeledSeeds}`);
+  
+  // ========================================================================
+  // STEP 3: Build final label array
+  // ========================================================================
+  // ========================================================================
+  
+  const voxelLabel = new Int8Array(voxelCount).fill(-1);
+  
+  // Label seeds
+  for (let i = 0; i < voxelCount; i++) {
+    if (innerSurfaceMask[i]) {
+      voxelLabel[i] = seedLabel[i];
+    }
   }
+  
+  // Also label boundary voxels for visualization
+  for (let i = 0; i < voxelCount; i++) {
+    if (boundaryLabel[i] !== 0) {
+      voxelLabel[i] = boundaryLabel[i];
+    }
+  }
+  
+  // ========================================================================
+  // STEP 5: Interior voxels remain unlabeled (we only care about seeds)
+  // ========================================================================
+  
+  // Note: We intentionally leave interior voxels unlabeled (-1).
+  // Only seeds and boundary voxels have labels assigned.
+  // The visualization will only show seed voxels anyway.
+  
+  // Count how many interior voxels there are (for logging)
+  let interiorCount = 0;
+  for (let i = 0; i < voxelCount; i++) {
+    if (voxelLabel[i] === -1) {
+      interiorCount++;
+    }
+  }
+  console.log(`  Interior voxels (intentionally unlabeled): ${interiorCount}`);
   
   // ========================================================================
   // COUNT RESULTS
   // ========================================================================
+  
+  // Create a simple escape cost array (not used for algorithm, just for API)
+  const escapeCost = new Float32Array(voxelCount).fill(0);
   
   let d1Count = 0;
   let d2Count = 0;
@@ -752,9 +758,101 @@ export function computeEscapeLabelingDijkstra(
   console.log(`  Boundary H₂: ${boundaryH2}`);
   console.log(`  Not boundary: ${boundaryNone}`);
   
+  // DEBUG: Analyze seed label neighbor consistency (detect mixing/orphans)
+  let consistentSeeds = 0;
+  let mixedSeeds = 0;
+  let isolatedSeeds = 0;
+  const mixedExamples: string[] = [];
+  
+  for (let i = 0; i < voxelCount; i++) {
+    if (!innerSurfaceMask[i]) continue;
+    
+    const myLabel = seedLabel[i];
+    if (myLabel === -1) continue;
+    
+    const cell = cells[i];
+    const gi = Math.round(cell.index.x);
+    const gj = Math.round(cell.index.y);
+    const gk = Math.round(cell.index.z);
+    
+    let sameCount = 0;
+    let diffCount = 0;
+    let neighborLabels: number[] = [];
+    
+    for (const [di, dj, dk] of neighborOffsets) {
+      const j = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
+      if (j >= 0 && innerSurfaceMask[j] && seedLabel[j] !== -1) {
+        neighborLabels.push(seedLabel[j]);
+        if (seedLabel[j] === myLabel) sameCount++;
+        else diffCount++;
+      }
+    }
+    
+    if (neighborLabels.length === 0) {
+      isolatedSeeds++;
+    } else if (diffCount === 0) {
+      consistentSeeds++;
+    } else {
+      mixedSeeds++;
+      if (mixedExamples.length < 5) {
+        mixedExamples.push(`Seed ${i}: label=${myLabel}, neighbors=[${neighborLabels.join(',')}]`);
+      }
+    }
+  }
+  
+  console.log('DEBUG - Seed neighbor consistency:');
+  console.log(`  Consistent (all neighbors same label): ${consistentSeeds}`);
+  console.log(`  Mixed (has neighbors with different label): ${mixedSeeds}`);
+  console.log(`  Isolated (no seed neighbors): ${isolatedSeeds}`);
+  if (mixedExamples.length > 0) {
+    console.log('  Examples of mixed seeds:');
+    mixedExamples.forEach(ex => console.log(`    ${ex}`));
+  }
+  
+  // DEBUG: Analyze boundary voxel neighbor consistency
+  let consistentBoundary = 0;
+  let mixedBoundary = 0;
+  let isolatedBoundary = 0;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    if (boundaryLabel[i] === 0) continue;
+    
+    const myLabel = boundaryLabel[i];
+    const cell = cells[i];
+    const gi = Math.round(cell.index.x);
+    const gj = Math.round(cell.index.y);
+    const gk = Math.round(cell.index.z);
+    
+    let sameCount = 0;
+    let diffCount = 0;
+    let neighborCount = 0;
+    
+    for (const [di, dj, dk] of neighborOffsets) {
+      const j = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
+      if (j >= 0 && boundaryLabel[j] !== 0) {
+        neighborCount++;
+        if (boundaryLabel[j] === myLabel) sameCount++;
+        else diffCount++;
+      }
+    }
+    
+    if (neighborCount === 0) {
+      isolatedBoundary++;
+    } else if (diffCount === 0) {
+      consistentBoundary++;
+    } else {
+      mixedBoundary++;
+    }
+  }
+  
+  console.log('DEBUG - Boundary voxel neighbor consistency:');
+  console.log(`  Consistent: ${consistentBoundary}`);
+  console.log(`  At H₁/H₂ interface: ${mixedBoundary}`);
+  console.log(`  Isolated: ${isolatedBoundary}`);
+  
   return {
     labels: voxelLabel,
-    escapeCost: voxelCost,
+    escapeCost,
     d1Count,
     d2Count,
     interfaceCount: 0,
@@ -882,78 +980,146 @@ export function createEscapeLabelingPointCloud(
 }
 
 /**
- * Create a point cloud showing boundary voxels and seed voxels
- * This is useful for debugging the escape labeling algorithm.
+ * Create a point cloud showing seed voxels (inner surface near part).
+ * 
+ * When showLabeled=false (default): Shows boundary voxels colored by H₁/H₂, 
+ * and seed voxels in cyan (original behavior).
+ * 
+ * When showLabeled=true: Shows ONLY seed voxels colored by their escape labels
+ * (which boundary they reach via shortest path).
  * 
  * Colors:
- * - Bright Green: Boundary voxels adjacent to H₁ (outer surface)
- * - Bright Orange: Boundary voxels adjacent to H₂ (outer surface)
- * - Cyan: Seed voxels (inner surface near part mesh)
+ * - Bright Green: H₁ (boundary or seed escaping to H₁)
+ * - Bright Orange: H₂ (boundary or seed escaping to H₂)
+ * - Cyan: Seeds (only when showLabeled=false)
+ * - Gray: Unlabeled seeds (only when showLabeled=true)
  */
 export function createPartingSurfaceInterfaceCloud(
   gridResult: VolumetricGridResult,
   labeling: EscapeLabelingResult,
   _adjacency: AdjacencyType = 6,
-  pointSize: number = 4
+  pointSize: number = 4,
+  showLabeled: boolean = false
 ): THREE.Points {
   const voxelCount = gridResult.moldVolumeCellCount;
   const cells = gridResult.moldVolumeCells;
-  const boundaryLabels = labeling.boundaryLabels;
   const seedMask = labeling.seedMask;
+  const boundaryLabels = labeling.boundaryLabels;
+  const labels = labeling.labels;
   
-  // Count how many voxels we'll show
-  let count = 0;
-  for (let i = 0; i < voxelCount; i++) {
-    if (boundaryLabels && boundaryLabels[i] !== 0) count++;
-    else if (seedMask && seedMask[i]) count++;
-  }
-  
-  const positions = new Float32Array(count * 3);
-  const colors = new Float32Array(count * 3);
-  
-  const colorH1 = new THREE.Color(0x00ff00);    // Green for H₁ boundary
-  const colorH2 = new THREE.Color(0xff6600);    // Orange for H₂ boundary
-  const colorSeed = new THREE.Color(0x00ffff);  // Cyan for seeds
-  
-  let idx = 0;
-  for (let i = 0; i < voxelCount; i++) {
-    let color: THREE.Color | null = null;
-    
-    if (boundaryLabels && boundaryLabels[i] === 1) {
-      color = colorH1;
-    } else if (boundaryLabels && boundaryLabels[i] === 2) {
-      color = colorH2;
-    } else if (seedMask && seedMask[i]) {
-      color = colorSeed;
+  if (showLabeled) {
+    // Show ONLY seed voxels, colored by their escape labels
+    let count = 0;
+    for (let i = 0; i < voxelCount; i++) {
+      if (seedMask && seedMask[i]) count++;
     }
     
-    if (color) {
-      const cell = cells[i];
-      positions[idx * 3] = cell.center.x;
-      positions[idx * 3 + 1] = cell.center.y;
-      positions[idx * 3 + 2] = cell.center.z;
-      colors[idx * 3] = color.r;
-      colors[idx * 3 + 1] = color.g;
-      colors[idx * 3 + 2] = color.b;
-      idx++;
+    const positions = new Float32Array(count * 3);
+    const colors = new Float32Array(count * 3);
+    
+    const colorH1 = new THREE.Color(0x00ff00);       // Green for H₁
+    const colorH2 = new THREE.Color(0xff6600);       // Orange for H₂
+    const colorUnlabeled = new THREE.Color(0x888888); // Gray for unlabeled
+    
+    let idx = 0;
+    let h1Count = 0, h2Count = 0, unlabeledCount = 0;
+    
+    for (let i = 0; i < voxelCount; i++) {
+      if (seedMask && seedMask[i]) {
+        const cell = cells[i];
+        positions[idx * 3] = cell.center.x;
+        positions[idx * 3 + 1] = cell.center.y;
+        positions[idx * 3 + 2] = cell.center.z;
+        
+        let color: THREE.Color;
+        if (labels[i] === 1) {
+          color = colorH1;
+          h1Count++;
+        } else if (labels[i] === 2) {
+          color = colorH2;
+          h2Count++;
+        } else {
+          color = colorUnlabeled;
+          unlabeledCount++;
+        }
+        
+        colors[idx * 3] = color.r;
+        colors[idx * 3 + 1] = color.g;
+        colors[idx * 3 + 2] = color.b;
+        idx++;
+      }
     }
+    
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    
+    const material = new THREE.PointsMaterial({
+      size: pointSize,
+      sizeAttenuation: true,
+      transparent: true,
+      opacity: 0.9,
+      vertexColors: true,
+    });
+    
+    console.log(`Labeled seed cloud: ${count} voxels (H₁: ${h1Count}, H₂: ${h2Count}, unlabeled: ${unlabeledCount})`);
+    
+    return new THREE.Points(geometry, material);
+  } else {
+    // Original behavior: boundary voxels + cyan seeds
+    let count = 0;
+    for (let i = 0; i < voxelCount; i++) {
+      if (boundaryLabels && boundaryLabels[i] !== 0) count++;
+      else if (seedMask && seedMask[i]) count++;
+    }
+    
+    const positions = new Float32Array(count * 3);
+    const colors = new Float32Array(count * 3);
+    
+    const colorH1 = new THREE.Color(0x00ff00);    // Green for H₁ boundary
+    const colorH2 = new THREE.Color(0xff6600);    // Orange for H₂ boundary
+    const colorSeed = new THREE.Color(0x00ffff);  // Cyan for seeds
+    
+    let idx = 0;
+    for (let i = 0; i < voxelCount; i++) {
+      let color: THREE.Color | null = null;
+      
+      if (boundaryLabels && boundaryLabels[i] === 1) {
+        color = colorH1;
+      } else if (boundaryLabels && boundaryLabels[i] === 2) {
+        color = colorH2;
+      } else if (seedMask && seedMask[i]) {
+        color = colorSeed;
+      }
+      
+      if (color) {
+        const cell = cells[i];
+        positions[idx * 3] = cell.center.x;
+        positions[idx * 3 + 1] = cell.center.y;
+        positions[idx * 3 + 2] = cell.center.z;
+        colors[idx * 3] = color.r;
+        colors[idx * 3 + 1] = color.g;
+        colors[idx * 3 + 2] = color.b;
+        idx++;
+      }
+    }
+    
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    
+    const material = new THREE.PointsMaterial({
+      size: pointSize,
+      sizeAttenuation: true,
+      transparent: true,
+      opacity: 0.9,
+      vertexColors: true,
+    });
+    
+    console.log(`Boundary/Seed cloud: ${count} voxels`);
+    
+    return new THREE.Points(geometry, material);
   }
-  
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  
-  const material = new THREE.PointsMaterial({
-    size: pointSize,
-    sizeAttenuation: true,
-    transparent: true,
-    opacity: 0.9,
-    vertexColors: true,
-  });
-  
-  console.log(`Boundary/Seed cloud: ${count} voxels (H₁: boundary, H₂: boundary, Cyan: seeds)`);
-  
-  return new THREE.Points(geometry, material);
 }
 
 /**
@@ -1098,6 +1264,207 @@ export function createBoundaryOnlyPointCloud(
     positions[i * 3 + 2] = cell.center.z;
     
     const color = boundaryLabels[voxelIdx] === 1 ? colorH1 : colorH2;
+    colors[i * 3] = color.r;
+    colors[i * 3 + 1] = color.g;
+    colors[i * 3 + 2] = color.b;
+  }
+  
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  
+  const material = new THREE.PointsMaterial({
+    size: pointSize,
+    sizeAttenuation: true,
+    transparent: true,
+    opacity: 1.0,
+    vertexColors: true,
+  });
+  
+  return new THREE.Points(geometry, material);
+}
+
+// ============================================================================
+// DEBUG VISUALIZATION FUNCTIONS
+// ============================================================================
+
+export type PartingSurfaceDebugMode = 'none' | 'surface-detection' | 'boundary-labels' | 'seed-labels' | 'seed-labels-only';
+
+/**
+ * Create debug visualization based on the selected mode.
+ * 
+ * Modes:
+ * - 'surface-detection': Shows inner surface (cyan) vs outer surface (yellow)
+ *   Only shows surface voxels, not bulk volume.
+ * - 'boundary-labels': Shows outer surface with H₁ (green) vs H₂ (orange) labels
+ * - 'seed-labels': Shows inner surface (seeds) with their Dijkstra-assigned labels
+ */
+export function createDebugVisualization(
+  gridResult: VolumetricGridResult,
+  labeling: EscapeLabelingResult,
+  mode: PartingSurfaceDebugMode,
+  pointSize: number = 6
+): THREE.Points | null {
+  if (mode === 'none') {
+    return null;
+  }
+  
+  const voxelCount = gridResult.moldVolumeCellCount;
+  const cells = gridResult.moldVolumeCells;
+  const seedMask = labeling.seedMask;
+  const boundaryLabels = labeling.boundaryLabels;
+  const labels = labeling.labels;
+  
+  if (!seedMask || !boundaryLabels) {
+    console.error('DEBUG: seedMask or boundaryLabels not available');
+    console.error('  seedMask:', seedMask);
+    console.error('  boundaryLabels:', boundaryLabels);
+    return null;
+  }
+  
+  // Log seed mask stats
+  let seedMaskCount = 0;
+  for (let i = 0; i < voxelCount; i++) {
+    if (seedMask[i]) seedMaskCount++;
+  }
+  console.log(`DEBUG: seedMask has ${seedMaskCount} seeds out of ${voxelCount} voxels`);
+  
+  // Colors
+  const colorInnerSurface = new THREE.Color(0x00ffff);   // Cyan - inner surface (seeds)
+  const colorOuterSurface = new THREE.Color(0xffff00);   // Yellow - outer surface (boundary)
+  const colorH1 = new THREE.Color(0x00ff00);             // Green - H₁
+  const colorH2 = new THREE.Color(0xff6600);             // Orange - H₂
+  const colorUnlabeled = new THREE.Color(0xff00ff);      // Magenta - unlabeled (error)
+  
+  // Collect voxels to display based on mode
+  const displayVoxels: { idx: number; color: THREE.Color }[] = [];
+  
+  if (mode === 'surface-detection') {
+    // Show ONLY surface voxels: inner (seeds) and outer (boundary)
+    // Inner surface = cyan, Outer surface = yellow
+    console.log('DEBUG MODE: Surface Detection (Inner=Cyan, Outer=Yellow)');
+    
+    let innerCount = 0;
+    let outerCount = 0;
+    
+    for (let i = 0; i < voxelCount; i++) {
+      if (seedMask[i]) {
+        displayVoxels.push({ idx: i, color: colorInnerSurface });
+        innerCount++;
+      } else if (boundaryLabels[i] !== 0) {
+        displayVoxels.push({ idx: i, color: colorOuterSurface });
+        outerCount++;
+      }
+      // Bulk volume voxels are NOT added
+    }
+    
+    console.log(`  Inner surface (seeds): ${innerCount}`);
+    console.log(`  Outer surface (boundary): ${outerCount}`);
+    console.log(`  Total displayed: ${displayVoxels.length} / ${voxelCount}`);
+    
+  } else if (mode === 'boundary-labels') {
+    // Show outer surface (boundary) voxels with H₁/H₂ colors AND seed voxels in cyan
+    // This shows the state BEFORE Dijkstra runs
+    console.log('DEBUG MODE: Boundary Labels + Seeds (H₁=Green, H₂=Orange, Seeds=Cyan)');
+    
+    let h1Count = 0;
+    let h2Count = 0;
+    let seedCount = 0;
+    
+    for (let i = 0; i < voxelCount; i++) {
+      if (boundaryLabels[i] === 1) {
+        displayVoxels.push({ idx: i, color: colorH1 });
+        h1Count++;
+      } else if (boundaryLabels[i] === 2) {
+        displayVoxels.push({ idx: i, color: colorH2 });
+        h2Count++;
+      } else if (seedMask[i]) {
+        // Seeds shown in cyan (before they get labeled)
+        displayVoxels.push({ idx: i, color: colorInnerSurface });
+        seedCount++;
+      }
+    }
+    
+    console.log(`  H₁ boundary: ${h1Count}`);
+    console.log(`  H₂ boundary: ${h2Count}`);
+    console.log(`  Seeds (unlabeled): ${seedCount}`);
+    console.log(`  Total displayed: ${displayVoxels.length}`);
+    
+  } else if (mode === 'seed-labels') {
+    // Show ALL voxels with their Dijkstra-assigned labels
+    console.log('DEBUG MODE: All Voxel Labels (H₁=Green, H₂=Orange, Unlabeled=Magenta)');
+    
+    let h1Count = 0;
+    let h2Count = 0;
+    let unlabeledCount = 0;
+    
+    for (let i = 0; i < voxelCount; i++) {
+      const label = labels[i];
+      if (label === 1) {
+        displayVoxels.push({ idx: i, color: colorH1 });
+        h1Count++;
+      } else if (label === 2) {
+        displayVoxels.push({ idx: i, color: colorH2 });
+        h2Count++;
+      } else {
+        displayVoxels.push({ idx: i, color: colorUnlabeled });
+        unlabeledCount++;
+      }
+    }
+    
+    console.log(`  H₁ voxels: ${h1Count}`);
+    console.log(`  H₂ voxels: ${h2Count}`);
+    console.log(`  Unlabeled: ${unlabeledCount}`);
+    console.log(`  Total displayed: ${displayVoxels.length}`);
+    
+  } else if (mode === 'seed-labels-only') {
+    // Show ONLY seed voxels with their Dijkstra-assigned labels
+    console.log('DEBUG MODE: Seed Labels Only (H₁=Green, H₂=Orange, Unlabeled=Magenta)');
+    
+    let h1Count = 0;
+    let h2Count = 0;
+    let unlabeledCount = 0;
+    
+    for (let i = 0; i < voxelCount; i++) {
+      if (seedMask[i]) {
+        const label = labels[i];
+        if (label === 1) {
+          displayVoxels.push({ idx: i, color: colorH1 });
+          h1Count++;
+        } else if (label === 2) {
+          displayVoxels.push({ idx: i, color: colorH2 });
+          h2Count++;
+        } else {
+          displayVoxels.push({ idx: i, color: colorUnlabeled });
+          unlabeledCount++;
+        }
+      }
+    }
+    
+    console.log(`  Seeds → H₁: ${h1Count}`);
+    console.log(`  Seeds → H₂: ${h2Count}`);
+    console.log(`  Seeds unlabeled: ${unlabeledCount}`);
+    console.log(`  Total displayed: ${displayVoxels.length}`);
+  }
+  
+  if (displayVoxels.length === 0) {
+    console.warn('DEBUG: No voxels to display!');
+    return null;
+  }
+  
+  // Create geometry
+  const count = displayVoxels.length;
+  const positions = new Float32Array(count * 3);
+  const colors = new Float32Array(count * 3);
+  
+  for (let i = 0; i < count; i++) {
+    const { idx, color } = displayVoxels[i];
+    const cell = cells[idx];
+    
+    positions[i * 3] = cell.center.x;
+    positions[i * 3 + 1] = cell.center.y;
+    positions[i * 3 + 2] = cell.center.z;
+    
     colors[i * 3] = color.r;
     colors[i * 3 + 1] = color.g;
     colors[i * 3 + 2] = color.b;

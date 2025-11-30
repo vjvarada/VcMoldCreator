@@ -39,9 +39,11 @@ import {
   createMoldVolumePointCloud,
   createMoldVolumeVoxels,
   createGridBoundingBoxHelper,
+  createRLineVisualization,
   removeGridVisualization,
   type VolumetricGridResult,
-  type VolumetricGridOptions
+  type VolumetricGridOptions,
+  type DistanceFieldType
 } from '../utils/volumetricGrid';
 import {
   classifyMoldHalves,
@@ -53,10 +55,10 @@ import {
   computeEscapeLabeling,
   computeEscapeLabelingDijkstra,
   createEscapeLabelingPointCloud,
-  createPartingSurfaceInterfaceCloud,
-  createBoundaryDebugPointCloud,
+  createDebugVisualization,
   type EscapeLabelingResult,
-  type AdjacencyType
+  type AdjacencyType,
+  type PartingSurfaceDebugMode
 } from '../utils/partingSurface';
 
 // ============================================================================
@@ -82,20 +84,24 @@ interface ThreeViewerProps {
   showVolumetricGrid?: boolean;
   /** Hide the volumetric grid visualization (without recomputing) */
   hideVoxelGrid?: boolean;
+  /** Show R line visualization (max distance from voxel to part) */
+  showRLine?: boolean;
   /** Grid resolution (cells per dimension) */
   gridResolution?: number;
   /** Grid visualization mode: 'points', 'voxels', or 'none' */
   gridVisualizationMode?: GridVisualizationMode;
   /** Use GPU acceleration for grid generation (WebGPU if available) */
   useGPUGrid?: boolean;
+  /** Which distance field to use for voxel coloring: 'part' (distance to part) or 'biased' (biased distance) */
+  distanceFieldType?: DistanceFieldType;
   /** Show mold half classification (H₁/H₂ coloring on cavity) */
   showMoldHalfClassification?: boolean;
   /** Show parting surface escape labeling */
   showPartingSurface?: boolean;
   /** Adjacency type for parting surface computation (6 or 26) */
   partingSurfaceAdjacency?: AdjacencyType;
-  /** Show only the parting surface interface (boundary between H1 and H2) */
-  showPartingSurfaceInterface?: boolean;
+  /** Debug visualization mode for parting surface */
+  partingSurfaceDebugMode?: 'none' | 'surface-detection' | 'boundary-labels' | 'seed-labels';
   onMeshLoaded?: (mesh: THREE.Mesh) => void;
   onMeshRepaired?: (result: MeshRepairResult) => void;
   onVisibilityDataReady?: (data: VisibilityPaintData | null) => void;
@@ -132,13 +138,15 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   hideCavity = false,
   showVolumetricGrid = false,
   hideVoxelGrid = false,
+  showRLine = true,
   gridResolution = 64,
   gridVisualizationMode = 'points',
   useGPUGrid = true,
+  distanceFieldType = 'part',
   showMoldHalfClassification = false,
   showPartingSurface = false,
   partingSurfaceAdjacency = 6,
-  showPartingSurfaceInterface = false,
+  partingSurfaceDebugMode = 'none',
   onMeshLoaded,
   onMeshRepaired,
   onVisibilityDataReady,
@@ -164,6 +172,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const volumetricGridRef = useRef<VolumetricGridResult | null>(null);
   const gridVisualizationRef = useRef<THREE.Points | THREE.InstancedMesh | null>(null);
   const gridBoundingBoxRef = useRef<THREE.LineSegments | null>(null);
+  const rLineVisualizationRef = useRef<THREE.Group | null>(null);
   const escapeLabelingRef = useRef<EscapeLabelingResult | null>(null);
   const escapeLabelingVisualizationRef = useRef<THREE.Points | null>(null);
 
@@ -517,6 +526,21 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       removeGridVisualization(scene, gridBoundingBoxRef.current);
       gridBoundingBoxRef.current = null;
     }
+    // Clean up R line visualization
+    if (rLineVisualizationRef.current) {
+      scene.remove(rLineVisualizationRef.current);
+      rLineVisualizationRef.current.traverse((obj) => {
+        if (obj instanceof THREE.Mesh || obj instanceof THREE.Line) {
+          obj.geometry?.dispose();
+          if (Array.isArray(obj.material)) {
+            obj.material.forEach(m => m.dispose());
+          } else {
+            obj.material?.dispose();
+          }
+        }
+      });
+      rLineVisualizationRef.current = null;
+    }
     volumetricGridRef.current = null;
     onVolumetricGridReady?.(null);
 
@@ -567,9 +591,9 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
           // Create initial visualization based on mode
           if (gridVisualizationMode !== 'none' && gridResult.moldVolumeCellCount > 0) {
             if (gridVisualizationMode === 'points') {
-              gridVisualizationRef.current = createMoldVolumePointCloud(gridResult, 0x00ffff, 3);
+              gridVisualizationRef.current = createMoldVolumePointCloud(gridResult, 0x00ffff, 3, distanceFieldType);
             } else if (gridVisualizationMode === 'voxels') {
-              gridVisualizationRef.current = createMoldVolumeVoxels(gridResult, 0x00ffff, 0.2);
+              gridVisualizationRef.current = createMoldVolumeVoxels(gridResult, 0x00ffff, 0.2, distanceFieldType);
             }
             
             if (gridVisualizationRef.current) {
@@ -579,6 +603,13 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
             // Add bounding box helper
             gridBoundingBoxRef.current = createGridBoundingBoxHelper(gridResult, 0xffff00);
             scene.add(gridBoundingBoxRef.current);
+            
+            // Add R line visualization (max distance from voxel to part) - visibility controlled by showRLine
+            rLineVisualizationRef.current = createRLineVisualization(gridResult, 0xff00ff);
+            if (rLineVisualizationRef.current) {
+              rLineVisualizationRef.current.visible = showRLine;
+              scene.add(rLineVisualizationRef.current);
+            }
           }
           
           // Clean up temporary geometries
@@ -590,7 +621,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
         }
       })();
     }
-  }, [showVolumetricGrid, gridResolution, useGPUGrid, onVolumetricGridReady]);
+  }, [showVolumetricGrid, gridResolution, useGPUGrid, showRLine, onVolumetricGridReady]);
 
   // ============================================================================
   // VOLUMETRIC GRID VISUALIZATION MODE UPDATE
@@ -615,9 +646,9 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
     // Recreate visualization with new mode
     if (gridVisualizationMode !== 'none' && gridResult.moldVolumeCellCount > 0) {
       if (gridVisualizationMode === 'points') {
-        gridVisualizationRef.current = createMoldVolumePointCloud(gridResult, 0x00ffff, 3);
+        gridVisualizationRef.current = createMoldVolumePointCloud(gridResult, 0x00ffff, 3, distanceFieldType);
       } else if (gridVisualizationMode === 'voxels') {
-        gridVisualizationRef.current = createMoldVolumeVoxels(gridResult, 0x00ffff, 0.2);
+        gridVisualizationRef.current = createMoldVolumeVoxels(gridResult, 0x00ffff, 0.2, distanceFieldType);
       }
       
       if (gridVisualizationRef.current) {
@@ -628,7 +659,17 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       gridBoundingBoxRef.current = createGridBoundingBoxHelper(gridResult, 0xffff00);
       scene.add(gridBoundingBoxRef.current);
     }
-  }, [gridVisualizationMode]);
+  }, [gridVisualizationMode, distanceFieldType]);
+
+  // ============================================================================
+  // R LINE VISIBILITY TOGGLE
+  // ============================================================================
+
+  useEffect(() => {
+    if (rLineVisualizationRef.current) {
+      rLineVisualizationRef.current.visible = showRLine;
+    }
+  }, [showRLine]);
 
   // ============================================================================
   // PARTING SURFACE COMPUTATION
@@ -646,80 +687,77 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       (escapeLabelingVisualizationRef.current.material as THREE.Material).dispose();
       escapeLabelingVisualizationRef.current = null;
     }
-    escapeLabelingRef.current = null;
-    onEscapeLabelingReady?.(null);
 
-    // Compute escape labeling if requested and we have the required data
+    // Only recompute labeling when showPartingSurface changes or adjacency changes
+    // Don't recompute just because debug mode or interface mode changed
     if (showPartingSurface && volumetricGridRef.current && visibilityDataRef.current && meshRef.current) {
-      try {
-        console.log('Computing escape labeling (parting surface)...');
-        
-        let labeling: EscapeLabelingResult;
-        
-        // Check if we have mold half classification and CSG result for Dijkstra-based labeling
-        if (moldHalfClassificationRef.current && csgResultRef.current) {
-          console.log('Using Dijkstra-based escape labeling with mold half classification');
+      // Check if we need to recompute or can use cached result
+      const needsRecompute = !escapeLabelingRef.current;
+      
+      if (needsRecompute) {
+        try {
+          console.log('Computing escape labeling (parting surface)...');
           
-          // Get CSG cavity geometry in world space (this is the outer shell ∂H)
-          const shellGeometry = csgResultRef.current.mesh.geometry.clone();
-          shellGeometry.applyMatrix4(csgResultRef.current.mesh.matrixWorld);
+          let labeling: EscapeLabelingResult;
           
-          // Compute escape labeling using multi-source Dijkstra
-          labeling = computeEscapeLabelingDijkstra(
-            volumetricGridRef.current,
-            shellGeometry,
-            moldHalfClassificationRef.current,
-            { adjacency: partingSurfaceAdjacency, seedRadius: 1.5 }
-          );
+          // Check if we have mold half classification and CSG result for Dijkstra-based labeling
+          if (moldHalfClassificationRef.current && csgResultRef.current) {
+            console.log('Using Dijkstra-based escape labeling with mold half classification');
+            
+            // Get CSG cavity geometry in world space (this is the outer shell ∂H)
+            const shellGeometry = csgResultRef.current.mesh.geometry.clone();
+            shellGeometry.applyMatrix4(csgResultRef.current.mesh.matrixWorld);
+            
+            // Compute escape labeling using multi-source Dijkstra
+            labeling = computeEscapeLabelingDijkstra(
+              volumetricGridRef.current,
+              shellGeometry,
+              moldHalfClassificationRef.current,
+              { adjacency: partingSurfaceAdjacency, seedRadius: 1.5 }
+            );
+            
+            shellGeometry.dispose();
+          } else {
+            console.log('Falling back to legacy escape labeling (no mold half classification)');
+            
+            // Get part geometry in world space
+            const partGeometry = meshRef.current.geometry.clone();
+            partGeometry.applyMatrix4(meshRef.current.matrixWorld);
+            
+            // Get d1/d2 directions from visibility data
+            const { d1, d2 } = visibilityDataRef.current;
+            
+            // Compute escape labeling using legacy method
+            labeling = computeEscapeLabeling(
+              volumetricGridRef.current,
+              partGeometry,
+              d1,
+              d2,
+              { adjacency: partingSurfaceAdjacency }
+            );
+            
+            partGeometry.dispose();
+          }
           
-          shellGeometry.dispose();
-        } else {
-          console.log('Falling back to legacy escape labeling (no mold half classification)');
-          
-          // Get part geometry in world space
-          const partGeometry = meshRef.current.geometry.clone();
-          partGeometry.applyMatrix4(meshRef.current.matrixWorld);
-          
-          // Get d1/d2 directions from visibility data
-          const { d1, d2 } = visibilityDataRef.current;
-          
-          // Compute escape labeling using legacy method
-          labeling = computeEscapeLabeling(
-            volumetricGridRef.current,
-            partGeometry,
-            d1,
-            d2,
-            { adjacency: partingSurfaceAdjacency }
-          );
-          
-          partGeometry.dispose();
+          escapeLabelingRef.current = labeling;
+          onEscapeLabelingReady?.(labeling);
+        } catch (error) {
+          console.error('Error computing escape labeling:', error);
         }
+      }
+      
+      // Create visualization from labeling data (cached or newly computed)
+      if (escapeLabelingRef.current && volumetricGridRef.current) {
+        const labeling = escapeLabelingRef.current;
         
-        escapeLabelingRef.current = labeling;
-        onEscapeLabelingReady?.(labeling);
-        
-        // DEBUG: Use boundary debug visualization to verify boundary labeling
-        // This shows:
-        // - Green: Boundary voxels adjacent to H₁
-        // - Orange: Boundary voxels adjacent to H₂
-        // - Blue: Seed voxels (near part mesh)
-        // - Dark gray: Everything else
-        const DEBUG_BOUNDARY_VISUALIZATION = false;  // Set to true to debug boundary detection
-        
-        // Create visualization
-        if (DEBUG_BOUNDARY_VISUALIZATION) {
-          console.log('DEBUG MODE: Showing boundary voxel labels only');
-          escapeLabelingVisualizationRef.current = createBoundaryDebugPointCloud(
+        if (partingSurfaceDebugMode !== 'none') {
+          // Debug visualization mode
+          console.log(`Using debug visualization mode: ${partingSurfaceDebugMode}`);
+          escapeLabelingVisualizationRef.current = createDebugVisualization(
             volumetricGridRef.current,
             labeling,
+            partingSurfaceDebugMode,
             6  // larger point size for visibility
-          );
-        } else if (showPartingSurfaceInterface) {
-          escapeLabelingVisualizationRef.current = createPartingSurfaceInterfaceCloud(
-            volumetricGridRef.current,
-            labeling,
-            partingSurfaceAdjacency,
-            4
           );
         } else {
           escapeLabelingVisualizationRef.current = createEscapeLabelingPointCloud(
@@ -732,22 +770,25 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
         if (escapeLabelingVisualizationRef.current) {
           scene.add(escapeLabelingVisualizationRef.current);
         }
-        
-        // Hide the regular voxel grid visualization when showing escape labeling
-        if (gridVisualizationRef.current) {
-          gridVisualizationRef.current.visible = false;
-        }
-        
-      } catch (error) {
-        console.error('Error computing escape labeling:', error);
       }
+      
+      // Hide the regular voxel grid visualization when showing escape labeling
+      if (gridVisualizationRef.current) {
+        gridVisualizationRef.current.visible = false;
+      }
+      
     } else {
+      // Clear labeling when not showing parting surface
+      if (!showPartingSurface) {
+        escapeLabelingRef.current = null;
+        onEscapeLabelingReady?.(null);
+      }
       // Show regular voxel grid if escape labeling is not shown
       if (gridVisualizationRef.current) {
         gridVisualizationRef.current.visible = !hideVoxelGrid;
       }
     }
-  }, [showPartingSurface, partingSurfaceAdjacency, showPartingSurfaceInterface, onEscapeLabelingReady, hideVoxelGrid, showMoldHalfClassification, showCsgResult]);
+  }, [showPartingSurface, partingSurfaceAdjacency, partingSurfaceDebugMode, onEscapeLabelingReady, hideVoxelGrid, showMoldHalfClassification, showCsgResult]);
 
   // ============================================================================
   // VISIBILITY PAINTING

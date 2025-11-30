@@ -11,7 +11,7 @@ import ThreeViewer, { type GridVisualizationMode } from './components/ThreeViewe
 import type { VisibilityPaintData } from './utils/partingDirection';
 import type { InflatedHullResult, ManifoldValidationResult, CsgSubtractionResult } from './utils/inflatedBoundingVolume';
 import type { MeshRepairResult, MeshDiagnostics } from './utils/meshRepairManifold';
-import type { VolumetricGridResult } from './utils/volumetricGrid';
+import type { VolumetricGridResult, DistanceFieldType } from './utils/volumetricGrid';
 import type { MoldHalfClassificationResult } from './utils/moldHalfClassification';
 import type { EscapeLabelingResult, AdjacencyType } from './utils/partingSurface';
 
@@ -86,6 +86,8 @@ function App() {
   const [volumetricGridStats, setVolumetricGridStats] = useState<VolumetricGridStats | null>(null);
   const [useGPUGrid, setUseGPUGrid] = useState(true);
   const [hideVoxelGrid, setHideVoxelGrid] = useState(false);
+  const [showRLine, setShowRLine] = useState(true);
+  const [distanceFieldType, setDistanceFieldType] = useState<DistanceFieldType>('part');
   const [showMoldHalfClassification, setShowMoldHalfClassification] = useState(false);
   const [moldHalfStats, setMoldHalfStats] = useState<{
     h1Count: number;
@@ -97,7 +99,6 @@ function App() {
     innerBoundaryCount: number;
   } | null>(null);
 
-  // Parting Surface state
   const [showPartingSurface, setShowPartingSurface] = useState(false);
   const [partingSurfaceAdjacency, setPartingSurfaceAdjacency] = useState<AdjacencyType>(6);
   const [escapeLabelingStats, setEscapeLabelingStats] = useState<{
@@ -108,7 +109,8 @@ function App() {
     h1Percentage: number;
     h2Percentage: number;
   } | null>(null);
-  const [showPartingSurfaceInterface, setShowPartingSurfaceInterface] = useState(false);
+  // Debug visualization modes: 'none' | 'surface-detection' | 'boundary-labels' | 'seed-labels' | 'seed-labels-only'
+  const [partingSurfaceDebugMode, setPartingSurfaceDebugMode] = useState<'none' | 'surface-detection' | 'boundary-labels' | 'seed-labels' | 'seed-labels-only'>('none');
 
   // Track parameters used for last computation (to detect changes)
   const [lastComputedInflationOffset, setLastComputedInflationOffset] = useState<number | null>(null);
@@ -767,14 +769,31 @@ function App() {
 
             {escapeLabelingStats && (
               <>
-                <label style={styles.checkbox}>
-                  <input
-                    type="checkbox"
-                    checked={showPartingSurfaceInterface}
-                    onChange={(e) => setShowPartingSurfaceInterface(e.target.checked)}
-                  />
-                  Show Interface Only
-                </label>
+                {/* Debug Visualization Mode */}
+                <div style={{ marginTop: '8px' }}>
+                  <label style={{ color: '#aaa', fontSize: '0.85em', display: 'block', marginBottom: '4px' }}>
+                    Debug View:
+                  </label>
+                  <select
+                    value={partingSurfaceDebugMode}
+                    onChange={(e) => setPartingSurfaceDebugMode(e.target.value as 'none' | 'surface-detection' | 'boundary-labels' | 'seed-labels' | 'seed-labels-only')}
+                    style={{
+                      width: '100%',
+                      padding: '4px 8px',
+                      backgroundColor: '#333',
+                      color: '#fff',
+                      border: '1px solid #555',
+                      borderRadius: '4px',
+                      fontSize: '0.9em',
+                    }}
+                  >
+                    <option value="none">Normal View</option>
+                    <option value="surface-detection">Step 1: Surface Detection (Inner/Outer)</option>
+                    <option value="boundary-labels">Step 2: Boundary Labels (H₁/H₂)</option>
+                    <option value="seed-labels">Step 3: Dijkstra Result (All Voxels)</option>
+                    <option value="seed-labels-only">Step 3.1: Dijkstra Result (Seeds Only)</option>
+                  </select>
+                </div>
 
                 <div style={styles.statsBox}>
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -900,6 +919,44 @@ function App() {
                 Hide Voxel Grid 🧊
               </label>
             )}
+
+            {/* R Line visibility - available after voxel is computed */}
+            {volumetricGridStats && (
+              <label style={styles.checkbox}>
+                <input
+                  type="checkbox"
+                  checked={showRLine}
+                  onChange={(e) => setShowRLine(e.target.checked)}
+                />
+                Show R Line 📏
+              </label>
+            )}
+
+            {/* Distance field type toggle - available after voxel is computed */}
+            {volumetricGridStats && (
+              <div style={{ marginTop: '8px' }}>
+                <label style={{ fontSize: '12px', color: '#aaa', display: 'block', marginBottom: '4px' }}>
+                  Distance Field Coloring:
+                </label>
+                <select
+                  value={distanceFieldType}
+                  onChange={(e) => setDistanceFieldType(e.target.value as DistanceFieldType)}
+                  style={{
+                    width: '100%',
+                    padding: '4px 8px',
+                    borderRadius: '4px',
+                    border: '1px solid #555',
+                    backgroundColor: '#2a2a2a',
+                    color: '#fff',
+                    fontSize: '12px',
+                    cursor: 'pointer'
+                  }}
+                >
+                  <option value="part">Part Distance (δᵢ)</option>
+                  <option value="biased">Biased Distance (δᵢ + λw)</option>
+                </select>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -971,13 +1028,15 @@ function App() {
           hideCavity={hideCavity}
           showVolumetricGrid={showVolumetricGrid}
           hideVoxelGrid={hideVoxelGrid}
+          showRLine={showRLine}
           gridResolution={gridResolution}
           gridVisualizationMode={gridVisualizationMode}
           useGPUGrid={useGPUGrid}
+          distanceFieldType={distanceFieldType}
           showMoldHalfClassification={showMoldHalfClassification}
           showPartingSurface={showPartingSurface}
           partingSurfaceAdjacency={partingSurfaceAdjacency}
-          showPartingSurfaceInterface={showPartingSurfaceInterface}
+          partingSurfaceDebugMode={partingSurfaceDebugMode}
           onMeshLoaded={handleMeshLoaded}
           onMeshRepaired={handleMeshRepaired}
           onVisibilityDataReady={handleVisibilityDataReady}

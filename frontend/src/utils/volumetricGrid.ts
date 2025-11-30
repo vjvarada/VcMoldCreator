@@ -59,10 +59,24 @@ export interface VolumetricGridResult {
   cellSize: THREE.Vector3;
   /** Volume statistics */
   stats: VolumetricGridStats;
-  /** Distance field: distance from each mold volume voxel center to part mesh M */
+  /** Distance field δ_i: distance from each mold volume voxel center to part mesh M */
   voxelDist: Float32Array | null;
-  /** Min/max distance values for normalization */
+  /** Distance field δ_w: distance from each mold volume voxel center to shell boundary ∂H */
+  voxelDistToShell: Float32Array | null;
+  /** Biased distance field: δ_i + λ_w where λ_w = R - δ_w */
+  biasedDist: Float32Array | null;
+  /** Min/max distance values for δ_i (part distance) */
   distanceStats: { min: number; max: number } | null;
+  /** Min/max distance values for δ_w (shell distance) */
+  shellDistanceStats: { min: number; max: number } | null;
+  /** Min/max distance values for biased distance field */
+  biasedDistanceStats: { min: number; max: number } | null;
+  /** R: Maximum distance from any voxel to part mesh M */
+  R: number;
+  /** Visualization line for R: start point (on shell boundary) */
+  rLineStart: THREE.Vector3 | null;
+  /** Visualization line for R: end point (on part mesh) */
+  rLineEnd: THREE.Vector3 | null;
 }
 
 export interface VolumetricGridStats {
@@ -377,15 +391,18 @@ export function generateVolumetricGrid(
   // DISTANCE FIELD COMPUTATION
   // For each silicone voxel node position x[i], compute d[i] = shortest distance to part surface M
   // Using BVH for efficient closest point queries
+  // R = maximum distance (the farthest voxel from the part mesh)
   // ========================================================================
   
   const voxelCount = moldVolumeCells.length;
   const voxelDist = new Float32Array(voxelCount);
   
-  // Use partTester's BVH for closest point queries
-  // The partTester already has the BVH built, we need to access it directly
+  // Track min/max and the voxel with max distance for R visualization
   let minDist = Infinity;
   let maxDist = -Infinity;
+  let maxDistVoxelIdx = -1;
+  let rLineStart: THREE.Vector3 | null = null;
+  let rLineEnd: THREE.Vector3 | null = null;
   
   const closestPoint = new THREE.Vector3();
   const target = { 
@@ -408,15 +425,94 @@ export function generateVolumetricGrid(
     
     // Track min/max for validation and normalization
     if (dist < minDist) minDist = dist;
-    if (dist > maxDist) maxDist = dist;
+    if (dist > maxDist) {
+      maxDist = dist;
+      maxDistVoxelIdx = i;
+      // Store the line endpoints for R visualization
+      rLineStart = center.clone();
+      rLineEnd = target.point.clone();
+    }
   }
   
-  // Log min/max distance values for validation
-  console.log(`Distance field computed for ${voxelCount} voxels:`);
+  // R = maximum distance from any voxel to the part mesh
+  const R = maxDist;
+  
+  // Log distance field and R values
+  console.log(`Distance field δ_i computed for ${voxelCount} voxels:`);
   console.log(`  Min distance to part: ${minDist.toFixed(6)}`);
-  console.log(`  Max distance to part: ${maxDist.toFixed(6)}`);
+  console.log(`  Max distance to part (R): ${maxDist.toFixed(6)}`);
+  
+  console.log(`═══════════════════════════════════════════════════════`);
+  console.log(`R (max voxel distance to part mesh M): ${R.toFixed(6)}`);
+  console.log(`  Voxel index with max distance: ${maxDistVoxelIdx}`);
+  if (rLineStart && rLineEnd) {
+    console.log(`  R line start (voxel): (${rLineStart.x.toFixed(4)}, ${rLineStart.y.toFixed(4)}, ${rLineStart.z.toFixed(4)})`);
+    console.log(`  R line end (part):    (${rLineEnd.x.toFixed(4)}, ${rLineEnd.y.toFixed(4)}, ${rLineEnd.z.toFixed(4)})`);
+  }
+  console.log(`═══════════════════════════════════════════════════════`);
   
   const distanceStats = { min: minDist, max: maxDist };
+  
+  // ========================================================================
+  // SHELL DISTANCE FIELD COMPUTATION (δ_w)
+  // For each voxel, compute distance to the outer shell boundary ∂H
+  // ========================================================================
+  
+  const voxelDistToShell = new Float32Array(voxelCount);
+  let minShellDist = Infinity;
+  let maxShellDist = -Infinity;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    const center = moldVolumeCells[i].center;
+    
+    // Reset target for each query
+    target.distance = Infinity;
+    
+    // Use shellTester's BVH for closest point to shell boundary
+    shellTester.closestPointToPoint(center, target);
+    
+    const dist = target.distance;
+    voxelDistToShell[i] = dist;
+    
+    if (dist < minShellDist) minShellDist = dist;
+    if (dist > maxShellDist) maxShellDist = dist;
+  }
+  
+  const shellDistanceStats = { min: minShellDist, max: maxShellDist };
+  
+  console.log(`Distance field δ_w (to shell) computed:`);
+  console.log(`  Min distance to shell: ${minShellDist.toFixed(6)}`);
+  console.log(`  Max distance to shell: ${maxShellDist.toFixed(6)}`);
+  
+  // ========================================================================
+  // BIASED DISTANCE FIELD COMPUTATION
+  // biasedDist = δ_i + λ_w where λ_w = R - δ_w
+  // This penalizes voxels far from the boundary (higher λ_w)
+  // Voxels closer to boundary have lower biased distance (act as sinks)
+  // ========================================================================
+  
+  const biasedDist = new Float32Array(voxelCount);
+  let minBiasedDist = Infinity;
+  let maxBiasedDist = -Infinity;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    const delta_i = voxelDist[i];           // Distance to part
+    const delta_w = voxelDistToShell[i];    // Distance to shell
+    const lambda_w = R - delta_w;           // Bias penalty
+    const biased = delta_i + lambda_w;      // Biased distance
+    
+    biasedDist[i] = biased;
+    
+    if (biased < minBiasedDist) minBiasedDist = biased;
+    if (biased > maxBiasedDist) maxBiasedDist = biased;
+  }
+  
+  const biasedDistanceStats = { min: minBiasedDist, max: maxBiasedDist };
+  
+  console.log(`Biased distance field (δ_i + R - δ_w) computed:`);
+  console.log(`  Min biased distance: ${minBiasedDist.toFixed(6)}`);
+  console.log(`  Max biased distance: ${maxBiasedDist.toFixed(6)}`);
+  console.log(`═══════════════════════════════════════════════════════`);
   
   // Clean up BVH resources
   shellTester.dispose();
@@ -448,7 +544,14 @@ export function generateVolumetricGrid(
     cellSize,
     stats,
     voxelDist,
+    voxelDistToShell,
+    biasedDist,
     distanceStats,
+    shellDistanceStats,
+    biasedDistanceStats,
+    R,
+    rLineStart,
+    rLineEnd,
   };
 }
 
@@ -670,6 +773,7 @@ export async function generateVolumetricGridGPU(
     // ========================================================================
     // DISTANCE FIELD COMPUTATION (CPU-based for GPU grid)
     // For each mold volume voxel, compute distance to part surface M
+    // R = maximum distance (the farthest voxel from the part mesh)
     // ========================================================================
     
     const voxelCount = moldVolumeCells.length;
@@ -677,9 +781,15 @@ export async function generateVolumetricGridGPU(
     
     // Build BVH on part geometry for distance queries
     const partTester = new MeshInsideOutsideTester(partGeom, 'part');
+    // Build BVH on shell geometry for shell distance queries
+    const shellTester = new MeshInsideOutsideTester(shellGeom, 'shell');
     
+    // Track min/max and the voxel with max distance for R visualization
     let minDist = Infinity;
     let maxDist = -Infinity;
+    let maxDistVoxelIdx = -1;
+    let rLineStart: THREE.Vector3 | null = null;
+    let rLineEnd: THREE.Vector3 | null = null;
     
     const closestPoint = new THREE.Vector3();
     const target = { 
@@ -694,18 +804,92 @@ export async function generateVolumetricGridGPU(
       partTester.closestPointToPoint(center, target);
       const dist = target.distance;
       voxelDist[i] = dist;
+      
       if (dist < minDist) minDist = dist;
-      if (dist > maxDist) maxDist = dist;
+      if (dist > maxDist) {
+        maxDist = dist;
+        maxDistVoxelIdx = i;
+        // Store the line endpoints for R visualization
+        rLineStart = center.clone();
+        rLineEnd = target.point.clone();
+      }
     }
     
-    console.log(`Distance field computed for ${voxelCount} voxels (GPU grid):`);
+    // R = maximum distance from any voxel to the part mesh
+    const R = maxDist;
+    
+    console.log(`Distance field δ_i computed for ${voxelCount} voxels (GPU grid):`);
     console.log(`  Min distance to part: ${minDist.toFixed(6)}`);
-    console.log(`  Max distance to part: ${maxDist.toFixed(6)}`);
+    console.log(`  Max distance to part (R): ${maxDist.toFixed(6)}`);
+    
+    console.log(`═══════════════════════════════════════════════════════`);
+    console.log(`R (max voxel distance to part mesh M): ${R.toFixed(6)}`);
+    console.log(`  Voxel index with max distance: ${maxDistVoxelIdx}`);
+    if (rLineStart && rLineEnd) {
+      console.log(`  R line start (voxel): (${rLineStart.x.toFixed(4)}, ${rLineStart.y.toFixed(4)}, ${rLineStart.z.toFixed(4)})`);
+      console.log(`  R line end (part):    (${rLineEnd.x.toFixed(4)}, ${rLineEnd.y.toFixed(4)}, ${rLineEnd.z.toFixed(4)})`);
+    }
+    console.log(`═══════════════════════════════════════════════════════`);
     
     const distanceStats = { min: minDist, max: maxDist };
     
+    // ========================================================================
+    // SHELL DISTANCE FIELD COMPUTATION (δ_w)
+    // For each voxel, compute distance to the outer shell boundary ∂H
+    // ========================================================================
+    
+    const voxelDistToShell = new Float32Array(voxelCount);
+    let minShellDist = Infinity;
+    let maxShellDist = -Infinity;
+    
+    for (let i = 0; i < voxelCount; i++) {
+      const center = moldVolumeCells[i].center;
+      target.distance = Infinity;
+      shellTester.closestPointToPoint(center, target);
+      const dist = target.distance;
+      voxelDistToShell[i] = dist;
+      
+      if (dist < minShellDist) minShellDist = dist;
+      if (dist > maxShellDist) maxShellDist = dist;
+    }
+    
+    const shellDistanceStats = { min: minShellDist, max: maxShellDist };
+    
+    console.log(`Distance field δ_w (to shell) computed:`);
+    console.log(`  Min distance to shell: ${minShellDist.toFixed(6)}`);
+    console.log(`  Max distance to shell: ${maxShellDist.toFixed(6)}`);
+    
+    // ========================================================================
+    // BIASED DISTANCE FIELD COMPUTATION
+    // biasedDist = δ_i + λ_w where λ_w = R - δ_w
+    // ========================================================================
+    
+    const biasedDist = new Float32Array(voxelCount);
+    let minBiasedDist = Infinity;
+    let maxBiasedDist = -Infinity;
+    
+    for (let i = 0; i < voxelCount; i++) {
+      const delta_i = voxelDist[i];
+      const delta_w = voxelDistToShell[i];
+      const lambda_w = R - delta_w;
+      const biased = delta_i + lambda_w;
+      
+      biasedDist[i] = biased;
+      
+      if (biased < minBiasedDist) minBiasedDist = biased;
+      if (biased > maxBiasedDist) maxBiasedDist = biased;
+    }
+    
+    const biasedDistanceStats = { min: minBiasedDist, max: maxBiasedDist };
+    
+    console.log(`Biased distance field (δ_i + R - δ_w) computed:`);
+    console.log(`  Min biased distance: ${minBiasedDist.toFixed(6)}`);
+    console.log(`  Max biased distance: ${maxBiasedDist.toFixed(6)}`);
+    console.log(`═══════════════════════════════════════════════════════`);
+    
     // Clean up
     partTester.dispose();
+    shellTester.dispose();
     shellGeom.dispose();
     partGeom.dispose();
     
@@ -737,7 +921,14 @@ export async function generateVolumetricGridGPU(
       cellSize,
       stats,
       voxelDist,
+      voxelDistToShell,
+      biasedDist,
       distanceStats,
+      shellDistanceStats,
+      biasedDistanceStats,
+      R,
+      rLineStart,
+      rLineEnd,
     };
     
   } catch (error) {
@@ -907,26 +1098,52 @@ function getWebGPUComputeShader(): string {
 // VISUALIZATION HELPERS
 // ============================================================================
 
+/** Type of distance field to use for visualization coloring */
+export type DistanceFieldType = 'part' | 'biased';
+
+/**
+ * Get the distance data and stats for a given field type
+ */
+function getDistanceFieldData(
+  gridResult: VolumetricGridResult,
+  fieldType: DistanceFieldType
+): { data: Float32Array | null; stats: { min: number; max: number } | null } {
+  if (fieldType === 'biased') {
+    return {
+      data: gridResult.biasedDist,
+      stats: gridResult.biasedDistanceStats
+    };
+  }
+  // Default to part distance
+  return {
+    data: gridResult.voxelDist,
+    stats: gridResult.distanceStats
+  };
+}
+
 /**
  * Create a point cloud visualization of the mold volume cells
- * Colors points based on distance to part mesh: red (close) to teal (far)
+ * Colors points based on distance field: red (close/low) to teal (far/high)
  * 
  * @param gridResult - The volumetric grid result
  * @param color - Fallback color for points if no distance data (default: cyan)
  * @param pointSize - Size of each point (default: 2)
+ * @param distanceFieldType - Which distance field to use for coloring: 'part' or 'biased' (default: 'part')
  * @returns THREE.Points object for adding to scene
  */
 export function createMoldVolumePointCloud(
   gridResult: VolumetricGridResult,
   color: THREE.ColorRepresentation = 0x00ffff,
-  pointSize: number = 2
+  pointSize: number = 2,
+  distanceFieldType: DistanceFieldType = 'part'
 ): THREE.Points {
   const cellCount = gridResult.moldVolumeCells.length;
   const positions = new Float32Array(cellCount * 3);
   const colors = new Float32Array(cellCount * 3);
   
-  // Check if we have distance data for coloring
-  const hasDistanceData = gridResult.voxelDist !== null && gridResult.distanceStats !== null;
+  // Get the appropriate distance field data
+  const { data: distData, stats: distStats } = getDistanceFieldData(gridResult, distanceFieldType);
+  const hasDistanceData = distData !== null && distStats !== null;
   
   // Color gradient: red (close to part) -> teal (far from part)
   // Red: (1, 0, 0) -> Teal: (0, 1, 1)
@@ -942,8 +1159,8 @@ export function createMoldVolumePointCloud(
     
     if (hasDistanceData) {
       // Normalize distance to [0, 1] range
-      const dist = gridResult.voxelDist![i];
-      const { min, max } = gridResult.distanceStats!;
+      const dist = distData![i];
+      const { min, max } = distStats!;
       const range = max - min;
       const t = range > 0 ? (dist - min) / range : 0;
       
@@ -984,12 +1201,14 @@ export function createMoldVolumePointCloud(
  * @param gridResult - The volumetric grid result
  * @param color - Fallback color for the boxes if no distance data (default: cyan)
  * @param opacity - Opacity of boxes (default: 0.3)
+ * @param distanceFieldType - Which distance field to use for coloring: 'part' or 'biased' (default: 'part')
  * @returns THREE.InstancedMesh for adding to scene
  */
 export function createMoldVolumeVoxels(
   gridResult: VolumetricGridResult,
   color: THREE.ColorRepresentation = 0x00ffff,
-  opacity: number = 0.3
+  opacity: number = 0.3,
+  distanceFieldType: DistanceFieldType = 'part'
 ): THREE.InstancedMesh {
   const cellCount = gridResult.moldVolumeCells.length;
   const { cellSize } = gridResult;
@@ -1007,10 +1226,11 @@ export function createMoldVolumeVoxels(
   // Create instanced mesh
   const instancedMesh = new THREE.InstancedMesh(boxGeometry, material, cellCount);
   
-  // Check if we have distance data for coloring
-  const hasDistanceData = gridResult.voxelDist !== null && gridResult.distanceStats !== null;
+  // Get the appropriate distance field data
+  const { data: distData, stats: distStats } = getDistanceFieldData(gridResult, distanceFieldType);
+  const hasDistanceData = distData !== null && distStats !== null;
   
-  // Color gradient: red (close to part) -> teal (far from part)
+  // Color gradient: red (close/low) -> teal (far/high)
   const colorClose = new THREE.Color(0xff0000); // Red
   const colorFar = new THREE.Color(0x00ffff);   // Teal (cyan)
   const fallbackColor = new THREE.Color(color);
@@ -1026,8 +1246,8 @@ export function createMoldVolumeVoxels(
     
     if (hasDistanceData) {
       // Normalize distance to [0, 1] range
-      const dist = gridResult.voxelDist![i];
-      const { min, max } = gridResult.distanceStats!;
+      const dist = distData![i];
+      const { min, max } = distStats!;
       const range = max - min;
       const t = range > 0 ? (dist - min) / range : 0;
       
@@ -1073,6 +1293,102 @@ export function createGridBoundingBoxHelper(
   wireframe.position.copy(center);
   
   return wireframe;
+}
+
+/**
+ * Create a visualization line showing R: the maximum distance from any voxel to the part mesh
+ * 
+ * This creates a thick line from the voxel with the maximum distance (rLineStart) to 
+ * the closest point on the part mesh (rLineEnd), with spheres at both endpoints for visibility.
+ * 
+ * @param gridResult - The volumetric grid result containing R and line endpoints
+ * @param lineColor - Color for the line (default: magenta)
+ * @param sphereColor - Color for the endpoint spheres (default: same as line)
+ * @returns THREE.Group containing the line and spheres, or null if R line not available
+ */
+export function createRLineVisualization(
+  gridResult: VolumetricGridResult,
+  lineColor: THREE.ColorRepresentation = 0xff00ff,
+  sphereColor?: THREE.ColorRepresentation
+): THREE.Group | null {
+  const { rLineStart, rLineEnd, R } = gridResult;
+  
+  if (!rLineStart || !rLineEnd || R <= 0) {
+    console.warn('R line visualization not available: missing endpoints or invalid R');
+    return null;
+  }
+  
+  const group = new THREE.Group();
+  group.name = 'RLineVisualization';
+  
+  // Create the line geometry
+  const lineGeometry = new THREE.BufferGeometry();
+  const positions = new Float32Array([
+    rLineStart.x, rLineStart.y, rLineStart.z,
+    rLineEnd.x, rLineEnd.y, rLineEnd.z
+  ]);
+  lineGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  
+  // Create a thick line using LineBasicMaterial
+  const lineMaterial = new THREE.LineBasicMaterial({ 
+    color: lineColor, 
+    linewidth: 3  // Note: linewidth > 1 only works on some systems
+  });
+  const line = new THREE.Line(lineGeometry, lineMaterial);
+  line.name = 'RLine';
+  group.add(line);
+  
+  // Calculate sphere size based on R (very small, subtle visualization)
+  const sphereRadius = Math.max(R * 0.0025, 0.03);
+  
+  // Create spheres at endpoints
+  const sphereGeometry = new THREE.SphereGeometry(sphereRadius, 8, 8);
+  const sphereMaterial = new THREE.MeshBasicMaterial({ 
+    color: sphereColor ?? lineColor 
+  });
+  
+  // Start sphere (voxel with max distance) - magenta
+  const startSphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+  startSphere.position.copy(rLineStart);
+  startSphere.name = 'RLineStart_Voxel';
+  group.add(startSphere);
+  
+  // End sphere (closest point on part mesh) - green
+  const endSphere = new THREE.Mesh(sphereGeometry, sphereMaterial.clone());
+  (endSphere.material as THREE.MeshBasicMaterial).color.setHex(0x00ff00); // Green for part mesh point
+  endSphere.position.copy(rLineEnd);
+  endSphere.name = 'RLineEnd_PartMesh';
+  group.add(endSphere);
+  
+  // Add a cylinder for better visibility (tube connecting the points)
+  const direction = new THREE.Vector3().subVectors(rLineEnd, rLineStart);
+  const length = direction.length();
+  direction.normalize();
+  
+  const tubeRadius = sphereRadius * 0.5;
+  const tubeGeometry = new THREE.CylinderGeometry(tubeRadius, tubeRadius, length, 6);
+  const tubeMaterial = new THREE.MeshBasicMaterial({ 
+    color: lineColor,
+    transparent: true,
+    opacity: 0.7
+  });
+  const tube = new THREE.Mesh(tubeGeometry, tubeMaterial);
+  
+  // Position and orient the tube
+  const midpoint = new THREE.Vector3().addVectors(rLineStart, rLineEnd).multiplyScalar(0.5);
+  tube.position.copy(midpoint);
+  
+  // Orient tube along the direction
+  const up = new THREE.Vector3(0, 1, 0);
+  const quaternion = new THREE.Quaternion();
+  quaternion.setFromUnitVectors(up, direction);
+  tube.setRotationFromQuaternion(quaternion);
+  tube.name = 'RLineTube';
+  group.add(tube);
+  
+  console.log(`R Line visualization created: R = ${R.toFixed(4)}`);
+  
+  return group;
 }
 
 /**
@@ -1445,6 +1761,13 @@ export async function generateVolumetricGridParallel(
     cellSize,
     stats,
     voxelDist: null,
+    voxelDistToShell: null,
+    biasedDist: null,
     distanceStats: null,
+    shellDistanceStats: null,
+    biasedDistanceStats: null,
+    R: 0, // Not computed in worker-based version
+    rLineStart: null,
+    rLineEnd: null,
   };
 }
