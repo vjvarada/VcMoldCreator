@@ -932,11 +932,11 @@ function App() {
               </label>
             )}
 
-            {/* Distance field type toggle - available after voxel is computed */}
+            {/* Voxel Grid Coloring - available after voxel is computed */}
             {volumetricGridStats && (
               <div style={{ marginTop: '8px' }}>
                 <label style={{ fontSize: '12px', color: '#aaa', display: 'block', marginBottom: '4px' }}>
-                  Distance Field Coloring:
+                  Voxel Grid Coloring:
                 </label>
                 <select
                   value={distanceFieldType}
@@ -954,6 +954,7 @@ function App() {
                 >
                   <option value="part">Part Distance (δᵢ)</option>
                   <option value="biased">Biased Distance (δᵢ + λw)</option>
+                  <option value="weight">Weighting Factor (wt)</option>
                 </select>
               </div>
             )}

@@ -65,12 +65,16 @@ export interface VolumetricGridResult {
   voxelDistToShell: Float32Array | null;
   /** Biased distance field: δ_i + λ_w where λ_w = R - δ_w */
   biasedDist: Float32Array | null;
+  /** Weighting factor: wt = 1/[(biasedDist^2) + 0.25] */
+  weightingFactor: Float32Array | null;
   /** Min/max distance values for δ_i (part distance) */
   distanceStats: { min: number; max: number } | null;
   /** Min/max distance values for δ_w (shell distance) */
   shellDistanceStats: { min: number; max: number } | null;
   /** Min/max distance values for biased distance field */
   biasedDistanceStats: { min: number; max: number } | null;
+  /** Min/max values for weighting factor */
+  weightingFactorStats: { min: number; max: number } | null;
   /** R: Maximum distance from any voxel to part mesh M */
   R: number;
   /** Visualization line for R: start point (on shell boundary) */
@@ -514,6 +518,33 @@ export function generateVolumetricGrid(
   console.log(`  Max biased distance: ${maxBiasedDist.toFixed(6)}`);
   console.log(`═══════════════════════════════════════════════════════`);
   
+  // ========================================================================
+  // WEIGHTING FACTOR COMPUTATION
+  // wt = 1/[(biasedDist^2) + 0.25]
+  // Higher weight near part (low biased distance), lower weight far from part
+  // ========================================================================
+  
+  const weightingFactor = new Float32Array(voxelCount);
+  let minWeight = Infinity;
+  let maxWeight = -Infinity;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    const bd = biasedDist[i];
+    const wt = 1.0 / (bd * bd + 0.25);
+    
+    weightingFactor[i] = wt;
+    
+    if (wt < minWeight) minWeight = wt;
+    if (wt > maxWeight) maxWeight = wt;
+  }
+  
+  const weightingFactorStats = { min: minWeight, max: maxWeight };
+  
+  console.log(`Weighting factor 1/(biasedDist² + 0.25) computed:`);
+  console.log(`  Min weight: ${minWeight.toFixed(6)}`);
+  console.log(`  Max weight: ${maxWeight.toFixed(6)}`);
+  console.log(`═══════════════════════════════════════════════════════`);
+  
   // Clean up BVH resources
   shellTester.dispose();
   partTester.dispose();
@@ -546,9 +577,11 @@ export function generateVolumetricGrid(
     voxelDist,
     voxelDistToShell,
     biasedDist,
+    weightingFactor,
     distanceStats,
     shellDistanceStats,
     biasedDistanceStats,
+    weightingFactorStats,
     R,
     rLineStart,
     rLineEnd,
@@ -887,6 +920,32 @@ export async function generateVolumetricGridGPU(
     console.log(`  Max biased distance: ${maxBiasedDist.toFixed(6)}`);
     console.log(`═══════════════════════════════════════════════════════`);
     
+    // ========================================================================
+    // WEIGHTING FACTOR COMPUTATION
+    // wt = 1/[(biasedDist^2) + 0.25]
+    // ========================================================================
+    
+    const weightingFactor = new Float32Array(voxelCount);
+    let minWeight = Infinity;
+    let maxWeight = -Infinity;
+    
+    for (let i = 0; i < voxelCount; i++) {
+      const bd = biasedDist[i];
+      const wt = 1.0 / (bd * bd + 0.25);
+      
+      weightingFactor[i] = wt;
+      
+      if (wt < minWeight) minWeight = wt;
+      if (wt > maxWeight) maxWeight = wt;
+    }
+    
+    const weightingFactorStats = { min: minWeight, max: maxWeight };
+    
+    console.log(`Weighting factor 1/(biasedDist² + 0.25) computed:`);
+    console.log(`  Min weight: ${minWeight.toFixed(6)}`);
+    console.log(`  Max weight: ${maxWeight.toFixed(6)}`);
+    console.log(`═══════════════════════════════════════════════════════`);
+    
     // Clean up
     partTester.dispose();
     shellTester.dispose();
@@ -923,9 +982,11 @@ export async function generateVolumetricGridGPU(
       voxelDist,
       voxelDistToShell,
       biasedDist,
+      weightingFactor,
       distanceStats,
       shellDistanceStats,
       biasedDistanceStats,
+      weightingFactorStats,
       R,
       rLineStart,
       rLineEnd,
@@ -1098,8 +1159,8 @@ function getWebGPUComputeShader(): string {
 // VISUALIZATION HELPERS
 // ============================================================================
 
-/** Type of distance field to use for visualization coloring */
-export type DistanceFieldType = 'part' | 'biased';
+/** Type of field to use for visualization coloring */
+export type DistanceFieldType = 'part' | 'biased' | 'weight';
 
 /**
  * Get the distance data and stats for a given field type
@@ -1112,6 +1173,12 @@ function getDistanceFieldData(
     return {
       data: gridResult.biasedDist,
       stats: gridResult.biasedDistanceStats
+    };
+  }
+  if (fieldType === 'weight') {
+    return {
+      data: gridResult.weightingFactor,
+      stats: gridResult.weightingFactorStats
     };
   }
   // Default to part distance
@@ -1763,9 +1830,11 @@ export async function generateVolumetricGridParallel(
     voxelDist: null,
     voxelDistToShell: null,
     biasedDist: null,
+    weightingFactor: null,
     distanceStats: null,
     shellDistanceStats: null,
     biasedDistanceStats: null,
+    weightingFactorStats: null,
     R: 0, // Not computed in worker-based version
     rLineStart: null,
     rLineEnd: null,
