@@ -7,6 +7,12 @@
  * 3. Inflate hull vertices outward by offset distance
  * 4. Create mesh from inflated vertices + hull faces
  * 5. Optionally subtract base mesh via CSG for mold cavity
+ * 
+ * Alternative: High-resolution offset surface generation:
+ * 1. Move all vertices outward along smooth normals
+ * 2. Add cylindrical fillet segments at convex edges
+ * 3. Add spherical cap segments at convex corners
+ * 4. Take convex hull of all points to ensure valid geometry
  */
 
 import * as THREE from 'three';
@@ -482,6 +488,331 @@ export function generateInflatedBoundingVolume(
     smoothNormals: smoothNormalsArray,
     vertexCount: finalVertices.length,
     faceCount,
+    manifoldValidation,
+    csgResult: null,
+  };
+}
+
+/**
+ * Generate a HIGH-RESOLUTION offset surface using Minkowski-sum-like approach.
+ * 
+ * Algorithm:
+ * 1. Move all original mesh vertices outward along their smooth normals
+ * 2. For each convex edge (where face normals diverge), generate cylindrical fillet points
+ * 3. For each convex corner (where multiple edges meet), generate spherical cap points
+ * 4. Take convex hull of all generated points
+ * 
+ * This produces a much smoother, higher-fidelity offset surface compared to simple
+ * vertex inflation, especially at sharp edges and corners.
+ * 
+ * @param mesh - The input mesh to create offset surface from
+ * @param offset - The offset distance
+ * @param edgeSubdivisions - Number of points along each cylindrical edge fillet
+ * @param cornerSubdivisions - Number of latitude bands for spherical corner caps
+ */
+export async function generateHighResolutionOffsetSurface(
+  mesh: THREE.Mesh,
+  offset: number = 5,
+  edgeSubdivisions: number = 8,
+  cornerSubdivisions: number = 4
+): Promise<InflatedHullResult> {
+  console.log('[HighResOffset] Starting high-resolution offset surface generation...');
+  
+  // Clone and transform geometry to world coordinates
+  const worldGeometry = mesh.geometry.clone();
+  worldGeometry.applyMatrix4(mesh.matrixWorld);
+  
+  // Ensure we have computed vertex normals
+  worldGeometry.computeVertexNormals();
+  
+  const positions = worldGeometry.getAttribute('position') as THREE.BufferAttribute;
+  const normals = worldGeometry.getAttribute('normal') as THREE.BufferAttribute;
+  const indices = worldGeometry.getIndex();
+  
+  if (!indices) {
+    throw new Error('Geometry must be indexed');
+  }
+  
+  // Build data structures
+  const vertexMap = new Map<string, number>(); // position key -> unique vertex index
+  const uniqueVertices: THREE.Vector3[] = [];
+  const vertexNormals: THREE.Vector3[] = []; // accumulated normals for each unique vertex
+  const vertexToFaces: Map<number, Set<number>> = new Map(); // vertex index -> face indices
+  const faceNormals: THREE.Vector3[] = []; // normal for each face
+  const faceVertices: number[][] = []; // vertex indices for each face
+  
+  // Build edge map: edge key -> {faceIndices, vertices}
+  const edgeMap = new Map<string, {faces: number[], v1: number, v2: number}>();
+  
+  const eps = 1e-6;
+  const getVertexKey = (v: THREE.Vector3) => 
+    `${Math.round(v.x / eps) * eps},${Math.round(v.y / eps) * eps},${Math.round(v.z / eps) * eps}`;
+  
+  const getEdgeKey = (i1: number, i2: number) => 
+    i1 < i2 ? `${i1}-${i2}` : `${i2}-${i1}`;
+  
+  // Pass 1: Build unique vertices and face data
+  const indexArray = indices.array;
+  const numFaces = indexArray.length / 3;
+  
+  for (let f = 0; f < numFaces; f++) {
+    const i0 = indexArray[f * 3];
+    const i1 = indexArray[f * 3 + 1];
+    const i2 = indexArray[f * 3 + 2];
+    
+    const v0 = new THREE.Vector3(positions.getX(i0), positions.getY(i0), positions.getZ(i0));
+    const v1 = new THREE.Vector3(positions.getX(i1), positions.getY(i1), positions.getZ(i1));
+    const v2 = new THREE.Vector3(positions.getX(i2), positions.getY(i2), positions.getZ(i2));
+    
+    // Compute face normal
+    const edge1 = v1.clone().sub(v0);
+    const edge2 = v2.clone().sub(v0);
+    const faceNormal = edge1.cross(edge2).normalize();
+    faceNormals.push(faceNormal);
+    
+    // Map vertices to unique indices
+    const faceUniqueIndices: number[] = [];
+    for (const [v, origIdx] of [[v0, i0], [v1, i1], [v2, i2]] as [THREE.Vector3, number][]) {
+      const key = getVertexKey(v);
+      let uniqueIdx: number;
+      
+      if (vertexMap.has(key)) {
+        uniqueIdx = vertexMap.get(key)!;
+        // Accumulate normal
+        const n = new THREE.Vector3(
+          normals.getX(origIdx),
+          normals.getY(origIdx),
+          normals.getZ(origIdx)
+        );
+        vertexNormals[uniqueIdx].add(n);
+      } else {
+        uniqueIdx = uniqueVertices.length;
+        vertexMap.set(key, uniqueIdx);
+        uniqueVertices.push(v.clone());
+        const n = new THREE.Vector3(
+          normals.getX(origIdx),
+          normals.getY(origIdx),
+          normals.getZ(origIdx)
+        );
+        vertexNormals.push(n);
+        vertexToFaces.set(uniqueIdx, new Set());
+      }
+      
+      vertexToFaces.get(uniqueIdx)!.add(f);
+      faceUniqueIndices.push(uniqueIdx);
+    }
+    
+    faceVertices.push(faceUniqueIndices);
+    
+    // Build edge map
+    const edges = [
+      [faceUniqueIndices[0], faceUniqueIndices[1]],
+      [faceUniqueIndices[1], faceUniqueIndices[2]],
+      [faceUniqueIndices[2], faceUniqueIndices[0]],
+    ];
+    
+    for (const [vi1, vi2] of edges) {
+      const edgeKey = getEdgeKey(vi1, vi2);
+      if (!edgeMap.has(edgeKey)) {
+        edgeMap.set(edgeKey, { faces: [], v1: Math.min(vi1, vi2), v2: Math.max(vi1, vi2) });
+      }
+      edgeMap.get(edgeKey)!.faces.push(f);
+    }
+  }
+  
+  // Normalize accumulated vertex normals
+  for (const n of vertexNormals) {
+    n.normalize();
+  }
+  
+  console.log(`[HighResOffset] Found ${uniqueVertices.length} unique vertices, ${numFaces} faces, ${edgeMap.size} edges`);
+  
+  // STEP 1: Generate offset vertices (original vertices moved outward)
+  const allOffsetPoints: THREE.Vector3[] = [];
+  
+  for (let i = 0; i < uniqueVertices.length; i++) {
+    const v = uniqueVertices[i];
+    const n = vertexNormals[i];
+    const offsetVertex = v.clone().add(n.clone().multiplyScalar(offset));
+    allOffsetPoints.push(offsetVertex);
+  }
+  
+  console.log(`[HighResOffset] Generated ${allOffsetPoints.length} offset face vertices`);
+  
+  // STEP 2: Generate cylindrical fillet points at convex edges
+  let convexEdgeCount = 0;
+  
+  for (const [_edgeKey, edgeData] of edgeMap) {
+    if (edgeData.faces.length !== 2) continue; // Skip boundary edges
+    
+    const n1 = faceNormals[edgeData.faces[0]];
+    const n2 = faceNormals[edgeData.faces[1]];
+    
+    // Check if edge is convex (normals diverge - dot product < 1)
+    const dotProduct = n1.dot(n2);
+    if (dotProduct > 0.999) continue; // Faces are nearly coplanar, skip
+    
+    // For convex edges (normals point outward), we need to add fillet
+    // A convex edge has normals pointing "away" from each other
+    const v1 = uniqueVertices[edgeData.v1];
+    const v2 = uniqueVertices[edgeData.v2];
+    
+    // Check convexity: edge is convex if the midpoint + average normal is outside both faces
+    // Simplified check: if dot product < ~0.9, it's a significant angle worth filleting
+    if (dotProduct > 0.95) continue;
+    
+    convexEdgeCount++;
+    
+    // Generate arc of points from n1 to n2 direction, centered on edge points
+    // These form a cylindrical fillet along the edge
+    for (let t = 1; t < edgeSubdivisions; t++) {
+      const fraction = t / edgeSubdivisions;
+      
+      // Spherical interpolation between normals
+      const interpNormal = new THREE.Vector3().lerpVectors(n1, n2, fraction).normalize();
+      
+      // Add fillet points along the edge
+      const numEdgePoints = 3; // Sample along edge length
+      for (let e = 0; e <= numEdgePoints; e++) {
+        const edgeFraction = e / numEdgePoints;
+        const edgePoint = new THREE.Vector3().lerpVectors(v1, v2, edgeFraction);
+        const filletPoint = edgePoint.clone().add(interpNormal.clone().multiplyScalar(offset));
+        allOffsetPoints.push(filletPoint);
+      }
+    }
+  }
+  
+  console.log(`[HighResOffset] Added fillet points for ${convexEdgeCount} convex edges, total points: ${allOffsetPoints.length}`);
+  
+  // STEP 3: Generate spherical cap points at convex corners
+  let convexCornerCount = 0;
+  
+  for (let vi = 0; vi < uniqueVertices.length; vi++) {
+    const adjacentFaces = vertexToFaces.get(vi);
+    if (!adjacentFaces || adjacentFaces.size < 3) continue;
+    
+    // Collect face normals around this vertex
+    const cornerNormals: THREE.Vector3[] = [];
+    for (const fi of adjacentFaces) {
+      cornerNormals.push(faceNormals[fi]);
+    }
+    
+    // Check if this is a convex corner by seeing if normals span a significant solid angle
+    // Simple heuristic: average pairwise dot product should be reasonably small
+    let avgDot = 0;
+    let count = 0;
+    for (let i = 0; i < cornerNormals.length; i++) {
+      for (let j = i + 1; j < cornerNormals.length; j++) {
+        avgDot += cornerNormals[i].dot(cornerNormals[j]);
+        count++;
+      }
+    }
+    avgDot /= count;
+    
+    if (avgDot > 0.9) continue; // Normals too similar, not a significant corner
+    
+    convexCornerCount++;
+    
+    // Generate spherical cap points around this vertex
+    const vertex = uniqueVertices[vi];
+    const avgNormal = vertexNormals[vi];
+    
+    // Create a local coordinate system around the average normal
+    const up = avgNormal;
+    let right = new THREE.Vector3(1, 0, 0);
+    if (Math.abs(up.dot(right)) > 0.9) {
+      right = new THREE.Vector3(0, 1, 0);
+    }
+    const forward = new THREE.Vector3().crossVectors(up, right).normalize();
+    right = new THREE.Vector3().crossVectors(forward, up).normalize();
+    
+    // Generate points on a spherical cap
+    for (let lat = 1; lat <= cornerSubdivisions; lat++) {
+      const latAngle = (Math.PI / 2) * (lat / (cornerSubdivisions + 1)); // 0 to ~90 degrees
+      const cosLat = Math.cos(latAngle);
+      const sinLat = Math.sin(latAngle);
+      
+      const numLonPoints = Math.max(4, Math.floor(8 * sinLat)); // More points at wider latitudes
+      for (let lon = 0; lon < numLonPoints; lon++) {
+        const lonAngle = (2 * Math.PI * lon) / numLonPoints;
+        
+        // Point on unit sphere
+        const sphereDir = new THREE.Vector3()
+          .addScaledVector(up, cosLat)
+          .addScaledVector(right, sinLat * Math.cos(lonAngle))
+          .addScaledVector(forward, sinLat * Math.sin(lonAngle))
+          .normalize();
+        
+        // Only add if this direction is within the cone of adjacent face normals
+        let isWithinCone = false;
+        for (const fn of cornerNormals) {
+          if (sphereDir.dot(fn) > 0.3) {
+            isWithinCone = true;
+            break;
+          }
+        }
+        
+        if (isWithinCone) {
+          const capPoint = vertex.clone().add(sphereDir.multiplyScalar(offset));
+          allOffsetPoints.push(capPoint);
+        }
+      }
+    }
+  }
+  
+  console.log(`[HighResOffset] Added spherical cap points for ${convexCornerCount} corners, total points: ${allOffsetPoints.length}`);
+  
+  // STEP 4: Generate convex hull from all points
+  console.log('[HighResOffset] Computing final convex hull...');
+  const finalHullGeometry = new ConvexGeometry(allOffsetPoints);
+  
+  // Validate as manifold
+  const manifoldValidation = validateManifold(finalHullGeometry);
+  console.log('[HighResOffset] Manifold validation:', manifoldValidation);
+  
+  // Count final faces
+  const finalFaceCount = finalHullGeometry.getAttribute('position').count / 3;
+  
+  // Create materials
+  const hullMaterial = new THREE.MeshPhongMaterial({
+    color: 0x00ff88,
+    transparent: true,
+    opacity: 0.3,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  
+  const originalHullMaterial = new THREE.MeshPhongMaterial({
+    color: 0x666666,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.2,
+  });
+  
+  // Create meshes
+  const inflatedMesh = new THREE.Mesh(finalHullGeometry, hullMaterial);
+  
+  // For original hull, use simple convex hull of input vertices
+  const inputVertices = extractUniqueVertices(worldGeometry);
+  const originalHullGeometry = new ConvexGeometry(inputVertices);
+  const originalHullMesh = new THREE.Mesh(originalHullGeometry, originalHullMaterial);
+  
+  // Convert smooth normals to Float32Array for return
+  const smoothNormalsArray = new Float32Array(vertexNormals.length * 3);
+  for (let i = 0; i < vertexNormals.length; i++) {
+    smoothNormalsArray[i * 3] = vertexNormals[i].x;
+    smoothNormalsArray[i * 3 + 1] = vertexNormals[i].y;
+    smoothNormalsArray[i * 3 + 2] = vertexNormals[i].z;
+  }
+  
+  console.log(`[HighResOffset] Complete! Final hull has ${finalFaceCount} faces`);
+  
+  return {
+    mesh: inflatedMesh,
+    originalHull: originalHullMesh,
+    smoothNormals: smoothNormalsArray,
+    vertexCount: allOffsetPoints.length,
+    faceCount: finalFaceCount,
     manifoldValidation,
     csgResult: null,
   };

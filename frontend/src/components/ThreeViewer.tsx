@@ -20,7 +20,7 @@ import {
   type VisibilityPaintData
 } from '../utils/partingDirection';
 import {
-  generateInflatedBoundingVolume,
+  generateHighResolutionOffsetSurface,
   removeInflatedHull,
   performCsgSubtraction,
   removeCsgResult,
@@ -32,19 +32,6 @@ import {
   formatDiagnostics,
   type MeshRepairResult
 } from '../utils/meshRepairManifold';
-import {
-  generateVolumetricGrid,
-  generateVolumetricGridGPU,
-  isWebGPUAvailable,
-  createMoldVolumePointCloud,
-  createMoldVolumeVoxels,
-  createGridBoundingBoxHelper,
-  createRLineVisualization,
-  removeGridVisualization,
-  type VolumetricGridResult,
-  type VolumetricGridOptions,
-  type DistanceFieldType
-} from '../utils/volumetricGrid';
 import {
   classifyMoldHalves,
   applyMoldHalfPaint,
@@ -80,9 +67,6 @@ import {
 // TYPES
 // ============================================================================
 
-/** Visualization mode for volumetric grid */
-export type GridVisualizationMode = 'points' | 'voxels' | 'none';
-
 /** Visualization mode for tetrahedralization */
 export type TetraVisualizationMode = 'points' | 'wireframe' | 'none';
 
@@ -98,20 +82,6 @@ interface ThreeViewerProps {
   hideHull?: boolean;
   /** Hide the mold cavity visualization */
   hideCavity?: boolean;
-  /** Show volumetric grid visualization */
-  showVolumetricGrid?: boolean;
-  /** Hide the volumetric grid visualization (without recomputing) */
-  hideVoxelGrid?: boolean;
-  /** Show R line visualization (max distance from voxel to part) */
-  showRLine?: boolean;
-  /** Grid resolution (cells per dimension) */
-  gridResolution?: number;
-  /** Grid visualization mode: 'points', 'voxels', or 'none' */
-  gridVisualizationMode?: GridVisualizationMode;
-  /** Use GPU acceleration for grid generation (WebGPU if available) */
-  useGPUGrid?: boolean;
-  /** Which distance field to use for voxel coloring: 'part' (distance to part) or 'biased' (biased distance) */
-  distanceFieldType?: DistanceFieldType;
   /** Show mold half classification (H₁/H₂ coloring on cavity) */
   showMoldHalfClassification?: boolean;
   /** Boundary zone threshold as fraction of bounding box diagonal (default: 0.15 = 15%) */
@@ -137,7 +107,6 @@ interface ThreeViewerProps {
   onVisibilityDataReady?: (data: VisibilityPaintData | null) => void;
   onInflatedHullReady?: (result: InflatedHullResult | null) => void;
   onCsgResultReady?: (result: CsgSubtractionResult | null) => void;
-  onVolumetricGridReady?: (result: VolumetricGridResult | null) => void;
   onMoldHalfClassificationReady?: (result: MoldHalfClassificationResult | null) => void;
   onTetraPartingSurfaceReady?: (result: TetraPartingSurfaceResult | null) => void;
   onTetrahedralizationReady?: (result: TetrahedralizationResult | null) => void;
@@ -168,13 +137,6 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   hideOriginalMesh = false,
   hideHull = false,
   hideCavity = false,
-  showVolumetricGrid = false,
-  hideVoxelGrid = false,
-  showRLine = true,
-  gridResolution = 64,
-  gridVisualizationMode = 'points',
-  useGPUGrid = true,
-  distanceFieldType = 'part',
   showMoldHalfClassification = false,
   boundaryZoneThreshold = 0.15,
   showPartingSurface = false,
@@ -190,7 +152,6 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   onVisibilityDataReady,
   onInflatedHullReady,
   onCsgResultReady,
-  onVolumetricGridReady,
   onMoldHalfClassificationReady,
   onTetraPartingSurfaceReady,
   onTetrahedralizationReady,
@@ -209,10 +170,6 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const inflatedHullRef = useRef<InflatedHullResult | null>(null);
   const csgResultRef = useRef<CsgSubtractionResult | null>(null);
   const moldHalfClassificationRef = useRef<MoldHalfClassificationResult | null>(null);
-  const volumetricGridRef = useRef<VolumetricGridResult | null>(null);
-  const gridVisualizationRef = useRef<THREE.Points | THREE.InstancedMesh | null>(null);
-  const gridBoundingBoxRef = useRef<THREE.LineSegments | null>(null);
-  const rLineVisualizationRef = useRef<THREE.Group | null>(null);
   // Tetrahedral parting surface refs
   const tetraPartingSurfaceRef = useRef<TetraPartingSurfaceResult | null>(null);
   const partingSurfaceVisualizationRef = useRef<THREE.Object3D | null>(null);
@@ -456,14 +413,17 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
     }
 
     if (showInflatedHull && meshRef.current) {
-      try {
-        const result = generateInflatedBoundingVolume(meshRef.current, inflationOffset);
-        scene.add(result.mesh);
-        inflatedHullRef.current = result;
-        onInflatedHullReady?.(result);
-      } catch (error) {
-        console.error('Error generating inflated hull:', error);
-      }
+      const mesh = meshRef.current;
+      (async () => {
+        try {
+          const result = await generateHighResolutionOffsetSurface(mesh, inflationOffset);
+          scene.add(result.mesh);
+          inflatedHullRef.current = result;
+          onInflatedHullReady?.(result);
+        } catch (error) {
+          console.error('Error generating inflated hull:', error);
+        }
+      })();
     }
   }, [showInflatedHull, inflationOffset, stlUrl, onInflatedHullReady, onCsgResultReady]);
 
@@ -563,169 +523,6 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   // so that moving the slider doesn't trigger recalculation - only clicking "Calculate" does
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showMoldHalfClassification, showCsgResult, showPartingDirections, onMoldHalfClassificationReady]);
-
-  // ============================================================================
-  // VOLUMETRIC GRID COMPUTATION
-  // ============================================================================
-
-  useEffect(() => {
-    if (!sceneRef.current) return;
-    
-    const scene = sceneRef.current;
-
-    // Clean up existing grid visualization
-    if (gridVisualizationRef.current) {
-      removeGridVisualization(scene, gridVisualizationRef.current);
-      gridVisualizationRef.current = null;
-    }
-    if (gridBoundingBoxRef.current) {
-      removeGridVisualization(scene, gridBoundingBoxRef.current);
-      gridBoundingBoxRef.current = null;
-    }
-    // Clean up R line visualization
-    if (rLineVisualizationRef.current) {
-      scene.remove(rLineVisualizationRef.current);
-      rLineVisualizationRef.current.traverse((obj) => {
-        if (obj instanceof THREE.Mesh || obj instanceof THREE.Line) {
-          obj.geometry?.dispose();
-          if (Array.isArray(obj.material)) {
-            obj.material.forEach(m => m.dispose());
-          } else {
-            obj.material?.dispose();
-          }
-        }
-      });
-      rLineVisualizationRef.current = null;
-    }
-    volumetricGridRef.current = null;
-    onVolumetricGridReady?.(null);
-
-    // Generate volumetric grid if requested and we have both hull and mesh
-    if (showVolumetricGrid && inflatedHullRef.current && meshRef.current) {
-      // Use async IIFE for GPU version
-      (async () => {
-        try {
-          // Check WebGPU availability
-          const gpuAvailable = isWebGPUAvailable();
-          const useGPU = useGPUGrid && gpuAvailable;
-          
-          console.log('Generating volumetric grid...');
-          console.log(`  Using: ${useGPU ? 'WebGPU (GPU)' : 'CPU'}`);
-          if (useGPUGrid && !gpuAvailable) {
-            console.log('  Note: WebGPU not available, falling back to CPU');
-          }
-          
-          // Get geometries in world space
-          const shellGeometry = inflatedHullRef.current!.mesh.geometry.clone();
-          shellGeometry.applyMatrix4(inflatedHullRef.current!.mesh.matrixWorld);
-          
-          const partGeometry = meshRef.current!.geometry.clone();
-          partGeometry.applyMatrix4(meshRef.current!.matrixWorld);
-          
-          const options: VolumetricGridOptions = {
-            resolution: gridResolution,
-            storeAllCells: false,
-            marginPercent: 0.02,
-            computeDistances: false,
-          };
-          
-          // Use GPU or CPU version based on availability and preference
-          const gridResult = useGPU
-            ? await generateVolumetricGridGPU(shellGeometry, partGeometry, options)
-            : generateVolumetricGrid(shellGeometry, partGeometry, options);
-          
-          console.log(`Volumetric grid generated:`);
-          console.log(`  Resolution: ${gridResult.resolution.x}×${gridResult.resolution.y}×${gridResult.resolution.z}`);
-          console.log(`  Mold volume cells: ${gridResult.moldVolumeCellCount} / ${gridResult.totalCellCount}`);
-          console.log(`  Fill ratio: ${(gridResult.stats.fillRatio * 100).toFixed(1)}%`);
-          console.log(`  Approx mold volume: ${gridResult.stats.moldVolume.toFixed(4)}`);
-          console.log(`  Compute time: ${gridResult.stats.computeTimeMs.toFixed(1)} ms`);
-          
-          volumetricGridRef.current = gridResult;
-          onVolumetricGridReady?.(gridResult);
-          
-          // Create initial visualization based on mode
-          if (gridVisualizationMode !== 'none' && gridResult.moldVolumeCellCount > 0) {
-            if (gridVisualizationMode === 'points') {
-              gridVisualizationRef.current = createMoldVolumePointCloud(gridResult, 0x00ffff, 3, distanceFieldType);
-            } else if (gridVisualizationMode === 'voxels') {
-              gridVisualizationRef.current = createMoldVolumeVoxels(gridResult, 0x00ffff, 0.2, distanceFieldType);
-            }
-            
-            if (gridVisualizationRef.current) {
-              scene.add(gridVisualizationRef.current);
-            }
-            
-            // Add bounding box helper
-            gridBoundingBoxRef.current = createGridBoundingBoxHelper(gridResult, 0xffff00);
-            scene.add(gridBoundingBoxRef.current);
-            
-            // Add R line visualization (max distance from voxel to part) - visibility controlled by showRLine
-            rLineVisualizationRef.current = createRLineVisualization(gridResult, 0xff00ff);
-            if (rLineVisualizationRef.current) {
-              rLineVisualizationRef.current.visible = showRLine;
-              scene.add(rLineVisualizationRef.current);
-            }
-          }
-          
-          // Clean up temporary geometries
-          shellGeometry.dispose();
-          partGeometry.dispose();
-          
-        } catch (error) {
-          console.error('Error generating volumetric grid:', error);
-        }
-      })();
-    }
-  }, [showVolumetricGrid, gridResolution, useGPUGrid, showRLine, onVolumetricGridReady]);
-
-  // ============================================================================
-  // VOLUMETRIC GRID VISUALIZATION MODE UPDATE
-  // ============================================================================
-
-  useEffect(() => {
-    if (!sceneRef.current || !volumetricGridRef.current) return;
-    
-    const scene = sceneRef.current;
-    const gridResult = volumetricGridRef.current;
-
-    // Remove existing visualization (but keep the computed data)
-    if (gridVisualizationRef.current) {
-      removeGridVisualization(scene, gridVisualizationRef.current);
-      gridVisualizationRef.current = null;
-    }
-    if (gridBoundingBoxRef.current) {
-      removeGridVisualization(scene, gridBoundingBoxRef.current);
-      gridBoundingBoxRef.current = null;
-    }
-
-    // Recreate visualization with new mode
-    if (gridVisualizationMode !== 'none' && gridResult.moldVolumeCellCount > 0) {
-      if (gridVisualizationMode === 'points') {
-        gridVisualizationRef.current = createMoldVolumePointCloud(gridResult, 0x00ffff, 3, distanceFieldType);
-      } else if (gridVisualizationMode === 'voxels') {
-        gridVisualizationRef.current = createMoldVolumeVoxels(gridResult, 0x00ffff, 0.2, distanceFieldType);
-      }
-      
-      if (gridVisualizationRef.current) {
-        scene.add(gridVisualizationRef.current);
-      }
-      
-      // Add bounding box helper
-      gridBoundingBoxRef.current = createGridBoundingBoxHelper(gridResult, 0xffff00);
-      scene.add(gridBoundingBoxRef.current);
-    }
-  }, [gridVisualizationMode, distanceFieldType]);
-
-  // ============================================================================
-  // R LINE VISIBILITY TOGGLE
-  // ============================================================================
-
-  useEffect(() => {
-    if (rLineVisualizationRef.current) {
-      rLineVisualizationRef.current.visible = showRLine;
-    }
-  }, [showRLine]);
 
   // ============================================================================
   // TETRAHEDRALIZATION (Backend fTetWild)
@@ -1118,10 +915,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
         }
       }
       
-      // Hide voxel grid and tetra visualization when showing parting surface
-      if (gridVisualizationRef.current) {
-        gridVisualizationRef.current.visible = false;
-      }
+      // Hide tetra visualization when showing parting surface
       if (tetraVisualizationRef.current) {
         tetraVisualizationRef.current.visible = false;
       }
@@ -1132,15 +926,12 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
         tetraPartingSurfaceRef.current = null;
         onTetraPartingSurfaceReady?.(null);
       }
-      // Show voxel/tetra visualization when parting surface is not shown
-      if (gridVisualizationRef.current) {
-        gridVisualizationRef.current.visible = !hideVoxelGrid;
-      }
+      // Show tetra visualization when parting surface is not shown
       if (tetraVisualizationRef.current) {
         tetraVisualizationRef.current.visible = !hideTetrahedralization;
       }
     }
-  }, [showPartingSurface, partingSurfaceDebugMode, onTetraPartingSurfaceReady, hideVoxelGrid, hideTetrahedralization]);
+  }, [showPartingSurface, partingSurfaceDebugMode, onTetraPartingSurfaceReady, hideTetrahedralization]);
 
   // ============================================================================
   // VISIBILITY PAINTING
@@ -1186,20 +977,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
     csgResultRef.current.mesh.visible = !hideCavity;
   }, [hideCavity]);
 
-  // ============================================================================
-  // VOXEL GRID VISIBILITY
-  // ============================================================================
-
-  useEffect(() => {
-    if (gridVisualizationRef.current) {
-      gridVisualizationRef.current.visible = !hideVoxelGrid;
-    }
-    if (gridBoundingBoxRef.current) {
-      gridBoundingBoxRef.current.visible = !hideVoxelGrid;
-    }
-  }, [hideVoxelGrid]);
-
-  // Cleanup arrows, hull, CSG result, grid, tetrahedralization, and escape labeling on unmount
+  // Cleanup arrows, hull, CSG result, tetrahedralization, and escape labeling on unmount
   useEffect(() => {
     return () => {
       if (partingArrowsRef.current.length > 0) {
@@ -1210,12 +988,6 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       }
       if (csgResultRef.current && sceneRef.current) {
         removeCsgResult(sceneRef.current, csgResultRef.current);
-      }
-      if (gridVisualizationRef.current && sceneRef.current) {
-        removeGridVisualization(sceneRef.current, gridVisualizationRef.current);
-      }
-      if (gridBoundingBoxRef.current && sceneRef.current) {
-        removeGridVisualization(sceneRef.current, gridBoundingBoxRef.current);
       }
       if (tetraVisualizationRef.current && sceneRef.current) {
         removeTetrahedralizationVisualization(sceneRef.current, tetraVisualizationRef.current);

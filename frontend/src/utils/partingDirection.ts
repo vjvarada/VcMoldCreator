@@ -421,7 +421,12 @@ export async function computeAndShowPartingDirectionsParallel(
   mesh.updateMatrixWorld(true);
   worldGeometry.applyMatrix4(mesh.matrixWorld);
   
-  const { d1, d2 } = await findPartingDirectionsParallel(worldGeometry, k, numWorkers);
+  const { d1: rawD1, d2: rawD2 } = await findPartingDirectionsParallel(worldGeometry, k, numWorkers);
+  
+  // Negate the directions so arrows point in the opposite direction
+  // This affects all downstream operations (arrows, visibility painting, mold half classification)
+  const d1 = rawD1.clone().negate();
+  const d2 = rawD2.clone().negate();
   
   // Create arrows at mesh center
   worldGeometry.computeBoundingBox();

@@ -8,11 +8,10 @@
 import React, { useState, useCallback, useRef } from 'react';
 import * as THREE from 'three';
 import './App.css';
-import ThreeViewer, { type GridVisualizationMode, type TetraVisualizationMode } from './components/ThreeViewer';
+import ThreeViewer, { type TetraVisualizationMode } from './components/ThreeViewer';
 import type { VisibilityPaintData } from './utils/partingDirection';
 import type { InflatedHullResult, ManifoldValidationResult, CsgSubtractionResult } from './utils/inflatedBoundingVolume';
 import type { MeshRepairResult, MeshDiagnostics } from './utils/meshRepairManifold';
-import type { VolumetricGridResult, DistanceFieldType } from './utils/volumetricGrid';
 import type { MoldHalfClassificationResult } from './utils/moldHalfClassification';
 import type { TetrahedralizationProgress } from './utils/tetrahedralization';
 import type { TetraPartingSurfaceResult } from './utils/tetraPartingSurface';
@@ -54,15 +53,6 @@ interface CsgStats {
   manifoldValidation: ManifoldValidationResult;
 }
 
-interface VolumetricGridStats {
-  resolution: { x: number; y: number; z: number };
-  totalCellCount: number;
-  moldVolumeCellCount: number;
-  moldVolume: number;
-  fillRatio: number;
-  computeTimeMs: number;
-}
-
 interface TetrahedralizationStats {
   numVertices: number;
   numTetrahedra: number;
@@ -92,14 +82,6 @@ function App() {
     wasRepaired: boolean;
     repairMethod: string;
   } | null>(null);
-  const [showVolumetricGrid, setShowVolumetricGrid] = useState(false);
-  const [gridResolution, setGridResolution] = useState(64);
-  const [gridVisualizationMode, setGridVisualizationMode] = useState<GridVisualizationMode>('points');
-  const [volumetricGridStats, setVolumetricGridStats] = useState<VolumetricGridStats | null>(null);
-  const [useGPUGrid, setUseGPUGrid] = useState(true);
-  const [hideVoxelGrid, setHideVoxelGrid] = useState(false);
-  const [showRLine, setShowRLine] = useState(true);
-  const [distanceFieldType, setDistanceFieldType] = useState<DistanceFieldType>('part');
   
   // Tetrahedralization state (replaces voxel for main workflow)
   const [showTetrahedralization, setShowTetrahedralization] = useState(false);
@@ -143,7 +125,6 @@ function App() {
 
   // Track parameters used for last computation (to detect changes)
   const [lastComputedInflationOffset, setLastComputedInflationOffset] = useState<number | null>(null);
-  const [lastComputedGridResolution, setLastComputedGridResolution] = useState<number | null>(null);
 
   // Helper to clear downstream steps (clears steps AFTER the given step, not the step itself)
   const clearFromStep = useCallback((step: Step) => {
@@ -157,9 +138,6 @@ function App() {
         setCsgStats(null);
         setShowMoldHalfClassification(false);
         setMoldHalfStats(null);
-        setShowVolumetricGrid(false);
-        setVolumetricGridStats(null);
-        setLastComputedGridResolution(null);
         setShowTetrahedralization(false);
         setTetraStats(null);
         setLastComputedTetraEdgeLengthFac(null);
@@ -173,9 +151,6 @@ function App() {
         setCsgStats(null);
         setShowMoldHalfClassification(false);
         setMoldHalfStats(null);
-        setShowVolumetricGrid(false);
-        setVolumetricGridStats(null);
-        setLastComputedGridResolution(null);
         setShowTetrahedralization(false);
         setTetraStats(null);
         setLastComputedTetraEdgeLengthFac(null);
@@ -187,9 +162,6 @@ function App() {
         // Clear mold-halves and beyond (downstream from cavity)
         setShowMoldHalfClassification(false);
         setMoldHalfStats(null);
-        setShowVolumetricGrid(false);
-        setVolumetricGridStats(null);
-        setLastComputedGridResolution(null);
         setShowTetrahedralization(false);
         setTetraStats(null);
         setLastComputedTetraEdgeLengthFac(null);
@@ -199,9 +171,6 @@ function App() {
         break;
       case 'mold-halves':
         // Clear tetra and parting-surface (downstream from mold-halves)
-        setShowVolumetricGrid(false);
-        setVolumetricGridStats(null);
-        setLastComputedGridResolution(null);
         setShowTetrahedralization(false);
         setTetraStats(null);
         setLastComputedTetraEdgeLengthFac(null);
@@ -229,14 +198,6 @@ function App() {
     }
   }, [hullStats, lastComputedInflationOffset, clearFromStep]);
 
-  const handleGridResolutionChange = useCallback((value: number) => {
-    setGridResolution(value);
-    // If grid was computed with different resolution, clear grid
-    if (volumetricGridStats && lastComputedGridResolution !== null && value !== lastComputedGridResolution) {
-      clearFromStep('tetra');
-    }
-  }, [volumetricGridStats, lastComputedGridResolution, clearFromStep]);
-
   const handleTetraEdgeLengthFacChange = useCallback((value: number) => {
     setTetraEdgeLengthFac(value);
     // If tetra was computed with different edge length, clear tetra and downstream
@@ -263,8 +224,6 @@ function App() {
     setHideHull(false);
     setHideCavity(false);
     setMeshRepairResult(null);
-    setShowVolumetricGrid(false);
-    setVolumetricGridStats(null);
     setShowMoldHalfClassification(false);
     setMoldHalfStats(null);
     setShowPartingSurface(false);
@@ -335,31 +294,8 @@ function App() {
         faceCount: result.faceCount,
         manifoldValidation: result.manifoldValidation,
       } : null);
-      // Reset volumetric grid when CSG changes
-      if (!result) {
-        setShowVolumetricGrid(false);
-        setVolumetricGridStats(null);
-      }
     },
     []
-  );
-
-  const handleVolumetricGridReady = useCallback(
-    (result: VolumetricGridResult | null) => {
-      setVolumetricGridStats(result ? {
-        resolution: { x: result.resolution.x, y: result.resolution.y, z: result.resolution.z },
-        totalCellCount: result.totalCellCount,
-        moldVolumeCellCount: result.moldVolumeCellCount,
-        moldVolume: result.stats.moldVolume,
-        fillRatio: result.stats.fillRatio,
-        computeTimeMs: result.stats.computeTimeMs,
-      } : null);
-      // Track the parameters used for this computation
-      if (result) {
-        setLastComputedGridResolution(gridResolution);
-      }
-    },
-    [gridResolution]
   );
 
   const handleTetrahedralizationReady = useCallback(
@@ -1215,57 +1151,6 @@ function App() {
                 Hide Cavity 🩵
               </label>
             )}
-
-            {/* Voxel grid visibility - available after voxel is computed */}
-            {volumetricGridStats && (
-              <label style={styles.checkbox}>
-                <input
-                  type="checkbox"
-                  checked={hideVoxelGrid}
-                  onChange={(e) => setHideVoxelGrid(e.target.checked)}
-                />
-                Hide Voxel Grid 🧊
-              </label>
-            )}
-
-            {/* R Line visibility - available after voxel is computed */}
-            {volumetricGridStats && (
-              <label style={styles.checkbox}>
-                <input
-                  type="checkbox"
-                  checked={showRLine}
-                  onChange={(e) => setShowRLine(e.target.checked)}
-                />
-                Show R Line 📏
-              </label>
-            )}
-
-            {/* Voxel Grid Coloring - available after voxel is computed */}
-            {volumetricGridStats && (
-              <div style={{ marginTop: '8px' }}>
-                <label style={{ fontSize: '12px', color: '#aaa', display: 'block', marginBottom: '4px' }}>
-                  Voxel Grid Coloring:
-                </label>
-                <select
-                  value={distanceFieldType}
-                  onChange={(e) => setDistanceFieldType(e.target.value as DistanceFieldType)}
-                  style={{
-                    width: '100%',
-                    padding: '4px 8px',
-                    borderRadius: '4px',
-                    border: '1px solid #555',
-                    backgroundColor: '#2a2a2a',
-                    color: '#fff',
-                    fontSize: '12px',
-                    cursor: 'pointer'
-                  }}
-                >
-                  <option value="part">Part Distance (δᵢ)</option>
-                  <option value="biased">Biased Distance (δᵢ + λw)</option>
-                  <option value="weight">Weighting Factor (wt)</option>
-                </select>
-              </div>
-            )}
           </div>
         )}
       </div>
@@ -1335,13 +1220,6 @@ function App() {
           hideOriginalMesh={hideOriginalMesh}
           hideHull={hideHull}
           hideCavity={hideCavity}
-          showVolumetricGrid={showVolumetricGrid}
-          hideVoxelGrid={hideVoxelGrid}
-          showRLine={showRLine}
-          gridResolution={gridResolution}
-          gridVisualizationMode={gridVisualizationMode}
-          useGPUGrid={useGPUGrid}
-          distanceFieldType={distanceFieldType}
           showMoldHalfClassification={showMoldHalfClassification}
           boundaryZoneThreshold={boundaryZoneThreshold}
           showPartingSurface={showPartingSurface}
@@ -1357,7 +1235,6 @@ function App() {
           onVisibilityDataReady={handleVisibilityDataReady}
           onInflatedHullReady={handleInflatedHullReady}
           onCsgResultReady={handleCsgResultReady}
-          onVolumetricGridReady={handleVolumetricGridReady}
           onMoldHalfClassificationReady={handleMoldHalfClassificationReady}
           onTetraPartingSurfaceReady={handleTetraPartingSurfaceReady}
           onTetrahedralizationReady={handleTetrahedralizationReady}
