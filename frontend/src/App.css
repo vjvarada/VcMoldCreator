@@ -39,6 +39,12 @@
   100% { transform: translateX(100%); }
 }
 
+/* Shimmer animation for progress bar */
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
 /* Scrollbar styling for context panel */
 ::-webkit-scrollbar {
   width: 6px;

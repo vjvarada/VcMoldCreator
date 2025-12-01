@@ -1,8 +1,14 @@
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 # FastAPI server for Mold Creator with tetrahedralization support
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
+=======
+# FastAPI server for mold creation with tetrahedralization support
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
+>>>>>>> Stashed changes
 =======
 # FastAPI server for mold creation with tetrahedralization support
 
@@ -18,6 +24,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 import numpy as np
+<<<<<<< Updated upstream
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
 import trimesh
@@ -38,6 +45,8 @@ except ImportError:
 =======
 =======
 >>>>>>> Stashed changes
+=======
+>>>>>>> Stashed changes
 import tempfile
 import os
 import threading
@@ -50,6 +59,9 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
 =======
 >>>>>>> Stashed changes
@@ -67,7 +79,11 @@ app.add_middleware(
     CORSMiddleware,
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
     allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:3000", "http://127.0.0.1:5173", "http://127.0.0.1:5174"],
+=======
+    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:3000"],  # Vite default ports
+>>>>>>> Stashed changes
 =======
     allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:3000"],  # Vite default ports
 >>>>>>> Stashed changes
@@ -743,6 +759,385 @@ async def tetrahedralize_info(file: UploadFile = File(...)):
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to analyze mesh: {str(e)}")
+
+
+@app.post("/tetrahedralize/start")
+async def start_tetrahedralization(
+    file: UploadFile = File(...),
+    edge_length_fac: float = 0.0065,
+    optimize: bool = True
+):
+    """
+    Start a tetrahedralization job and return a job ID for tracking progress.
+    Use GET /tetrahedralize/progress/{job_id} to check status.
+    Use GET /tetrahedralize/result/{job_id} to get the result when complete.
+    """
+    allowed_extensions = {'.stl', '.obj', '.ply', '.off'}
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    if file_ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format. Allowed formats: {', '.join(allowed_extensions)}"
+        )
+    
+    # Save file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+    
+    # Create job
+    job_id = str(uuid.uuid4())
+    job = JobStatus(job_id)
+    jobs[job_id] = job
+    
+    # Start tetrahedralization in background thread
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(
+        executor,
+        run_tetrahedralization_sync,
+        tmp_path, file_ext, edge_length_fac, optimize, job
+    )
+    
+    return {"job_id": job_id, "message": "Tetrahedralization started"}
+
+
+@app.get("/tetrahedralize/progress/{job_id}")
+async def get_tetrahedralization_progress(job_id: str, last_log_index: int = 0):
+    """Get the progress of a tetrahedralization job"""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    elapsed = time.time() - job.start_time
+    
+    # Get new logs since last_log_index
+    new_logs = job.logs[last_log_index:] if hasattr(job, 'logs') else []
+    
+    return {
+        "job_id": job_id,
+        "status": job.status,
+        "progress": job.progress,
+        "message": job.message,
+        "substep": getattr(job, 'substep', ''),
+        "elapsed_seconds": round(elapsed, 1),
+        "estimated_remaining": round(max(0, (job.estimated_duration or 0) - elapsed), 1) if job.estimated_duration else None,
+        "input_stats": job.input_stats,
+        "complete": job.status in ("complete", "error"),
+        "error": job.error,
+        "logs": new_logs,
+        "log_index": len(job.logs) if hasattr(job, 'logs') else 0
+    }
+
+
+@app.get("/tetrahedralize/result/{job_id}")
+async def get_tetrahedralization_result(job_id: str):
+    """Get the result of a completed tetrahedralization job"""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    
+    if job.status == "error":
+        raise HTTPException(status_code=500, detail=job.error)
+    
+    if job.status != "complete":
+        raise HTTPException(status_code=202, detail="Job not yet complete")
+    
+    # Clean up job after returning result
+    result = job.result
+    del jobs[job_id]
+    
+    return result
+
+
+@app.post("/tetrahedralize/stats")
+async def tetrahedralize_mesh_stats(
+    file: UploadFile = File(...),
+    edge_length_fac: float = 0.0065,
+    optimize: bool = True
+):
+    """
+    Tetrahedralize a surface mesh and return only statistics (no mesh data).
+    Use this endpoint for testing or when you only need to know the output size.
+    
+    Args:
+        file: Surface mesh file (.stl, .obj, .ply, .off)
+        edge_length_fac: Tetrahedral edge length as fraction of bounding box diagonal
+        optimize: Whether to optimize mesh quality
+    
+    Returns:
+        Statistics about input and output meshes
+    """
+    allowed_extensions = {'.stl', '.obj', '.ply', '.off'}
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    if file_ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format. Allowed formats: {', '.join(allowed_extensions)}"
+        )
+    
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+        
+        mesh = trimesh.load(tmp_path)
+        os.unlink(tmp_path)
+        
+        if not isinstance(mesh, trimesh.Trimesh):
+            raise HTTPException(
+                status_code=400,
+                detail="Could not load mesh as a valid triangle mesh"
+            )
+        
+        vertices = np.array(mesh.vertices, dtype=np.float64)
+        faces = np.array(mesh.faces, dtype=np.int32)
+        
+        tet_vertices, tetrahedra = pytetwild.tetrahedralize(
+            vertices,
+            faces,
+            edge_length_fac=edge_length_fac,
+            optimize=optimize
+        )
+        
+        return {
+            "success": True,
+            "message": "Tetrahedralization completed successfully",
+            "input_stats": {
+                "num_vertices": int(len(vertices)),
+                "num_faces": int(len(faces)),
+                "bounding_box": {
+                    "min": mesh.bounds[0].tolist(),
+                    "max": mesh.bounds[1].tolist()
+                }
+            },
+            "output_stats": {
+                "num_vertices": int(len(tet_vertices)),
+                "num_tetrahedra": int(len(tetrahedra))
+            },
+            "parameters": {
+                "edge_length_fac": edge_length_fac,
+                "optimize": optimize
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Tetrahedralization failed: {str(e)}"
+        )
+
+
+@app.post("/tetrahedralize")
+async def tetrahedralize_mesh(
+    file: UploadFile = File(...),
+    edge_length_fac: float = 0.0065,
+    optimize: bool = True
+):
+    """
+    Tetrahedralize a surface mesh using fTetWild (via pytetwild).
+    
+    Args:
+        file: Surface mesh file (.stl, .obj, .ply, .off)
+        edge_length_fac: Tetrahedral edge length as fraction of bounding box diagonal (default: 0.0065)
+        optimize: Whether to optimize mesh quality (default: True)
+    
+    Returns:
+        Tetrahedral mesh data as JSON with vertices and tetrahedra
+    """
+    # Validate file extension
+    allowed_extensions = {'.stl', '.obj', '.ply', '.off'}
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    if file_ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format. Allowed formats: {', '.join(allowed_extensions)}"
+        )
+    
+    try:
+        # Save uploaded file to temp location
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+        
+        # Load mesh using trimesh
+        mesh = trimesh.load(tmp_path)
+        
+        # Clean up temp file
+        os.unlink(tmp_path)
+        
+        if not isinstance(mesh, trimesh.Trimesh):
+            raise HTTPException(
+                status_code=400,
+                detail="Could not load mesh as a valid triangle mesh"
+            )
+        
+        # Get vertices and faces
+        vertices = np.array(mesh.vertices, dtype=np.float64)
+        faces = np.array(mesh.faces, dtype=np.int32)
+        
+        # Tetrahedralize using pytetwild
+        tet_vertices, tetrahedra = pytetwild.tetrahedralize(
+            vertices,
+            faces,
+            edge_length_fac=edge_length_fac,
+            optimize=optimize
+        )
+        
+        return {
+            "success": True,
+            "message": "Tetrahedralization completed successfully",
+            "input_stats": {
+                "num_vertices": len(vertices),
+                "num_faces": len(faces)
+            },
+            "output_stats": {
+                "num_vertices": len(tet_vertices),
+                "num_tetrahedra": len(tetrahedra)
+            },
+            "vertices": tet_vertices.tolist(),
+            "tetrahedra": tetrahedra.tolist()
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Tetrahedralization failed: {str(e)}"
+        )
+
+
+@app.post("/tetrahedralize/msh")
+async def tetrahedralize_mesh_to_msh(
+    file: UploadFile = File(...),
+    edge_length_fac: float = 0.0065,
+    optimize: bool = True
+):
+    """
+    Tetrahedralize a surface mesh and return as MSH file format.
+    
+    Args:
+        file: Surface mesh file (.stl, .obj, .ply, .off)
+        edge_length_fac: Tetrahedral edge length as fraction of bounding box diagonal
+        optimize: Whether to optimize mesh quality
+    
+    Returns:
+        MSH file as downloadable response
+    """
+    allowed_extensions = {'.stl', '.obj', '.ply', '.off'}
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    if file_ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format. Allowed formats: {', '.join(allowed_extensions)}"
+        )
+    
+    try:
+        # Save uploaded file to temp location
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+        
+        # Load mesh using trimesh
+        mesh = trimesh.load(tmp_path)
+        os.unlink(tmp_path)
+        
+        if not isinstance(mesh, trimesh.Trimesh):
+            raise HTTPException(
+                status_code=400,
+                detail="Could not load mesh as a valid triangle mesh"
+            )
+        
+        # Get vertices and faces
+        vertices = np.array(mesh.vertices, dtype=np.float64)
+        faces = np.array(mesh.faces, dtype=np.int32)
+        
+        # Tetrahedralize
+        tet_vertices, tetrahedra = pytetwild.tetrahedralize(
+            vertices,
+            faces,
+            edge_length_fac=edge_length_fac,
+            optimize=optimize
+        )
+        
+        # Create meshio mesh and save to MSH
+        cells = [("tetra", tetrahedra)]
+        msh_mesh = meshio.Mesh(points=tet_vertices, cells=cells)
+        
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.msh') as tmp:
+            msh_path = tmp.name
+        
+        meshio.write(msh_path, msh_mesh, file_format="gmsh")
+        
+        # Read file content
+        with open(msh_path, 'rb') as f:
+            msh_content = f.read()
+        
+        os.unlink(msh_path)
+        
+        # Return as downloadable file
+        output_filename = os.path.splitext(file.filename)[0] + '_tet.msh'
+        return Response(
+            content=msh_content,
+            media_type='application/octet-stream',
+            headers={
+                'Content-Disposition': f'attachment; filename="{output_filename}"'
+            }
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Tetrahedralization failed: {str(e)}"
+        )
+
+
+@app.post("/tetrahedralize/arrays")
+async def tetrahedralize_from_arrays(
+    vertices: list,
+    faces: list,
+    edge_length_fac: float = 0.0065,
+    optimize: bool = True
+):
+    """
+    Tetrahedralize from raw vertex and face arrays.
+    
+    Args:
+        vertices: List of [x, y, z] vertex coordinates
+        faces: List of face vertex indices (triangles or quads)
+        edge_length_fac: Tetrahedral edge length as fraction of bounding box diagonal
+        optimize: Whether to optimize mesh quality
+    
+    Returns:
+        Tetrahedral mesh data with vertices and tetrahedra
+    """
+    try:
+        vertices_np = np.array(vertices, dtype=np.float64)
+        faces_np = np.array(faces, dtype=np.int32)
+        
+        tet_vertices, tetrahedra = pytetwild.tetrahedralize(
+            vertices_np,
+            faces_np,
+            edge_length_fac=edge_length_fac,
+            optimize=optimize
+        )
+        
+        return {
+            "success": True,
+            "vertices": tet_vertices.tolist(),
+            "tetrahedra": tetrahedra.tolist()
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Tetrahedralization failed: {str(e)}"
+        )
+
 
 
 @app.post("/tetrahedralize/start")
