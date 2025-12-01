@@ -740,30 +740,25 @@ export interface TetraPartingSurfaceOptions {
 // ============================================================================
 
 /**
- * Identify seed vertices (on/adjacent to part surface) and boundary vertices (on/adjacent to hull surface)
+ * Identify seed vertices (inner surface near part) and boundary vertices (outer surface near shell)
  * 
- * Approach:
+ * SIMPLIFIED APPROACH:
  * 1. Find all SURFACE vertices of the tetrahedral mesh (vertices on boundary faces)
- *    - Boundary faces are faces that belong to only one tetrahedron
- * 2. For each surface vertex, check if it's closer to part mesh or hull mesh:
- *    - Close to PART mesh → seed vertex (inner boundary)
- *    - Close to HULL mesh → boundary vertex, labeled H₁ or H₂ based on mold half classification
+ * 2. Build a list of cavity mesh vertices with their H₁/H₂ labels (from classification)
+ * 3. Compute distance from each tet surface vertex to the PART mesh
+ * 4. Use GAP-BASED detection to separate inner (seeds) from outer (boundary) surface
+ * 5. For boundary vertices: find the CLOSEST cavity vertex and use its label
  * 
- * This is analogous to how voxel grids identified inner vs outer surface voxels.
- * 
- * @param graph - The tetrahedral graph
- * @param partMesh - The original part mesh (for identifying inner boundary)
- * @param hullMesh - The outer hull mesh (for identifying outer boundary)
- * @param classification - Mold half classification result (provides H₁/H₂ labeling)
+ * This is much simpler than triangle-based lookup - just vertex-to-vertex distance!
  */
 export function identifySeedsAndBoundaries(
   graph: TetraGraph,
   cavityMesh: THREE.Mesh,
   classification: MoldHalfClassificationResult,
-  _seedThreshold: number,  // Kept for API compatibility, not used in this approach
-  _boundaryThreshold?: number,  // Kept for API compatibility, not used in this approach
+  _seedThreshold: number,  // Kept for API compatibility, not used (we use gap-based detection)
+  _boundaryThreshold?: number,  // Kept for API compatibility, not used
   partMesh?: THREE.Mesh,
-  hullMesh?: THREE.Mesh
+  _hullMesh?: THREE.Mesh  // Kept for API compatibility, not needed with gap-based approach
 ): {
   seedVertices: number[];
   boundaryLabels: Int8Array;  // 0 = not boundary, 1 = H₁, 2 = H₂
@@ -774,15 +769,16 @@ export function identifySeedsAndBoundaries(
   const numVertices = graph.numVertices;
   const startTime = performance.now();
   
-  console.log(`  Identifying seeds and boundaries...`);
-  console.log(`    Total vertices: ${numVertices}`);
+  console.log(`═══════════════════════════════════════════════════════`);
+  console.log(`SEED & BOUNDARY VERTEX IDENTIFICATION (Simplified)`);
+  console.log(`═══════════════════════════════════════════════════════`);
+  console.log(`  Total tet vertices: ${numVertices}`);
   
   // ========================================================================
   // STEP 1: Find boundary faces (faces belonging to only one tetrahedron)
+  // These are the SURFACE faces of the tetrahedral mesh
   // ========================================================================
   
-  // Build a map of face -> tetrahedra that share it
-  // A face is defined by 3 vertex indices (sorted for consistent key)
   const faceToTetras = new Map<string, number[]>();
   const numTetrahedra = graph.tetrahedra.length / 4;
   
@@ -791,7 +787,6 @@ export function identifySeedsAndBoundaries(
     return `${sorted[0]}_${sorted[1]}_${sorted[2]}`;
   };
   
-  // Each tetrahedron has 4 faces
   for (let t = 0; t < numTetrahedra; t++) {
     const base = t * 4;
     const v0 = graph.tetrahedra[base];
@@ -799,12 +794,8 @@ export function identifySeedsAndBoundaries(
     const v2 = graph.tetrahedra[base + 2];
     const v3 = graph.tetrahedra[base + 3];
     
-    // 4 faces of tetrahedron: (0,1,2), (0,1,3), (0,2,3), (1,2,3)
     const faces = [
-      [v0, v1, v2],
-      [v0, v1, v3],
-      [v0, v2, v3],
-      [v1, v2, v3]
+      [v0, v1, v2], [v0, v1, v3], [v0, v2, v3], [v1, v2, v3]
     ];
     
     for (const [a, b, c] of faces) {
@@ -816,165 +807,204 @@ export function identifySeedsAndBoundaries(
     }
   }
   
-  // Find boundary faces (shared by only 1 tetrahedron) and collect boundary vertices
-  const boundaryVertexSet = new Set<number>();
+  const surfaceVertexSet = new Set<number>();
   let boundaryFaceCount = 0;
   
   for (const [faceKey, tetras] of faceToTetras) {
     if (tetras.length === 1) {
-      // This is a boundary face
       boundaryFaceCount++;
       const [v0, v1, v2] = faceKey.split('_').map(Number);
-      boundaryVertexSet.add(v0);
-      boundaryVertexSet.add(v1);
-      boundaryVertexSet.add(v2);
+      surfaceVertexSet.add(v0);
+      surfaceVertexSet.add(v1);
+      surfaceVertexSet.add(v2);
     }
   }
   
-  console.log(`    Boundary faces: ${boundaryFaceCount}`);
-  console.log(`    Boundary vertices: ${boundaryVertexSet.size}`);
+  console.log(`  Surface faces (boundary of tet mesh): ${boundaryFaceCount}`);
+  console.log(`  Surface vertices: ${surfaceVertexSet.size}`);
   
   // ========================================================================
-  // STEP 2: Build BVHs for part mesh and hull mesh
+  // STEP 2: Build list of CAVITY MESH VERTICES with their H₁/H₂ labels
+  // 
+  // SIMPLE: For each cavity vertex, check which triangle it belongs to,
+  // and look up that triangle's classification.
+  // 
+  // Since cavity mesh is non-indexed (each triangle has 3 unique vertices),
+  // vertex i belongs to triangle floor(i/3).
   // ========================================================================
   
-  // Part mesh BVH (for identifying inner boundary / seeds)
-  let partBVH: MeshBVH | null = null;
-  if (partMesh) {
-    let partGeom = partMesh.geometry.clone();
-    partGeom.applyMatrix4(partMesh.matrixWorld);
-    if (partGeom.index) {
-      const nonIndexed = partGeom.toNonIndexed();
-      partGeom.dispose();
-      partGeom = nonIndexed;
-    }
-    partBVH = new MeshBVH(partGeom);
-  }
-  
-  // Hull mesh BVH (for identifying outer boundary)
-  // We use classification sets to determine H₁/H₂, but need hull BVH for distance
-  let hullBVH: MeshBVH | null = null;
-  if (hullMesh) {
-    let hullGeom = hullMesh.geometry.clone();
-    hullGeom.applyMatrix4(hullMesh.matrixWorld);
-    if (hullGeom.index) {
-      const nonIndexed = hullGeom.toNonIndexed();
-      hullGeom.dispose();
-      hullGeom = nonIndexed;
-    }
-    hullBVH = new MeshBVH(hullGeom);
-  }
-  
-  // Cavity mesh BVH (for H₁/H₂ classification lookup via closest triangle)
   let cavityGeom = cavityMesh.geometry.clone();
   cavityGeom.applyMatrix4(cavityMesh.matrixWorld);
-  if (cavityGeom.index) {
-    const nonIndexed = cavityGeom.toNonIndexed();
-    cavityGeom.dispose();
-    cavityGeom = nonIndexed;
+  
+  const cavityPosAttr = cavityGeom.getAttribute('position');
+  const cavityVertexCount = cavityPosAttr.count;
+  
+  // Build arrays of H₁ and H₂ vertex positions (for closest vertex search)
+  const h1Vertices: THREE.Vector3[] = [];
+  const h2Vertices: THREE.Vector3[] = [];
+  
+  for (let v = 0; v < cavityVertexCount; v++) {
+    const triIdx = Math.floor(v / 3);  // Which triangle does this vertex belong to?
+    
+    const pos = new THREE.Vector3(
+      cavityPosAttr.getX(v),
+      cavityPosAttr.getY(v),
+      cavityPosAttr.getZ(v)
+    );
+    
+    if (classification.h1Triangles.has(triIdx)) {
+      h1Vertices.push(pos);
+    } else if (classification.h2Triangles.has(triIdx)) {
+      h2Vertices.push(pos);
+    }
+    // Ignore boundary zone and inner boundary vertices
   }
-  const cavityBVH = new MeshBVH(cavityGeom);
+  
+  console.log(`  Cavity mesh vertices: ${cavityVertexCount}`);
+  console.log(`  H₁ vertices: ${h1Vertices.length}`);
+  console.log(`  H₂ vertices: ${h2Vertices.length}`);
+  
+  // ========================================================================
+  // STEP 3: Build BVH for part mesh (for seed/boundary gap detection)
+  // ========================================================================
+  
+  if (!partMesh) {
+    console.error('ERROR: partMesh is required for gap-based seed/boundary detection');
+    return {
+      seedVertices: [],
+      boundaryLabels: new Int8Array(numVertices),
+      numSeeds: 0,
+      numH1Boundary: 0,
+      numH2Boundary: 0,
+    };
+  }
+  
+  let partGeom = partMesh.geometry.clone();
+  partGeom.applyMatrix4(partMesh.matrixWorld);
+  if (partGeom.index) {
+    const nonIndexed = partGeom.toNonIndexed();
+    partGeom.dispose();
+    partGeom = nonIndexed;
+  }
+  const partBVH = new MeshBVH(partGeom);
   
   const hitInfoPart = { point: new THREE.Vector3(), distance: Infinity, faceIndex: 0 };
-  const hitInfoHull = { point: new THREE.Vector3(), distance: Infinity, faceIndex: 0 };
-  const hitInfoCavity = { point: new THREE.Vector3(), distance: Infinity, faceIndex: 0 };
   
   // ========================================================================
-  // STEP 3: Classify boundary vertices as seeds or H₁/H₂ boundaries
+  // STEP 4: Compute distance from each tet surface vertex to PART mesh
   // ========================================================================
   
-  const seedVertices: number[] = [];
-  const boundaryLabels = new Int8Array(numVertices).fill(0);
-  let numH1Boundary = 0;
-  let numH2Boundary = 0;
-  let numBoundaryZone = 0;
-  
+  const surfaceVertexArray = Array.from(surfaceVertexSet);
+  const surfaceDistances: { vertIdx: number; dist: number }[] = [];
   const vertexPos = new THREE.Vector3();
   
-  // For boundary vertices, we classify based on which surface they are closer to:
-  // - Closer to part mesh → SEED (inner boundary)
-  // - Closer to hull mesh → BOUNDARY (outer, labeled H₁/H₂)
-  // No distance threshold needed - we use relative comparison
-  
-  // Debug counters
-  let nearPartCount = 0;
-  let nearHullCount = 0;
-  let ambiguousCount = 0;
-  
-  for (const vertIdx of boundaryVertexSet) {
+  for (const vertIdx of surfaceVertexArray) {
     vertexPos.set(
       graph.vertices[vertIdx * 3],
       graph.vertices[vertIdx * 3 + 1],
       graph.vertices[vertIdx * 3 + 2]
     );
     
-    // Compute distance to part mesh
-    let distToPart = Infinity;
-    if (partBVH) {
-      hitInfoPart.distance = Infinity;
-      partBVH.closestPointToPoint(vertexPos, hitInfoPart);
-      distToPart = hitInfoPart.distance;
+    hitInfoPart.distance = Infinity;
+    partBVH.closestPointToPoint(vertexPos, hitInfoPart);
+    surfaceDistances.push({ vertIdx, dist: hitInfoPart.distance });
+  }
+  
+  // ========================================================================
+  // STEP 5: Find LARGEST GAP to separate seeds from boundary
+  // ========================================================================
+  
+  surfaceDistances.sort((a, b) => a.dist - b.dist);
+  
+  const minDist = surfaceDistances[0]?.dist || 0;
+  const maxDist = surfaceDistances[surfaceDistances.length - 1]?.dist || 0;
+  
+  console.log(`  Distance to part range: [${minDist.toFixed(6)}, ${maxDist.toFixed(6)}]`);
+  
+  let maxGap = 0;
+  let gapIndex = Math.floor(surfaceDistances.length / 2);
+  
+  for (let i = 1; i < surfaceDistances.length; i++) {
+    const gap = surfaceDistances[i].dist - surfaceDistances[i - 1].dist;
+    if (gap > maxGap) {
+      maxGap = gap;
+      gapIndex = i;
     }
-    
-    // Compute distance to hull mesh
-    let distToHull = Infinity;
-    if (hullBVH) {
-      hitInfoHull.distance = Infinity;
-      hullBVH.closestPointToPoint(vertexPos, hitInfoHull);
-      distToHull = hitInfoHull.distance;
-    }
-    
-    // Classify based on which surface the vertex is closer to
-    // No distance threshold - pure relative comparison
-    if (distToPart < distToHull) {
-      // Vertex is closer to part surface → SEED
+  }
+  
+  const distanceThreshold = surfaceDistances[gapIndex]?.dist || (minDist + maxDist) / 2;
+  
+  console.log(`  Gap at index ${gapIndex}/${surfaceDistances.length}, size: ${maxGap.toFixed(6)}`);
+  console.log(`  Threshold: ${distanceThreshold.toFixed(6)}`);
+  
+  // ========================================================================
+  // STEP 6: Classify vertices
+  // - Below threshold → SEED (inner surface)
+  // - Above threshold → BOUNDARY (find closest H₁ or H₂ vertex)
+  // ========================================================================
+  
+  const seedVertices: number[] = [];
+  const boundaryLabels = new Int8Array(numVertices).fill(0);
+  let numH1Boundary = 0;
+  let numH2Boundary = 0;
+  let numUnlabeled = 0;
+  
+  for (const { vertIdx, dist } of surfaceDistances) {
+    if (dist < distanceThreshold) {
+      // Inner surface vertex → SEED
       seedVertices.push(vertIdx);
-      nearPartCount++;
-    } else if (distToHull < distToPart) {
-      // Vertex is closer to hull surface → BOUNDARY (H₁ or H₂)
-      nearHullCount++;
-      
-      // Find closest triangle on cavity mesh to determine H₁/H₂
-      hitInfoCavity.distance = Infinity;
-      cavityBVH.closestPointToPoint(vertexPos, hitInfoCavity);
-      const closestTriIdx = hitInfoCavity.faceIndex;
-      
-      if (classification.h1Triangles.has(closestTriIdx)) {
-        boundaryLabels[vertIdx] = 1;
-        numH1Boundary++;
-      } else if (classification.h2Triangles.has(closestTriIdx)) {
-        boundaryLabels[vertIdx] = 2;
-        numH2Boundary++;
-      } else if (classification.boundaryZoneTriangles.has(closestTriIdx)) {
-        // In boundary zone - don't label
-        numBoundaryZone++;
-      } else {
-        // Fallback: check which mold half based on position relative to parting direction
-        // For now, leave unlabeled
-        numBoundaryZone++;
-      }
     } else {
-      // Ambiguous (equidistant) - rare case
-      ambiguousCount++;
+      // Outer surface vertex → BOUNDARY
+      // Find closest H₁ or H₂ vertex
+      vertexPos.set(
+        graph.vertices[vertIdx * 3],
+        graph.vertices[vertIdx * 3 + 1],
+        graph.vertices[vertIdx * 3 + 2]
+      );
       
-      // Default to seed (inner boundary)
-      seedVertices.push(vertIdx);
+      // Simple brute-force closest vertex search (can optimize with KD-tree if needed)
+      let minDistH1 = Infinity;
+      let minDistH2 = Infinity;
+      
+      for (const h1v of h1Vertices) {
+        const d = vertexPos.distanceToSquared(h1v);
+        if (d < minDistH1) minDistH1 = d;
+      }
+      
+      for (const h2v of h2Vertices) {
+        const d = vertexPos.distanceToSquared(h2v);
+        if (d < minDistH2) minDistH2 = d;
+      }
+      
+      // Assign label based on which is closer
+      if (minDistH1 < Infinity || minDistH2 < Infinity) {
+        if (minDistH1 <= minDistH2) {
+          boundaryLabels[vertIdx] = 1;
+          numH1Boundary++;
+        } else {
+          boundaryLabels[vertIdx] = 2;
+          numH2Boundary++;
+        }
+      } else {
+        // No H₁ or H₂ vertices found - leave unlabeled
+        numUnlabeled++;
+      }
     }
   }
   
   const elapsed = performance.now() - startTime;
   
-  console.log(`  Vertex classification results:`);
-  console.log(`    Seeds (near part): ${seedVertices.length}`);
+  console.log(`───────────────────────────────────────────────────────`);
+  console.log(`  RESULTS:`);
+  console.log(`    Seeds: ${seedVertices.length}`);
   console.log(`    H₁ boundary: ${numH1Boundary}`);
   console.log(`    H₂ boundary: ${numH2Boundary}`);
-  console.log(`    Boundary zone (unlabeled): ${numBoundaryZone}`);
-  console.log(`    Near part surface: ${nearPartCount}`);
-  console.log(`    Near hull surface: ${nearHullCount}`);
-  console.log(`    Ambiguous: ${ambiguousCount}`);
+  console.log(`    Unlabeled: ${numUnlabeled}`);
   console.log(`    Time: ${elapsed.toFixed(1)} ms`);
+  console.log(`═══════════════════════════════════════════════════════`);
   
   // Clean up
+  partGeom.dispose();
   cavityGeom.dispose();
   
   return {
