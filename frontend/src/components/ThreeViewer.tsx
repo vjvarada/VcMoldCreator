@@ -85,6 +85,9 @@ import {
   type TetrahedralizationProgress,
   type TetrahedralizationOptions
 } from '../utils/tetrahedralization';
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
 
 // ============================================================================
@@ -99,6 +102,9 @@ export type GridVisualizationMode = 'points' | 'voxels' | 'none';
 /** Visualization mode for tetrahedralization */
 export type TetraVisualizationMode = 'points' | 'wireframe' | 'none';
 
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
 interface ThreeViewerProps {
   stlUrl?: string;
@@ -154,6 +160,9 @@ interface ThreeViewerProps {
   /** Pre-loaded tetrahedral mesh (from file) to use instead of computing */
   preloadedTetraResult?: TetrahedralizationResult | null;
   onMeshLoaded?: (mesh: THREE.Mesh, meshInfo: { diagonal: number; size: { x: number; y: number; z: number }; scale: number }) => void;
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
   onMeshRepaired?: (result: MeshRepairResult) => void;
   onVisibilityDataReady?: (data: VisibilityPaintData | null) => void;
@@ -170,6 +179,9 @@ interface ThreeViewerProps {
   onTetraPartingSurfaceReady?: (result: TetraPartingSurfaceResult | null) => void;
   onTetrahedralizationReady?: (result: TetrahedralizationResult | null) => void;
   onTetrahedralizationProgress?: (progress: TetrahedralizationProgress) => void;
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
 }
 
@@ -220,6 +232,9 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   tetraEdgeLengthFac = 0.0065,
   tetraVisualizationMode = 'points',
   preloadedTetraResult = null,
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
   onMeshLoaded,
   onMeshRepaired,
@@ -237,6 +252,9 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   onTetraPartingSurfaceReady,
   onTetrahedralizationReady,
   onTetrahedralizationProgress
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
 }) => {
   // Refs for Three.js objects
@@ -269,6 +287,9 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const tetrahedralizationRef = useRef<TetrahedralizationResult | null>(null);
   const tetraVisualizationRef = useRef<THREE.Object3D | null>(null);
   const tetraBoundingBoxRef = useRef<THREE.LineSegments | null>(null);
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
 
   // ============================================================================
@@ -1340,6 +1361,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   }, [sectionPlaneEnabled, sectionPlanePosition]);
 
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
   // ============================================================================
   // TETRAHEDRAL MESH VISUALIZATION
   // ============================================================================
@@ -1409,6 +1431,9 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   }, [showTetMesh, onTetProgress, onTetComplete, onTetError, onTetVisualizationReady]);
 
   // Cleanup arrows, hull, CSG result, and tet mesh on unmount
+=======
+  // Cleanup arrows, hull, CSG result, grid, tetrahedralization, and escape labeling on unmount
+>>>>>>> Stashed changes
 =======
   // Cleanup arrows, hull, CSG result, grid, tetrahedralization, and escape labeling on unmount
 >>>>>>> Stashed changes

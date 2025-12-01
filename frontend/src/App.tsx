@@ -6,6 +6,7 @@
  */
 
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 import { useState, useCallback } from 'react';
 import './App.css';
 import ThreeViewer from './components/ThreeViewer';
@@ -18,6 +19,11 @@ import type { TetMeshData, TetrahedralizeProgress, TetMeshVisualization } from '
 import React, { useState, useCallback, useRef } from 'react';
 import * as THREE from 'three';
 import './App.css';
+=======
+import React, { useState, useCallback, useRef } from 'react';
+import * as THREE from 'three';
+import './App.css';
+>>>>>>> Stashed changes
 import ThreeViewer, { type GridVisualizationMode, type TetraVisualizationMode } from './components/ThreeViewer';
 import type { VisibilityPaintData } from './utils/partingDirection';
 import type { InflatedHullResult, ManifoldValidationResult, CsgSubtractionResult } from './utils/inflatedBoundingVolume';
@@ -28,6 +34,9 @@ import type { TetrahedralizationProgress } from './utils/tetrahedralization';
 import type { TetraPartingSurfaceResult } from './utils/tetraPartingSurface';
 import type { TetrahedralizationResult } from './utils/tetrahedralization';
 import { loadTetrahedralMesh } from './utils/tetrahedralization';
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
 
 // ============================================================================
@@ -35,7 +44,10 @@ import { loadTetrahedralMesh } from './utils/tetrahedralization';
 // ============================================================================
 
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 =======
+=======
+>>>>>>> Stashed changes
 type Step = 'import' | 'parting' | 'hull' | 'cavity' | 'mold-halves' | 'tetra' | 'parting-surface';
 
 interface StepInfo {
@@ -71,6 +83,14 @@ interface CsgStats {
 interface TetStats {
   vertexCount: number;
   tetrahedraCount: number;
+}
+
+interface TetrahedralizationStats {
+  numVertices: number;
+  numTetrahedra: number;
+  inputVertices: number;
+  inputFaces: number;
+  computeTimeMs: number;
 }
 
 interface TetrahedralizationStats {
@@ -261,6 +281,14 @@ function App() {
     }
   }, [volumetricGridStats, lastComputedGridResolution, clearFromStep]);
 >>>>>>> Stashed changes
+
+  const handleTetraEdgeLengthFacChange = useCallback((value: number) => {
+    setTetraEdgeLengthFac(value);
+    // If tetra was computed with different edge length, clear tetra and downstream
+    if (tetraStats && lastComputedTetraEdgeLengthFac !== null && value !== lastComputedTetraEdgeLengthFac) {
+      clearFromStep('tetra');
+    }
+  }, [tetraStats, lastComputedTetraEdgeLengthFac, clearFromStep]);
 
   const handleTetraEdgeLengthFacChange = useCallback((value: number) => {
     setTetraEdgeLengthFac(value);
