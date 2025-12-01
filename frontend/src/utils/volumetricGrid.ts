@@ -81,6 +81,8 @@ export interface VolumetricGridResult {
   rLineStart: THREE.Vector3 | null;
   /** Visualization line for R: end point (on part mesh) */
   rLineEnd: THREE.Vector3 | null;
+  /** Mask indicating which voxels have biased weighting applied (boundary + one level deep) */
+  boundaryAdjacentMask: Uint8Array | null;
 }
 
 export interface VolumetricGridStats {
@@ -105,6 +107,13 @@ export interface VolumetricGridOptions {
   computeDistances?: boolean;
   /** Whether to use GPU acceleration (WebGPU if available, otherwise falls back to CPU) */
   useGPU?: boolean;
+}
+
+export interface BiasedDistanceWeights {
+  /** Weight for δ_i (distance to part) term. Default: 1.0 */
+  partDistanceWeight: number;
+  /** Weight for (R - δ_w) (shell bias) term. Default: 1.0 */
+  shellBiasWeight: number;
 }
 
 // ============================================================================
@@ -489,11 +498,158 @@ export function generateVolumetricGrid(
   console.log(`  Max distance to shell: ${maxShellDist.toFixed(6)}`);
   
   // ========================================================================
-  // BIASED DISTANCE FIELD COMPUTATION
-  // biasedDist = δ_i + λ_w where λ_w = R - δ_w
-  // This penalizes voxels far from the boundary (higher λ_w)
-  // Voxels closer to boundary have lower biased distance (act as sinks)
+  // IDENTIFY OUTER SURFACE VOXELS (NEAR SHELL) AND TWO LEVELS DEEP
+  // Using same approach as partingSurface.ts:
+  // 1. Find ALL surface voxels (those with at least one missing 6-neighbor)
+  // 2. Use distance-to-part to distinguish inner (near part) vs outer (near shell)
+  // 3. Mark outer surface + two levels deep for biased weighting
   // ========================================================================
+  
+  console.log(`Identifying boundary voxels for biased weighting...`);
+  
+  // Build spatial index for neighbor lookups
+  const voxelSpatialIndex = new Map<string, number>();
+  for (let i = 0; i < voxelCount; i++) {
+    const cell = moldVolumeCells[i];
+    const key = `${Math.round(cell.index.x)},${Math.round(cell.index.y)},${Math.round(cell.index.z)}`;
+    voxelSpatialIndex.set(key, i);
+  }
+  
+  const getVoxelIdx = (gi: number, gj: number, gk: number): number => {
+    const key = `${gi},${gj},${gk}`;
+    return voxelSpatialIndex.get(key) ?? -1;
+  };
+  
+  // 6-connected neighbor offsets (face-adjacent)
+  const faceNeighborOffsets: [number, number, number][] = [
+    [1, 0, 0], [-1, 0, 0],
+    [0, 1, 0], [0, -1, 0],
+    [0, 0, 1], [0, 0, -1],
+  ];
+  
+  // Step 1: Find ALL surface voxels (those with at least one missing 6-neighbor)
+  const isSurfaceVoxel = new Uint8Array(voxelCount);
+  let totalSurfaceCount = 0;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    const cell = moldVolumeCells[i];
+    const gi = Math.round(cell.index.x);
+    const gj = Math.round(cell.index.y);
+    const gk = Math.round(cell.index.z);
+    
+    // Check if any 6-connected neighbor is missing
+    for (const [di, dj, dk] of faceNeighborOffsets) {
+      const neighborIdx = getVoxelIdx(gi + di, gj + dj, gk + dk);
+      if (neighborIdx < 0) {
+        // Missing neighbor = this is a surface voxel
+        isSurfaceVoxel[i] = 1;
+        totalSurfaceCount++;
+        break;
+      }
+    }
+  }
+  
+  console.log(`  Total surface voxels (both inner & outer): ${totalSurfaceCount}`);
+  
+  // Step 2: Use distance-to-part to distinguish inner vs outer surface
+  // Inner surface = close to part (small voxelDist)
+  // Outer surface = far from part (large voxelDist)
+  const surfaceDistances: number[] = [];
+  const surfaceIndices: number[] = [];
+  for (let i = 0; i < voxelCount; i++) {
+    if (isSurfaceVoxel[i]) {
+      surfaceDistances.push(voxelDist[i]);
+      surfaceIndices.push(i);
+    }
+  }
+  
+  // Sort by distance to find the gap
+  const sortedPairs = surfaceIndices.map((idx, i) => ({ idx, dist: surfaceDistances[i] }));
+  sortedPairs.sort((a, b) => a.dist - b.dist);
+  
+  const surfaceMinDist = sortedPairs[0]?.dist || 0;
+  const surfaceMaxDist = sortedPairs[sortedPairs.length - 1]?.dist || 0;
+  
+  console.log(`  Surface distance range: [${surfaceMinDist.toFixed(4)}, ${surfaceMaxDist.toFixed(4)}]`);
+  
+  // Find the largest gap in the sorted distances
+  // This gap separates inner surface (low distances) from outer surface (high distances)
+  let maxGap = 0;
+  let gapIndex = Math.floor(sortedPairs.length / 2); // Default to median
+  
+  for (let i = 1; i < sortedPairs.length; i++) {
+    const gap = sortedPairs[i].dist - sortedPairs[i - 1].dist;
+    if (gap > maxGap) {
+      maxGap = gap;
+      gapIndex = i;
+    }
+  }
+  
+  // The threshold is at the gap - everything before is inner, everything after is outer
+  const distanceThreshold = sortedPairs[gapIndex]?.dist || (surfaceMinDist + surfaceMaxDist) / 2;
+  
+  console.log(`  Largest gap at index ${gapIndex}/${sortedPairs.length}, gap size: ${maxGap.toFixed(4)}`);
+  console.log(`  Distance threshold: ${distanceThreshold.toFixed(4)}`);
+  
+  // Step 3: Mark OUTER surface voxels only (far from part = near shell)
+  const isOuterSurface = new Uint8Array(voxelCount);
+  let outerSurfaceCount = 0;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    if (isSurfaceVoxel[i] && voxelDist[i] >= distanceThreshold) {
+      isOuterSurface[i] = 1;
+      outerSurfaceCount++;
+    }
+  }
+  
+  console.log(`  Outer surface voxels (near shell): ${outerSurfaceCount}`);
+  console.log(`  Inner surface voxels (near part): ${totalSurfaceCount - outerSurfaceCount}`);
+  
+  // Step 4: Build mask for boundary voxels (outer surface + one level deep)
+  const isBoundaryAdjacent = new Uint8Array(voxelCount);
+  let boundaryAdjacentCount = 0;
+  
+  // First, mark all outer surface voxels
+  for (let i = 0; i < voxelCount; i++) {
+    if (isOuterSurface[i]) {
+      isBoundaryAdjacent[i] = 1;
+      boundaryAdjacentCount++;
+    }
+  }
+  
+  // Mark level 1: immediate neighbors of outer surface voxels
+  for (let i = 0; i < voxelCount; i++) {
+    if (isOuterSurface[i]) {
+      const cell = moldVolumeCells[i];
+      const gi = Math.round(cell.index.x);
+      const gj = Math.round(cell.index.y);
+      const gk = Math.round(cell.index.z);
+      
+      for (const [di, dj, dk] of faceNeighborOffsets) {
+        const neighborIdx = getVoxelIdx(gi + di, gj + dj, gk + dk);
+        if (neighborIdx >= 0 && !isBoundaryAdjacent[neighborIdx]) {
+          isBoundaryAdjacent[neighborIdx] = 1;
+          boundaryAdjacentCount++;
+        }
+      }
+    }
+  }
+  
+  console.log(`Boundary detection for biased weighting:`);
+  console.log(`  Boundary voxels (outer + 1 level): ${boundaryAdjacentCount}`);
+  console.log(`  Interior voxels (unbiased): ${voxelCount - boundaryAdjacentCount}`);
+  
+  // ========================================================================
+  // BIASED DISTANCE FIELD COMPUTATION
+  // biasedDist = w₁ * δ_i + w₂ * λ_w where λ_w = R - δ_w
+  // Default weights: w₁ = 1.0, w₂ = 1.0
+  // BUT: Only apply bias to boundary-adjacent voxels (outer surface + one level deep)
+  // Interior voxels use w₁ * δ_i (no shell bias)
+  // ========================================================================
+  
+  // Default weights (can be recalculated later with custom weights)
+  const w1 = DEFAULT_BIASED_DISTANCE_WEIGHTS.partDistanceWeight;
+  const w2 = DEFAULT_BIASED_DISTANCE_WEIGHTS.shellBiasWeight;
   
   const biasedDist = new Float32Array(voxelCount);
   let minBiasedDist = Infinity;
@@ -501,9 +657,17 @@ export function generateVolumetricGrid(
   
   for (let i = 0; i < voxelCount; i++) {
     const delta_i = voxelDist[i];           // Distance to part
-    const delta_w = voxelDistToShell[i];    // Distance to shell
-    const lambda_w = R - delta_w;           // Bias penalty
-    const biased = delta_i + lambda_w;      // Biased distance
+    
+    let biased: number;
+    if (isBoundaryAdjacent[i]) {
+      // Boundary-adjacent: apply full bias with weights
+      const delta_w = voxelDistToShell[i];    // Distance to shell
+      const lambda_w = R - delta_w;           // Bias penalty
+      biased = w1 * delta_i + w2 * lambda_w;  // Weighted biased distance
+    } else {
+      // Interior: only part distance term with weight
+      biased = w1 * delta_i;
+    }
     
     biasedDist[i] = biased;
     
@@ -513,7 +677,7 @@ export function generateVolumetricGrid(
   
   const biasedDistanceStats = { min: minBiasedDist, max: maxBiasedDist };
   
-  console.log(`Biased distance field (δ_i + R - δ_w) computed:`);
+  console.log(`Biased distance field computed (boundary-adjacent only):`);
   console.log(`  Min biased distance: ${minBiasedDist.toFixed(6)}`);
   console.log(`  Max biased distance: ${maxBiasedDist.toFixed(6)}`);
   console.log(`═══════════════════════════════════════════════════════`);
@@ -585,6 +749,7 @@ export function generateVolumetricGrid(
     R,
     rLineStart,
     rLineEnd,
+    boundaryAdjacentMask: isBoundaryAdjacent,
   };
 }
 
@@ -893,9 +1058,141 @@ export async function generateVolumetricGridGPU(
     console.log(`  Max distance to shell: ${maxShellDist.toFixed(6)}`);
     
     // ========================================================================
-    // BIASED DISTANCE FIELD COMPUTATION
-    // biasedDist = δ_i + λ_w where λ_w = R - δ_w
+    // IDENTIFY OUTER SURFACE VOXELS (NEAR SHELL) AND TWO LEVELS DEEP
+    // Same logic as CPU version
     // ========================================================================
+    
+    console.log(`Identifying boundary voxels for biased weighting (GPU grid)...`);
+    
+    // Build spatial index for neighbor lookups
+    const voxelSpatialIndex = new Map<string, number>();
+    for (let i = 0; i < voxelCount; i++) {
+      const cell = moldVolumeCells[i];
+      const key = `${Math.round(cell.index.x)},${Math.round(cell.index.y)},${Math.round(cell.index.z)}`;
+      voxelSpatialIndex.set(key, i);
+    }
+    
+    const getVoxelIdx = (gi: number, gj: number, gk: number): number => {
+      const key = `${gi},${gj},${gk}`;
+      return voxelSpatialIndex.get(key) ?? -1;
+    };
+    
+    // 6-connected neighbor offsets
+    const faceNeighborOffsets: [number, number, number][] = [
+      [1, 0, 0], [-1, 0, 0],
+      [0, 1, 0], [0, -1, 0],
+      [0, 0, 1], [0, 0, -1],
+    ];
+    
+    // Step 1: Find ALL surface voxels
+    const isSurfaceVoxel = new Uint8Array(voxelCount);
+    let totalSurfaceCount = 0;
+    
+    for (let i = 0; i < voxelCount; i++) {
+      const cell = moldVolumeCells[i];
+      const gi = Math.round(cell.index.x);
+      const gj = Math.round(cell.index.y);
+      const gk = Math.round(cell.index.z);
+      
+      for (const [di, dj, dk] of faceNeighborOffsets) {
+        const neighborIdx = getVoxelIdx(gi + di, gj + dj, gk + dk);
+        if (neighborIdx < 0) {
+          isSurfaceVoxel[i] = 1;
+          totalSurfaceCount++;
+          break;
+        }
+      }
+    }
+    
+    console.log(`  Total surface voxels: ${totalSurfaceCount}`);
+    
+    // Step 2: Use distance-to-part to distinguish inner vs outer surface
+    const surfaceDistances: number[] = [];
+    const surfaceIndices: number[] = [];
+    for (let i = 0; i < voxelCount; i++) {
+      if (isSurfaceVoxel[i]) {
+        surfaceDistances.push(voxelDist[i]);
+        surfaceIndices.push(i);
+      }
+    }
+    
+    const sortedPairs = surfaceIndices.map((idx, i) => ({ idx, dist: surfaceDistances[i] }));
+    sortedPairs.sort((a, b) => a.dist - b.dist);
+    
+    const surfaceMinDist = sortedPairs[0]?.dist || 0;
+    const surfaceMaxDist = sortedPairs[sortedPairs.length - 1]?.dist || 0;
+    
+    // Find the largest gap
+    let maxGap = 0;
+    let gapIndex = Math.floor(sortedPairs.length / 2);
+    
+    for (let i = 1; i < sortedPairs.length; i++) {
+      const gap = sortedPairs[i].dist - sortedPairs[i - 1].dist;
+      if (gap > maxGap) {
+        maxGap = gap;
+        gapIndex = i;
+      }
+    }
+    
+    const distanceThreshold = sortedPairs[gapIndex]?.dist || (surfaceMinDist + surfaceMaxDist) / 2;
+    console.log(`  Distance threshold: ${distanceThreshold.toFixed(4)}`);
+    
+    // Step 3: Mark OUTER surface voxels only
+    const isOuterSurface = new Uint8Array(voxelCount);
+    let outerSurfaceCount = 0;
+    
+    for (let i = 0; i < voxelCount; i++) {
+      if (isSurfaceVoxel[i] && voxelDist[i] >= distanceThreshold) {
+        isOuterSurface[i] = 1;
+        outerSurfaceCount++;
+      }
+    }
+    
+    console.log(`  Outer surface voxels: ${outerSurfaceCount}`);
+    
+    // Step 4: Build mask for boundary voxels (outer surface + one level deep)
+    const isBoundaryAdjacent = new Uint8Array(voxelCount);
+    let boundaryAdjacentCount = 0;
+    
+    // First, mark all outer surface voxels
+    for (let i = 0; i < voxelCount; i++) {
+      if (isOuterSurface[i]) {
+        isBoundaryAdjacent[i] = 1;
+        boundaryAdjacentCount++;
+      }
+    }
+    
+    // Mark level 1: immediate neighbors of outer surface voxels
+    for (let i = 0; i < voxelCount; i++) {
+      if (isOuterSurface[i]) {
+        const cell = moldVolumeCells[i];
+        const gi = Math.round(cell.index.x);
+        const gj = Math.round(cell.index.y);
+        const gk = Math.round(cell.index.z);
+        
+        for (const [di, dj, dk] of faceNeighborOffsets) {
+          const neighborIdx = getVoxelIdx(gi + di, gj + dj, gk + dk);
+          if (neighborIdx >= 0 && !isBoundaryAdjacent[neighborIdx]) {
+            isBoundaryAdjacent[neighborIdx] = 1;
+            boundaryAdjacentCount++;
+          }
+        }
+      }
+    }
+    
+    console.log(`  Boundary voxels (outer + 1 level): ${boundaryAdjacentCount}`);
+    console.log(`  Interior voxels (unbiased): ${voxelCount - boundaryAdjacentCount}`);
+    
+    // ========================================================================
+    // BIASED DISTANCE FIELD COMPUTATION
+    // biasedDist = w₁ * δ_i + w₂ * λ_w where λ_w = R - δ_w
+    // Default weights: w₁ = 1.0, w₂ = 1.0
+    // BUT: Only apply bias to boundary-adjacent voxels
+    // ========================================================================
+    
+    // Default weights (can be recalculated later with custom weights)
+    const w1 = DEFAULT_BIASED_DISTANCE_WEIGHTS.partDistanceWeight;
+    const w2 = DEFAULT_BIASED_DISTANCE_WEIGHTS.shellBiasWeight;
     
     const biasedDist = new Float32Array(voxelCount);
     let minBiasedDist = Infinity;
@@ -903,9 +1200,15 @@ export async function generateVolumetricGridGPU(
     
     for (let i = 0; i < voxelCount; i++) {
       const delta_i = voxelDist[i];
-      const delta_w = voxelDistToShell[i];
-      const lambda_w = R - delta_w;
-      const biased = delta_i + lambda_w;
+      
+      let biased: number;
+      if (isBoundaryAdjacent[i]) {
+        const delta_w = voxelDistToShell[i];
+        const lambda_w = R - delta_w;
+        biased = w1 * delta_i + w2 * lambda_w;
+      } else {
+        biased = w1 * delta_i;
+      }
       
       biasedDist[i] = biased;
       
@@ -915,7 +1218,7 @@ export async function generateVolumetricGridGPU(
     
     const biasedDistanceStats = { min: minBiasedDist, max: maxBiasedDist };
     
-    console.log(`Biased distance field (δ_i + R - δ_w) computed:`);
+    console.log(`Biased distance field computed (boundary-adjacent only):`);
     console.log(`  Min biased distance: ${minBiasedDist.toFixed(6)}`);
     console.log(`  Max biased distance: ${maxBiasedDist.toFixed(6)}`);
     console.log(`═══════════════════════════════════════════════════════`);
@@ -990,6 +1293,7 @@ export async function generateVolumetricGridGPU(
       R,
       rLineStart,
       rLineEnd,
+      boundaryAdjacentMask: isBoundaryAdjacent,
     };
     
   } catch (error) {
@@ -1160,7 +1464,7 @@ function getWebGPUComputeShader(): string {
 // ============================================================================
 
 /** Type of field to use for visualization coloring */
-export type DistanceFieldType = 'part' | 'biased' | 'weight';
+export type DistanceFieldType = 'part' | 'biased' | 'weight' | 'boundary';
 
 /**
  * Get the distance data and stats for a given field type
@@ -1168,7 +1472,7 @@ export type DistanceFieldType = 'part' | 'biased' | 'weight';
 function getDistanceFieldData(
   gridResult: VolumetricGridResult,
   fieldType: DistanceFieldType
-): { data: Float32Array | null; stats: { min: number; max: number } | null } {
+): { data: Float32Array | Uint8Array | null; stats: { min: number; max: number } | null; isBinaryMask?: boolean } {
   if (fieldType === 'biased') {
     return {
       data: gridResult.biasedDist,
@@ -1179,6 +1483,14 @@ function getDistanceFieldData(
     return {
       data: gridResult.weightingFactor,
       stats: gridResult.weightingFactorStats
+    };
+  }
+  if (fieldType === 'boundary') {
+    // Return boundary mask as binary data (0 = interior/unbiased, 1 = boundary-adjacent/biased)
+    return {
+      data: gridResult.boundaryAdjacentMask,
+      stats: { min: 0, max: 1 },
+      isBinaryMask: true
     };
   }
   // Default to part distance
@@ -1209,13 +1521,26 @@ export function createMoldVolumePointCloud(
   const colors = new Float32Array(cellCount * 3);
   
   // Get the appropriate distance field data
-  const { data: distData, stats: distStats } = getDistanceFieldData(gridResult, distanceFieldType);
+  const fieldData = getDistanceFieldData(gridResult, distanceFieldType);
+  const { data: distData, stats: distStats, isBinaryMask } = fieldData;
   const hasDistanceData = distData !== null && distStats !== null;
   
+  // Debug logging for boundary mask
+  if (distanceFieldType === 'boundary') {
+    console.log('Boundary mask visualization:', {
+      hasData: distData !== null,
+      dataLength: distData?.length,
+      isBinaryMask,
+      hasDistanceData
+    });
+  }
+  
   // Color gradient: red (close to part) -> teal (far from part)
-  // Red: (1, 0, 0) -> Teal: (0, 1, 1)
+  // For boundary mask: orange (biased/boundary) vs blue (unbiased/interior)
   const colorClose = new THREE.Color(0xff0000); // Red
   const colorFar = new THREE.Color(0x00ffff);   // Teal (cyan)
+  const colorBiased = new THREE.Color(0xff8800);   // Orange - biased (boundary-adjacent)
+  const colorUnbiased = new THREE.Color(0x0088ff); // Blue - unbiased (interior)
   const tempColor = new THREE.Color();
   
   for (let i = 0; i < cellCount; i++) {
@@ -1225,14 +1550,21 @@ export function createMoldVolumePointCloud(
     positions[i * 3 + 2] = cell.center.z;
     
     if (hasDistanceData) {
-      // Normalize distance to [0, 1] range
-      const dist = distData![i];
-      const { min, max } = distStats!;
-      const range = max - min;
-      const t = range > 0 ? (dist - min) / range : 0;
-      
-      // Interpolate between red (close) and teal (far)
-      tempColor.lerpColors(colorClose, colorFar, t);
+      if (isBinaryMask === true) {
+        // Binary mask: use distinct colors for biased vs unbiased
+        const maskValue = distData![i];
+        const isBiased = maskValue === 1;
+        tempColor.copy(isBiased ? colorBiased : colorUnbiased);
+      } else {
+        // Continuous field: interpolate based on normalized value
+        const dist = distData![i];
+        const { min, max } = distStats!;
+        const range = max - min;
+        const t = range > 0 ? (dist - min) / range : 0;
+        
+        // Interpolate between red (close) and teal (far)
+        tempColor.lerpColors(colorClose, colorFar, t);
+      }
       colors[i * 3] = tempColor.r;
       colors[i * 3 + 1] = tempColor.g;
       colors[i * 3 + 2] = tempColor.b;
@@ -1294,12 +1626,35 @@ export function createMoldVolumeVoxels(
   const instancedMesh = new THREE.InstancedMesh(boxGeometry, material, cellCount);
   
   // Get the appropriate distance field data
-  const { data: distData, stats: distStats } = getDistanceFieldData(gridResult, distanceFieldType);
+  const fieldData = getDistanceFieldData(gridResult, distanceFieldType);
+  const { data: distData, stats: distStats, isBinaryMask } = fieldData;
   const hasDistanceData = distData !== null && distStats !== null;
   
+  // Debug logging for boundary mask
+  if (distanceFieldType === 'boundary') {
+    console.log('Boundary mask visualization (voxels):', {
+      hasData: distData !== null,
+      dataLength: distData?.length,
+      isBinaryMask,
+      hasDistanceData,
+      boundaryAdjacentMask: gridResult.boundaryAdjacentMask !== null ? 'exists' : 'null'
+    });
+    if (distData) {
+      let biasedCount = 0, unbiasedCount = 0;
+      for (let i = 0; i < distData.length; i++) {
+        if (distData[i] === 1) biasedCount++;
+        else unbiasedCount++;
+      }
+      console.log(`  Biased voxels: ${biasedCount}, Unbiased voxels: ${unbiasedCount}`);
+    }
+  }
+  
   // Color gradient: red (close/low) -> teal (far/high)
+  // For boundary mask: orange (biased/boundary) vs blue (unbiased/interior)
   const colorClose = new THREE.Color(0xff0000); // Red
   const colorFar = new THREE.Color(0x00ffff);   // Teal (cyan)
+  const colorBiased = new THREE.Color(0xff8800);   // Orange - biased (boundary-adjacent)
+  const colorUnbiased = new THREE.Color(0x0088ff); // Blue - unbiased (interior)
   const fallbackColor = new THREE.Color(color);
   const tempColor = new THREE.Color();
   
@@ -1312,14 +1667,21 @@ export function createMoldVolumeVoxels(
     instancedMesh.setMatrixAt(i, matrix);
     
     if (hasDistanceData) {
-      // Normalize distance to [0, 1] range
-      const dist = distData![i];
-      const { min, max } = distStats!;
-      const range = max - min;
-      const t = range > 0 ? (dist - min) / range : 0;
-      
-      // Interpolate between red (close) and teal (far)
-      tempColor.lerpColors(colorClose, colorFar, t);
+      if (isBinaryMask === true) {
+        // Binary mask: use distinct colors for biased vs unbiased
+        const maskValue = distData![i];
+        const isBiased = maskValue === 1;
+        tempColor.copy(isBiased ? colorBiased : colorUnbiased);
+      } else {
+        // Continuous field: interpolate based on normalized value
+        const dist = distData![i];
+        const { min, max } = distStats!;
+        const range = max - min;
+        const t = range > 0 ? (dist - min) / range : 0;
+        
+        // Interpolate between red (close) and teal (far)
+        tempColor.lerpColors(colorClose, colorFar, t);
+      }
       instancedMesh.setColorAt(i, tempColor);
     } else {
       instancedMesh.setColorAt(i, fallbackColor);
@@ -1838,5 +2200,128 @@ export async function generateVolumetricGridParallel(
     R: 0, // Not computed in worker-based version
     rLineStart: null,
     rLineEnd: null,
+    boundaryAdjacentMask: null, // Not computed in worker-based version
+  };
+}
+
+// ============================================================================
+// BIASED DISTANCE RECALCULATION WITH WEIGHTS
+// ============================================================================
+
+/** Default weights for biased distance calculation */
+export const DEFAULT_BIASED_DISTANCE_WEIGHTS: BiasedDistanceWeights = {
+  partDistanceWeight: 1.0,
+  shellBiasWeight: 1.0,
+};
+
+/**
+ * Recalculate biased distances and weighting factors with custom weights.
+ * This is much faster than regenerating the entire grid since it only
+ * recomputes the biased distance field using the already-computed distance fields.
+ * 
+ * Formula: biasedDist = w₁ * δ_i + w₂ * (R - δ_w)
+ * Where:
+ *   - w₁ = partDistanceWeight (weight for distance to part)
+ *   - w₂ = shellBiasWeight (weight for shell bias term)
+ *   - δ_i = distance to part mesh
+ *   - δ_w = distance to shell
+ *   - R = maximum distance from any voxel to part mesh
+ * 
+ * Note: The bias is only applied to boundary-adjacent voxels (outer surface + one level deep).
+ * Interior voxels use just w₁ * δ_i (no shell bias).
+ * 
+ * @param gridResult - The existing volumetric grid result
+ * @param weights - Custom weights for the biased distance calculation
+ * @returns Updated VolumetricGridResult with recalculated biasedDist and weightingFactor
+ */
+export function recalculateBiasedDistances(
+  gridResult: VolumetricGridResult,
+  weights: BiasedDistanceWeights = DEFAULT_BIASED_DISTANCE_WEIGHTS
+): VolumetricGridResult {
+  const { voxelDist, voxelDistToShell, boundaryAdjacentMask, R } = gridResult;
+  
+  if (!voxelDist || !voxelDistToShell || !boundaryAdjacentMask) {
+    console.warn('Cannot recalculate biased distances: missing distance field data');
+    return gridResult;
+  }
+  
+  const voxelCount = voxelDist.length;
+  const { partDistanceWeight: w1, shellBiasWeight: w2 } = weights;
+  
+  console.log('═══════════════════════════════════════════════════════');
+  console.log('RECALCULATING BIASED DISTANCES WITH CUSTOM WEIGHTS');
+  console.log('═══════════════════════════════════════════════════════');
+  console.log(`  Part distance weight (w₁): ${w1.toFixed(2)}`);
+  console.log(`  Shell bias weight (w₂): ${w2.toFixed(2)}`);
+  console.log(`  R: ${R.toFixed(6)}`);
+  console.log(`  Voxel count: ${voxelCount}`);
+  
+  // Recalculate biased distances
+  const biasedDist = new Float32Array(voxelCount);
+  let minBiasedDist = Infinity;
+  let maxBiasedDist = -Infinity;
+  
+  let boundaryCount = 0;
+  let interiorCount = 0;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    const delta_i = voxelDist[i];
+    
+    let biased: number;
+    if (boundaryAdjacentMask[i]) {
+      // Boundary-adjacent: apply weighted bias
+      const delta_w = voxelDistToShell[i];
+      const lambda_w = R - delta_w;
+      biased = w1 * delta_i + w2 * lambda_w;
+      boundaryCount++;
+    } else {
+      // Interior: only part distance term (no shell bias)
+      biased = w1 * delta_i;
+      interiorCount++;
+    }
+    
+    biasedDist[i] = biased;
+    
+    if (biased < minBiasedDist) minBiasedDist = biased;
+    if (biased > maxBiasedDist) maxBiasedDist = biased;
+  }
+  
+  const biasedDistanceStats = { min: minBiasedDist, max: maxBiasedDist };
+  
+  console.log(`Biased distance field recalculated:`);
+  console.log(`  Boundary voxels: ${boundaryCount}`);
+  console.log(`  Interior voxels: ${interiorCount}`);
+  console.log(`  Min biased distance: ${minBiasedDist.toFixed(6)}`);
+  console.log(`  Max biased distance: ${maxBiasedDist.toFixed(6)}`);
+  
+  // Recalculate weighting factors
+  const weightingFactor = new Float32Array(voxelCount);
+  let minWeight = Infinity;
+  let maxWeight = -Infinity;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    const bd = biasedDist[i];
+    const wt = 1.0 / (bd * bd + 0.25);
+    
+    weightingFactor[i] = wt;
+    
+    if (wt < minWeight) minWeight = wt;
+    if (wt > maxWeight) maxWeight = wt;
+  }
+  
+  const weightingFactorStats = { min: minWeight, max: maxWeight };
+  
+  console.log(`Weighting factor 1/(biasedDist² + 0.25) recalculated:`);
+  console.log(`  Min weight: ${minWeight.toFixed(6)}`);
+  console.log(`  Max weight: ${maxWeight.toFixed(6)}`);
+  console.log('═══════════════════════════════════════════════════════');
+  
+  // Return updated result (preserving all other fields)
+  return {
+    ...gridResult,
+    biasedDist,
+    weightingFactor,
+    biasedDistanceStats,
+    weightingFactorStats,
   };
 }

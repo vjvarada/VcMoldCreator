@@ -8,7 +8,7 @@
  * - Visibility painting for mold analysis
  */
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useImperativeHandle, forwardRef } from 'react';
 import * as THREE from 'three';
 import { OrbitControls, STLLoader } from 'three-stdlib';
 import {
@@ -41,9 +41,11 @@ import {
   createGridBoundingBoxHelper,
   createRLineVisualization,
   removeGridVisualization,
+  recalculateBiasedDistances,
   type VolumetricGridResult,
   type VolumetricGridOptions,
-  type DistanceFieldType
+  type DistanceFieldType,
+  type BiasedDistanceWeights
 } from '../utils/volumetricGrid';
 import {
   classifyMoldHalves,
@@ -114,6 +116,11 @@ interface ThreeViewerProps {
   onEscapeLabelingReady?: (result: EscapeLabelingResult | null) => void;
 }
 
+/** Handle exposed by ThreeViewer via useImperativeHandle */
+export interface ThreeViewerHandle {
+  recalculateBiasedDistances: (weights: BiasedDistanceWeights) => void;
+}
+
 // ============================================================================
 // CONSTANTS
 // ============================================================================
@@ -127,7 +134,7 @@ const GRID_COLOR_LINES = 0x333333;
 // COMPONENT
 // ============================================================================
 
-const ThreeViewer: React.FC<ThreeViewerProps> = ({
+const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
   stlUrl,
   showPartingDirections = false,
   showD1Paint = false,
@@ -158,7 +165,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   onVolumetricGridReady,
   onMoldHalfClassificationReady,
   onEscapeLabelingReady
-}) => {
+}, ref) => {
   // Refs for Three.js objects
   const containerRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -178,6 +185,53 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const rLineVisualizationRef = useRef<THREE.Group | null>(null);
   const escapeLabelingRef = useRef<EscapeLabelingResult | null>(null);
   const escapeLabelingVisualizationRef = useRef<THREE.Object3D | null>(null);
+
+  // ============================================================================
+  // IMPERATIVE HANDLE - Expose methods to parent component
+  // ============================================================================
+
+  useImperativeHandle(ref, () => ({
+    recalculateBiasedDistances: (weights: BiasedDistanceWeights) => {
+      const gridResult = volumetricGridRef.current;
+      const scene = sceneRef.current;
+      
+      if (!gridResult || !scene) {
+        console.warn('Cannot recalculate: no volumetric grid or scene available');
+        return;
+      }
+      
+      console.log('Recalculating biased distances with weights:', weights);
+      
+      // Recalculate biased distances
+      const updatedResult = recalculateBiasedDistances(gridResult, weights);
+      volumetricGridRef.current = updatedResult;
+      
+      // Update visualization if visible
+      if (gridVisualizationRef.current && !hideVoxelGrid) {
+        // Remove old visualization
+        scene.remove(gridVisualizationRef.current);
+        if (gridVisualizationRef.current instanceof THREE.Points) {
+          gridVisualizationRef.current.geometry.dispose();
+          (gridVisualizationRef.current.material as THREE.PointsMaterial).dispose();
+        } else if (gridVisualizationRef.current instanceof THREE.InstancedMesh) {
+          gridVisualizationRef.current.geometry.dispose();
+          (gridVisualizationRef.current.material as THREE.Material).dispose();
+        }
+        
+        // Create new visualization with updated data
+        if (gridVisualizationMode === 'points') {
+          gridVisualizationRef.current = createMoldVolumePointCloud(updatedResult, 0x00ffff, 3, distanceFieldType);
+        } else {
+          gridVisualizationRef.current = createMoldVolumeVoxels(updatedResult, 0x00ffff, 0.2, distanceFieldType);
+        }
+        scene.add(gridVisualizationRef.current);
+        gridVisualizationRef.current.visible = true;
+      }
+      
+      // Notify parent of updated grid result
+      onVolumetricGridReady?.(updatedResult);
+    }
+  }), [hideVoxelGrid, gridVisualizationMode, distanceFieldType, onVolumetricGridReady]);
 
   // ============================================================================
   // SCENE SETUP
@@ -905,6 +959,6 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       }}
     />
   );
-};
+});
 
 export default ThreeViewer;

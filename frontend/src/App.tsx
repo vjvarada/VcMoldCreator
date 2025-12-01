@@ -7,11 +7,11 @@
 
 import React, { useState, useCallback, useRef } from 'react';
 import './App.css';
-import ThreeViewer, { type GridVisualizationMode } from './components/ThreeViewer';
+import ThreeViewer, { type GridVisualizationMode, type ThreeViewerHandle } from './components/ThreeViewer';
 import type { VisibilityPaintData } from './utils/partingDirection';
 import type { InflatedHullResult, ManifoldValidationResult, CsgSubtractionResult } from './utils/inflatedBoundingVolume';
 import type { MeshRepairResult, MeshDiagnostics } from './utils/meshRepairManifold';
-import type { VolumetricGridResult, DistanceFieldType } from './utils/volumetricGrid';
+import type { VolumetricGridResult, DistanceFieldType, BiasedDistanceWeights } from './utils/volumetricGrid';
 import type { MoldHalfClassificationResult } from './utils/moldHalfClassification';
 import type { EscapeLabelingResult, AdjacencyType } from './utils/partingSurface';
 
@@ -88,6 +88,11 @@ function App() {
   const [hideVoxelGrid, setHideVoxelGrid] = useState(false);
   const [showRLine, setShowRLine] = useState(true);
   const [distanceFieldType, setDistanceFieldType] = useState<DistanceFieldType>('part');
+  // Biased distance weights
+  const [biasedDistanceWeights, setBiasedDistanceWeights] = useState<BiasedDistanceWeights>({
+    partDistanceWeight: 1.0,
+    shellBiasWeight: 1.0,
+  });
   const [showMoldHalfClassification, setShowMoldHalfClassification] = useState(false);
   const [boundaryZoneThreshold, setBoundaryZoneThreshold] = useState(0.15); // 15% of bbox diagonal
   const [moldHalfStats, setMoldHalfStats] = useState<{
@@ -117,6 +122,9 @@ function App() {
   const [lastComputedInflationOffset, setLastComputedInflationOffset] = useState<number | null>(null);
   const [lastComputedGridResolution, setLastComputedGridResolution] = useState<number | null>(null);
   const [lastComputedAdjacency, setLastComputedAdjacency] = useState<AdjacencyType | null>(null);
+
+  // Ref for ThreeViewer component to call methods like recalculateBiasedDistances
+  const threeViewerRef = useRef<ThreeViewerHandle | null>(null);
 
   // Helper to clear downstream steps (clears steps AFTER the given step, not the step itself)
   const clearFromStep = useCallback((step: Step) => {
@@ -750,6 +758,82 @@ function App() {
                 <div>Compute: {volumetricGridStats.computeTimeMs.toFixed(0)} ms</div>
               </div>
             )}
+
+            {/* Biased Distance Weights - only available after grid is computed */}
+            {volumetricGridStats && (
+              <div style={{ marginTop: '16px', paddingTop: '12px', borderTop: '1px solid #444' }}>
+                <div style={{ ...styles.optionLabel, marginBottom: '8px' }}>Biased Distance Weights:</div>
+                
+                <div style={{ marginBottom: '8px' }}>
+                  <label style={{ fontSize: '11px', color: '#aaa', display: 'block', marginBottom: '2px' }}>
+                    Part Distance (δᵢ) weight: {biasedDistanceWeights.partDistanceWeight.toFixed(2)}
+                  </label>
+                  <input
+                    type="range"
+                    min="0"
+                    max="10"
+                    step="0.1"
+                    value={biasedDistanceWeights.partDistanceWeight}
+                    onChange={(e) => setBiasedDistanceWeights(prev => ({
+                      ...prev,
+                      partDistanceWeight: parseFloat(e.target.value)
+                    }))}
+                    style={{ width: '100%', cursor: 'pointer' }}
+                  />
+                </div>
+                
+                <div style={{ marginBottom: '8px' }}>
+                  <label style={{ fontSize: '11px', color: '#aaa', display: 'block', marginBottom: '2px' }}>
+                    Shell Bias (R-δw) weight: {biasedDistanceWeights.shellBiasWeight.toFixed(2)}
+                  </label>
+                  <input
+                    type="range"
+                    min="0"
+                    max="10"
+                    step="0.1"
+                    value={biasedDistanceWeights.shellBiasWeight}
+                    onChange={(e) => setBiasedDistanceWeights(prev => ({
+                      ...prev,
+                      shellBiasWeight: parseFloat(e.target.value)
+                    }))}
+                    style={{ width: '100%', cursor: 'pointer' }}
+                  />
+                </div>
+                
+                <button
+                  onClick={() => {
+                    // Trigger recalculation via ThreeViewer ref
+                    if (threeViewerRef.current) {
+                      threeViewerRef.current.recalculateBiasedDistances(biasedDistanceWeights);
+                    }
+                  }}
+                  style={{
+                    ...styles.primaryButton,
+                    marginTop: '8px',
+                    width: '100%',
+                    padding: '6px 12px',
+                    fontSize: '12px',
+                  }}
+                >
+                  🔄 Recalculate Biased Distances
+                </button>
+                
+                <button
+                  onClick={() => {
+                    setBiasedDistanceWeights({ partDistanceWeight: 1.0, shellBiasWeight: 1.0 });
+                  }}
+                  style={{
+                    ...styles.secondaryButton,
+                    marginTop: '6px',
+                    width: '100%',
+                    padding: '4px 8px',
+                    fontSize: '11px',
+                  }}
+                >
+                  Reset to Defaults
+                </button>
+              </div>
+            )}
           </div>
         )}
 
@@ -969,6 +1053,7 @@ function App() {
                   <option value="part">Part Distance (δᵢ)</option>
                   <option value="biased">Biased Distance (δᵢ + λw)</option>
                   <option value="weight">Weighting Factor (wt)</option>
+                  <option value="boundary">Boundary Mask (Biased vs Unbiased)</option>
                 </select>
               </div>
             )}
@@ -1031,6 +1116,7 @@ function App() {
       {/* Column 3: 3D Viewer (70%) */}
       <div style={styles.viewerContainer}>
         <ThreeViewer
+          ref={threeViewerRef}
           stlUrl={stlUrl}
           showPartingDirections={showPartingDirections}
           showD1Paint={showD1Paint}
@@ -1202,6 +1288,23 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: '4px',
     fontSize: '11px',
     lineHeight: 1.6,
+  },
+  primaryButton: {
+    backgroundColor: '#00aaff',
+    border: 'none',
+    borderRadius: '4px',
+    color: '#000',
+    fontWeight: 'bold',
+    cursor: 'pointer',
+    transition: 'background-color 0.2s',
+  },
+  secondaryButton: {
+    backgroundColor: '#333',
+    border: '1px solid #555',
+    borderRadius: '4px',
+    color: '#aaa',
+    cursor: 'pointer',
+    transition: 'all 0.2s',
   },
   legend: {
     marginTop: '8px',

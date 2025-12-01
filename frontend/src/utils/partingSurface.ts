@@ -8,10 +8,19 @@
  * - Identify inner surface voxels (near part mesh M) as seeds
  * - Identify outer surface voxels (near shell ∂H) and label them as H₁ or H₂
  * - Run Dijkstra from each seed to find lowest cost path to boundary:
- *     edgeCost(i,j) = L / avg_weight
- *   where L = Euclidean distance, avg_weight = average of weighting factors
- *   weightingFactor = 1/[(biasedDist² + 0.25)]
- *   biasedDist = δ_i + (R - δ_w)  (distance to part + bias from shell distance)
+ *     edgeCost(i,j) = L * wt_j
+ *   where L = Euclidean distance, wt_j = weighting factor of destination voxel
+ * 
+ * Weighting factor computation:
+ * - For boundary-adjacent voxels (outer surface + one level deep):
+ *     wt = 1/[(biasedDist² + 0.25)]
+ *     biasedDist = δ_i + (R - δ_w)  (distance to part + bias from shell distance)
+ * - For interior voxels (more than one level from boundary):
+ *     wt = 1/[(δ_i² + 0.25)]  (unbiased, only distance to part)
+ * 
+ * This ensures the shell-based bias only affects paths near the boundary,
+ * not throughout the entire volume.
+ * 
  * - Each seed inherits the label of the boundary it reaches via lowest cost path
  * - The parting surface is where label transitions occur (interface voxels)
  */
@@ -241,6 +250,8 @@ function identifyBoundaryAdjacentVoxels(
 ): { 
   boundaryLabel: Int8Array; 
   innerSurfaceMask: Uint8Array;
+  /** Mask for voxels that are boundary or one level deep from boundary (for biased weighting) */
+  boundaryAdjacentMask: Uint8Array;
   h1Adjacent: number; 
   h2Adjacent: number;
   innerSurfaceCount: number;
@@ -254,6 +265,7 @@ function identifyBoundaryAdjacentVoxels(
     return { 
       boundaryLabel: new Int8Array(voxelCount), 
       innerSurfaceMask: new Uint8Array(voxelCount),
+      boundaryAdjacentMask: new Uint8Array(voxelCount),
       h1Adjacent: 0, 
       h2Adjacent: 0,
       innerSurfaceCount: 0
@@ -471,7 +483,40 @@ function identifyBoundaryAdjacentVoxels(
   h2Geometry.dispose();
   boundaryZoneGeometry.dispose();
   
-  return { boundaryLabel, innerSurfaceMask, h1Adjacent, h2Adjacent, innerSurfaceCount };
+  // Step 5: Build boundaryAdjacentMask - outer surface + one level deep
+  // This mask identifies which voxels should use the biased weighting factor
+  const boundaryAdjacentMask = new Uint8Array(voxelCount);
+  let boundaryAdjacentCount = 0;
+  
+  // First, mark all outer surface voxels
+  for (let i = 0; i < voxelCount; i++) {
+    if (isOuterSurface[i]) {
+      boundaryAdjacentMask[i] = 1;
+      boundaryAdjacentCount++;
+    }
+  }
+  
+  // Mark level 1: immediate neighbors of outer surface voxels
+  for (let i = 0; i < voxelCount; i++) {
+    if (isOuterSurface[i]) {
+      const cell = cells[i];
+      const gi = Math.round(cell.index.x);
+      const gj = Math.round(cell.index.y);
+      const gk = Math.round(cell.index.z);
+      
+      for (const [di, dj, dk] of faceNeighborOffsets) {
+        const neighborIdx = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
+        if (neighborIdx >= 0 && !boundaryAdjacentMask[neighborIdx]) {
+          boundaryAdjacentMask[neighborIdx] = 1;
+          boundaryAdjacentCount++;
+        }
+      }
+    }
+  }
+  
+  console.log(`  Boundary voxels (outer + 1 level): ${boundaryAdjacentCount}`);
+  
+  return { boundaryLabel, innerSurfaceMask, boundaryAdjacentMask, h1Adjacent, h2Adjacent, innerSurfaceCount };
 }
 
 // ============================================================================
@@ -631,16 +676,20 @@ export function computeEscapeLabelingDijkstra(
   }
   
   // ========================================================================
-  // STEP 2: Multi-source Dijkstra from ALL seeds simultaneously
+  // STEP 2: Independent Dijkstra from each seed to find nearest boundary
   // 
-  // Instead of running separate Dijkstra for each seed, we run ONE search
-  // where all seeds start at cost 0. Each voxel tracks which seed it came from.
-  // When a path reaches a boundary, that seed gets labeled.
+  // The multi-source approach fails because seeds compete for voxels - inner
+  // seeds get blocked by outer seeds' paths. Instead, we run independent
+  // Dijkstra for each seed, but optimize by:
+  // 1. Reusing boundary voxel indices
+  // 2. Early termination when any boundary is reached
+  // 3. Batching for efficiency
   //
-  // This is much faster O(voxels × log(voxels)) and produces consistent results.
+  // Gap jumping: If a direct neighbor doesn't exist, we try progressively
+  // larger hops (up to 5 voxels) in the same direction.
   // ========================================================================
   
-  console.log('Running multi-source Dijkstra from all seeds...');
+  console.log('Running independent Dijkstra from each seed to find nearest boundary...');
   
   // Use 26-connectivity for better coverage (diagonal neighbors)
   const fullNeighborOffsets = getNeighborOffsets(26);
@@ -657,195 +706,148 @@ export function computeEscapeLabelingDijkstra(
   }
   console.log(`  Total seeds: ${seedIndices.length}`);
   
-  // Arrays for Dijkstra
-  const costFromSeed = new Float32Array(voxelCount).fill(Infinity);
-  const parentVoxel = new Int32Array(voxelCount).fill(-1);  // Track path back to seed
-  const originSeed = new Int32Array(voxelCount).fill(-1);   // Which seed this voxel's path originated from
-  const seedLabel = new Int8Array(voxelCount).fill(-1);     // Final label for each seed
-  
-  // Initialize priority queue with all seeds
-  const pq = new MinHeap();
-  for (const seedIdx of seedIndices) {
-    costFromSeed[seedIdx] = 0;
-    originSeed[seedIdx] = seedIdx;  // Seeds originate from themselves
-    pq.push(seedIdx, 0);
+  // Count how many boundary voxels exist
+  let boundaryVoxelCount = 0;
+  for (let i = 0; i < voxelCount; i++) {
+    if (boundaryLabel[i] !== 0) {
+      boundaryVoxelCount++;
+    }
   }
+  console.log(`  Total boundary voxels (H₁ + H₂): ${boundaryVoxelCount}`);
   
-  // Track which seeds have been labeled
-  const seedLabeled = new Uint8Array(voxelCount);
-  let labeledSeedCount = 0;
-  let visitedCount = 0;
+  // Seed labels array
+  const seedLabel = new Int8Array(voxelCount).fill(-1);
   
-  // Run Dijkstra until all seeds are labeled or we exhaust the queue
-  while (pq.size > 0 && labeledSeedCount < seedIndices.length) {
-    const current = pq.pop()!;
-    const i = current.index;
-    const currentCost = current.cost;
+  // For each seed, run Dijkstra until we hit a boundary
+  // Use a reusable cost array and visited set per seed
+  const MAX_HOP_DISTANCE = 5;
+  
+  let labeledCount = 0;
+  let totalVisited = 0;
+  let totalExpanded = 0;
+  const dijkstraStartTime = performance.now();
+  
+  // Process seeds in batches for better memory locality
+  // We'll use a shared cost array but reset relevant parts between seeds
+  const costArray = new Float32Array(voxelCount);
+  const visitedSet = new Uint8Array(voxelCount);
+  
+  // Version counter to avoid clearing arrays (much faster)
+  // Each seed gets a unique version number
+  const versionArray = new Uint32Array(voxelCount);
+  let currentVersion = 1;
+  
+  const progressInterval = Math.max(1, Math.floor(seedIndices.length / 10));
+  
+  for (let seedNum = 0; seedNum < seedIndices.length; seedNum++) {
+    const seedIdx = seedIndices[seedNum];
     
-    // Skip if we've already processed this with a better cost
-    if (currentCost > costFromSeed[i]) continue;
-    
-    visitedCount++;
-    
-    // Get the seed this path originated from
-    const mySeed = originSeed[i];
-    
-    // If this seed is already labeled, skip (we found a shorter path earlier)
-    if (mySeed >= 0 && seedLabeled[mySeed]) continue;
-    
-    // Check if we've reached a boundary
-    if (boundaryLabel[i] !== 0 && mySeed >= 0) {
-      // Label the originating seed with this boundary's label
-      seedLabel[mySeed] = boundaryLabel[i];
-      seedLabeled[mySeed] = 1;
-      labeledSeedCount++;
-      continue;  // Don't expand from boundary voxels
+    // Progress logging
+    if (seedNum % progressInterval === 0) {
+      const pct = Math.round(100 * seedNum / seedIndices.length);
+      console.log(`  Processing seed ${seedNum}/${seedIndices.length} (${pct}%)...`);
     }
     
-    // Get current voxel's grid coordinates
-    const cell = cells[i];
-    const gi = Math.round(cell.index.x);
-    const gj = Math.round(cell.index.y);
-    const gk = Math.round(cell.index.z);
+    // Increment version to "clear" arrays without actually clearing them
+    currentVersion++;
+    if (currentVersion === 0) {
+      // Handle overflow - actually clear and reset
+      versionArray.fill(0);
+      currentVersion = 1;
+    }
     
-    // Expand to neighbors (using 26-connectivity)
-    for (let n = 0; n < fullNeighborOffsets.length; n++) {
-      const [di, dj, dk] = fullNeighborOffsets[n];
-      const j = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
-      if (j < 0) continue;
+    // Initialize Dijkstra for this seed
+    const pq = new MinHeap();
+    costArray[seedIdx] = 0;
+    versionArray[seedIdx] = currentVersion;
+    pq.push(seedIdx, 0);
+    
+    let foundBoundary = false;
+    let boundaryLabelFound = 0;
+    
+    while (pq.size > 0 && !foundBoundary) {
+      const current = pq.pop()!;
+      const i = current.index;
+      const currentCost = current.cost;
       
-      // Use weighting factor of destination voxel as edge cost
-      // wt = 1/(biasedDist² + 0.25) - based on the destination voxel's biased distance
-      const L = fullNeighborDistances[n];
-      const wt_j = weightingFactor[j];
+      // Skip if already visited in this version or cost is stale
+      if (visitedSet[i] === currentVersion) continue;
+      if (versionArray[i] === currentVersion && currentCost > costArray[i]) continue;
       
-      // Edge cost = L * wt_j (cost depends on destination voxel's weight)
-      const edgeCost = L * wt_j;
+      visitedSet[i] = currentVersion;
+      totalVisited++;
       
-      const candidateCost = costFromSeed[i] + edgeCost;
+      // Check if we've reached a boundary
+      if (boundaryLabel[i] !== 0) {
+        boundaryLabelFound = boundaryLabel[i];
+        foundBoundary = true;
+        break;
+      }
       
-      if (candidateCost < costFromSeed[j]) {
-        costFromSeed[j] = candidateCost;
-        parentVoxel[j] = i;
-        originSeed[j] = mySeed;  // Inherit the seed origin
-        pq.decreaseKey(j, candidateCost);
+      totalExpanded++;
+      
+      // Get current voxel's grid coordinates
+      const cell = cells[i];
+      const gi = Math.round(cell.index.x);
+      const gj = Math.round(cell.index.y);
+      const gk = Math.round(cell.index.z);
+      
+      // Expand to neighbors
+      for (let n = 0; n < fullNeighborOffsets.length; n++) {
+        const [di, dj, dk] = fullNeighborOffsets[n];
+        
+        // Try hop distances from 1 to MAX_HOP_DISTANCE
+        for (let hopDistance = 1; hopDistance <= MAX_HOP_DISTANCE; hopDistance++) {
+          const j = getVoxelIndex(gi + hopDistance*di, gj + hopDistance*dj, gk + hopDistance*dk, spatialIndex);
+          
+          if (j < 0) continue;  // No voxel at this hop distance, try next
+          
+          // Skip if already visited in this version
+          if (visitedSet[j] === currentVersion) {
+            break;  // Found a neighbor, don't try larger hops
+          }
+          
+          const L = fullNeighborDistances[n] * hopDistance;
+          const wt_j = weightingFactor[j];
+          const edgeCost = L * wt_j;
+          const candidateCost = currentCost + edgeCost;
+          
+          // Check if this is a better path (or first path in this version)
+          if (versionArray[j] !== currentVersion || candidateCost < costArray[j]) {
+            costArray[j] = candidateCost;
+            versionArray[j] = currentVersion;
+            pq.push(j, candidateCost);
+          }
+          
+          break;  // Found a neighbor at this hop distance, don't try larger hops
+        }
       }
     }
+    
+    // Label this seed
+    if (foundBoundary) {
+      seedLabel[seedIdx] = boundaryLabelFound;
+      labeledCount++;
+    }
   }
   
-  console.log(`  Dijkstra visited ${visitedCount} voxels`);
-  console.log(`  Seeds labeled via paths: ${labeledSeedCount}`);
+  const dijkstraElapsed = performance.now() - dijkstraStartTime;
+  console.log(`  Independent Dijkstra completed in ${dijkstraElapsed.toFixed(1)}ms`);
+  console.log(`  Total visited: ${totalVisited}, Total expanded: ${totalExpanded}`);
+  console.log(`  Average voxels visited per seed: ${(totalVisited / seedIndices.length).toFixed(1)}`);
+  console.log(`  Seeds labeled: ${labeledCount} / ${seedIndices.length}`);
   
-  // Count labeled seeds
+  // Count results
   let h1Seeds = 0, h2Seeds = 0, unlabeledSeeds = 0;
   for (const seedIdx of seedIndices) {
     if (seedLabel[seedIdx] === 1) h1Seeds++;
     else if (seedLabel[seedIdx] === 2) h2Seeds++;
     else unlabeledSeeds++;
   }
-  console.log(`  Initial: H₁=${h1Seeds}, H₂=${h2Seeds}, unlabeled=${unlabeledSeeds}`);
-  
-  // ========================================================================
-  // STEP 2.5: Handle unlabeled seeds using spatial proximity voting
-  // 
-  // For seeds that couldn't find a path to boundary (disconnected regions),
-  // we use a voting scheme based on nearby labeled seeds within a search radius.
-  // ========================================================================
-  
-  if (unlabeledSeeds > 0) {
-    console.log(`  Post-processing ${unlabeledSeeds} unlabeled seeds...`);
-    
-    // Collect labeled and unlabeled seed indices
-    const labeledSeedsList: number[] = [];
-    const unlabeledSeedIndices: number[] = [];
-    
-    for (const seedIdx of seedIndices) {
-      if (seedLabel[seedIdx] === -1) {
-        unlabeledSeedIndices.push(seedIdx);
-      } else {
-        labeledSeedsList.push(seedIdx);
-      }
-    }
-    
-    // For each unlabeled seed, find nearby labeled seeds and vote
-    const searchRadius = voxelSize * 5;  // Search within 5 voxel radius
-    const searchRadiusSq = searchRadius * searchRadius;
-    
-    let fixedCount = 0;
-    for (const unlabeledIdx of unlabeledSeedIndices) {
-      const unlabeledCenter = cells[unlabeledIdx].center;
-      
-      // Count votes from nearby labeled seeds (weighted by inverse distance)
-      let h1Weight = 0;
-      let h2Weight = 0;
-      
-      for (const labeledIdx of labeledSeedsList) {
-        const labeledCenter = cells[labeledIdx].center;
-        const dx = unlabeledCenter.x - labeledCenter.x;
-        const dy = unlabeledCenter.y - labeledCenter.y;
-        const dz = unlabeledCenter.z - labeledCenter.z;
-        const distSq = dx * dx + dy * dy + dz * dz;
-        
-        if (distSq < searchRadiusSq && distSq > 0) {
-          const weight = 1.0 / distSq;  // Inverse square distance weighting
-          if (seedLabel[labeledIdx] === 1) h1Weight += weight;
-          else if (seedLabel[labeledIdx] === 2) h2Weight += weight;
-        }
-      }
-      
-      // If no nearby seeds found, expand search to all labeled seeds
-      if (h1Weight === 0 && h2Weight === 0) {
-        let nearestDistSq = Infinity;
-        let nearestLabel = -1;
-        
-        for (const labeledIdx of labeledSeedsList) {
-          const labeledCenter = cells[labeledIdx].center;
-          const dx = unlabeledCenter.x - labeledCenter.x;
-          const dy = unlabeledCenter.y - labeledCenter.y;
-          const dz = unlabeledCenter.z - labeledCenter.z;
-          const distSq = dx * dx + dy * dy + dz * dz;
-          
-          if (distSq < nearestDistSq) {
-            nearestDistSq = distSq;
-            nearestLabel = seedLabel[labeledIdx];
-          }
-        }
-        
-        if (nearestLabel !== -1) {
-          if (nearestLabel === 1) h1Weight = 1;
-          else h2Weight = 1;
-        }
-      }
-      
-      // Assign based on weighted vote
-      if (h1Weight > h2Weight) {
-        seedLabel[unlabeledIdx] = 1;
-        h1Seeds++;
-        unlabeledSeeds--;
-        fixedCount++;
-      } else if (h2Weight > h1Weight) {
-        seedLabel[unlabeledIdx] = 2;
-        h2Seeds++;
-        unlabeledSeeds--;
-        fixedCount++;
-      } else if (h1Weight > 0) {
-        // Tie - pick H1 arbitrarily
-        seedLabel[unlabeledIdx] = 1;
-        h1Seeds++;
-        unlabeledSeeds--;
-        fixedCount++;
-      }
-    }
-    
-    console.log(`  Fixed ${fixedCount} isolated seeds by proximity voting`);
-    console.log(`  Updated: H₁=${h1Seeds}, H₂=${h2Seeds}, unlabeled=${unlabeledSeeds}`);
-  }
-  
-  console.log(`  Final: H₁=${h1Seeds}, H₂=${h2Seeds}, unlabeled=${unlabeledSeeds}`);
+  console.log(`  Seeds after Dijkstra: H₁=${h1Seeds}, H₂=${h2Seeds}, orphaned=${unlabeledSeeds}`);
   
   // ========================================================================
   // STEP 3: Build final label array
-  // ========================================================================
   // ========================================================================
   
   const voxelLabel = new Int8Array(voxelCount).fill(-1);
@@ -863,14 +865,6 @@ export function computeEscapeLabelingDijkstra(
       voxelLabel[i] = boundaryLabel[i];
     }
   }
-  
-  // ========================================================================
-  // STEP 5: Interior voxels remain unlabeled (we only care about seeds)
-  // ========================================================================
-  
-  // Note: We intentionally leave interior voxels unlabeled (-1).
-  // Only seeds and boundary voxels have labels assigned.
-  // The visualization will only show seed voxels anyway.
   
   // Count how many interior voxels there are (for logging)
   let interiorCount = 0;
