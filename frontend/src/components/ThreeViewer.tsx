@@ -6,7 +6,6 @@
  * - Orthographic camera with orbit controls
  * - Parting direction computation and visualization
  * - Visibility painting for mold analysis
- * - Tetrahedral mesh visualization
  */
 
 import { useEffect, useRef } from 'react';
@@ -34,15 +33,6 @@ import {
   type MeshRepairResult
 } from '../utils/meshRepairManifold';
 import {
-<<<<<<< Updated upstream
-  createTetVisualization,
-  removeTetVisualization,
-  tetrahedralizeMeshWithProgress,
-  type TetMeshData,
-  type TetMeshVisualization,
-  type TetrahedralizeProgress
-} from '../utils/tetrahedralViewer';
-=======
   generateVolumetricGrid,
   generateVolumetricGridGPU,
   isWebGPUAvailable,
@@ -85,33 +75,17 @@ import {
   type TetrahedralizationProgress,
   type TetrahedralizationOptions
 } from '../utils/tetrahedralization';
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
 
 // ============================================================================
 // TYPES
 // ============================================================================
 
-<<<<<<< Updated upstream
-=======
 /** Visualization mode for volumetric grid */
 export type GridVisualizationMode = 'points' | 'voxels' | 'none';
 
 /** Visualization mode for tetrahedralization */
 export type TetraVisualizationMode = 'points' | 'wireframe' | 'none';
 
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
 interface ThreeViewerProps {
   stlUrl?: string;
   showPartingDirections?: boolean;
@@ -122,13 +96,6 @@ interface ThreeViewerProps {
   showCsgResult?: boolean;
   hideOriginalMesh?: boolean;
   hideHull?: boolean;
-<<<<<<< Updated upstream
-  hideCsgMesh?: boolean;
-  showTetMesh?: boolean;
-  sectionPlaneEnabled?: boolean;
-  sectionPlanePosition?: number; // 0 to 1, position along the clipping axis
-  onMeshLoaded?: (mesh: THREE.Mesh) => void;
-=======
   /** Hide the mold cavity visualization */
   hideCavity?: boolean;
   /** Show volumetric grid visualization */
@@ -166,35 +133,15 @@ interface ThreeViewerProps {
   /** Pre-loaded tetrahedral mesh (from file) to use instead of computing */
   preloadedTetraResult?: TetrahedralizationResult | null;
   onMeshLoaded?: (mesh: THREE.Mesh, meshInfo: { diagonal: number; size: { x: number; y: number; z: number }; scale: number }) => void;
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
   onMeshRepaired?: (result: MeshRepairResult) => void;
   onVisibilityDataReady?: (data: VisibilityPaintData | null) => void;
   onInflatedHullReady?: (result: InflatedHullResult | null) => void;
   onCsgResultReady?: (result: CsgSubtractionResult | null) => void;
-<<<<<<< Updated upstream
-  onTetProgress?: (progress: TetrahedralizeProgress) => void;
-  onTetComplete?: (data: TetMeshData) => void;
-  onTetError?: (error: string) => void;
-  onTetVisualizationReady?: (visualization: TetMeshVisualization | null) => void;
-=======
   onVolumetricGridReady?: (result: VolumetricGridResult | null) => void;
   onMoldHalfClassificationReady?: (result: MoldHalfClassificationResult | null) => void;
   onTetraPartingSurfaceReady?: (result: TetraPartingSurfaceResult | null) => void;
   onTetrahedralizationReady?: (result: TetrahedralizationResult | null) => void;
   onTetrahedralizationProgress?: (progress: TetrahedralizationProgress) => void;
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
 }
 
 // ============================================================================
@@ -220,12 +167,6 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   showCsgResult = false,
   hideOriginalMesh = false,
   hideHull = false,
-<<<<<<< Updated upstream
-  hideCsgMesh = false,
-  showTetMesh = false,
-  sectionPlaneEnabled = false,
-  sectionPlanePosition = 0.5,
-=======
   hideCavity = false,
   showVolumetricGrid = false,
   hideVoxelGrid = false,
@@ -244,36 +185,16 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   tetraEdgeLengthFac = 0.0065,
   tetraVisualizationMode = 'points',
   preloadedTetraResult = null,
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
   onMeshLoaded,
   onMeshRepaired,
   onVisibilityDataReady,
   onInflatedHullReady,
   onCsgResultReady,
-<<<<<<< Updated upstream
-  onTetProgress,
-  onTetComplete,
-  onTetError,
-  onTetVisualizationReady
-=======
   onVolumetricGridReady,
   onMoldHalfClassificationReady,
   onTetraPartingSurfaceReady,
   onTetrahedralizationReady,
   onTetrahedralizationProgress
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
 }) => {
   // Refs for Three.js objects
   const containerRef = useRef<HTMLDivElement>(null);
@@ -287,12 +208,6 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const visibilityDataRef = useRef<VisibilityPaintData | null>(null);
   const inflatedHullRef = useRef<InflatedHullResult | null>(null);
   const csgResultRef = useRef<CsgSubtractionResult | null>(null);
-<<<<<<< Updated upstream
-  const tetVisualizationRef = useRef<TetMeshVisualization | null>(null);
-  const isTetrahedralizingRef = useRef<boolean>(false);
-  const clippingPlaneRef = useRef<THREE.Plane | null>(null);
-  const meshBoundsRef = useRef<{ min: THREE.Vector3; max: THREE.Vector3 } | null>(null);
-=======
   const moldHalfClassificationRef = useRef<MoldHalfClassificationResult | null>(null);
   const volumetricGridRef = useRef<VolumetricGridResult | null>(null);
   const gridVisualizationRef = useRef<THREE.Points | THREE.InstancedMesh | null>(null);
@@ -305,13 +220,6 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const tetrahedralizationRef = useRef<TetrahedralizationResult | null>(null);
   const tetraVisualizationRef = useRef<THREE.Object3D | null>(null);
   const tetraBoundingBoxRef = useRef<THREE.LineSegments | null>(null);
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
 
   // ============================================================================
   // SCENE SETUP
@@ -346,13 +254,8 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(container.clientWidth, container.clientHeight);
     renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.localClippingEnabled = true; // Enable clipping planes
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
-
-    // Create clipping plane (initially disabled)
-    const clippingPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
-    clippingPlaneRef.current = clippingPlane;
 
     // Add lights
     scene.add(new THREE.AmbientLight(0xffffff, 0.6));
@@ -480,15 +383,6 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
         
         scene.add(mesh);
         meshRef.current = mesh;
-        
-        // Store scaled bounds for clipping plane
-        const scaledMin = geometry.boundingBox!.min.clone().multiplyScalar(scale);
-        const scaledMax = geometry.boundingBox!.max.clone().multiplyScalar(scale);
-        // Account for rotation (Z becomes Y)
-        meshBoundsRef.current = {
-          min: new THREE.Vector3(scaledMin.x, -scaledMax.z, scaledMin.y),
-          max: new THREE.Vector3(scaledMax.x, -scaledMin.z, scaledMax.y)
-        };
 
         // Calculate bounding box diagonal for mesh info
         const diagonal = Math.sqrt(size.x * size.x + size.y * size.y + size.z * size.z);
@@ -611,8 +505,6 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   }, [showCsgResult, onCsgResultReady]);
 
   // ============================================================================
-<<<<<<< Updated upstream
-=======
   // MOLD HALF CLASSIFICATION
   // ============================================================================
 
@@ -1251,7 +1143,6 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   }, [showPartingSurface, partingSurfaceDebugMode, onTetraPartingSurfaceReady, hideVoxelGrid, hideTetrahedralization]);
 
   // ============================================================================
->>>>>>> Stashed changes
   // VISIBILITY PAINTING
   // ============================================================================
 
@@ -1287,181 +1178,28 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   }, [hideHull]);
 
   // ============================================================================
-  // CSG MESH VISIBILITY
+  // CAVITY VISIBILITY
   // ============================================================================
 
   useEffect(() => {
     if (!csgResultRef.current) return;
-    csgResultRef.current.mesh.visible = !hideCsgMesh;
-  }, [hideCsgMesh]);
+    csgResultRef.current.mesh.visible = !hideCavity;
+  }, [hideCavity]);
 
   // ============================================================================
-  // SECTION PLANE (CLIPPING)
-  // ============================================================================
-
-  useEffect(() => {
-    if (!clippingPlaneRef.current) return;
-    
-    const plane = clippingPlaneRef.current;
-    
-    // Get bounds from tet visualization if available, otherwise fall back to mesh bounds
-    let bounds = meshBoundsRef.current;
-    
-    if (tetVisualizationRef.current?.surface) {
-      const tetGeom = tetVisualizationRef.current.surface.geometry;
-      tetGeom.computeBoundingBox();
-      if (tetGeom.boundingBox) {
-        bounds = {
-          min: tetGeom.boundingBox.min.clone(),
-          max: tetGeom.boundingBox.max.clone()
-        };
-      }
-    }
-    
-    if (!bounds) return;
-    
-    if (sectionPlaneEnabled) {
-      // Calculate Y position based on slider (0 = bottom, 1 = top)
-      const yRange = bounds.max.y - bounds.min.y;
-      const yPos = bounds.min.y + yRange * sectionPlanePosition;
-      
-      // THREE.Plane: clips points where (normal · point + constant) < 0
-      // To show everything ABOVE yPos: normal = (0, 1, 0), constant = -yPos
-      // This clips everything below the plane
-      plane.set(new THREE.Vector3(0, 1, 0), -yPos);
-      
-      console.log('Section plane:', { yPos, yRange, bounds, position: sectionPlanePosition });
-      
-      // Apply clipping plane to all relevant meshes
-      const applyClipping = (mesh: THREE.Mesh | THREE.LineSegments | undefined, enable: boolean) => {
-        if (!mesh) return;
-        const mat = mesh.material;
-        if (Array.isArray(mat)) {
-          mat.forEach(m => {
-            m.clippingPlanes = enable ? [plane] : [];
-            m.needsUpdate = true;
-          });
-        } else if (mat) {
-          mat.clippingPlanes = enable ? [plane] : [];
-          mat.needsUpdate = true;
-        }
-      };
-      
-      // Apply to all meshes
-      applyClipping(meshRef.current ?? undefined, true);
-      if (inflatedHullRef.current) applyClipping(inflatedHullRef.current.mesh, true);
-      if (csgResultRef.current) applyClipping(csgResultRef.current.mesh, true);
-      if (tetVisualizationRef.current) {
-        applyClipping(tetVisualizationRef.current.surface, true);
-        applyClipping(tetVisualizationRef.current.wireframe as unknown as THREE.Mesh, true);
-      }
-    } else {
-      // Disable clipping
-      const removeClipping = (mesh: THREE.Mesh | THREE.LineSegments | undefined) => {
-        if (!mesh) return;
-        const mat = mesh.material;
-        if (Array.isArray(mat)) {
-          mat.forEach(m => {
-            m.clippingPlanes = [];
-            m.needsUpdate = true;
-          });
-        } else if (mat) {
-          mat.clippingPlanes = [];
-          mat.needsUpdate = true;
-        }
-      };
-      
-      removeClipping(meshRef.current ?? undefined);
-      if (inflatedHullRef.current) removeClipping(inflatedHullRef.current.mesh);
-      if (csgResultRef.current) removeClipping(csgResultRef.current.mesh);
-      if (tetVisualizationRef.current) {
-        removeClipping(tetVisualizationRef.current.surface);
-        removeClipping(tetVisualizationRef.current.wireframe as unknown as THREE.Mesh);
-      }
-    }
-  }, [sectionPlaneEnabled, sectionPlanePosition]);
-
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
-  // ============================================================================
-  // TETRAHEDRAL MESH VISUALIZATION
+  // VOXEL GRID VISIBILITY
   // ============================================================================
 
   useEffect(() => {
-    if (!sceneRef.current || !csgResultRef.current) return;
-    
-    const scene = sceneRef.current;
-
-    // Remove existing tet visualization
-    if (tetVisualizationRef.current) {
-      removeTetVisualization(scene, tetVisualizationRef.current);
-      tetVisualizationRef.current = null;
-      onTetVisualizationReady?.(null);
+    if (gridVisualizationRef.current) {
+      gridVisualizationRef.current.visible = !hideVoxelGrid;
     }
-
-    // Start tetrahedralization if requested and not already running
-    if (showTetMesh && csgResultRef.current && !isTetrahedralizingRef.current) {
-      isTetrahedralizingRef.current = true;
-      console.log('Starting tetrahedralization...');
-      
-      tetrahedralizeMeshWithProgress(
-        csgResultRef.current.mesh,
-        {
-          onProgress: (progress) => {
-            onTetProgress?.(progress);
-          },
-          onComplete: (data) => {
-            console.log('Tetrahedralization onComplete callback:', data.num_vertices, 'verts,', data.num_tetrahedra, 'tets');
-            isTetrahedralizingRef.current = false;
-            onTetComplete?.(data);
-            
-            // Create visualization
-            if (sceneRef.current) {
-              console.log('Creating tet visualization...');
-              const visualization = createTetVisualization(data, {
-                showWireframe: true,
-                showSurface: true,
-                wireframeOpacity: 0.4,
-                surfaceOpacity: 0.35,
-              });
-              console.log('Visualization created:', visualization.stats);
-              
-              // Apply the same transform as CSG mesh
-              if (csgResultRef.current) {
-                visualization.group.matrix.copy(csgResultRef.current.mesh.matrix);
-                visualization.group.matrixAutoUpdate = false;
-              }
-              
-              sceneRef.current.add(visualization.group);
-              tetVisualizationRef.current = visualization;
-              onTetVisualizationReady?.(visualization);
-              console.log('Tet visualization added to scene');
-            }
-          },
-          onError: (error) => {
-            console.error('Tetrahedralization error:', error);
-            isTetrahedralizingRef.current = false;
-            onTetError?.(error);
-          }
-        },
-        {
-          edgeLengthRatio: 0.0065, // TetWild default
-        }
-      );
+    if (gridBoundingBoxRef.current) {
+      gridBoundingBoxRef.current.visible = !hideVoxelGrid;
     }
-  }, [showTetMesh, onTetProgress, onTetComplete, onTetError, onTetVisualizationReady]);
+  }, [hideVoxelGrid]);
 
-  // Cleanup arrows, hull, CSG result, and tet mesh on unmount
-=======
   // Cleanup arrows, hull, CSG result, grid, tetrahedralization, and escape labeling on unmount
->>>>>>> Stashed changes
-=======
-  // Cleanup arrows, hull, CSG result, grid, tetrahedralization, and escape labeling on unmount
->>>>>>> Stashed changes
-=======
-  // Cleanup arrows, hull, CSG result, grid, tetrahedralization, and escape labeling on unmount
->>>>>>> Stashed changes
   useEffect(() => {
     return () => {
       if (partingArrowsRef.current.length > 0) {
@@ -1473,10 +1211,6 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       if (csgResultRef.current && sceneRef.current) {
         removeCsgResult(sceneRef.current, csgResultRef.current);
       }
-<<<<<<< Updated upstream
-      if (tetVisualizationRef.current && sceneRef.current) {
-        removeTetVisualization(sceneRef.current, tetVisualizationRef.current);
-=======
       if (gridVisualizationRef.current && sceneRef.current) {
         removeGridVisualization(sceneRef.current, gridVisualizationRef.current);
       }
@@ -1504,7 +1238,6 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
             }
           }
         });
->>>>>>> Stashed changes
       }
     };
   }, []);

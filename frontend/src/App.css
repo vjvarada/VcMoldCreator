@@ -18,7 +18,6 @@
   filter: drop-shadow(0 0 2em #61dafbaa);
 }
 
-<<<<<<< Updated upstream
 @keyframes logo-spin {
   from {
     transform: rotate(0deg);
@@ -26,17 +25,6 @@
   to {
     transform: rotate(360deg);
   }
-=======
-/* Shimmer animation for progress bar */
-@keyframes shimmer {
-  0% { transform: translateX(-100%); }
-  100% { transform: translateX(100%); }
-}
-
-/* Shimmer animation for progress bar */
-@keyframes shimmer {
-  0% { transform: translateX(-100%); }
-  100% { transform: translateX(100%); }
 }
 
 /* Shimmer animation for progress bar */
@@ -48,7 +36,6 @@
 /* Scrollbar styling for context panel */
 ::-webkit-scrollbar {
   width: 6px;
->>>>>>> Stashed changes
 }
 
 @media (prefers-reduced-motion: no-preference) {
