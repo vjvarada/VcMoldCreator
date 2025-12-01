@@ -2,15 +2,17 @@
  * Parting Surface / Escape Labeling
  * 
  * This module computes the parting surface for mold design using multi-source
- * Dijkstra from outer mold halves (H₁, H₂) inward through the silicone volume.
+ * Dijkstra from inner seed boundaries (near part mesh) outward to the mold boundary.
  * 
  * Algorithm (STEP 3.5):
- * - Seed voxels near H₁ faces with label=1, cost=0
- * - Seed voxels near H₂ faces with label=2, cost=0
- * - Run Dijkstra with thickness-weighted edge costs:
- *     edgeCost(i,j) = L / (d_mid² + eps)
- *   where L = Euclidean distance, d_mid = average distance to part mesh
- * - Each voxel inherits the label of its cheapest escape path to the boundary
+ * - Identify inner surface voxels (near part mesh M) as seeds
+ * - Identify outer surface voxels (near shell ∂H) and label them as H₁ or H₂
+ * - Run Dijkstra from each seed to find lowest cost path to boundary:
+ *     edgeCost(i,j) = L / avg_weight
+ *   where L = Euclidean distance, avg_weight = average of weighting factors
+ *   weightingFactor = 1/[(biasedDist² + 0.25)]
+ *   biasedDist = δ_i + (R - δ_w)  (distance to part + bias from shell distance)
+ * - Each seed inherits the label of the boundary it reaches via lowest cost path
  * - The parting surface is where label transitions occur (interface voxels)
  */
 
@@ -356,18 +358,25 @@ function identifyBoundaryAdjacentVoxels(
   console.log(`  Inner surface (near part): ${innerSurfaceCount}`);
   console.log(`  Outer surface (near shell): ${outerSurfaceCount}`);
   
-  // Step 4: For each OUTER surface voxel, determine if it's closer to H₁ or H₂
+  // Step 4: For each OUTER surface voxel, determine if it's closer to H₁, H₂, or boundary zone
   // Use BVH for fast closest-point queries
+  // Voxels closest to boundary zone triangles will not receive a label (stay 0)
   
-  console.log('  Building BVH for H₁ and H₂ triangles...');
+  console.log('  Building BVH for H₁, H₂, and boundary zone triangles...');
   const bvhStartTime = performance.now();
   
   const position = shellGeometry.getAttribute('position');
   const shellIndex = shellGeometry.getIndex();
   
-  // Create separate geometries for H1 and H2 with their own BVHs
+  // Create separate geometries for H1, H2, and boundary zone with their own BVHs
   const createSubGeometry = (triangleSet: Set<number>): THREE.BufferGeometry => {
     const triCount = triangleSet.size;
+    if (triCount === 0) {
+      // Return empty geometry
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
+      return geom;
+    }
     const positions = new Float32Array(triCount * 9); // 3 vertices × 3 components
     
     let writeIdx = 0;
@@ -399,25 +408,30 @@ function identifyBoundaryAdjacentVoxels(
     return geom;
   };
   
-  // Create sub-geometries for H1 and H2
+  // Create sub-geometries for H1, H2, and boundary zone
   const h1Geometry = createSubGeometry(classification.h1Triangles);
   const h2Geometry = createSubGeometry(classification.h2Triangles);
+  const boundaryZoneGeometry = createSubGeometry(classification.boundaryZoneTriangles);
   
-  // Build BVH for each
-  const h1BVH = new MeshBVH(h1Geometry);
-  const h2BVH = new MeshBVH(h2Geometry);
+  // Build BVH for each (only if they have triangles)
+  const h1BVH = classification.h1Triangles.size > 0 ? new MeshBVH(h1Geometry) : null;
+  const h2BVH = classification.h2Triangles.size > 0 ? new MeshBVH(h2Geometry) : null;
+  const boundaryZoneBVH = classification.boundaryZoneTriangles.size > 0 ? new MeshBVH(boundaryZoneGeometry) : null;
   
   console.log(`  BVH build time: ${(performance.now() - bvhStartTime).toFixed(1)}ms`);
-  console.log(`  H₁ triangles: ${classification.h1Triangles.size}, H₂ triangles: ${classification.h2Triangles.size}`);
+  console.log(`  H₁ triangles: ${classification.h1Triangles.size}, H₂ triangles: ${classification.h2Triangles.size}, Boundary zone: ${classification.boundaryZoneTriangles.size}`);
   
-  // Label each OUTER surface voxel based on closest mold half using BVH
+  // Label each OUTER surface voxel based on closest region using BVH
+  // Voxels closest to boundary zone triangles stay unlabeled (0)
   const boundaryLabel = new Int8Array(voxelCount);
   let h1Adjacent = 0;
   let h2Adjacent = 0;
+  let boundaryZoneAdjacent = 0;
   
   const labelStartTime = performance.now();
   const hitInfoH1 = { point: new THREE.Vector3(), distance: Infinity, faceIndex: 0 };
   const hitInfoH2 = { point: new THREE.Vector3(), distance: Infinity, faceIndex: 0 };
+  const hitInfoBZ = { point: new THREE.Vector3(), distance: Infinity, faceIndex: 0 };
   
   for (let i = 0; i < voxelCount; i++) {
     if (!isOuterSurface[i]) continue;
@@ -428,15 +442,19 @@ function identifyBoundaryAdjacentVoxels(
     // Reset hit info
     hitInfoH1.distance = Infinity;
     hitInfoH2.distance = Infinity;
+    hitInfoBZ.distance = Infinity;
     
-    h1BVH.closestPointToPoint(center, hitInfoH1);
-    h2BVH.closestPointToPoint(center, hitInfoH2);
+    const distH1 = h1BVH ? (h1BVH.closestPointToPoint(center, hitInfoH1), hitInfoH1.distance) : Infinity;
+    const distH2 = h2BVH ? (h2BVH.closestPointToPoint(center, hitInfoH2), hitInfoH2.distance) : Infinity;
+    const distBZ = boundaryZoneBVH ? (boundaryZoneBVH.closestPointToPoint(center, hitInfoBZ), hitInfoBZ.distance) : Infinity;
     
-    const distH1 = hitInfoH1.distance;
-    const distH2 = hitInfoH2.distance;
-    
-    // Assign to closer mold half
-    if (distH1 <= distH2) {
+    // Assign based on which region is closest
+    // If closest to boundary zone, leave unlabeled (0)
+    if (distBZ <= distH1 && distBZ <= distH2) {
+      // Closest to boundary zone - no label
+      boundaryLabel[i] = 0;
+      boundaryZoneAdjacent++;
+    } else if (distH1 <= distH2) {
       boundaryLabel[i] = 1;
       h1Adjacent++;
     } else {
@@ -446,11 +464,12 @@ function identifyBoundaryAdjacentVoxels(
   }
   
   console.log(`  Labeling time: ${(performance.now() - labelStartTime).toFixed(1)}ms`);
-  console.log(`  Outer boundary labeled: H₁=${h1Adjacent}, H₂=${h2Adjacent}`);
+  console.log(`  Outer boundary labeled: H₁=${h1Adjacent}, H₂=${h2Adjacent}, BoundaryZone(unlabeled)=${boundaryZoneAdjacent}`);
   
   // Clean up
   h1Geometry.dispose();
   h2Geometry.dispose();
+  boundaryZoneGeometry.dispose();
   
   return { boundaryLabel, innerSurfaceMask, h1Adjacent, h2Adjacent, innerSurfaceCount };
 }
@@ -502,19 +521,19 @@ export function computeEscapeLabelingDijkstra(
     throw new Error('Distance field (voxelDist) is required for escape labeling');
   }
   
+  const weightingFactor = gridResult.weightingFactor;
+  if (!weightingFactor) {
+    console.error('ERROR: weightingFactor is null - weighting factor not computed!');
+    throw new Error('Weighting factor is required for escape labeling');
+  }
+  
+  console.log(`  Weighting factor range: [${gridResult.weightingFactorStats?.min.toFixed(6)}, ${gridResult.weightingFactorStats?.max.toFixed(6)}]`);
+  
   // Build spatial index for neighbor lookups
   const spatialIndex = buildVoxelSpatialIndex(gridResult);
   
-  // Get neighbor offsets
+  // Get neighbor offsets (used for connectivity checks)
   const neighborOffsets = getNeighborOffsets(adjacency);
-  
-  // Pre-compute Euclidean distances for each neighbor offset
-  const neighborDistances = neighborOffsets.map(([di, dj, dk]) => 
-    Math.sqrt(di * di + dj * dj + dk * dk) * voxelSize
-  );
-  
-  // Small epsilon to avoid division by zero
-  const eps = 1e-6 * voxelSize * voxelSize;
   
   // ========================================================================
   // STEP 1: Identify boundary-adjacent voxels (which touch H₁ or H₂)
@@ -530,6 +549,35 @@ export function computeEscapeLabelingDijkstra(
   console.log(`  H₁ adjacent: ${h1Adjacent}`);
   console.log(`  H₂ adjacent: ${h2Adjacent}`);
   console.log(`  Inner surface (seeds): ${innerSurfaceCount}`);
+  
+  // Diagnostic: Check if there are any boundary voxels at all
+  const totalBoundaryVoxels = h1Adjacent + h2Adjacent;
+  if (totalBoundaryVoxels === 0) {
+    console.error('ERROR: No boundary voxels found! All seeds will be unlabeled.');
+  }
+  
+  // Diagnostic: Quick connectivity check - count how many voxels have at least one neighbor
+  let connectedVoxels = 0;
+  let isolatedVoxels = 0;
+  for (let i = 0; i < voxelCount; i++) {
+    const cell = cells[i];
+    const gi = Math.round(cell.index.x);
+    const gj = Math.round(cell.index.y);
+    const gk = Math.round(cell.index.z);
+    
+    let hasNeighbor = false;
+    for (const [di, dj, dk] of neighborOffsets) {
+      const j = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
+      if (j >= 0) {
+        hasNeighbor = true;
+        break;
+      }
+    }
+    
+    if (hasNeighbor) connectedVoxels++;
+    else isolatedVoxels++;
+  }
+  console.log(`  Connectivity check: ${connectedVoxels} connected, ${isolatedVoxels} isolated voxels`);
   
   // ========================================================================
   // TEMPORARY: Skip Dijkstra and return boundary-only results for debugging
@@ -583,15 +631,22 @@ export function computeEscapeLabelingDijkstra(
   }
   
   // ========================================================================
-  // STEP 2: For EACH seed individually, find shortest path to ANY boundary
+  // STEP 2: Multi-source Dijkstra from ALL seeds simultaneously
   // 
-  // We run a separate Dijkstra from each seed. This guarantees every
-  // seed finds ITS OWN shortest path to a boundary, without competition.
+  // Instead of running separate Dijkstra for each seed, we run ONE search
+  // where all seeds start at cost 0. Each voxel tracks which seed it came from.
+  // When a path reaches a boundary, that seed gets labeled.
   //
-  // This is O(seeds × voxels × log(voxels)) but ensures correctness.
+  // This is much faster O(voxels × log(voxels)) and produces consistent results.
   // ========================================================================
   
-  console.log('Finding shortest path from each seed to boundary (individual searches)...');
+  console.log('Running multi-source Dijkstra from all seeds...');
+  
+  // Use 26-connectivity for better coverage (diagonal neighbors)
+  const fullNeighborOffsets = getNeighborOffsets(26);
+  const fullNeighborDistances = fullNeighborOffsets.map(([di, dj, dk]) => 
+    Math.sqrt(di * di + dj * dj + dk * dk) * voxelSize
+  );
   
   // Collect seed indices
   const seedIndices: number[] = [];
@@ -602,83 +657,191 @@ export function computeEscapeLabelingDijkstra(
   }
   console.log(`  Total seeds: ${seedIndices.length}`);
   
-  // For each seed, run Dijkstra to find closest boundary
-  const seedLabel = new Int8Array(voxelCount).fill(-1);
-  let h1Seeds = 0, h2Seeds = 0, unlabeledSeeds = 0;
+  // Arrays for Dijkstra
+  const costFromSeed = new Float32Array(voxelCount).fill(Infinity);
+  const parentVoxel = new Int32Array(voxelCount).fill(-1);  // Track path back to seed
+  const originSeed = new Int32Array(voxelCount).fill(-1);   // Which seed this voxel's path originated from
+  const seedLabel = new Int8Array(voxelCount).fill(-1);     // Final label for each seed
   
-  // Reusable arrays for Dijkstra (reset for each seed)
-  const tempCost = new Float32Array(voxelCount);
-  
-  // Process seeds in batches for progress reporting
-  const batchSize = Math.max(100, Math.floor(seedIndices.length / 10));
-  let processedSeeds = 0;
-  
+  // Initialize priority queue with all seeds
+  const pq = new MinHeap();
   for (const seedIdx of seedIndices) {
-    // Reset costs for this seed's search
-    tempCost.fill(Infinity);
-    tempCost[seedIdx] = 0;
-    
-    const pq = new MinHeap();
+    costFromSeed[seedIdx] = 0;
+    originSeed[seedIdx] = seedIdx;  // Seeds originate from themselves
     pq.push(seedIdx, 0);
+  }
+  
+  // Track which seeds have been labeled
+  const seedLabeled = new Uint8Array(voxelCount);
+  let labeledSeedCount = 0;
+  let visitedCount = 0;
+  
+  // Run Dijkstra until all seeds are labeled or we exhaust the queue
+  while (pq.size > 0 && labeledSeedCount < seedIndices.length) {
+    const current = pq.pop()!;
+    const i = current.index;
+    const currentCost = current.cost;
     
-    let foundBoundary = -1;
+    // Skip if we've already processed this with a better cost
+    if (currentCost > costFromSeed[i]) continue;
     
-    // Dijkstra from this single seed until we hit a boundary
-    while (pq.size > 0 && foundBoundary === -1) {
-      const current = pq.pop()!;
-      const i = current.index;
-      const currentCost = current.cost;
-      
-      if (currentCost > tempCost[i]) continue;
-      
-      // Check if we've reached a boundary - STOP here, this is our answer
-      if (boundaryLabel[i] !== 0) {
-        foundBoundary = boundaryLabel[i];
-        break;
-      }
-      
-      // Get current voxel's grid coordinates
-      const cell = cells[i];
-      const gi = Math.round(cell.index.x);
-      const gj = Math.round(cell.index.y);
-      const gk = Math.round(cell.index.z);
-      
-      const di_current = voxelDist[i];
-      
-      // Expand to neighbors
-      for (let n = 0; n < neighborOffsets.length; n++) {
-        const [di, dj, dk] = neighborOffsets[n];
-        const j = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
-        if (j < 0) continue;
-        
-        const dj_neighbor = voxelDist[j];
-        const L = neighborDistances[n];
-        const d_mid = 0.5 * (di_current + dj_neighbor);
-        const edgeCost = L / (d_mid * d_mid + eps);
-        
-        const candidateCost = tempCost[i] + edgeCost;
-        
-        if (candidateCost < tempCost[j]) {
-          tempCost[j] = candidateCost;
-          pq.decreaseKey(j, candidateCost);
-        }
-      }
+    visitedCount++;
+    
+    // Get the seed this path originated from
+    const mySeed = originSeed[i];
+    
+    // If this seed is already labeled, skip (we found a shorter path earlier)
+    if (mySeed >= 0 && seedLabeled[mySeed]) continue;
+    
+    // Check if we've reached a boundary
+    if (boundaryLabel[i] !== 0 && mySeed >= 0) {
+      // Label the originating seed with this boundary's label
+      seedLabel[mySeed] = boundaryLabel[i];
+      seedLabeled[mySeed] = 1;
+      labeledSeedCount++;
+      continue;  // Don't expand from boundary voxels
     }
     
-    // Label this seed
-    seedLabel[seedIdx] = foundBoundary;
+    // Get current voxel's grid coordinates
+    const cell = cells[i];
+    const gi = Math.round(cell.index.x);
+    const gj = Math.round(cell.index.y);
+    const gk = Math.round(cell.index.z);
     
-    if (foundBoundary === 1) h1Seeds++;
-    else if (foundBoundary === 2) h2Seeds++;
-    else unlabeledSeeds++;
-    
-    processedSeeds++;
-    if (processedSeeds % batchSize === 0) {
-      console.log(`  Processed ${processedSeeds}/${seedIndices.length} seeds...`);
+    // Expand to neighbors (using 26-connectivity)
+    for (let n = 0; n < fullNeighborOffsets.length; n++) {
+      const [di, dj, dk] = fullNeighborOffsets[n];
+      const j = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
+      if (j < 0) continue;
+      
+      // Use weighting factor of destination voxel as edge cost
+      // wt = 1/(biasedDist² + 0.25) - based on the destination voxel's biased distance
+      const L = fullNeighborDistances[n];
+      const wt_j = weightingFactor[j];
+      
+      // Edge cost = L * wt_j (cost depends on destination voxel's weight)
+      const edgeCost = L * wt_j;
+      
+      const candidateCost = costFromSeed[i] + edgeCost;
+      
+      if (candidateCost < costFromSeed[j]) {
+        costFromSeed[j] = candidateCost;
+        parentVoxel[j] = i;
+        originSeed[j] = mySeed;  // Inherit the seed origin
+        pq.decreaseKey(j, candidateCost);
+      }
     }
   }
   
-  console.log(`  Seeds labeled: H₁=${h1Seeds}, H₂=${h2Seeds}, unlabeled=${unlabeledSeeds}`);
+  console.log(`  Dijkstra visited ${visitedCount} voxels`);
+  console.log(`  Seeds labeled via paths: ${labeledSeedCount}`);
+  
+  // Count labeled seeds
+  let h1Seeds = 0, h2Seeds = 0, unlabeledSeeds = 0;
+  for (const seedIdx of seedIndices) {
+    if (seedLabel[seedIdx] === 1) h1Seeds++;
+    else if (seedLabel[seedIdx] === 2) h2Seeds++;
+    else unlabeledSeeds++;
+  }
+  console.log(`  Initial: H₁=${h1Seeds}, H₂=${h2Seeds}, unlabeled=${unlabeledSeeds}`);
+  
+  // ========================================================================
+  // STEP 2.5: Handle unlabeled seeds using spatial proximity voting
+  // 
+  // For seeds that couldn't find a path to boundary (disconnected regions),
+  // we use a voting scheme based on nearby labeled seeds within a search radius.
+  // ========================================================================
+  
+  if (unlabeledSeeds > 0) {
+    console.log(`  Post-processing ${unlabeledSeeds} unlabeled seeds...`);
+    
+    // Collect labeled and unlabeled seed indices
+    const labeledSeedsList: number[] = [];
+    const unlabeledSeedIndices: number[] = [];
+    
+    for (const seedIdx of seedIndices) {
+      if (seedLabel[seedIdx] === -1) {
+        unlabeledSeedIndices.push(seedIdx);
+      } else {
+        labeledSeedsList.push(seedIdx);
+      }
+    }
+    
+    // For each unlabeled seed, find nearby labeled seeds and vote
+    const searchRadius = voxelSize * 5;  // Search within 5 voxel radius
+    const searchRadiusSq = searchRadius * searchRadius;
+    
+    let fixedCount = 0;
+    for (const unlabeledIdx of unlabeledSeedIndices) {
+      const unlabeledCenter = cells[unlabeledIdx].center;
+      
+      // Count votes from nearby labeled seeds (weighted by inverse distance)
+      let h1Weight = 0;
+      let h2Weight = 0;
+      
+      for (const labeledIdx of labeledSeedsList) {
+        const labeledCenter = cells[labeledIdx].center;
+        const dx = unlabeledCenter.x - labeledCenter.x;
+        const dy = unlabeledCenter.y - labeledCenter.y;
+        const dz = unlabeledCenter.z - labeledCenter.z;
+        const distSq = dx * dx + dy * dy + dz * dz;
+        
+        if (distSq < searchRadiusSq && distSq > 0) {
+          const weight = 1.0 / distSq;  // Inverse square distance weighting
+          if (seedLabel[labeledIdx] === 1) h1Weight += weight;
+          else if (seedLabel[labeledIdx] === 2) h2Weight += weight;
+        }
+      }
+      
+      // If no nearby seeds found, expand search to all labeled seeds
+      if (h1Weight === 0 && h2Weight === 0) {
+        let nearestDistSq = Infinity;
+        let nearestLabel = -1;
+        
+        for (const labeledIdx of labeledSeedsList) {
+          const labeledCenter = cells[labeledIdx].center;
+          const dx = unlabeledCenter.x - labeledCenter.x;
+          const dy = unlabeledCenter.y - labeledCenter.y;
+          const dz = unlabeledCenter.z - labeledCenter.z;
+          const distSq = dx * dx + dy * dy + dz * dz;
+          
+          if (distSq < nearestDistSq) {
+            nearestDistSq = distSq;
+            nearestLabel = seedLabel[labeledIdx];
+          }
+        }
+        
+        if (nearestLabel !== -1) {
+          if (nearestLabel === 1) h1Weight = 1;
+          else h2Weight = 1;
+        }
+      }
+      
+      // Assign based on weighted vote
+      if (h1Weight > h2Weight) {
+        seedLabel[unlabeledIdx] = 1;
+        h1Seeds++;
+        unlabeledSeeds--;
+        fixedCount++;
+      } else if (h2Weight > h1Weight) {
+        seedLabel[unlabeledIdx] = 2;
+        h2Seeds++;
+        unlabeledSeeds--;
+        fixedCount++;
+      } else if (h1Weight > 0) {
+        // Tie - pick H1 arbitrarily
+        seedLabel[unlabeledIdx] = 1;
+        h1Seeds++;
+        unlabeledSeeds--;
+        fixedCount++;
+      }
+    }
+    
+    console.log(`  Fixed ${fixedCount} isolated seeds by proximity voting`);
+    console.log(`  Updated: H₁=${h1Seeds}, H₂=${h2Seeds}, unlabeled=${unlabeledSeeds}`);
+  }
+  
+  console.log(`  Final: H₁=${h1Seeds}, H₂=${h2Seeds}, unlabeled=${unlabeledSeeds}`);
   
   // ========================================================================
   // STEP 3: Build final label array
@@ -1304,7 +1467,7 @@ export function createDebugVisualization(
   labeling: EscapeLabelingResult,
   mode: PartingSurfaceDebugMode,
   pointSize: number = 6
-): THREE.Points | null {
+): THREE.Object3D | null {
   if (mode === 'none') {
     return null;
   }
@@ -1334,10 +1497,12 @@ export function createDebugVisualization(
   const colorOuterSurface = new THREE.Color(0xffff00);   // Yellow - outer surface (boundary)
   const colorH1 = new THREE.Color(0x00ff00);             // Green - H₁
   const colorH2 = new THREE.Color(0xff6600);             // Orange - H₂
-  const colorUnlabeled = new THREE.Color(0xff00ff);      // Magenta - unlabeled (error)
+  const colorUnlabeled = new THREE.Color(0x888888);      // Grey - unlabeled (boundary zone)
+  const unlabeledOpacity = 0.15;                          // Very low opacity for unlabeled
   
   // Collect voxels to display based on mode
-  const displayVoxels: { idx: number; color: THREE.Color }[] = [];
+  // Separate labeled and unlabeled voxels for different opacity
+  const displayVoxels: { idx: number; color: THREE.Color; isUnlabeled: boolean }[] = [];
   
   if (mode === 'surface-detection') {
     // Show ONLY surface voxels: inner (seeds) and outer (boundary)
@@ -1349,10 +1514,10 @@ export function createDebugVisualization(
     
     for (let i = 0; i < voxelCount; i++) {
       if (seedMask[i]) {
-        displayVoxels.push({ idx: i, color: colorInnerSurface });
+        displayVoxels.push({ idx: i, color: colorInnerSurface, isUnlabeled: false });
         innerCount++;
       } else if (boundaryLabels[i] !== 0) {
-        displayVoxels.push({ idx: i, color: colorOuterSurface });
+        displayVoxels.push({ idx: i, color: colorOuterSurface, isUnlabeled: false });
         outerCount++;
       }
       // Bulk volume voxels are NOT added
@@ -1373,14 +1538,14 @@ export function createDebugVisualization(
     
     for (let i = 0; i < voxelCount; i++) {
       if (boundaryLabels[i] === 1) {
-        displayVoxels.push({ idx: i, color: colorH1 });
+        displayVoxels.push({ idx: i, color: colorH1, isUnlabeled: false });
         h1Count++;
       } else if (boundaryLabels[i] === 2) {
-        displayVoxels.push({ idx: i, color: colorH2 });
+        displayVoxels.push({ idx: i, color: colorH2, isUnlabeled: false });
         h2Count++;
       } else if (seedMask[i]) {
         // Seeds shown in cyan (before they get labeled)
-        displayVoxels.push({ idx: i, color: colorInnerSurface });
+        displayVoxels.push({ idx: i, color: colorInnerSurface, isUnlabeled: false });
         seedCount++;
       }
     }
@@ -1392,7 +1557,7 @@ export function createDebugVisualization(
     
   } else if (mode === 'seed-labels') {
     // Show ALL voxels with their Dijkstra-assigned labels
-    console.log('DEBUG MODE: All Voxel Labels (H₁=Green, H₂=Orange, Unlabeled=Magenta)');
+    console.log('DEBUG MODE: All Voxel Labels (H₁=Green, H₂=Orange, Unlabeled=Grey)');
     
     let h1Count = 0;
     let h2Count = 0;
@@ -1401,13 +1566,13 @@ export function createDebugVisualization(
     for (let i = 0; i < voxelCount; i++) {
       const label = labels[i];
       if (label === 1) {
-        displayVoxels.push({ idx: i, color: colorH1 });
+        displayVoxels.push({ idx: i, color: colorH1, isUnlabeled: false });
         h1Count++;
       } else if (label === 2) {
-        displayVoxels.push({ idx: i, color: colorH2 });
+        displayVoxels.push({ idx: i, color: colorH2, isUnlabeled: false });
         h2Count++;
       } else {
-        displayVoxels.push({ idx: i, color: colorUnlabeled });
+        displayVoxels.push({ idx: i, color: colorUnlabeled, isUnlabeled: true });
         unlabeledCount++;
       }
     }
@@ -1419,7 +1584,7 @@ export function createDebugVisualization(
     
   } else if (mode === 'seed-labels-only') {
     // Show ONLY seed voxels with their Dijkstra-assigned labels
-    console.log('DEBUG MODE: Seed Labels Only (H₁=Green, H₂=Orange, Unlabeled=Magenta)');
+    console.log('DEBUG MODE: Seed Labels Only (H₁=Green, H₂=Orange, Unlabeled=Grey)');
     
     let h1Count = 0;
     let h2Count = 0;
@@ -1429,13 +1594,13 @@ export function createDebugVisualization(
       if (seedMask[i]) {
         const label = labels[i];
         if (label === 1) {
-          displayVoxels.push({ idx: i, color: colorH1 });
+          displayVoxels.push({ idx: i, color: colorH1, isUnlabeled: false });
           h1Count++;
         } else if (label === 2) {
-          displayVoxels.push({ idx: i, color: colorH2 });
+          displayVoxels.push({ idx: i, color: colorH2, isUnlabeled: false });
           h2Count++;
         } else {
-          displayVoxels.push({ idx: i, color: colorUnlabeled });
+          displayVoxels.push({ idx: i, color: colorUnlabeled, isUnlabeled: true });
           unlabeledCount++;
         }
       }
@@ -1452,35 +1617,81 @@ export function createDebugVisualization(
     return null;
   }
   
-  // Create geometry
-  const count = displayVoxels.length;
-  const positions = new Float32Array(count * 3);
-  const colors = new Float32Array(count * 3);
+  // Separate labeled and unlabeled voxels for different opacity rendering
+  const labeledVoxels = displayVoxels.filter(v => !v.isUnlabeled);
+  const unlabeledVoxels = displayVoxels.filter(v => v.isUnlabeled);
   
-  for (let i = 0; i < count; i++) {
-    const { idx, color } = displayVoxels[i];
-    const cell = cells[idx];
+  // Create a group to hold both point clouds
+  const group = new THREE.Group();
+  
+  // Create labeled voxels point cloud (full opacity)
+  if (labeledVoxels.length > 0) {
+    const count = labeledVoxels.length;
+    const positions = new Float32Array(count * 3);
+    const colors = new Float32Array(count * 3);
     
-    positions[i * 3] = cell.center.x;
-    positions[i * 3 + 1] = cell.center.y;
-    positions[i * 3 + 2] = cell.center.z;
+    for (let i = 0; i < count; i++) {
+      const { idx, color } = labeledVoxels[i];
+      const cell = cells[idx];
+      
+      positions[i * 3] = cell.center.x;
+      positions[i * 3 + 1] = cell.center.y;
+      positions[i * 3 + 2] = cell.center.z;
+      
+      colors[i * 3] = color.r;
+      colors[i * 3 + 1] = color.g;
+      colors[i * 3 + 2] = color.b;
+    }
     
-    colors[i * 3] = color.r;
-    colors[i * 3 + 1] = color.g;
-    colors[i * 3 + 2] = color.b;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    
+    const material = new THREE.PointsMaterial({
+      size: pointSize,
+      sizeAttenuation: true,
+      transparent: true,
+      opacity: 1.0,
+      vertexColors: true,
+    });
+    
+    group.add(new THREE.Points(geometry, material));
   }
   
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  // Create unlabeled voxels point cloud (very low opacity)
+  if (unlabeledVoxels.length > 0) {
+    const count = unlabeledVoxels.length;
+    const positions = new Float32Array(count * 3);
+    const colors = new Float32Array(count * 3);
+    
+    for (let i = 0; i < count; i++) {
+      const { idx, color } = unlabeledVoxels[i];
+      const cell = cells[idx];
+      
+      positions[i * 3] = cell.center.x;
+      positions[i * 3 + 1] = cell.center.y;
+      positions[i * 3 + 2] = cell.center.z;
+      
+      colors[i * 3] = color.r;
+      colors[i * 3 + 1] = color.g;
+      colors[i * 3 + 2] = color.b;
+    }
+    
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    
+    const material = new THREE.PointsMaterial({
+      size: pointSize,
+      sizeAttenuation: true,
+      transparent: true,
+      opacity: unlabeledOpacity,
+      vertexColors: true,
+      depthWrite: false,  // Prevent z-fighting with labeled voxels
+    });
+    
+    group.add(new THREE.Points(geometry, material));
+  }
   
-  const material = new THREE.PointsMaterial({
-    size: pointSize,
-    sizeAttenuation: true,
-    transparent: true,
-    opacity: 1.0,
-    vertexColors: true,
-  });
-  
-  return new THREE.Points(geometry, material);
+  return group;
 }

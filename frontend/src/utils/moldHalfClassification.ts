@@ -31,11 +31,13 @@ export interface MoldHalfClassificationResult {
   h1Triangles: Set<number>;
   /** Triangle indices belonging to mold half 2 (H₂) */
   h2Triangles: Set<number>;
+  /** Triangle indices in the boundary zone between H₁ and H₂ (grey, no label) */
+  boundaryZoneTriangles: Set<number>;
   /** Triangle indices belonging to inner boundary (part surface) - not classified */
   innerBoundaryTriangles: Set<number>;
   /** Total triangles in boundary mesh */
   totalTriangles: number;
-  /** Total outer boundary triangles (H₁ + H₂) */
+  /** Total outer boundary triangles (H₁ + H₂ + boundary zone) */
   outerBoundaryCount: number;
 }
 
@@ -53,6 +55,7 @@ interface TriangleInfo {
 const MOLD_HALF_COLORS: Record<string, { r: number; g: number; b: number }> = {
   H1: { r: 0, g: 255, b: 0 },       // Green (same as D1) - faces extracted by d1
   H2: { r: 255, g: 102, b: 0 },     // Orange (same as D2) - faces extracted by d2
+  BOUNDARY_ZONE: { r: 180, g: 180, b: 180 }, // Light gray for H1/H2 boundary zone
   INNER: { r: 80, g: 80, b: 80 },   // Dark gray for inner boundary (part surface)
   UNCLASSIFIED: { r: 136, g: 136, b: 136 }, // Gray
 };
@@ -326,160 +329,184 @@ function classifyAndSmooth(
   d1: THREE.Vector3,
   d2: THREE.Vector3
 ): Map<number, 1 | 2> {
-  const side = new Map<number, 1 | 2>();
+  // OPTIMIZATION: Use typed array for faster label access
+  // Convert outerTriangles to sorted array for consistent iteration
+  const outerArray = Array.from(outerTriangles);
+  
+  // Find max index without spread operator (avoids stack overflow for large arrays)
+  let maxTriIdx = 0;
+  for (let i = 0; i < outerArray.length; i++) {
+    if (outerArray[i] > maxTriIdx) maxTriIdx = outerArray[i];
+  }
+  maxTriIdx += 1;
+  
+  // Use Int8Array for labels: 0=not outer, 1=H1, 2=H2
+  const sideArray = new Int8Array(maxTriIdx);
+  
+  // Pre-extract direction components for faster dot products
+  const d1x = d1.x, d1y = d1.y, d1z = d1.z;
+  const d2x = d2.x, d2y = d2.y, d2z = d2.z;
   
   // Step 1: Initial classification by directional preference
-  for (const i of outerTriangles) {
+  for (let idx = 0; idx < outerArray.length; idx++) {
+    const i = outerArray[idx];
     const normal = triangles[i].normal;
-    const dot1 = normal.dot(d1);
-    const dot2 = normal.dot(d2);
-    side.set(i, dot1 >= dot2 ? 1 : 2);
+    const dot1 = normal.x * d1x + normal.y * d1y + normal.z * d1z;
+    const dot2 = normal.x * d2x + normal.y * d2y + normal.z * d2z;
+    sideArray[i] = dot1 >= dot2 ? 1 : 2;
   }
   
   // Pre-compute 1-ring neighbors (filtered to outer triangles only)
-  const neighbors = new Map<number, number[]>();
+  // Store as arrays for faster iteration
+  const neighbors = new Map<number, Int32Array>();
   for (const i of outerTriangles) {
-    neighbors.set(i, (adjacency.get(i) || []).filter(n => outerTriangles.has(n)));
+    const adj = adjacency.get(i) || [];
+    const filtered: number[] = [];
+    for (let j = 0; j < adj.length; j++) {
+      if (outerTriangles.has(adj[j])) filtered.push(adj[j]);
+    }
+    neighbors.set(i, new Int32Array(filtered));
   }
   
   // Step 2: Morphological opening to remove peninsulas
   // Opening = Erosion followed by Dilation
-  // This removes thin protrusions while preserving the overall shape
+  // OPTIMIZED: Use pre-allocated flip buffer, typed array access
   
-  const erodeIterations = 2;
-  const dilateIterations = 2;
+  const erodeIterations = 4;
+  const dilateIterations = 4;
+  const toFlip = new Int32Array(outerArray.length);
+  let flipCount = 0;
   
-  // Erode H1 (shrink H1 by converting boundary H1 triangles to H2)
-  for (let iter = 0; iter < erodeIterations; iter++) {
-    const toFlip: number[] = [];
-    for (const i of outerTriangles) {
-      if (side.get(i) !== 1) continue;
-      
-      const nbrs = neighbors.get(i)!;
-      let oppCount = 0;
-      for (const n of nbrs) {
-        if (side.get(n) === 2) oppCount++;
+  // Helper function for morphological operations
+  const doMorphOp = (targetSide: number, flipTo: number, threshold: number, iterations: number) => {
+    for (let iter = 0; iter < iterations; iter++) {
+      flipCount = 0;
+      for (let idx = 0; idx < outerArray.length; idx++) {
+        const i = outerArray[idx];
+        if (sideArray[i] !== targetSide) continue;
+        
+        const nbrs = neighbors.get(i)!;
+        let oppCount = 0;
+        for (let j = 0; j < nbrs.length; j++) {
+          if (sideArray[nbrs[j]] === flipTo) oppCount++;
+        }
+        
+        if (oppCount > 0 && oppCount >= nbrs.length * threshold) {
+          toFlip[flipCount++] = i;
+        }
       }
-      
-      // Erode: if any neighbor is opposite, and we're not deeply embedded
-      if (oppCount > 0 && oppCount >= nbrs.length / 2) {
-        toFlip.push(i);
-      }
+      if (flipCount === 0) break;
+      for (let j = 0; j < flipCount; j++) sideArray[toFlip[j]] = flipTo;
     }
-    for (const i of toFlip) side.set(i, 2);
-    if (toFlip.length === 0) break;
-  }
+  };
   
-  // Dilate H1 (grow H1 back by converting boundary H2 triangles to H1)
-  for (let iter = 0; iter < dilateIterations; iter++) {
-    const toFlip: number[] = [];
-    for (const i of outerTriangles) {
-      if (side.get(i) !== 2) continue;
-      
-      const nbrs = neighbors.get(i)!;
-      let h1Count = 0;
-      for (const n of nbrs) {
-        if (side.get(n) === 1) h1Count++;
-      }
-      
-      // Dilate: if we have H1 neighbors and they're majority
-      if (h1Count > 0 && h1Count >= nbrs.length / 2) {
-        toFlip.push(i);
-      }
-    }
-    for (const i of toFlip) side.set(i, 1);
-    if (toFlip.length === 0) break;
-  }
+  // Erode H1, Dilate H1, Erode H2, Dilate H2
+  doMorphOp(1, 2, 0.5, erodeIterations);
+  doMorphOp(2, 1, 0.5, dilateIterations);
+  doMorphOp(2, 1, 0.5, erodeIterations);
+  doMorphOp(1, 2, 0.5, dilateIterations);
   
-  // Now do the same for H2 (erode H2, dilate H2)
-  for (let iter = 0; iter < erodeIterations; iter++) {
-    const toFlip: number[] = [];
-    for (const i of outerTriangles) {
-      if (side.get(i) !== 2) continue;
-      
-      const nbrs = neighbors.get(i)!;
-      let oppCount = 0;
-      for (const n of nbrs) {
-        if (side.get(n) === 1) oppCount++;
-      }
-      
-      if (oppCount > 0 && oppCount >= nbrs.length / 2) {
-        toFlip.push(i);
-      }
-    }
-    for (const i of toFlip) side.set(i, 1);
-    if (toFlip.length === 0) break;
-  }
-  
-  for (let iter = 0; iter < dilateIterations; iter++) {
-    const toFlip: number[] = [];
-    for (const i of outerTriangles) {
-      if (side.get(i) !== 1) continue;
-      
-      const nbrs = neighbors.get(i)!;
-      let h2Count = 0;
-      for (const n of nbrs) {
-        if (side.get(n) === 2) h2Count++;
-      }
-      
-      if (h2Count > 0 && h2Count >= nbrs.length / 2) {
-        toFlip.push(i);
-      }
-    }
-    for (const i of toFlip) side.set(i, 2);
-    if (toFlip.length === 0) break;
-  }
-  
-  // Step 3: Laplacian smoothing - only flip if STRONGLY outnumbered
-  for (let pass = 0; pass < 5; pass++) {
-    const toFlip: number[] = [];
+  // Step 3: Laplacian smoothing - flip if outnumbered by neighbors
+  // OPTIMIZED: Reuse flip buffer, direct array access
+  for (let pass = 0; pass < 10; pass++) {
+    flipCount = 0;
     
-    for (const i of outerTriangles) {
-      const currentSide = side.get(i)!;
+    for (let idx = 0; idx < outerArray.length; idx++) {
+      const i = outerArray[idx];
+      const currentSide = sideArray[i];
       const nbrs = neighbors.get(i)!;
       
       let h1Count = 0;
       let h2Count = 0;
-      for (const n of nbrs) {
-        if (side.get(n) === 1) h1Count++;
+      for (let j = 0; j < nbrs.length; j++) {
+        if (sideArray[nbrs[j]] === 1) h1Count++;
         else h2Count++;
       }
       
-      // Only flip if ratio is > 2:1 (strong majority)
-      if (currentSide === 1 && h2Count > h1Count * 2) {
-        toFlip.push(i);
-      } else if (currentSide === 2 && h1Count > h2Count * 2) {
-        toFlip.push(i);
+      // Flip if majority of neighbors disagree (ratio > 1.5:1)
+      if (currentSide === 1 && h2Count > h1Count * 1.5) {
+        toFlip[flipCount++] = i;
+      } else if (currentSide === 2 && h1Count > h2Count * 1.5) {
+        toFlip[flipCount++] = i;
       }
     }
     
-    if (toFlip.length === 0) break;
-    for (const i of toFlip) {
-      side.set(i, side.get(i) === 1 ? 2 : 1);
+    if (flipCount === 0) break;
+    for (let j = 0; j < flipCount; j++) {
+      sideArray[toFlip[j]] = sideArray[toFlip[j]] === 1 ? 2 : 1;
     }
   }
   
-  // Step 4: Remove orphan regions
-  removeOrphans(side, adjacency, outerTriangles, 40);
+  // Step 4: Remove orphan regions (increased max size)
+  // Convert to Map temporarily for removeOrphans compatibility
+  const side = new Map<number, 1 | 2>();
+  for (let idx = 0; idx < outerArray.length; idx++) {
+    side.set(outerArray[idx], sideArray[outerArray[idx]] as 1 | 2);
+  }
+  removeOrphans(side, adjacency, outerTriangles, 80);
+  // Sync back to array
+  for (const [i, s] of side) sideArray[i] = s;
   
   // Step 5: Re-apply strong directional constraints
-  // Triangles with normals strongly aligned to a direction must be that side
-  const strongThreshold = 0.6;
-  for (const i of outerTriangles) {
+  const strongThreshold = 0.7;
+  for (let idx = 0; idx < outerArray.length; idx++) {
+    const i = outerArray[idx];
     const normal = triangles[i].normal;
-    const dot1 = normal.dot(d1);
-    const dot2 = normal.dot(d2);
+    const dot1 = normal.x * d1x + normal.y * d1y + normal.z * d1z;
+    const dot2 = normal.x * d2x + normal.y * d2y + normal.z * d2z;
     
-    if (dot1 > strongThreshold && dot1 > dot2 + 0.2) {
-      side.set(i, 1);
-    } else if (dot2 > strongThreshold && dot2 > dot1 + 0.2) {
-      side.set(i, 2);
+    if (dot1 > strongThreshold && dot1 > dot2 + 0.3) {
+      sideArray[i] = 1;
+    } else if (dot2 > strongThreshold && dot2 > dot1 + 0.3) {
+      sideArray[i] = 2;
     }
   }
   
-  // Final orphan cleanup
-  removeOrphans(side, adjacency, outerTriangles, 25);
+  // Sync to map and final orphan cleanup
+  for (let idx = 0; idx < outerArray.length; idx++) {
+    side.set(outerArray[idx], sideArray[outerArray[idx]] as 1 | 2);
+  }
+  removeOrphans(side, adjacency, outerTriangles, 60);
+  for (const [i, s] of side) sideArray[i] = s;
   
+  // Step 6: Final boundary smoothing pass
+  for (let pass = 0; pass < 5; pass++) {
+    flipCount = 0;
+    
+    for (let idx = 0; idx < outerArray.length; idx++) {
+      const i = outerArray[idx];
+      const currentSide = sideArray[i];
+      const nbrs = neighbors.get(i)!;
+      
+      if (nbrs.length < 3) continue;
+      
+      let h1Count = 0;
+      let h2Count = 0;
+      for (let j = 0; j < nbrs.length; j++) {
+        if (sideArray[nbrs[j]] === 1) h1Count++;
+        else h2Count++;
+      }
+      
+      const atBoundary = h1Count > 0 && h2Count > 0;
+      if (atBoundary) {
+        if (currentSide === 1 && h2Count >= h1Count * 2) {
+          toFlip[flipCount++] = i;
+        } else if (currentSide === 2 && h1Count >= h2Count * 2) {
+          toFlip[flipCount++] = i;
+        }
+      }
+    }
+    
+    if (flipCount === 0) break;
+    for (let j = 0; j < flipCount; j++) {
+      sideArray[toFlip[j]] = sideArray[toFlip[j]] === 1 ? 2 : 1;
+    }
+  }
+  
+  // Convert back to Map for return
+  for (let idx = 0; idx < outerArray.length; idx++) {
+    side.set(outerArray[idx], sideArray[outerArray[idx]] as 1 | 2);
+  }
   return side;
 }
 
@@ -544,7 +571,8 @@ export function classifyMoldHalves(
   cavityGeometry: THREE.BufferGeometry,
   hullGeometry: THREE.BufferGeometry,
   d1: THREE.Vector3,
-  d2: THREE.Vector3
+  d2: THREE.Vector3,
+  boundaryZoneThreshold: number = 0.15
 ): MoldHalfClassificationResult {
   const startTime = performance.now();
   
@@ -581,6 +609,7 @@ export function classifyMoldHalves(
       sideMap: new Map(),
       h1Triangles: new Set(),
       h2Triangles: new Set(),
+      boundaryZoneTriangles: new Set(),
       innerBoundaryTriangles,
       totalTriangles: triangles.length,
       outerBoundaryCount: 0,
@@ -590,12 +619,79 @@ export function classifyMoldHalves(
   // Step 4: Classify and smooth
   const side = classifyAndSmooth(triangles, adjacency, effectiveOuterTriangles, d1, d2);
   
-  // Build result sets
+  // Step 5: Compute boundary zone parameters
+  // The boundary zone is defined by graph distance (triangle hops) from the H₁/H₂ interface
+  // We use the threshold percentage to determine how many hops constitute the boundary zone
+  // Lower threshold = thinner boundary zone
+  
+  // Pre-compute neighbors filtered to outer triangles
+  const neighbors = new Map<number, number[]>();
+  for (const i of effectiveOuterTriangles) {
+    neighbors.set(i, (adjacency.get(i) || []).filter(n => effectiveOuterTriangles.has(n)));
+  }
+  
+  // Find interface triangles (where H₁ meets H₂)
+  const interfaceTriangles = new Set<number>();
+  for (const triIdx of effectiveOuterTriangles) {
+    const mySide = side.get(triIdx);
+    if (mySide === undefined) continue;
+    
+    for (const neighborIdx of neighbors.get(triIdx) || []) {
+      const neighborSide = side.get(neighborIdx);
+      if (neighborSide !== undefined && neighborSide !== mySide) {
+        // This triangle is at the H₁/H₂ interface
+        interfaceTriangles.add(triIdx);
+        break;
+      }
+    }
+  }
+  
+  console.log(`  Interface triangles (H₁/H₂ border): ${interfaceTriangles.size}`);
+  
+  // Step 6: Expand boundary zone using BFS from interface triangles
+  // Scale: 0% = 0 hops (just interface), 15% = 3 hops, 30% = 8 hops
+  // Using quadratic scaling for better control: hops = threshold^2 * 180
+  const boundaryZoneHops = Math.round(boundaryZoneThreshold * boundaryZoneThreshold * 180);
+  console.log(`  Boundary zone threshold: ${(boundaryZoneThreshold * 100).toFixed(0)}% → ${boundaryZoneHops} hops`);
+  
+  const boundaryZoneTriangles = new Set<number>(interfaceTriangles);
+  const distance = new Map<number, number>();
+  
+  // Initialize distances for interface triangles
+  for (const triIdx of interfaceTriangles) {
+    distance.set(triIdx, 0);
+  }
+  
+  // BFS to expand boundary zone
+  const queue: number[] = Array.from(interfaceTriangles);
+  let head = 0;
+  
+  while (head < queue.length) {
+    const triIdx = queue[head++];
+    const dist = distance.get(triIdx)!;
+    
+    if (dist >= boundaryZoneHops) continue;
+    
+    for (const neighborIdx of neighbors.get(triIdx) || []) {
+      if (!distance.has(neighborIdx)) {
+        distance.set(neighborIdx, dist + 1);
+        boundaryZoneTriangles.add(neighborIdx);
+        queue.push(neighborIdx);
+      }
+    }
+  }
+  
+  console.log(`  Boundary zone triangles: ${boundaryZoneTriangles.size}`);
+  
+  // Remove boundary zone triangles from H₁ and H₂ sets, and from sideMap
   const h1Triangles = new Set<number>();
   const h2Triangles = new Set<number>();
   
   for (const [triIdx, moldSide] of side) {
-    if (moldSide === 1) {
+    if (boundaryZoneTriangles.has(triIdx)) {
+      // Remove from sideMap - this triangle is in the grey zone
+      side.delete(triIdx);
+    } else if (moldSide === 1) {
       h1Triangles.add(triIdx);
     } else {
       h2Triangles.add(triIdx);
@@ -605,12 +701,13 @@ export function classifyMoldHalves(
   const elapsed = performance.now() - startTime;
   
   // Summary logging
-  console.log(`Mold Half Classification: H₁=${h1Triangles.size} (${(h1Triangles.size / effectiveOuterTriangles.size * 100).toFixed(1)}%), H₂=${h2Triangles.size} (${(h2Triangles.size / effectiveOuterTriangles.size * 100).toFixed(1)}%), Inner=${innerBoundaryTriangles.size} [${elapsed.toFixed(0)}ms]`);
+  console.log(`Mold Half Classification: H₁=${h1Triangles.size}, H₂=${h2Triangles.size}, BoundaryZone=${boundaryZoneTriangles.size}, Inner=${innerBoundaryTriangles.size} [${elapsed.toFixed(0)}ms]`);
   
   return {
     sideMap: side,
     h1Triangles,
     h2Triangles,
+    boundaryZoneTriangles,
     innerBoundaryTriangles,
     totalTriangles: triangles.length,
     outerBoundaryCount: effectiveOuterTriangles.size,
@@ -656,6 +753,9 @@ export function applyMoldHalfPaint(
     // Check if this is an inner boundary triangle
     if (classification.innerBoundaryTriangles.has(triIdx)) {
       color = MOLD_HALF_COLORS.INNER;
+    } else if (classification.boundaryZoneTriangles.has(triIdx)) {
+      // Boundary zone between H₁ and H₂ (grey, disjoint zone)
+      color = MOLD_HALF_COLORS.BOUNDARY_ZONE;
     } else {
       // Outer boundary - check classification
       const side = classification.sideMap.get(triIdx);

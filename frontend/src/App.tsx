@@ -89,6 +89,7 @@ function App() {
   const [showRLine, setShowRLine] = useState(true);
   const [distanceFieldType, setDistanceFieldType] = useState<DistanceFieldType>('part');
   const [showMoldHalfClassification, setShowMoldHalfClassification] = useState(false);
+  const [boundaryZoneThreshold, setBoundaryZoneThreshold] = useState(0.15); // 15% of bbox diagonal
   const [moldHalfStats, setMoldHalfStats] = useState<{
     h1Count: number;
     h2Count: number;
@@ -117,15 +118,11 @@ function App() {
   const [lastComputedGridResolution, setLastComputedGridResolution] = useState<number | null>(null);
   const [lastComputedAdjacency, setLastComputedAdjacency] = useState<AdjacencyType | null>(null);
 
-  // Helper to clear downstream steps
+  // Helper to clear downstream steps (clears steps AFTER the given step, not the step itself)
   const clearFromStep = useCallback((step: Step) => {
     switch (step) {
       case 'parting':
-        setShowPartingDirections(false);
-        setVisibilityDataReady(false);
-        setShowD1Paint(false);
-        setShowD2Paint(false);
-        // Fall through to clear hull and beyond
+        // Clear hull and beyond (downstream from parting)
         setShowInflatedHull(false);
         setHullStats(null);
         setLastComputedInflationOffset(null);
@@ -141,10 +138,7 @@ function App() {
         setLastComputedAdjacency(null);
         break;
       case 'hull':
-        setShowInflatedHull(false);
-        setHullStats(null);
-        setLastComputedInflationOffset(null);
-        // Fall through to clear cavity and beyond
+        // Clear cavity and beyond (downstream from hull)
         setShowCsgResult(false);
         setCsgStats(null);
         setShowMoldHalfClassification(false);
@@ -157,9 +151,7 @@ function App() {
         setLastComputedAdjacency(null);
         break;
       case 'cavity':
-        setShowCsgResult(false);
-        setCsgStats(null);
-        // Fall through to clear mold-halves and beyond
+        // Clear mold-halves and beyond (downstream from cavity)
         setShowMoldHalfClassification(false);
         setMoldHalfStats(null);
         setShowVolumetricGrid(false);
@@ -170,9 +162,7 @@ function App() {
         setLastComputedAdjacency(null);
         break;
       case 'mold-halves':
-        setShowMoldHalfClassification(false);
-        setMoldHalfStats(null);
-        // Fall through to clear voxel and parting-surface
+        // Clear voxel and parting-surface (downstream from mold-halves)
         setShowVolumetricGrid(false);
         setVolumetricGridStats(null);
         setLastComputedGridResolution(null);
@@ -181,18 +171,13 @@ function App() {
         setLastComputedAdjacency(null);
         break;
       case 'voxel':
-        setShowVolumetricGrid(false);
-        setVolumetricGridStats(null);
-        setLastComputedGridResolution(null);
-        // Fall through to clear parting-surface
+        // Clear parting-surface (downstream from voxel)
         setShowPartingSurface(false);
         setEscapeLabelingStats(null);
         setLastComputedAdjacency(null);
         break;
       case 'parting-surface':
-        setShowPartingSurface(false);
-        setEscapeLabelingStats(null);
-        setLastComputedAdjacency(null);
+        // No downstream steps
         break;
     }
   }, []);
@@ -424,27 +409,46 @@ function App() {
     switch (activeStep) {
       case 'parting':
         clearFromStep('parting');
-        setShowPartingDirections(true);
+        // Reset current step's state to trigger recalculation
+        setVisibilityDataReady(false);
+        setShowPartingDirections(false);
+        // Use setTimeout to ensure state updates before triggering
+        setTimeout(() => setShowPartingDirections(true), 0);
         break;
       case 'hull':
         clearFromStep('hull');
-        setShowInflatedHull(true);
+        // Reset current step's state to trigger recalculation
+        setHullStats(null);
+        setShowInflatedHull(false);
+        setTimeout(() => setShowInflatedHull(true), 0);
         break;
       case 'cavity':
         clearFromStep('cavity');
-        setShowCsgResult(true);
+        // Reset current step's state to trigger recalculation
+        setCsgStats(null);
+        setShowCsgResult(false);
+        setTimeout(() => setShowCsgResult(true), 0);
         break;
       case 'mold-halves':
         clearFromStep('mold-halves');
-        setShowMoldHalfClassification(true);
+        // Reset current step's state to trigger recalculation
+        setMoldHalfStats(null);
+        setShowMoldHalfClassification(false);
+        setTimeout(() => setShowMoldHalfClassification(true), 0);
         break;
       case 'voxel':
         clearFromStep('voxel');
-        setShowVolumetricGrid(true);
+        // Reset current step's state to trigger recalculation
+        setVolumetricGridStats(null);
+        setShowVolumetricGrid(false);
+        setTimeout(() => setShowVolumetricGrid(true), 0);
         break;
       case 'parting-surface':
         clearFromStep('parting-surface');
-        setShowPartingSurface(true);
+        // Reset current step's state to trigger recalculation
+        setEscapeLabelingStats(null);
+        setShowPartingSurface(false);
+        setTimeout(() => setShowPartingSurface(true), 0);
         break;
     }
     
@@ -636,6 +640,16 @@ function App() {
 
         {activeStep === 'mold-halves' && status !== 'locked' && (
           <div style={styles.optionsSection}>
+            <div style={styles.optionLabel}>Boundary Zone Width: {(boundaryZoneThreshold * 100).toFixed(0)}% of diagonal</div>
+            <input
+              type="range"
+              min="0"
+              max="30"
+              step="1"
+              value={boundaryZoneThreshold * 100}
+              onChange={(e) => setBoundaryZoneThreshold(parseFloat(e.target.value) / 100)}
+              style={{ width: '100%', marginBottom: '12px' }}
+            />
             {/* Mold Half Stats */}
             {moldHalfStats && (
               <div style={styles.statsBox}>
@@ -829,14 +843,14 @@ function App() {
           <div style={styles.calculateSection}>
             <button
               onClick={handleCalculate}
-              disabled={isCalculating || status === 'completed'}
+              disabled={isCalculating}
               style={{
                 ...styles.calculateButton,
                 backgroundColor: status === 'completed' ? '#00aa00' : status === 'needs-recalc' ? '#ff8800' : isCalculating ? '#666' : '#00aaff',
-                cursor: isCalculating || status === 'completed' ? 'default' : 'pointer',
+                cursor: isCalculating ? 'default' : 'pointer',
               }}
             >
-              {status === 'completed' ? '✓ Completed' : status === 'needs-recalc' ? '⟳ Recalculate' : isCalculating ? 'Calculating...' : 'Calculate'}
+              {status === 'completed' ? '⟳ Recalculate' : status === 'needs-recalc' ? '⟳ Recalculate' : isCalculating ? 'Calculating...' : 'Calculate'}
             </button>
             
             {isCalculating && (
@@ -1035,6 +1049,7 @@ function App() {
           useGPUGrid={useGPUGrid}
           distanceFieldType={distanceFieldType}
           showMoldHalfClassification={showMoldHalfClassification}
+          boundaryZoneThreshold={boundaryZoneThreshold}
           showPartingSurface={showPartingSurface}
           partingSurfaceAdjacency={partingSurfaceAdjacency}
           partingSurfaceDebugMode={partingSurfaceDebugMode}

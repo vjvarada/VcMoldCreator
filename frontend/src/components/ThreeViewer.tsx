@@ -96,6 +96,8 @@ interface ThreeViewerProps {
   distanceFieldType?: DistanceFieldType;
   /** Show mold half classification (H₁/H₂ coloring on cavity) */
   showMoldHalfClassification?: boolean;
+  /** Boundary zone threshold as fraction of bounding box diagonal (default: 0.15 = 15%) */
+  boundaryZoneThreshold?: number;
   /** Show parting surface escape labeling */
   showPartingSurface?: boolean;
   /** Adjacency type for parting surface computation (6 or 26) */
@@ -144,6 +146,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   useGPUGrid = true,
   distanceFieldType = 'part',
   showMoldHalfClassification = false,
+  boundaryZoneThreshold = 0.15,
   showPartingSurface = false,
   partingSurfaceAdjacency = 6,
   partingSurfaceDebugMode = 'none',
@@ -174,7 +177,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const gridBoundingBoxRef = useRef<THREE.LineSegments | null>(null);
   const rLineVisualizationRef = useRef<THREE.Group | null>(null);
   const escapeLabelingRef = useRef<EscapeLabelingResult | null>(null);
-  const escapeLabelingVisualizationRef = useRef<THREE.Points | null>(null);
+  const escapeLabelingVisualizationRef = useRef<THREE.Object3D | null>(null);
 
   // ============================================================================
   // SCENE SETUP
@@ -492,7 +495,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       hullGeometry.applyMatrix4(hullMesh.matrixWorld);
       
       // Classify triangles into H₁ and H₂
-      const classification = classifyMoldHalves(cavityGeometry, hullGeometry, d1, d2);
+      const classification = classifyMoldHalves(cavityGeometry, hullGeometry, d1, d2, boundaryZoneThreshold);
       moldHalfClassificationRef.current = classification;
       onMoldHalfClassificationReady?.(classification);
       
@@ -506,6 +509,9 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
     } catch (error) {
       console.error('Error classifying mold halves:', error);
     }
+  // Note: boundaryZoneThreshold is intentionally NOT in dependency array
+  // so that moving the slider doesn't trigger recalculation - only clicking "Calculate" does
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showMoldHalfClassification, showCsgResult, showPartingDirections, onMoldHalfClassificationReady]);
 
   // ============================================================================
@@ -683,8 +689,13 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
     // Clean up existing escape labeling visualization
     if (escapeLabelingVisualizationRef.current) {
       scene.remove(escapeLabelingVisualizationRef.current);
-      escapeLabelingVisualizationRef.current.geometry.dispose();
-      (escapeLabelingVisualizationRef.current.material as THREE.Material).dispose();
+      // Handle both Group and Points cleanup
+      escapeLabelingVisualizationRef.current.traverse((child) => {
+        if (child instanceof THREE.Points) {
+          child.geometry.dispose();
+          (child.material as THREE.Material).dispose();
+        }
+      });
       escapeLabelingVisualizationRef.current = null;
     }
 
@@ -867,8 +878,13 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       }
       if (escapeLabelingVisualizationRef.current && sceneRef.current) {
         sceneRef.current.remove(escapeLabelingVisualizationRef.current);
-        escapeLabelingVisualizationRef.current.geometry.dispose();
-        (escapeLabelingVisualizationRef.current.material as THREE.Material).dispose();
+        // Handle both Group and Points cleanup
+        escapeLabelingVisualizationRef.current.traverse((child) => {
+          if (child instanceof THREE.Points) {
+            child.geometry.dispose();
+            (child.material as THREE.Material).dispose();
+          }
+        });
       }
     };
   }, []);

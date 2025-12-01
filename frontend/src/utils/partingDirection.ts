@@ -283,9 +283,10 @@ export async function findPartingDirectionsParallel(
   // Find best pair
   const { bestD1, bestD2 } = findBestPair(directionScores, areas, totalSurfaceArea);
   
-  // Report results
-  const d1 = bestD1.direction;
-  const d2 = bestD2.direction;
+  // Report results - negate directions so they point in the pull/extraction direction
+  // (i.e., the direction the mold half would move to release the part)
+  const d1 = bestD1.direction.clone().negate();
+  const d2 = bestD2.direction.clone().negate();
   const angleDeg = Math.acos(Math.max(-1, Math.min(1, d1.dot(d2)))) * (180 / Math.PI);
   
   let d2UniqueArea = 0;
