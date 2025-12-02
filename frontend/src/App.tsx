@@ -950,126 +950,132 @@ function App() {
           </div>
         )}
 
-        {/* Display Options - shows toggles for all completed steps */}
-        {meshLoaded && activeStep !== 'import' && (
-          <div style={{ marginTop: '20px', borderTop: '1px solid #e1e5eb', paddingTop: '16px' }}>
-            <div style={styles.optionLabel}>Display Options:</div>
-            
-            {/* Original Mesh - always available when loaded */}
-            <label style={styles.checkbox}>
+      </div>
+    );
+  };
+
+  // Render Display Options floating panel (top right of viewer)
+  const renderDisplayOptions = () => {
+    if (!meshLoaded) return null;
+    
+    return (
+      <div style={styles.displayOptionsPanel}>
+        <div style={styles.displayOptionsHeader}>Display Options</div>
+        <div style={styles.displayOptionsContent}>
+          {/* Original Mesh - always available when loaded */}
+          <label style={styles.displayCheckbox}>
+            <input
+              type="checkbox"
+              checked={hideOriginalMesh}
+              onChange={(e) => setHideOriginalMesh(e.target.checked)}
+            />
+            Hide Original Mesh
+          </label>
+
+          {/* Parting Direction visibility options */}
+          {visibilityDataReady && (
+            <>
+              <label style={styles.displayCheckbox}>
+                <input
+                  type="checkbox"
+                  checked={showD1Paint}
+                  onChange={(e) => setShowD1Paint(e.target.checked)}
+                />
+                <span>Show D1 Visibility</span>
+                <span style={{ color: '#17c671', marginLeft: '4px' }}>🟢</span>
+              </label>
+              <label style={styles.displayCheckbox}>
+                <input
+                  type="checkbox"
+                  checked={showD2Paint}
+                  onChange={(e) => setShowD2Paint(e.target.checked)}
+                />
+                <span>Show D2 Visibility</span>
+                <span style={{ color: '#ffb400', marginLeft: '4px' }}>🟠</span>
+              </label>
+            </>
+          )}
+
+          {/* Hull visibility - available after hull is computed */}
+          {hullStats && (
+            <label style={styles.displayCheckbox}>
               <input
                 type="checkbox"
-                checked={hideOriginalMesh}
-                onChange={(e) => setHideOriginalMesh(e.target.checked)}
+                checked={hideHull}
+                onChange={(e) => setHideHull(e.target.checked)}
               />
-              Hide Original Mesh
+              <span>Hide Hull</span>
+              <span style={{ color: '#8445f7', marginLeft: '4px' }}>🟣</span>
             </label>
+          )}
 
-            {/* Parting Direction visibility options */}
-            {visibilityDataReady && (
-              <>
-                <label style={styles.checkbox}>
-                  <input
-                    type="checkbox"
-                    checked={showD1Paint}
-                    onChange={(e) => setShowD1Paint(e.target.checked)}
-                  />
-                  <span>Show D1 Visibility</span>
-                  <span style={{ color: '#17c671', marginLeft: '4px' }}>🟢</span>
-                </label>
-                <label style={styles.checkbox}>
-                  <input
-                    type="checkbox"
-                    checked={showD2Paint}
-                    onChange={(e) => setShowD2Paint(e.target.checked)}
-                  />
-                  <span>Show D2 Visibility</span>
-                  <span style={{ color: '#ffb400', marginLeft: '4px' }}>🟠</span>
-                </label>
-              </>
-            )}
+          {/* Cavity visibility - available after cavity is computed */}
+          {csgStats && (
+            <label style={styles.displayCheckbox}>
+              <input
+                type="checkbox"
+                checked={hideCavity}
+                onChange={(e) => setHideCavity(e.target.checked)}
+              />
+              <span>Hide Cavity</span>
+              <span style={{ color: '#00b8d8', marginLeft: '4px' }}>🩵</span>
+            </label>
+          )}
 
-            {/* Hull visibility - available after hull is computed */}
-            {hullStats && (
-              <label style={styles.checkbox}>
-                <input
-                  type="checkbox"
-                  checked={hideHull}
-                  onChange={(e) => setHideHull(e.target.checked)}
-                />
-                <span>Hide Hull</span>
-                <span style={{ color: '#8445f7', marginLeft: '4px' }}>🟣</span>
+          {/* Voxel grid visibility - available after voxel is computed */}
+          {volumetricGridStats && (
+            <label style={styles.displayCheckbox}>
+              <input
+                type="checkbox"
+                checked={hideVoxelGrid}
+                onChange={(e) => setHideVoxelGrid(e.target.checked)}
+              />
+              <span>Hide Voxel Grid</span>
+              <span style={{ color: '#00b8d8', marginLeft: '4px' }}>🧊</span>
+            </label>
+          )}
+
+          {/* R Line visibility - available after voxel is computed */}
+          {volumetricGridStats && (
+            <label style={styles.displayCheckbox}>
+              <input
+                type="checkbox"
+                checked={showRLine}
+                onChange={(e) => setShowRLine(e.target.checked)}
+              />
+              <span>Show R Line</span>
+              <span style={{ marginLeft: '4px' }}>📏</span>
+            </label>
+          )}
+
+          {/* Voxel Grid Coloring - available after voxel is computed */}
+          {volumetricGridStats && (
+            <div style={{ marginTop: '8px' }}>
+              <label style={{ fontSize: '11px', color: 'rgba(255,255,255,0.7)', display: 'block', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                Voxel Grid Coloring:
               </label>
-            )}
-
-            {/* Cavity visibility - available after cavity is computed */}
-            {csgStats && (
-              <label style={styles.checkbox}>
-                <input
-                  type="checkbox"
-                  checked={hideCavity}
-                  onChange={(e) => setHideCavity(e.target.checked)}
-                />
-                <span>Hide Cavity</span>
-                <span style={{ color: '#00b8d8', marginLeft: '4px' }}>🩵</span>
-              </label>
-            )}
-
-            {/* Voxel grid visibility - available after voxel is computed */}
-            {volumetricGridStats && (
-              <label style={styles.checkbox}>
-                <input
-                  type="checkbox"
-                  checked={hideVoxelGrid}
-                  onChange={(e) => setHideVoxelGrid(e.target.checked)}
-                />
-                <span>Hide Voxel Grid</span>
-                <span style={{ color: '#00b8d8', marginLeft: '4px' }}>🧊</span>
-              </label>
-            )}
-
-            {/* R Line visibility - available after voxel is computed */}
-            {volumetricGridStats && (
-              <label style={styles.checkbox}>
-                <input
-                  type="checkbox"
-                  checked={showRLine}
-                  onChange={(e) => setShowRLine(e.target.checked)}
-                />
-                <span>Show R Line</span>
-                <span style={{ marginLeft: '4px' }}>📏</span>
-              </label>
-            )}
-
-            {/* Voxel Grid Coloring - available after voxel is computed */}
-            {volumetricGridStats && (
-              <div style={{ marginTop: '12px' }}>
-                <label style={{ fontSize: '12px', color: '#5A6169', display: 'block', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-                  Voxel Grid Coloring:
-                </label>
-                <select
-                  value={distanceFieldType}
-                  onChange={(e) => setDistanceFieldType(e.target.value as DistanceFieldType)}
-                  style={{
-                    width: '100%',
-                    padding: '10px 14px',
-                    borderRadius: '0.375rem',
-                    border: '1px solid #becad6',
-                    backgroundColor: '#ffffff',
-                    color: '#495057',
-                    fontSize: '13px',
-                    cursor: 'pointer'
-                  }}
-                >
-                  <option value="part">Part Distance (δᵢ)</option>
-                  <option value="biased">Biased Distance (δᵢ + λw)</option>
-                  <option value="weight">Weighting Factor (wt)</option>
-                  <option value="boundary">Boundary Mask (Biased vs Unbiased)</option>
-                </select>
-              </div>
-            )}
-          </div>
-        )}
+              <select
+                value={distanceFieldType}
+                onChange={(e) => setDistanceFieldType(e.target.value as DistanceFieldType)}
+                style={{
+                  width: '100%',
+                  padding: '6px 10px',
+                  borderRadius: '0.375rem',
+                  border: '1px solid rgba(255,255,255,0.2)',
+                  backgroundColor: 'rgba(0,0,0,0.3)',
+                  color: '#ffffff',
+                  fontSize: '12px',
+                  cursor: 'pointer'
+                }}
+              >
+                <option value="part">Part Distance (δᵢ)</option>
+                <option value="biased">Biased Distance (δᵢ + λw)</option>
+                <option value="weight">Weighting Factor (wt)</option>
+                <option value="boundary">Boundary Mask (Biased vs Unbiased)</option>
+              </select>
+            </div>
+          )}
+        </div>
       </div>
     );
   };
@@ -1126,6 +1132,7 @@ function App() {
 
       {/* Column 3: 3D Viewer (70%) */}
       <div style={styles.viewerContainer}>
+        {renderDisplayOptions()}
         <ThreeViewer
           ref={threeViewerRef}
           stlUrl={stlUrl}
@@ -1394,6 +1401,41 @@ const styles: Record<string, React.CSSProperties> = {
     overflow: 'hidden',
     margin: '12px 12px 12px 0',
     boxShadow: '0 0.46875rem 2.1875rem rgba(90,97,105,0.1), 0 0.9375rem 1.40625rem rgba(90,97,105,0.1)',
+  },
+  displayOptionsPanel: {
+    position: 'absolute',
+    top: '16px',
+    right: '16px',
+    zIndex: 100,
+    backgroundColor: 'rgba(26, 29, 33, 0.9)',
+    backdropFilter: 'blur(10px)',
+    borderRadius: '0.625rem',
+    border: '1px solid rgba(255, 255, 255, 0.1)',
+    boxShadow: '0 4px 20px rgba(0, 0, 0, 0.3)',
+    minWidth: '200px',
+    maxWidth: '250px',
+  },
+  displayOptionsHeader: {
+    padding: '12px 16px',
+    fontSize: '12px',
+    fontWeight: 500,
+    color: 'rgba(255, 255, 255, 0.9)',
+    borderBottom: '1px solid rgba(255, 255, 255, 0.1)',
+    textTransform: 'uppercase',
+    letterSpacing: '0.5px',
+  },
+  displayOptionsContent: {
+    padding: '12px 16px',
+  },
+  displayCheckbox: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    fontSize: '12px',
+    cursor: 'pointer',
+    marginBottom: '8px',
+    color: 'rgba(255, 255, 255, 0.8)',
+    fontWeight: 300,
   },
 };
 

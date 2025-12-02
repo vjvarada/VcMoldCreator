@@ -1,100 +1,126 @@
 /**
  * Web Worker for parallelized Dijkstra search
  * 
- * This worker processes batches of seed voxels, running independent Dijkstra
- * searches from each seed to find the nearest boundary voxel.
+ * OPTIMIZED VERSION:
+ * - Direct 3D array index lookup (no string keys)
+ * - 6-connected neighbors only (faster, usually sufficient)
+ * - Inlined hot paths
  */
 
 // ============================================================================
-// MIN-HEAP PRIORITY QUEUE (Worker-local copy)
+// OPTIMIZED MIN-HEAP (Flat arrays, no object allocation)
 // ============================================================================
 
-class MinHeap {
-  private heap: { index: number; cost: number }[] = [];
+class FastMinHeap {
+  private indices: Uint32Array;
+  private costs: Float32Array;
+  private size_: number = 0;
+  private capacity: number;
+
+  constructor(initialCapacity: number = 4096) {
+    this.capacity = initialCapacity;
+    this.indices = new Uint32Array(initialCapacity);
+    this.costs = new Float32Array(initialCapacity);
+  }
 
   get size(): number {
-    return this.heap.length;
+    return this.size_;
+  }
+
+  clear(): void {
+    this.size_ = 0;
   }
 
   push(index: number, cost: number): void {
-    const node = { index, cost };
-    this.heap.push(node);
-    this.bubbleUp(this.heap.length - 1);
-  }
-
-  pop(): { index: number; cost: number } | undefined {
-    if (this.heap.length === 0) return undefined;
-    
-    const min = this.heap[0];
-    const last = this.heap.pop()!;
-    
-    if (this.heap.length > 0) {
-      this.heap[0] = last;
-      this.bubbleDown(0);
+    if (this.size_ >= this.capacity) {
+      this.grow();
     }
     
-    return min;
-  }
-
-  private bubbleUp(pos: number): void {
+    let pos = this.size_++;
+    this.indices[pos] = index;
+    this.costs[pos] = cost;
+    
+    // Bubble up
     while (pos > 0) {
-      const parent = Math.floor((pos - 1) / 2);
-      if (this.heap[pos].cost >= this.heap[parent].cost) break;
+      const parent = (pos - 1) >> 1;
+      if (this.costs[pos] >= this.costs[parent]) break;
       
       // Swap
-      const temp = this.heap[pos];
-      this.heap[pos] = this.heap[parent];
-      this.heap[parent] = temp;
+      const tmpIdx = this.indices[pos];
+      const tmpCost = this.costs[pos];
+      this.indices[pos] = this.indices[parent];
+      this.costs[pos] = this.costs[parent];
+      this.indices[parent] = tmpIdx;
+      this.costs[parent] = tmpCost;
       pos = parent;
     }
   }
 
-  private bubbleDown(pos: number): void {
-    const n = this.heap.length;
+  pop(): { index: number; cost: number } | null {
+    if (this.size_ === 0) return null;
+    
+    const minIdx = this.indices[0];
+    const minCost = this.costs[0];
+    
+    this.size_--;
+    if (this.size_ > 0) {
+      this.indices[0] = this.indices[this.size_];
+      this.costs[0] = this.costs[this.size_];
+      this.bubbleDown();
+    }
+    
+    return { index: minIdx, cost: minCost };
+  }
+
+  private bubbleDown(): void {
+    let pos = 0;
+    const n = this.size_;
+    
     while (true) {
-      const left = 2 * pos + 1;
-      const right = 2 * pos + 2;
+      const left = (pos << 1) + 1;
+      const right = left + 1;
       let smallest = pos;
       
-      if (left < n && this.heap[left].cost < this.heap[smallest].cost) {
+      if (left < n && this.costs[left] < this.costs[smallest]) {
         smallest = left;
       }
-      if (right < n && this.heap[right].cost < this.heap[smallest].cost) {
+      if (right < n && this.costs[right] < this.costs[smallest]) {
         smallest = right;
       }
       
       if (smallest === pos) break;
       
       // Swap
-      const temp = this.heap[pos];
-      this.heap[pos] = this.heap[smallest];
-      this.heap[smallest] = temp;
+      const tmpIdx = this.indices[pos];
+      const tmpCost = this.costs[pos];
+      this.indices[pos] = this.indices[smallest];
+      this.costs[pos] = this.costs[smallest];
+      this.indices[smallest] = tmpIdx;
+      this.costs[smallest] = tmpCost;
       pos = smallest;
     }
+  }
+
+  private grow(): void {
+    this.capacity *= 2;
+    const newIndices = new Uint32Array(this.capacity);
+    const newCosts = new Float32Array(this.capacity);
+    newIndices.set(this.indices);
+    newCosts.set(this.costs);
+    this.indices = newIndices;
+    this.costs = newCosts;
   }
 }
 
 // ============================================================================
-// NEIGHBOR OFFSETS (26-connected)
+// 6-CONNECTED NEIGHBORS (face-adjacent only - much faster)
 // ============================================================================
 
-const NEIGHBORS_26: [number, number, number][] = [
-  // Face neighbors (6)
-  [-1, 0, 0], [1, 0, 0],
-  [0, -1, 0], [0, 1, 0],
-  [0, 0, -1], [0, 0, 1],
-  // Edge neighbors (12)
-  [-1, -1, 0], [-1, 1, 0], [1, -1, 0], [1, 1, 0],
-  [-1, 0, -1], [-1, 0, 1], [1, 0, -1], [1, 0, 1],
-  [0, -1, -1], [0, -1, 1], [0, 1, -1], [0, 1, 1],
-  // Corner neighbors (8)
-  [-1, -1, -1], [-1, -1, 1], [-1, 1, -1], [-1, 1, 1],
-  [1, -1, -1], [1, -1, 1], [1, 1, -1], [1, 1, 1],
-];
-
-const NEIGHBOR_DISTANCES = NEIGHBORS_26.map(([di, dj, dk]) => 
-  Math.sqrt(di * di + dj * dj + dk * dk)
-);
+// Pre-computed offsets for 6-connected neighbors
+const NEIGHBOR_DI = new Int8Array([-1, 1, 0, 0, 0, 0]);
+const NEIGHBOR_DJ = new Int8Array([0, 0, -1, 1, 0, 0]);
+const NEIGHBOR_DK = new Int8Array([0, 0, 0, 0, -1, 1]);
+const NEIGHBOR_DIST = 1.0; // All face neighbors are distance 1
 
 // ============================================================================
 // TYPES
@@ -103,23 +129,25 @@ const NEIGHBOR_DISTANCES = NEIGHBORS_26.map(([di, dj, dk]) =>
 export interface DijkstraWorkerInput {
   type: 'process';
   workerId: number;
-  seedIndices: number[];           // Indices of seeds to process
+  seedIndices: number[];
   voxelCount: number;
   voxelSize: number;
   maxHopDistance: number;
-  
-  // Transferred arrays (SharedArrayBuffer or regular ArrayBuffer)
-  gridIndices: Int32Array;         // [i0, j0, k0, i1, j1, k1, ...] for all voxels
-  boundaryLabel: Int8Array;        // Boundary labels for all voxels
-  weightingFactor: Float32Array;   // Weighting factor for all voxels
-  spatialIndexKeys: string[];      // Serialized spatial index keys
-  spatialIndexValues: Int32Array;  // Corresponding voxel indices
+  gridIndices: Int32Array;
+  boundaryLabel: Int8Array;
+  weightingFactor: Float32Array;
+  spatialIndexKeys: string[];
+  spatialIndexValues: Int32Array;
+  // Grid dimensions for direct index computation
+  gridResX?: number;
+  gridResY?: number;
+  gridResZ?: number;
 }
 
 export interface DijkstraWorkerOutput {
   type: 'result';
   workerId: number;
-  seedLabels: Int8Array;           // Labels for the processed seeds (same order as input)
+  seedLabels: Int8Array;
   visitedCount: number;
   expandedCount: number;
   labeledCount: number;
@@ -134,28 +162,40 @@ export interface DijkstraWorkerProgress {
 }
 
 // ============================================================================
-// WORKER MESSAGE HANDLER
+// FAST SPATIAL INDEX (Int32Array-based 3D lookup)
 // ============================================================================
 
-// Rebuild spatial index from serialized data
-function rebuildSpatialIndex(keys: string[], values: Int32Array): Map<string, number> {
-  const map = new Map<string, number>();
-  for (let i = 0; i < keys.length; i++) {
-    map.set(keys[i], values[i]);
+/**
+ * Build a fast 3D lookup table from grid indices
+ * Returns -1 for empty cells
+ */
+function buildFastSpatialIndex(
+  gridIndices: Int32Array,
+  voxelCount: number,
+  resX: number,
+  resY: number,
+  resZ: number
+): Int32Array {
+  // Allocate 3D grid as flat array, initialized to -1
+  const gridSize = resX * resY * resZ;
+  const lookup = new Int32Array(gridSize).fill(-1);
+  
+  for (let idx = 0; idx < voxelCount; idx++) {
+    const i3 = idx * 3;
+    const gi = gridIndices[i3];
+    const gj = gridIndices[i3 + 1];
+    const gk = gridIndices[i3 + 2];
+    
+    // Flat index into 3D grid
+    const flatIdx = gi + gj * resX + gk * resX * resY;
+    lookup[flatIdx] = idx;
   }
-  return map;
-}
-
-function getVoxelIndex(
-  i: number, j: number, k: number,
-  spatialIndex: Map<string, number>
-): number {
-  const key = `${i},${j},${k}`;
-  return spatialIndex.get(key) ?? -1;
+  
+  return lookup;
 }
 
 /**
- * Process a batch of seeds using Dijkstra
+ * Process a batch of seeds using optimized Dijkstra
  */
 function processSeedBatch(input: DijkstraWorkerInput): DijkstraWorkerOutput {
   const startTime = performance.now();
@@ -165,28 +205,48 @@ function processSeedBatch(input: DijkstraWorkerInput): DijkstraWorkerOutput {
     seedIndices,
     voxelCount,
     voxelSize,
-    maxHopDistance,
     gridIndices,
     boundaryLabel,
     weightingFactor,
-    spatialIndexKeys,
-    spatialIndexValues,
+    gridResX,
+    gridResY,
+    gridResZ,
   } = input;
   
-  // Rebuild spatial index
-  const spatialIndex = rebuildSpatialIndex(spatialIndexKeys, spatialIndexValues);
+  // If grid dimensions not provided, fall back to Map-based lookup
+  const useDirectLookup = gridResX !== undefined && gridResY !== undefined && gridResZ !== undefined;
   
-  // Pre-compute neighbor distances
-  const fullNeighborDistances = NEIGHBOR_DISTANCES.map(d => d * voxelSize);
+  let spatialLookup: Int32Array | null = null;
+  let spatialMap: Map<string, number> | null = null;
+  
+  if (useDirectLookup) {
+    spatialLookup = buildFastSpatialIndex(gridIndices, voxelCount, gridResX!, gridResY!, gridResZ!);
+  } else {
+    // Fallback: rebuild Map-based spatial index
+    spatialMap = new Map<string, number>();
+    for (let i = 0; i < input.spatialIndexKeys.length; i++) {
+      spatialMap.set(input.spatialIndexKeys[i], input.spatialIndexValues[i]);
+    }
+  }
+  
+  const resX = gridResX ?? 0;
+  const resY = gridResY ?? 0;
+  const resZ = gridResZ ?? 0;
+  const resXY = resX * resY;
+  
+  // Pre-compute neighbor distance with voxel size
+  const neighborDist = NEIGHBOR_DIST * voxelSize;
   
   // Result arrays
   const seedLabels = new Int8Array(seedIndices.length).fill(-1);
   
   // Reusable arrays for Dijkstra (version-based clearing)
   const costArray = new Float32Array(voxelCount);
-  const visitedSet = new Uint8Array(voxelCount);
   const versionArray = new Uint32Array(voxelCount);
   let currentVersion = 1;
+  
+  // Reusable priority queue
+  const pq = new FastMinHeap(Math.min(voxelCount, 65536));
   
   let totalVisited = 0;
   let totalExpanded = 0;
@@ -216,10 +276,8 @@ function processSeedBatch(input: DijkstraWorkerInput): DijkstraWorkerOutput {
       currentVersion = 1;
     }
     
-    // Seed's grid coordinates are retrieved via gridIndices array during traversal
-    
-    // Initialize Dijkstra
-    const pq = new MinHeap();
+    // Clear and initialize priority queue
+    pq.clear();
     costArray[seedIdx] = 0;
     versionArray[seedIdx] = currentVersion;
     pq.push(seedIdx, 0);
@@ -227,21 +285,22 @@ function processSeedBatch(input: DijkstraWorkerInput): DijkstraWorkerOutput {
     let foundBoundary = false;
     let boundaryLabelFound = 0;
     
-    while (pq.size > 0 && !foundBoundary) {
+    while (pq.size > 0) {
       const current = pq.pop()!;
-      const i = current.index;
+      const idx = current.index;
       const currentCost = current.cost;
       
-      // Skip if already visited or cost is stale
-      if (visitedSet[i] === currentVersion) continue;
-      if (versionArray[i] === currentVersion && currentCost > costArray[i]) continue;
+      // Skip if cost is stale (already found better path)
+      if (versionArray[idx] === currentVersion && currentCost > costArray[idx]) {
+        continue;
+      }
       
-      visitedSet[i] = currentVersion;
       totalVisited++;
       
       // Check if we've reached a boundary
-      if (boundaryLabel[i] !== 0) {
-        boundaryLabelFound = boundaryLabel[i];
+      const bl = boundaryLabel[idx];
+      if (bl !== 0) {
+        boundaryLabelFound = bl;
         foundBoundary = true;
         break;
       }
@@ -249,43 +308,42 @@ function processSeedBatch(input: DijkstraWorkerInput): DijkstraWorkerOutput {
       totalExpanded++;
       
       // Get current voxel's grid coordinates
-      const gi = gridIndices[i * 3];
-      const gj = gridIndices[i * 3 + 1];
-      const gk = gridIndices[i * 3 + 2];
+      const i3 = idx * 3;
+      const gi = gridIndices[i3];
+      const gj = gridIndices[i3 + 1];
+      const gk = gridIndices[i3 + 2];
       
-      // Expand to neighbors
-      for (let n = 0; n < NEIGHBORS_26.length; n++) {
-        const [di, dj, dk] = NEIGHBORS_26[n];
+      // Expand to 6-connected neighbors (inlined for speed)
+      for (let n = 0; n < 6; n++) {
+        const ni = gi + NEIGHBOR_DI[n];
+        const nj = gj + NEIGHBOR_DJ[n];
+        const nk = gk + NEIGHBOR_DK[n];
         
-        // Try hop distances from 1 to maxHopDistance
-        for (let hopDistance = 1; hopDistance <= maxHopDistance; hopDistance++) {
-          const j = getVoxelIndex(
-            gi + hopDistance * di,
-            gj + hopDistance * dj,
-            gk + hopDistance * dk,
-            spatialIndex
-          );
-          
-          if (j < 0) continue;
-          
-          // Skip if already visited
-          if (visitedSet[j] === currentVersion) {
-            break;
+        // Get neighbor voxel index
+        let neighborIdx: number;
+        if (useDirectLookup) {
+          // Bounds check
+          if (ni < 0 || ni >= resX || nj < 0 || nj >= resY || nk < 0 || nk >= resZ) {
+            continue;
           }
-          
-          const L = fullNeighborDistances[n] * hopDistance;
-          const wt_j = weightingFactor[j];
-          const edgeCost = L * wt_j;
-          const candidateCost = currentCost + edgeCost;
-          
-          // Check if this is a better path
-          if (versionArray[j] !== currentVersion || candidateCost < costArray[j]) {
-            costArray[j] = candidateCost;
-            versionArray[j] = currentVersion;
-            pq.push(j, candidateCost);
-          }
-          
-          break;
+          neighborIdx = spatialLookup![ni + nj * resX + nk * resXY];
+        } else {
+          const key = `${ni},${nj},${nk}`;
+          neighborIdx = spatialMap!.get(key) ?? -1;
+        }
+        
+        if (neighborIdx < 0) continue;
+        
+        // Compute edge cost
+        const wt = weightingFactor[neighborIdx];
+        const edgeCost = neighborDist * wt;
+        const candidateCost = currentCost + edgeCost;
+        
+        // Check if this is a better path
+        if (versionArray[neighborIdx] !== currentVersion || candidateCost < costArray[neighborIdx]) {
+          costArray[neighborIdx] = candidateCost;
+          versionArray[neighborIdx] = currentVersion;
+          pq.push(neighborIdx, candidateCost);
         }
       }
     }
@@ -319,7 +377,6 @@ self.onmessage = (event: MessageEvent<DijkstraWorkerInput>) => {
   
   if (input.type === 'process') {
     const result = processSeedBatch(input);
-    // Transfer the result array back to main thread
     (self as unknown as Worker).postMessage(result, [result.seedLabels.buffer]);
   }
 };
