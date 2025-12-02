@@ -368,9 +368,6 @@ export function generateVolumetricGrid(
   const storeAllCells = options.storeAllCells ?? false;
   const computeDistances = options.computeDistances ?? false;
   const includeSurfaceVoxels = options.includeSurfaceVoxels ?? false;
-  const maxPartOverlapRatio = options.maxPartOverlapRatio ?? DEFAULT_MAX_PART_OVERLAP_RATIO;
-  const minPartOverlapRatio = options.minPartOverlapRatio ?? DEFAULT_MIN_PART_OVERLAP_RATIO;
-  const surfaceDistanceThreshold = options.surfaceDistanceThreshold ?? DEFAULT_SURFACE_DISTANCE_THRESHOLD;
   const targetVoxelSizePercent = options.targetVoxelSizePercent ?? DEFAULT_TARGET_VOXEL_SIZE_PERCENT;
   
   // Auto-calculate resolution if not provided
@@ -432,7 +429,7 @@ export function generateVolumetricGrid(
     : 0;
   
   if (includeSurfaceVoxels) {
-    logDebug(`Surface voxel inclusion enabled, tolerance: ${surfaceTolerance.toFixed(6)}, overlapRange: ${minPartOverlapRatio*100}%-${maxPartOverlapRatio*100}%, distThresh: ${surfaceDistanceThreshold*100}%`);
+    logDebug(`Surface voxel inclusion enabled, tolerance: ${surfaceTolerance.toFixed(6)} (centers must be outside part)`);
   }
 
   // Iterate through all grid cells
@@ -453,36 +450,18 @@ export function generateVolumetricGrid(
           const isInsideOrOnShell = shellTester.isInsideOrOnSurface(cellCenter, surfaceTolerance);
           
           if (isInsideOrOnShell) {
-            // Check if voxel center is outside the part
+            // Check if voxel center is outside the part - CRITICAL for thin wall prevention
             const isOutsidePart = partTester.isOutside(cellCenter);
             
-            // Helper function to check if this is a surface voxel
-            // Surface voxels: 1-10% overlap OR within 50% voxel distance of part surface
-            const isSurfaceVoxel = (): boolean => {
-              const avgCellSize = (cellSize.x + cellSize.y + cellSize.z) / 3;
-              const distThreshold = avgCellSize * surfaceDistanceThreshold;
-              
-              // Check distance to part surface
-              const distToPart = partTester.getDistanceToSurface(cellCenter);
-              if (distToPart <= distThreshold) {
-                return true;
-              }
-              
-              // Check volume overlap ratio (1-10%)
-              const overlapRatio = partTester.computeVolumeIntersection(cellCenter, cellSize, 3);
-              if (overlapRatio >= minPartOverlapRatio && overlapRatio <= maxPartOverlapRatio) {
-                return true;
-              }
-              
-              return false;
-            };
-            
             if (isOutsidePart) {
-              // Outside part - include as mold volume (surface or regular)
+              // Voxel center is outside part - include it as mold volume
+              // This includes both regular mold voxels and surface voxels
+              // (surface voxels have 1-50% overlap OR within 50% voxel distance of part)
               isMoldVolume = true;
             } else {
-              // Voxel center is inside part - only include if it's a surface voxel
-              isMoldVolume = isSurfaceVoxel();
+              // Voxel center is INSIDE the part - EXCLUDE to prevent thin wall bridging
+              // We never include voxels whose centers are inside the part mesh
+              isMoldVolume = false;
             }
           } else {
             isMoldVolume = false;
@@ -2060,14 +2039,6 @@ interface WorkerInitMessage {
   partIndexArray: Uint32Array | null;
   /** Surface tolerance for including boundary voxels (0 = strict containment) */
   surfaceTolerance?: number;
-  /** Maximum overlap ratio with part mesh for boundary voxels (default: 0.10 = 10%) */
-  maxPartOverlapRatio?: number;
-  /** Minimum overlap ratio with part mesh for surface voxels (default: 0.01 = 1%) */
-  minPartOverlapRatio?: number;
-  /** Distance threshold as fraction of voxel size for surface voxels (default: 0.5 = 50%) */
-  surfaceDistanceThreshold?: number;
-  /** Cell size for volume intersection calculations [x, y, z] */
-  cellSize?: [number, number, number];
 }
 
 interface WorkerComputeMessage {
@@ -2140,9 +2111,6 @@ export async function generateVolumetricGridParallel(
   // Parse options
   const marginPercent = options.marginPercent ?? 0.05;
   const includeSurfaceVoxels = options.includeSurfaceVoxels ?? false;
-  const maxPartOverlapRatio = options.maxPartOverlapRatio ?? DEFAULT_MAX_PART_OVERLAP_RATIO;
-  const minPartOverlapRatio = options.minPartOverlapRatio ?? DEFAULT_MIN_PART_OVERLAP_RATIO;
-  const surfaceDistanceThreshold = options.surfaceDistanceThreshold ?? DEFAULT_SURFACE_DISTANCE_THRESHOLD;
   const targetVoxelSizePercent = options.targetVoxelSizePercent ?? DEFAULT_TARGET_VOXEL_SIZE_PERCENT;
   
   // Auto-calculate resolution if not provided
@@ -2187,7 +2155,7 @@ export async function generateVolumetricGridParallel(
     : 0;
   
   if (includeSurfaceVoxels) {
-    logDebug(`[Parallel] Surface voxel inclusion enabled, tolerance: ${surfaceTolerance.toFixed(6)}, overlapRange: ${minPartOverlapRatio*100}%-${maxPartOverlapRatio*100}%, distThresh: ${surfaceDistanceThreshold*100}%`);
+    logDebug(`[Parallel] Surface voxel inclusion enabled, tolerance: ${surfaceTolerance.toFixed(6)} (centers must be outside part)`);
   }
   
   const totalCellCount = resX * resY * resZ;
@@ -2228,10 +2196,6 @@ export async function generateVolumetricGridParallel(
       partPositionArray: partData.positionArray.slice(),
       partIndexArray: partData.indexArray?.slice() ?? null,
       surfaceTolerance,
-      maxPartOverlapRatio,
-      minPartOverlapRatio,
-      surfaceDistanceThreshold,
-      cellSize: [cellSize.x, cellSize.y, cellSize.z] as [number, number, number],
     };
     
     const transfers: Transferable[] = [initMsg.shellPositionArray.buffer, initMsg.partPositionArray.buffer];

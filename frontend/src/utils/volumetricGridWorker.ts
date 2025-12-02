@@ -21,14 +21,6 @@ interface InitMessage {
   partIndexArray: Uint32Array | null;
   /** Surface tolerance for including boundary voxels (0 = strict containment) */
   surfaceTolerance?: number;
-  /** Maximum overlap ratio with part mesh for boundary voxels (default: 0.10 = 10%) */
-  maxPartOverlapRatio?: number;
-  /** Minimum overlap ratio with part mesh for surface voxels (default: 0.01 = 1%) */
-  minPartOverlapRatio?: number;
-  /** Distance threshold as fraction of voxel size for surface voxels (default: 0.5 = 50%) */
-  surfaceDistanceThreshold?: number;
-  /** Cell size for volume intersection calculations [x, y, z] */
-  cellSize?: [number, number, number];
 }
 
 interface ComputeMessage {
@@ -60,10 +52,6 @@ let partGeometry: BufferGeometry | null = null;
 let shellBoundingBox: Box3 | null = null;
 let partBoundingBox: Box3 | null = null;
 let surfaceTolerance = 0; // 0 = strict containment, > 0 = include surface voxels
-let maxPartOverlapRatio = 0.10; // Maximum overlap ratio with part for boundary voxels (10%)
-let minPartOverlapRatio = 0.01; // Minimum overlap ratio for surface voxels (1%)
-let surfaceDistanceThreshold = 0.5; // Distance threshold as fraction of voxel size (50%)
-let cellSizeVec = new Vector3(1, 1, 1); // Cell size for volume intersection
 
 // Ray casting setup - use 3 directions for faster computation
 const RAY_DIRECTIONS = [
@@ -84,18 +72,10 @@ function initWorker(
   shellIndexArray: Uint32Array | null,
   partPositionArray: Float32Array,
   partIndexArray: Uint32Array | null,
-  tolerance: number = 0,
-  overlapRatio: number = 0.10,
-  minOverlapRatio: number = 0.01,
-  distanceThreshold: number = 0.5,
-  cellSize: [number, number, number] = [1, 1, 1]
+  tolerance: number = 0
 ): void {
   const startTime = performance.now();
   surfaceTolerance = tolerance;
-  maxPartOverlapRatio = overlapRatio;
-  minPartOverlapRatio = minOverlapRatio;
-  surfaceDistanceThreshold = distanceThreshold;
-  cellSizeVec.set(cellSize[0], cellSize[1], cellSize[2]);
   
   // Build shell geometry and BVH
   shellGeometry = new BufferGeometry();
@@ -132,7 +112,7 @@ function initWorker(
   partBvh = new MeshBVH(partGeometry, { maxLeafTris: 10 });
   
   const elapsed = performance.now() - startTime;
-  console.log(`[GridWorker ${workerId}] Ready in ${elapsed.toFixed(0)}ms (overlapRange=${minPartOverlapRatio*100}%-${maxPartOverlapRatio*100}%, distThresh=${surfaceDistanceThreshold*100}%)`);
+  console.log(`[GridWorker ${workerId}] Ready in ${elapsed.toFixed(0)}ms (surfaceTol=${surfaceTolerance.toFixed(4)})`);
   
   self.postMessage({
     type: 'ready',
@@ -219,85 +199,6 @@ function isInsideOrOnSurface(bvh: MeshBVH, boundingBox: Box3, point: Vector3, to
   return dist <= tolerance;
 }
 
-/**
- * Compute volume intersection ratio of a box with the mesh
- * Uses uniform sampling within the box
- * 
- * @param bvh - BVH of the mesh to test against
- * @param boundingBox - Bounding box of the mesh
- * @param center - Box center position
- * @param size - Box size vector
- * @param samplesPerAxis - Number of samples per axis (e.g., 3 = 27 total samples)
- * @returns Ratio of sample points inside the mesh (0 to 1)
- */
-function computeVolumeIntersection(
-  bvh: MeshBVH,
-  boundingBox: Box3,
-  center: Vector3,
-  size: Vector3,
-  samplesPerAxis: number = 3
-): number {
-  const halfSize = size.clone().multiplyScalar(0.5);
-  const samplePoint = new Vector3();
-  
-  let insideCount = 0;
-  const totalSamples = samplesPerAxis * samplesPerAxis * samplesPerAxis;
-  
-  for (let i = 0; i < samplesPerAxis; i++) {
-    const tx = (i + 0.5) / samplesPerAxis;
-    const x = center.x - halfSize.x + tx * size.x;
-    
-    for (let j = 0; j < samplesPerAxis; j++) {
-      const ty = (j + 0.5) / samplesPerAxis;
-      const y = center.y - halfSize.y + ty * size.y;
-      
-      for (let k = 0; k < samplesPerAxis; k++) {
-        const tz = (k + 0.5) / samplesPerAxis;
-        const z = center.z - halfSize.z + tz * size.z;
-        
-        samplePoint.set(x, y, z);
-        
-        if (isInsideMesh(bvh, boundingBox, samplePoint)) {
-          insideCount++;
-        }
-      }
-    }
-  }
-  
-  return insideCount / totalSamples;
-}
-
-/**
- * Check if a voxel qualifies as a surface voxel
- * Surface voxels are identified by:
- * 1. Having 1-10% overlap with the part mesh, OR
- * 2. Being within 50% of a voxel distance from the part boundary
- */
-function isSurfaceVoxel(
-  partBvh: MeshBVH,
-  partBoundingBox: Box3,
-  center: Vector3,
-  cellSize: Vector3
-): boolean {
-  // Calculate average cell size for distance threshold
-  const avgCellSize = (cellSize.x + cellSize.y + cellSize.z) / 3;
-  const distanceThreshold = avgCellSize * surfaceDistanceThreshold;
-  
-  // Check distance to part surface
-  const distToPart = getDistanceToSurface(partBvh, center);
-  if (distToPart <= distanceThreshold) {
-    return true;
-  }
-  
-  // Check volume overlap ratio (1-10%)
-  const overlapRatio = computeVolumeIntersection(partBvh, partBoundingBox, center, cellSize, 3);
-  if (overlapRatio >= minPartOverlapRatio && overlapRatio <= maxPartOverlapRatio) {
-    return true;
-  }
-  
-  return false;
-}
-
 // ============================================================================
 // GRID CELL PROCESSING
 // ============================================================================
@@ -327,22 +228,18 @@ function processCells(cellCenters: Float32Array, cellIndices: Uint32Array): void
       const isInsideOrOnShell = isInsideOrOnSurface(shellBvh, shellBoundingBox, tempVec, surfaceTolerance);
       
       if (isInsideOrOnShell) {
-        // Check if voxel center is outside the part
+        // Check if voxel center is outside the part - CRITICAL for thin wall prevention
         const isOutsidePart = !isInsideMesh(partBvh, partBoundingBox, tempVec);
         
         if (isOutsidePart) {
-          // Check if this is a surface voxel (1-10% overlap OR within 50% voxel distance of part)
-          // Surface voxels are near the part boundary
-          if (isSurfaceVoxel(partBvh, partBoundingBox, tempVec, cellSizeVec)) {
-            isMoldVolume = true;
-          } else {
-            // Regular mold volume voxel - include it
-            isMoldVolume = true;
-          }
+          // Voxel center is outside part - include it as mold volume
+          // This includes both regular mold voxels and surface voxels
+          // (surface voxels have 1-50% overlap OR within 50% voxel distance of part)
+          isMoldVolume = true;
         } else {
-          // Voxel center is inside part - check if it qualifies as a surface voxel
-          // Surface voxels have 1-10% overlap OR are within 50% voxel distance of part surface
-          isMoldVolume = isSurfaceVoxel(partBvh, partBoundingBox, tempVec, cellSizeVec);
+          // Voxel center is INSIDE the part - EXCLUDE to prevent thin wall bridging
+          // We never include voxels whose centers are inside the part mesh
+          isMoldVolume = false;
         }
       } else {
         isMoldVolume = false;
@@ -388,11 +285,7 @@ self.onmessage = (event: MessageEvent<InitMessage | ComputeMessage>) => {
       data.shellIndexArray,
       data.partPositionArray,
       data.partIndexArray,
-      data.surfaceTolerance ?? 0,
-      data.maxPartOverlapRatio ?? 0.10,
-      data.minPartOverlapRatio ?? 0.01,
-      data.surfaceDistanceThreshold ?? 0.5,
-      data.cellSize ?? [1, 1, 1]
+      data.surfaceTolerance ?? 0
     );
   } else if (data.type === 'compute') {
     processCells(data.cellCenters, data.cellIndices);
