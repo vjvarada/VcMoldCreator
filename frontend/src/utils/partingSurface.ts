@@ -30,6 +30,7 @@ import { MeshBVH, acceleratedRaycast, computeBoundsTree, disposeBoundsTree } fro
 import type { VolumetricGridResult } from './volumetricGrid';
 import type { MoldHalfClassificationResult } from './moldHalfClassification';
 import { runParallelDijkstra, isWebWorkersAvailable } from './parallelDijkstra';
+import { MeshTester, getNeighborOffsets, type AdjacencyType } from './meshUtils';
 
 // Extend Three.js with BVH acceleration
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
@@ -40,7 +41,8 @@ THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 // TYPES
 // ============================================================================
 
-export type AdjacencyType = 6 | 18 | 26;
+// Re-export AdjacencyType for backwards compatibility
+export type { AdjacencyType } from './meshUtils';
 
 export interface EscapeLabelingResult {
   /** Labels for each mold volume voxel: -1 = unlabeled, 1 = escapes via H₁, 2 = escapes via H₂ */
@@ -182,155 +184,6 @@ class MinHeap {
     this.heap[j] = temp;
     this.positions.set(this.heap[i].index, i);
     this.positions.set(this.heap[j].index, j);
-  }
-}
-
-// ============================================================================
-// NEIGHBOR OFFSETS
-// ============================================================================
-
-/** 6-connected neighbors (face adjacency) */
-const NEIGHBORS_6 = [
-  [-1, 0, 0], [1, 0, 0],
-  [0, -1, 0], [0, 1, 0],
-  [0, 0, -1], [0, 0, 1],
-];
-
-/** 18-connected neighbors (face + edge adjacency) */
-const NEIGHBORS_18 = [
-  ...NEIGHBORS_6,
-  [-1, -1, 0], [-1, 1, 0], [1, -1, 0], [1, 1, 0],
-  [-1, 0, -1], [-1, 0, 1], [1, 0, -1], [1, 0, 1],
-  [0, -1, -1], [0, -1, 1], [0, 1, -1], [0, 1, 1],
-];
-
-/** 26-connected neighbors (face + edge + corner adjacency) */
-const NEIGHBORS_26 = [
-  ...NEIGHBORS_18,
-  [-1, -1, -1], [-1, -1, 1], [-1, 1, -1], [-1, 1, 1],
-  [1, -1, -1], [1, -1, 1], [1, 1, -1], [1, 1, 1],
-];
-
-function getNeighborOffsets(adjacency: AdjacencyType): number[][] {
-  switch (adjacency) {
-    case 6: return NEIGHBORS_6;
-    case 18: return NEIGHBORS_18;
-    case 26: return NEIGHBORS_26;
-  }
-}
-
-// ============================================================================
-// PART MESH INSIDE/OUTSIDE TESTER
-// ============================================================================
-
-/**
- * Helper class for fast inside/outside tests on the part mesh
- * Uses BVH for acceleration and ray casting for inside/outside determination
- */
-class PartMeshTester {
-  private bvh: MeshBVH;
-  private raycaster: THREE.Raycaster;
-  private mesh: THREE.Mesh;
-  private boundingBox: THREE.Box3;
-  private rayDirection = new THREE.Vector3(1, 0, 0);
-  
-  constructor(geometry: THREE.BufferGeometry) {
-    // Ensure geometry is indexed for BVH
-    let indexedGeometry = geometry;
-    if (!geometry.index) {
-      const posAttr = geometry.getAttribute('position');
-      const indices: number[] = [];
-      for (let i = 0; i < posAttr.count; i++) {
-        indices.push(i);
-      }
-      indexedGeometry = geometry.clone();
-      indexedGeometry.setIndex(indices);
-    }
-    
-    // Compute normals and bounds
-    indexedGeometry.computeVertexNormals();
-    indexedGeometry.computeBoundingBox();
-    this.boundingBox = indexedGeometry.boundingBox!.clone();
-    
-    // Create mesh and BVH
-    const material = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
-    this.mesh = new THREE.Mesh(indexedGeometry, material);
-    this.mesh.updateMatrixWorld(true);
-    
-    this.bvh = new MeshBVH(indexedGeometry, { maxLeafTris: 10 });
-    indexedGeometry.boundsTree = this.bvh;
-    
-    this.raycaster = new THREE.Raycaster();
-    this.raycaster.firstHitOnly = false;
-  }
-  
-  /**
-   * Test if a point is inside the part mesh using ray casting
-   * Odd number of intersections = inside
-   */
-  isInside(point: THREE.Vector3): boolean {
-    // Quick bounding box check
-    if (!this.boundingBox.containsPoint(point)) {
-      return false;
-    }
-    
-    this.raycaster.set(point, this.rayDirection);
-    this.raycaster.far = Infinity;
-    const intersects = this.raycaster.intersectObject(this.mesh, false);
-    
-    return intersects.length % 2 === 1;
-  }
-  
-  /**
-   * Compute volume intersection ratio of a voxel with the part mesh
-   * Uses uniform sampling within the voxel
-   * 
-   * @param center - Voxel center position
-   * @param size - Voxel size in each dimension
-   * @param samplesPerAxis - Number of samples per axis (e.g., 4 = 64 total samples)
-   * @returns Ratio of sample points inside the part (0 to 1)
-   */
-  computeVolumeIntersection(
-    center: THREE.Vector3,
-    size: THREE.Vector3,
-    samplesPerAxis: number = 4
-  ): number {
-    const halfSize = size.clone().multiplyScalar(0.5);
-    const samplePoint = new THREE.Vector3();
-    
-    let insideCount = 0;
-    const totalSamples = samplesPerAxis * samplesPerAxis * samplesPerAxis;
-    
-    // Generate uniform sample points within the voxel
-    for (let i = 0; i < samplesPerAxis; i++) {
-      const tx = (i + 0.5) / samplesPerAxis; // 0.125, 0.375, 0.625, 0.875 for n=4
-      const x = center.x - halfSize.x + tx * size.x;
-      
-      for (let j = 0; j < samplesPerAxis; j++) {
-        const ty = (j + 0.5) / samplesPerAxis;
-        const y = center.y - halfSize.y + ty * size.y;
-        
-        for (let k = 0; k < samplesPerAxis; k++) {
-          const tz = (k + 0.5) / samplesPerAxis;
-          const z = center.z - halfSize.z + tz * size.z;
-          
-          samplePoint.set(x, y, z);
-          
-          if (this.isInside(samplePoint)) {
-            insideCount++;
-          }
-        }
-      }
-    }
-    
-    return insideCount / totalSamples;
-  }
-  
-  dispose(): void {
-    if (this.mesh.geometry.boundsTree) {
-      this.mesh.geometry.disposeBoundsTree();
-    }
-    (this.mesh.material as THREE.Material).dispose();
   }
 }
 
@@ -558,7 +411,7 @@ function identifyBoundaryAdjacentVoxels(
   shellGeometry: THREE.BufferGeometry,
   classification: MoldHalfClassificationResult,
   _boundaryRadius: number,
-  partMeshTester?: PartMeshTester,
+  partMeshTester?: MeshTester,
   seedVolumeThreshold: number = 0.75,
   seedVolumeSamples: number = 4
 ): { 
@@ -1245,10 +1098,10 @@ export function computeEscapeLabelingDijkstra(
   const neighborOffsets = getNeighborOffsets(adjacency);
   
   // Create part mesh tester if geometry is provided and threshold > 0
-  let partMeshTester: PartMeshTester | undefined;
+  let partMeshTester: MeshTester | undefined;
   if (partGeometry && seedVolumeThreshold > 0) {
     console.log('  Building part mesh BVH for volume intersection...');
-    partMeshTester = new PartMeshTester(partGeometry);
+    partMeshTester = new MeshTester(partGeometry, 'part');
   }
   
   // ========================================================================
@@ -1303,57 +1156,6 @@ export function computeEscapeLabelingDijkstra(
     else isolatedVoxels++;
   }
   console.log(`  Connectivity check: ${connectedVoxels} connected, ${isolatedVoxels} isolated voxels`);
-  
-  // ========================================================================
-  // TEMPORARY: Skip Dijkstra and return boundary-only results for debugging
-  // ========================================================================
-  
-  const SKIP_DIJKSTRA = false;  // Set to true to disable Dijkstra for debugging
-  
-  if (SKIP_DIJKSTRA) {
-    console.log('DIJKSTRA DISABLED - returning boundary labels only');
-    
-    const computeTimeMs = performance.now() - startTime;
-    
-    // Use boundary labels directly as the final labels
-    // Interior voxels remain unlabeled (-1)
-    const voxelLabel = new Int8Array(voxelCount).fill(-1);
-    for (let i = 0; i < voxelCount; i++) {
-      if (boundaryLabel[i] !== 0) {
-        voxelLabel[i] = boundaryLabel[i];
-      }
-    }
-    
-    // Count results
-    let d1Count = 0;
-    let d2Count = 0;
-    let unlabeledCount = 0;
-    for (let i = 0; i < voxelCount; i++) {
-      if (voxelLabel[i] === 1) d1Count++;
-      else if (voxelLabel[i] === 2) d2Count++;
-      else unlabeledCount++;
-    }
-    
-    console.log('───────────────────────────────────────────────────────');
-    console.log('BOUNDARY-ONLY RESULTS (Dijkstra disabled):');
-    console.log(`  H₁ boundary: ${d1Count}`);
-    console.log(`  H₂ boundary: ${d2Count}`);
-    console.log(`  Unlabeled (interior): ${unlabeledCount}`);
-    console.log(`  Time: ${computeTimeMs.toFixed(1)}ms`);
-    console.log('═══════════════════════════════════════════════════════');
-    
-    return {
-      labels: voxelLabel,
-      escapeCost: new Float32Array(voxelCount),
-      d1Count,
-      d2Count,
-      interfaceCount: 0,
-      unlabeledCount,
-      computeTimeMs,
-      boundaryLabels: boundaryLabel,
-      seedMask: innerSurfaceMask,
-    };
-  }
   
   // ========================================================================
   // STEP 2: Independent Dijkstra from each seed to find nearest boundary

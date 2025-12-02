@@ -16,7 +16,8 @@
  */
 
 import * as THREE from 'three';
-import { MeshBVH, acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from 'three-mesh-bvh';
+import { acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from 'three-mesh-bvh';
+import { MeshTester } from './meshUtils';
 
 // Extend Three.js with BVH acceleration
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
@@ -181,201 +182,6 @@ export interface BiasedDistanceWeights {
 /** Default grid resolution (cells per dimension) */
 export const DEFAULT_GRID_RESOLUTION = 64;
 
-/** Ray direction for inside/outside testing (single ray is sufficient for watertight meshes) */
-const RAY_DIRECTION = new THREE.Vector3(1, 0, 0);
-
-// ============================================================================
-// BVH HELPER CLASS
-// ============================================================================
-
-/**
- * Helper class that wraps a mesh with BVH acceleration for fast inside/outside queries
- */
-class MeshInsideOutsideTester {
-  private mesh: THREE.Mesh;
-  private bvh: MeshBVH;
-  private raycaster: THREE.Raycaster;
-  private boundingBox: THREE.Box3;
-  public readonly name: string;
-  
-  constructor(geometry: THREE.BufferGeometry, debugName: string = 'mesh') {
-    this.name = debugName;
-    
-    // Ensure geometry is indexed for BVH
-    let indexedGeometry = geometry;
-    if (!geometry.index) {
-      // Create indexed version
-      const posAttr = geometry.getAttribute('position');
-      const indices: number[] = [];
-      for (let i = 0; i < posAttr.count; i++) {
-        indices.push(i);
-      }
-      indexedGeometry = geometry.clone();
-      indexedGeometry.setIndex(indices);
-    }
-    
-    // Ensure normals and bounds are computed
-    indexedGeometry.computeVertexNormals();
-    indexedGeometry.computeBoundingBox();
-    this.boundingBox = indexedGeometry.boundingBox!.clone();
-    
-    // Create a temporary mesh for raycasting
-    const material = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
-    this.mesh = new THREE.Mesh(indexedGeometry, material);
-    this.mesh.updateMatrixWorld(true); // Ensure matrix is updated
-    
-    // Build BVH for the geometry
-    this.bvh = new MeshBVH(indexedGeometry, { maxLeafTris: 10 });
-    indexedGeometry.boundsTree = this.bvh;
-    
-    // Set up raycaster with proper settings
-    this.raycaster = new THREE.Raycaster();
-    this.raycaster.firstHitOnly = false; // We need all hits for inside/outside test
-  }
-  
-  /**
-   * Quick check if point is outside the bounding box
-   */
-  isOutsideBoundingBox(point: THREE.Vector3): boolean {
-    return !this.boundingBox.containsPoint(point);
-  }
-  
-  /**
-   * Test if a point is inside the mesh using ray casting
-   * 
-   * Uses the crossing number algorithm: cast a ray and count intersections.
-   * Odd number of crossings → inside.
-   */
-  isInside(point: THREE.Vector3): boolean {
-    // Quick bounding box check
-    if (this.isOutsideBoundingBox(point)) {
-      return false;
-    }
-    
-    // Cast single ray in +X direction
-    this.raycaster.set(point, RAY_DIRECTION);
-    this.raycaster.far = Infinity;
-    const intersects = this.raycaster.intersectObject(this.mesh, false);
-    
-    // Odd number of intersections → inside
-    return intersects.length % 2 === 1;
-  }
-  
-  /**
-   * Test if a point is outside the mesh (inverse of isInside)
-   */
-  isOutside(point: THREE.Vector3): boolean {
-    return !this.isInside(point);
-  }
-  
-  /**
-   * Get approximate signed distance to mesh surface
-   * Positive = outside, Negative = inside
-   * 
-   * Uses closest point query with BVH for efficiency
-   */
-  getSignedDistance(point: THREE.Vector3): number {
-    const closestPoint = new THREE.Vector3();
-    const target = { 
-      point: closestPoint, 
-      distance: Infinity,
-      faceIndex: 0
-    };
-    
-    // Use BVH to find closest point on surface
-    this.bvh.closestPointToPoint(point, target);
-    
-    const distance = target.distance;
-    const isInside = this.isInside(point);
-    
-    return isInside ? -distance : distance;
-  }
-  
-  /**
-   * Debug: test a single point and log results
-   */
-  debugPoint(point: THREE.Vector3): { insideVotes: number; intersectionCounts: number[] } {
-    const intersectionCounts: number[] = [];
-    let insideVotes = 0;
-    
-    this.raycaster.set(point, RAY_DIRECTION);
-    this.raycaster.far = Infinity;
-    const intersects = this.raycaster.intersectObject(this.mesh, false);
-    intersectionCounts.push(intersects.length);
-    
-    if (intersects.length % 2 === 1) {
-      insideVotes++;
-    }
-    
-    return { insideVotes, intersectionCounts };
-  }
-  
-  /**
-   * Find closest point on mesh surface to given point using BVH acceleration
-   * This is used for computing distance fields to the part mesh
-   */
-  closestPointToPoint(
-    point: THREE.Vector3,
-    target: { point: THREE.Vector3; distance: number; faceIndex: number }
-  ): void {
-    this.bvh.closestPointToPoint(point, target);
-  }
-  
-  /**
-   * Get the unsigned distance from a point to the mesh surface
-   * Uses BVH for efficient closest point query
-   */
-  getDistanceToSurface(point: THREE.Vector3): number {
-    const target = { 
-      point: new THREE.Vector3(), 
-      distance: Infinity,
-      faceIndex: 0
-    };
-    this.bvh.closestPointToPoint(point, target);
-    return target.distance;
-  }
-  
-  /**
-   * Test if a point is inside the mesh OR within a tolerance of the surface
-   * This allows including surface/boundary voxels
-   */
-  isInsideOrOnSurface(point: THREE.Vector3, tolerance: number): boolean {
-    // Quick check: if inside, return true
-    if (this.isInside(point)) {
-      return true;
-    }
-    
-    // If outside, check if within tolerance of surface
-    const dist = this.getDistanceToSurface(point);
-    return dist <= tolerance;
-  }
-  
-  /**
-   * Test if a point is outside the mesh OR within a tolerance of the surface
-   * This allows including surface/boundary voxels near the part
-   */
-  isOutsideOrOnSurface(point: THREE.Vector3, tolerance: number): boolean {
-    // Quick check: if outside, return true
-    if (this.isOutside(point)) {
-      return true;
-    }
-    
-    // If inside, check if within tolerance of surface (i.e., very close to boundary)
-    const dist = this.getDistanceToSurface(point);
-    return dist <= tolerance;
-  }
-  
-  /**
-   * Clean up BVH and resources
-   */
-  dispose(): void {
-    if (this.mesh.geometry.boundsTree) {
-      this.mesh.geometry.disposeBoundsTree();
-    }
-    (this.mesh.material as THREE.Material).dispose();
-  }
-}
-
 // ============================================================================
 // GRID GENERATION
 // ============================================================================
@@ -445,8 +251,8 @@ export function generateVolumetricGrid(
   );
   
   // Create BVH testers for both meshes
-  const shellTester = new MeshInsideOutsideTester(shellGeom, 'shell');
-  const partTester = new MeshInsideOutsideTester(partGeom, 'part');
+  const shellTester = new MeshTester(shellGeom, 'shell');
+  const partTester = new MeshTester(partGeom, 'part');
   
   // Initialize result arrays
   const allCells: GridCell[] = [];
@@ -1139,9 +945,9 @@ export async function generateVolumetricGridGPU(
     const voxelDist = new Float32Array(voxelCount);
     
     // Build BVH on part geometry for distance queries
-    const partTester = new MeshInsideOutsideTester(partGeom, 'part');
+    const partTester = new MeshTester(partGeom, 'part');
     // Build BVH on shell geometry for shell distance queries
-    const shellTester = new MeshInsideOutsideTester(shellGeom, 'shell');
+    const shellTester = new MeshTester(shellGeom, 'shell');
     
     // Track min/max and the voxel with max distance for R visualization
     let minDist = Infinity;
@@ -2503,7 +2309,7 @@ export async function generateVolumetricGridParallel(
   
   // Get R line endpoints (need to recompute closest point for the max distance voxel)
   if (maxDistIdx >= 0) {
-    const partTester = new MeshInsideOutsideTester(partGeom, 'part');
+    const partTester = new MeshTester(partGeom, 'part');
     const center = moldVolumeCells[maxDistIdx].center;
     const target = { point: new THREE.Vector3(), distance: Infinity, faceIndex: 0 };
     partTester.closestPointToPoint(center, target);
