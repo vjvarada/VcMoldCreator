@@ -35,6 +35,7 @@ import {
 import {
   generateVolumetricGrid,
   generateVolumetricGridGPU,
+  generateVolumetricGridParallel,
   isWebGPUAvailable,
   createMoldVolumePointCloud,
   createMoldVolumeVoxels,
@@ -93,6 +94,8 @@ interface ThreeViewerProps {
   gridVisualizationMode?: GridVisualizationMode;
   /** Use GPU acceleration for grid generation (WebGPU if available) */
   useGPUGrid?: boolean;
+  /** Use parallel Web Workers for grid generation (faster for high resolutions) */
+  useParallelGrid?: boolean;
   /** Which distance field to use for voxel coloring: 'part' (distance to part) or 'biased' (biased distance) */
   distanceFieldType?: DistanceFieldType;
   /** Show mold half classification (H₁/H₂ coloring on cavity) */
@@ -150,6 +153,7 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
   gridResolution = 64,
   gridVisualizationMode = 'points',
   useGPUGrid = true,
+  useParallelGrid = false,
   distanceFieldType = 'part',
   showMoldHalfClassification = false,
   boundaryZoneThreshold = 0.15,
@@ -616,13 +620,32 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
         try {
           // Check WebGPU availability
           const gpuAvailable = isWebGPUAvailable();
-          const useGPU = useGPUGrid && gpuAvailable;
+          
+          // Auto-select best method based on resolution
+          // When surface voxels are included, GPU falls back to CPU anyway, so use parallel workers
+          const totalCells = gridResolution ** 3;
+          const includeSurfaceVoxels = true; // We always include surface voxels
+          
+          // Force parallel when surface voxels are enabled (GPU can't handle this efficiently)
+          // or when explicitly requested, or for very high resolutions
+          const shouldUseParallel = useParallelGrid || includeSurfaceVoxels || totalCells >= 500000;
+          
+          // Only use GPU if not using parallel AND GPU is available AND surface voxels disabled
+          const useGPU = !shouldUseParallel && useGPUGrid && gpuAvailable && !includeSurfaceVoxels;
+          
+          // Determine which method to use
+          let method: string;
+          if (shouldUseParallel) {
+            method = `Parallel Web Workers (${navigator.hardwareConcurrency || 4} cores)`;
+          } else if (useGPU) {
+            method = 'WebGPU (GPU)';
+          } else {
+            method = 'CPU (single-threaded)';
+          }
           
           console.log('Generating volumetric grid...');
-          console.log(`  Using: ${useGPU ? 'WebGPU (GPU)' : 'CPU'}`);
-          if (useGPUGrid && !gpuAvailable) {
-            console.log('  Note: WebGPU not available, falling back to CPU');
-          }
+          console.log(`  Using: ${method}`);
+          console.log(`  Total cells to process: ${totalCells.toLocaleString()}`);
           
           // Get geometries in world space
           const shellGeometry = inflatedHullRef.current!.mesh.geometry.clone();
@@ -636,13 +659,19 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
             storeAllCells: false,
             marginPercent: 0.02,
             computeDistances: false,
-            includeSurfaceVoxels: true, // Include voxels on boundaries and inner surfaces
+            includeSurfaceVoxels, // Include voxels on boundaries and inner surfaces
           };
           
-          // Use GPU or CPU version based on availability and preference
-          const gridResult = useGPU
-            ? await generateVolumetricGridGPU(shellGeometry, partGeometry, options)
-            : generateVolumetricGrid(shellGeometry, partGeometry, options);
+          // Use parallel, GPU, or CPU version based on selection
+          let gridResult: VolumetricGridResult;
+          if (shouldUseParallel) {
+            // Parallel workers - best for high resolutions and surface voxel inclusion
+            gridResult = await generateVolumetricGridParallel(shellGeometry, partGeometry, options);
+          } else if (useGPU) {
+            gridResult = await generateVolumetricGridGPU(shellGeometry, partGeometry, options);
+          } else {
+            gridResult = generateVolumetricGrid(shellGeometry, partGeometry, options);
+          }
           
           console.log(`Volumetric grid generated:`);
           console.log(`  Resolution: ${gridResult.resolution.x}×${gridResult.resolution.y}×${gridResult.resolution.z}`);
@@ -650,6 +679,40 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
           console.log(`  Fill ratio: ${(gridResult.stats.fillRatio * 100).toFixed(1)}%`);
           console.log(`  Approx mold volume: ${gridResult.stats.moldVolume.toFixed(4)}`);
           console.log(`  Compute time: ${gridResult.stats.computeTimeMs.toFixed(1)} ms`);
+          
+          // Log memory size of voxel grid data
+          const voxelCount = gridResult.moldVolumeCellCount;
+          
+          // New flat arrays (memory efficient)
+          const voxelCentersMemory = gridResult.voxelCenters?.byteLength ?? 0;
+          const voxelIndicesMemory = gridResult.voxelIndices?.byteLength ?? 0;
+          
+          // Legacy cells array (deprecated but still populated for backward compatibility)
+          const cellsMemory = voxelCount * 120; // ~120 bytes per GridCell (3 Vector3s + overhead)
+          
+          const voxelDistMemory = gridResult.voxelDist?.byteLength ?? 0;
+          const voxelDistToShellMemory = gridResult.voxelDistToShell?.byteLength ?? 0;
+          const biasedDistMemory = gridResult.biasedDist?.byteLength ?? 0;
+          const weightingFactorMemory = gridResult.weightingFactor?.byteLength ?? 0;
+          const boundaryMaskMemory = gridResult.boundaryAdjacentMask?.byteLength ?? 0;
+          
+          // Total includes both flat arrays and legacy cells for now
+          const flatArraysTotal = voxelCentersMemory + voxelIndicesMemory + voxelDistMemory + voxelDistToShellMemory + biasedDistMemory + weightingFactorMemory + boundaryMaskMemory;
+          const legacyTotal = cellsMemory + voxelDistMemory + voxelDistToShellMemory + biasedDistMemory + weightingFactorMemory + boundaryMaskMemory;
+          
+          console.log(`  📊 Memory footprint:`);
+          console.log(`    voxelCenters (flat Float32): ${(voxelCentersMemory / 1024 / 1024).toFixed(2)} MB`);
+          console.log(`    voxelIndices (flat Uint32): ${(voxelIndicesMemory / 1024 / 1024).toFixed(2)} MB`);
+          console.log(`    moldVolumeCells (legacy): ${(cellsMemory / 1024 / 1024).toFixed(2)} MB (${voxelCount} cells × ~120 bytes) [DEPRECATED]`);
+          console.log(`    voxelDist: ${(voxelDistMemory / 1024 / 1024).toFixed(2)} MB`);
+          console.log(`    voxelDistToShell: ${(voxelDistToShellMemory / 1024 / 1024).toFixed(2)} MB`);
+          console.log(`    biasedDist: ${(biasedDistMemory / 1024 / 1024).toFixed(2)} MB`);
+          console.log(`    weightingFactor: ${(weightingFactorMemory / 1024 / 1024).toFixed(2)} MB`);
+          console.log(`    boundaryAdjacentMask: ${(boundaryMaskMemory / 1024 / 1024).toFixed(2)} MB`);
+          console.log(`    --- `);
+          console.log(`    Flat arrays only: ${(flatArraysTotal / 1024 / 1024).toFixed(2)} MB`);
+          console.log(`    With legacy cells: ${((flatArraysTotal + cellsMemory) / 1024 / 1024).toFixed(2)} MB`);
+          console.log(`    ⚡ Savings when legacy removed: ${(cellsMemory / 1024 / 1024).toFixed(2)} MB (${((1 - flatArraysTotal / legacyTotal) * 100).toFixed(1)}% reduction)`);
           
           volumetricGridRef.current = gridResult;
           onVolumetricGridReady?.(gridResult);
@@ -687,7 +750,7 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
         }
       })();
     }
-  }, [showVolumetricGrid, gridResolution, useGPUGrid, showRLine, onVolumetricGridReady]);
+  }, [showVolumetricGrid, gridResolution, useGPUGrid, useParallelGrid, showRLine, onVolumetricGridReady]);
 
   // ============================================================================
   // VOLUMETRIC GRID VISUALIZATION MODE UPDATE
@@ -828,6 +891,20 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
             
             escapeLabelingRef.current = labeling;
             onEscapeLabelingReady?.(labeling);
+            
+            // Log memory size of parting surface data
+            const labelsMemory = labeling.labels?.byteLength ?? 0;
+            const escapeCostMemory = labeling.escapeCost?.byteLength ?? 0;
+            const boundaryLabelsMemory = labeling.boundaryLabels?.byteLength ?? 0;
+            const seedMaskMemory = labeling.seedMask?.byteLength ?? 0;
+            const partingSurfaceMemory = labelsMemory + escapeCostMemory + boundaryLabelsMemory + seedMaskMemory;
+            
+            console.log(`  📊 Parting Surface Memory footprint:`);
+            console.log(`    labels: ${(labelsMemory / 1024 / 1024).toFixed(2)} MB`);
+            console.log(`    escapeCost: ${(escapeCostMemory / 1024 / 1024).toFixed(2)} MB`);
+            console.log(`    boundaryLabels: ${(boundaryLabelsMemory / 1024 / 1024).toFixed(2)} MB`);
+            console.log(`    seedMask: ${(seedMaskMemory / 1024 / 1024).toFixed(2)} MB`);
+            console.log(`    TOTAL (parting surface only): ${(partingSurfaceMemory / 1024 / 1024).toFixed(2)} MB`);
             
             // Create visualization after labeling is computed
             if (escapeLabelingRef.current && volumetricGridRef.current) {

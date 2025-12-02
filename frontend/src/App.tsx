@@ -537,27 +537,27 @@ function App() {
               onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
               onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
               style={{
-                padding: '24px 16px',
-                backgroundColor: isDragging ? 'rgba(0, 170, 255, 0.2)' : 'rgba(255, 255, 255, 0.05)',
-                border: `2px dashed ${isDragging ? '#00aaff' : '#444'}`,
-                borderRadius: '8px',
+                padding: '28px 20px',
+                backgroundColor: isDragging ? 'rgba(0, 123, 255, 0.1)' : '#f9fafb',
+                border: `2px dashed ${isDragging ? '#007bff' : '#becad6'}`,
+                borderRadius: '0.625rem',
                 cursor: 'pointer',
                 textAlign: 'center',
-                transition: 'all 0.2s',
+                transition: 'all 250ms cubic-bezier(0.27, 0.01, 0.38, 1.06)',
               }}
             >
               {loadedFileName ? (
                 <>
-                  <div style={{ fontSize: '24px', marginBottom: '8px' }}>✅</div>
-                  <div style={{ fontSize: '12px', fontWeight: 'bold', marginBottom: '4px' }}>Loaded:</div>
-                  <div style={{ fontSize: '11px', opacity: 0.8, wordBreak: 'break-all' }}>{loadedFileName}</div>
-                  <div style={{ fontSize: '10px', opacity: 0.5, marginTop: '8px' }}>Click to replace</div>
+                  <div style={{ fontSize: '28px', marginBottom: '10px' }}>✅</div>
+                  <div style={{ fontSize: '12px', fontWeight: 500, marginBottom: '4px', color: '#17c671' }}>Loaded:</div>
+                  <div style={{ fontSize: '12px', color: '#5A6169', wordBreak: 'break-all' }}>{loadedFileName}</div>
+                  <div style={{ fontSize: '11px', color: '#868e96', marginTop: '10px' }}>Click to replace</div>
                 </>
               ) : (
                 <>
-                  <div style={{ fontSize: '32px', marginBottom: '8px' }}>📁</div>
-                  <div style={{ fontSize: '13px', fontWeight: 'bold' }}>Upload STL File</div>
-                  <div style={{ fontSize: '11px', opacity: 0.6, marginTop: '4px' }}>Click or drag & drop</div>
+                  <div style={{ fontSize: '36px', marginBottom: '10px' }}>📁</div>
+                  <div style={{ fontSize: '14px', fontWeight: 500, color: '#212529' }}>Upload STL File</div>
+                  <div style={{ fontSize: '12px', color: '#868e96', marginTop: '6px' }}>Click or drag & drop</div>
                 </>
               )}
             </div>
@@ -565,7 +565,7 @@ function App() {
             {/* Mesh info after loading */}
             {meshLoaded && meshRepairResult && (
               <div style={{ ...styles.statsBox, marginTop: '16px' }}>
-                <div style={{ fontWeight: 'bold', marginBottom: '6px' }}>
+                <div style={{ fontWeight: 500, marginBottom: '8px', color: meshRepairResult.diagnostics.isManifold ? '#17c671' : '#ffb400' }}>
                   {meshRepairResult.diagnostics.isManifold ? '✅ Mesh Valid' : '⚠️ Mesh Issues'}
                 </div>
                 <div>Vertices: {meshRepairResult.diagnostics.vertexCount.toLocaleString()}</div>
@@ -574,7 +574,7 @@ function App() {
                   <div>Genus: {meshRepairResult.diagnostics.genus}</div>
                 )}
                 {meshRepairResult.wasRepaired && (
-                  <div style={{ color: '#aaf', marginTop: '4px' }}>Repaired: {meshRepairResult.repairMethod}</div>
+                  <div style={{ color: '#007bff', marginTop: '6px' }}>Repaired: {meshRepairResult.repairMethod}</div>
                 )}
               </div>
             )}
@@ -586,10 +586,10 @@ function App() {
           <div style={styles.optionsSection}>
             {visibilityDataReady && (
               <div style={styles.statsBox}>
-                <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>✅ Parting Directions Computed</div>
+                <div style={{ fontWeight: 500, marginBottom: '6px', color: '#17c671' }}>✅ Parting Directions Computed</div>
                 <div style={styles.legend}>
-                  <div>🟢 Green arrow: Primary direction (D1)</div>
-                  <div>🟠 Orange arrow: Secondary direction (D2)</div>
+                  <div style={{ color: '#17c671' }}>🟢 Green arrow: Primary direction (D1)</div>
+                  <div style={{ color: '#ffb400' }}>🟠 Orange arrow: Secondary direction (D2)</div>
                 </div>
               </div>
             )}
@@ -624,7 +624,7 @@ function App() {
               <div style={styles.statsBox}>
                 <div>Vertices: {hullStats.vertexCount}</div>
                 <div>Faces: {hullStats.faceCount}</div>
-                <div style={{ color: hullStats.manifoldValidation.isManifold ? '#0f0' : '#f90' }}>
+                <div style={{ color: hullStats.manifoldValidation.isManifold ? '#17c671' : '#ffb400', fontWeight: 500, marginTop: '4px' }}>
                   {hullStats.manifoldValidation.isManifold ? '✅ Valid Manifold' : '⚠️ Not Manifold'}
                 </div>
               </div>
@@ -638,7 +638,7 @@ function App() {
               <div style={styles.statsBox}>
                 <div>Cavity vertices: {csgStats.vertexCount}</div>
                 <div>Cavity faces: {csgStats.faceCount}</div>
-                <div style={{ color: csgStats.manifoldValidation.isManifold ? '#0f0' : '#f90' }}>
+                <div style={{ color: csgStats.manifoldValidation.isManifold ? '#17c671' : '#ffb400', fontWeight: 500, marginTop: '4px' }}>
                   {csgStats.manifoldValidation.isManifold ? '✅ Valid Manifold' : '⚠️ Not Manifold'}
                 </div>
               </div>
@@ -656,23 +656,23 @@ function App() {
               step="1"
               value={boundaryZoneThreshold * 100}
               onChange={(e) => setBoundaryZoneThreshold(parseFloat(e.target.value) / 100)}
-              style={{ width: '100%', marginBottom: '12px' }}
+              style={{ width: '100%', marginBottom: '16px' }}
             />
             {/* Mold Half Stats */}
             {moldHalfStats && (
               <div style={styles.statsBox}>
-                <div style={{ marginBottom: '4px', fontSize: '0.85em', color: '#aaa' }}>
+                <div style={{ marginBottom: '6px', fontSize: '11px', color: '#868e96', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
                   Outer boundary (hull):
                 </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                  <span style={{ color: '#0f0' }}>H₁ (Green):</span>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                  <span style={{ color: '#17c671', fontWeight: 500 }}>H₁ (Green):</span>
                   <span>{moldHalfStats.h1Count} ({moldHalfStats.h1Percentage.toFixed(1)}%)</span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                  <span style={{ color: '#f60' }}>H₂ (Orange):</span>
+                  <span style={{ color: '#ffb400', fontWeight: 500 }}>H₂ (Orange):</span>
                   <span>{moldHalfStats.h2Count} ({moldHalfStats.h2Percentage.toFixed(1)}%)</span>
                 </div>
-                <div style={{ marginTop: '6px', paddingTop: '4px', borderTop: '1px solid #444', fontSize: '0.85em', color: '#888' }}>
+                <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid #e1e5eb', fontSize: '11px', color: '#868e96' }}>
                   <div>Outer: {moldHalfStats.outerBoundaryCount} tris</div>
                   <div>Inner (part): {moldHalfStats.innerBoundaryCount} tris</div>
                 </div>
@@ -680,7 +680,7 @@ function App() {
             )}
             
             {!moldHalfStats && csgStats && (
-              <div style={{ color: '#888', fontSize: '0.9em' }}>
+              <div style={{ color: '#868e96', fontSize: '13px', lineHeight: 1.5 }}>
                 Click "Calculate" to classify the mold cavity into H₁ and H₂ halves based on parting directions.
               </div>
             )}
@@ -712,15 +712,16 @@ function App() {
               style={styles.input}
             />
 
-            <div style={{ ...styles.optionLabel, marginTop: '12px' }}>Visualization:</div>
-            <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+            <div style={{ ...styles.optionLabel, marginTop: '16px' }}>Visualization:</div>
+            <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
               <button
                 onClick={() => setGridVisualizationMode('points')}
                 style={{
                   ...styles.toggleButton,
-                  backgroundColor: gridVisualizationMode === 'points' ? '#00ffff' : '#333',
-                  borderColor: gridVisualizationMode === 'points' ? '#00ffff' : '#555',
-                  color: gridVisualizationMode === 'points' ? '#000' : '#fff',
+                  backgroundColor: gridVisualizationMode === 'points' ? '#007bff' : '#ffffff',
+                  borderColor: gridVisualizationMode === 'points' ? '#007bff' : '#becad6',
+                  color: gridVisualizationMode === 'points' ? '#ffffff' : '#5A6169',
+                  boxShadow: gridVisualizationMode === 'points' ? '0 2px 8px rgba(0,123,255,0.3)' : 'none',
                 }}
               >
                 Points
@@ -729,9 +730,10 @@ function App() {
                 onClick={() => setGridVisualizationMode('voxels')}
                 style={{
                   ...styles.toggleButton,
-                  backgroundColor: gridVisualizationMode === 'voxels' ? '#00ffff' : '#333',
-                  borderColor: gridVisualizationMode === 'voxels' ? '#00ffff' : '#555',
-                  color: gridVisualizationMode === 'voxels' ? '#000' : '#fff',
+                  backgroundColor: gridVisualizationMode === 'voxels' ? '#007bff' : '#ffffff',
+                  borderColor: gridVisualizationMode === 'voxels' ? '#007bff' : '#becad6',
+                  color: gridVisualizationMode === 'voxels' ? '#ffffff' : '#5A6169',
+                  boxShadow: gridVisualizationMode === 'voxels' ? '0 2px 8px rgba(0,123,255,0.3)' : 'none',
                 }}
               >
                 Voxels
@@ -745,7 +747,7 @@ function App() {
                 onChange={(e) => setUseGPUGrid(e.target.checked)}
               />
               Use GPU (WebGPU)
-              <span style={{ opacity: 0.6, fontSize: '10px', marginLeft: '4px' }}>
+              <span style={{ fontSize: '11px', marginLeft: '4px', color: typeof navigator !== 'undefined' && 'gpu' in navigator ? '#17c671' : '#c4183c' }}>
                 {typeof navigator !== 'undefined' && 'gpu' in navigator ? '✅' : '❌'}
               </span>
             </label>
@@ -761,11 +763,11 @@ function App() {
 
             {/* Biased Distance Weights - only available after grid is computed */}
             {volumetricGridStats && (
-              <div style={{ marginTop: '16px', paddingTop: '12px', borderTop: '1px solid #444' }}>
-                <div style={{ ...styles.optionLabel, marginBottom: '8px' }}>Biased Distance Weights:</div>
+              <div style={{ marginTop: '20px', paddingTop: '16px', borderTop: '1px solid #e1e5eb' }}>
+                <div style={{ ...styles.optionLabel, marginBottom: '12px' }}>Biased Distance Weights:</div>
                 
-                <div style={{ marginBottom: '8px' }}>
-                  <label style={{ fontSize: '11px', color: '#aaa', display: 'block', marginBottom: '2px' }}>
+                <div style={{ marginBottom: '12px' }}>
+                  <label style={{ fontSize: '12px', color: '#5A6169', display: 'block', marginBottom: '4px' }}>
                     Part Distance (δᵢ) weight: {biasedDistanceWeights.partDistanceWeight.toFixed(2)}
                   </label>
                   <input
@@ -782,8 +784,8 @@ function App() {
                   />
                 </div>
                 
-                <div style={{ marginBottom: '8px' }}>
-                  <label style={{ fontSize: '11px', color: '#aaa', display: 'block', marginBottom: '2px' }}>
+                <div style={{ marginBottom: '12px' }}>
+                  <label style={{ fontSize: '12px', color: '#5A6169', display: 'block', marginBottom: '4px' }}>
                     Shell Bias (R-δw) weight: {biasedDistanceWeights.shellBiasWeight.toFixed(2)}
                   </label>
                   <input
@@ -811,8 +813,8 @@ function App() {
                     ...styles.primaryButton,
                     marginTop: '8px',
                     width: '100%',
-                    padding: '6px 12px',
-                    fontSize: '12px',
+                    padding: '10px 14px',
+                    fontSize: '13px',
                   }}
                 >
                   🔄 Recalculate Biased Distances
@@ -824,10 +826,10 @@ function App() {
                   }}
                   style={{
                     ...styles.secondaryButton,
-                    marginTop: '6px',
+                    marginTop: '8px',
                     width: '100%',
-                    padding: '4px 8px',
-                    fontSize: '11px',
+                    padding: '8px 12px',
+                    fontSize: '12px',
                   }}
                 >
                   Reset to Defaults
@@ -840,14 +842,15 @@ function App() {
         {activeStep === 'parting-surface' && status !== 'locked' && (
           <div style={styles.optionsSection}>
             <div style={styles.optionLabel}>Adjacency Type:</div>
-            <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+            <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
               <button
                 onClick={() => setPartingSurfaceAdjacency(6)}
                 style={{
                   ...styles.toggleButton,
-                  backgroundColor: partingSurfaceAdjacency === 6 ? '#00ffff' : '#333',
-                  borderColor: partingSurfaceAdjacency === 6 ? '#00ffff' : '#555',
-                  color: partingSurfaceAdjacency === 6 ? '#000' : '#fff',
+                  backgroundColor: partingSurfaceAdjacency === 6 ? '#007bff' : '#ffffff',
+                  borderColor: partingSurfaceAdjacency === 6 ? '#007bff' : '#becad6',
+                  color: partingSurfaceAdjacency === 6 ? '#ffffff' : '#5A6169',
+                  boxShadow: partingSurfaceAdjacency === 6 ? '0 2px 8px rgba(0,123,255,0.3)' : 'none',
                 }}
               >
                 6 (Faces)
@@ -856,9 +859,10 @@ function App() {
                 onClick={() => setPartingSurfaceAdjacency(26)}
                 style={{
                   ...styles.toggleButton,
-                  backgroundColor: partingSurfaceAdjacency === 26 ? '#00ffff' : '#333',
-                  borderColor: partingSurfaceAdjacency === 26 ? '#00ffff' : '#555',
-                  color: partingSurfaceAdjacency === 26 ? '#000' : '#fff',
+                  backgroundColor: partingSurfaceAdjacency === 26 ? '#007bff' : '#ffffff',
+                  borderColor: partingSurfaceAdjacency === 26 ? '#007bff' : '#becad6',
+                  color: partingSurfaceAdjacency === 26 ? '#ffffff' : '#5A6169',
+                  boxShadow: partingSurfaceAdjacency === 26 ? '0 2px 8px rgba(0,123,255,0.3)' : 'none',
                 }}
               >
                 26 (Full)
@@ -868,8 +872,8 @@ function App() {
             {escapeLabelingStats && (
               <>
                 {/* Debug Visualization Mode */}
-                <div style={{ marginTop: '8px' }}>
-                  <label style={{ color: '#aaa', fontSize: '0.85em', display: 'block', marginBottom: '4px' }}>
+                <div style={{ marginTop: '12px' }}>
+                  <label style={{ color: '#5A6169', fontSize: '12px', display: 'block', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
                     Debug View:
                   </label>
                   <select
@@ -877,12 +881,13 @@ function App() {
                     onChange={(e) => setPartingSurfaceDebugMode(e.target.value as 'none' | 'surface-detection' | 'boundary-labels' | 'seed-labels' | 'seed-labels-only')}
                     style={{
                       width: '100%',
-                      padding: '4px 8px',
-                      backgroundColor: '#333',
-                      color: '#fff',
-                      border: '1px solid #555',
-                      borderRadius: '4px',
-                      fontSize: '0.9em',
+                      padding: '10px 14px',
+                      backgroundColor: '#ffffff',
+                      color: '#495057',
+                      border: '1px solid #becad6',
+                      borderRadius: '0.375rem',
+                      fontSize: '13px',
+                      cursor: 'pointer',
                     }}
                   >
                     <option value="none">Normal View</option>
@@ -894,20 +899,20 @@ function App() {
                 </div>
 
                 <div style={styles.statsBox}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#0f0' }}>H₁ voxels:</span>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                    <span style={{ color: '#17c671', fontWeight: 500 }}>H₁ voxels:</span>
                     <span>{escapeLabelingStats.h1VoxelCount.toLocaleString()} ({escapeLabelingStats.h1Percentage.toFixed(1)}%)</span>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#f60' }}>H₂ voxels:</span>
+                    <span style={{ color: '#ffb400', fontWeight: 500 }}>H₂ voxels:</span>
                     <span>{escapeLabelingStats.h2VoxelCount.toLocaleString()} ({escapeLabelingStats.h2Percentage.toFixed(1)}%)</span>
                   </div>
                   {escapeLabelingStats.unassignedCount > 0 && (
-                    <div style={{ color: '#f00' }}>
+                    <div style={{ color: '#c4183c', marginTop: '4px' }}>
                       Unassigned: {escapeLabelingStats.unassignedCount}
                     </div>
                   )}
-                  <div style={{ marginTop: '4px', paddingTop: '4px', borderTop: '1px solid #444', fontSize: '0.85em', color: '#888' }}>
+                  <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid #e1e5eb', fontSize: '11px', color: '#868e96' }}>
                     Compute: {escapeLabelingStats.computeTimeMs.toFixed(0)} ms
                   </div>
                 </div>
@@ -915,7 +920,7 @@ function App() {
             )}
 
             {!escapeLabelingStats && volumetricGridStats && moldHalfStats && (
-              <div style={{ color: '#888', fontSize: '0.9em' }}>
+              <div style={{ color: '#868e96', fontSize: '13px', lineHeight: 1.5 }}>
                 Click "Calculate" to compute escape labeling via multi-source Dijkstra flood.
               </div>
             )}
@@ -930,7 +935,7 @@ function App() {
               disabled={isCalculating}
               style={{
                 ...styles.calculateButton,
-                backgroundColor: status === 'completed' ? '#00aa00' : status === 'needs-recalc' ? '#ff8800' : isCalculating ? '#666' : '#00aaff',
+                backgroundColor: status === 'completed' ? '#17c671' : status === 'needs-recalc' ? '#ffb400' : isCalculating ? '#868e96' : '#007bff',
                 cursor: isCalculating ? 'default' : 'pointer',
               }}
             >
@@ -947,7 +952,7 @@ function App() {
 
         {/* Display Options - shows toggles for all completed steps */}
         {meshLoaded && activeStep !== 'import' && (
-          <div style={{ marginTop: '16px', borderTop: '1px solid #444', paddingTop: '12px' }}>
+          <div style={{ marginTop: '20px', borderTop: '1px solid #e1e5eb', paddingTop: '16px' }}>
             <div style={styles.optionLabel}>Display Options:</div>
             
             {/* Original Mesh - always available when loaded */}
@@ -969,7 +974,8 @@ function App() {
                     checked={showD1Paint}
                     onChange={(e) => setShowD1Paint(e.target.checked)}
                   />
-                  Show D1 Visibility 🟢
+                  <span>Show D1 Visibility</span>
+                  <span style={{ color: '#17c671', marginLeft: '4px' }}>🟢</span>
                 </label>
                 <label style={styles.checkbox}>
                   <input
@@ -977,7 +983,8 @@ function App() {
                     checked={showD2Paint}
                     onChange={(e) => setShowD2Paint(e.target.checked)}
                   />
-                  Show D2 Visibility 🟠
+                  <span>Show D2 Visibility</span>
+                  <span style={{ color: '#ffb400', marginLeft: '4px' }}>🟠</span>
                 </label>
               </>
             )}
@@ -990,7 +997,8 @@ function App() {
                   checked={hideHull}
                   onChange={(e) => setHideHull(e.target.checked)}
                 />
-                Hide Hull 🟣
+                <span>Hide Hull</span>
+                <span style={{ color: '#8445f7', marginLeft: '4px' }}>🟣</span>
               </label>
             )}
 
@@ -1002,7 +1010,8 @@ function App() {
                   checked={hideCavity}
                   onChange={(e) => setHideCavity(e.target.checked)}
                 />
-                Hide Cavity 🩵
+                <span>Hide Cavity</span>
+                <span style={{ color: '#00b8d8', marginLeft: '4px' }}>🩵</span>
               </label>
             )}
 
@@ -1014,7 +1023,8 @@ function App() {
                   checked={hideVoxelGrid}
                   onChange={(e) => setHideVoxelGrid(e.target.checked)}
                 />
-                Hide Voxel Grid 🧊
+                <span>Hide Voxel Grid</span>
+                <span style={{ color: '#00b8d8', marginLeft: '4px' }}>🧊</span>
               </label>
             )}
 
@@ -1026,14 +1036,15 @@ function App() {
                   checked={showRLine}
                   onChange={(e) => setShowRLine(e.target.checked)}
                 />
-                Show R Line 📏
+                <span>Show R Line</span>
+                <span style={{ marginLeft: '4px' }}>📏</span>
               </label>
             )}
 
             {/* Voxel Grid Coloring - available after voxel is computed */}
             {volumetricGridStats && (
-              <div style={{ marginTop: '8px' }}>
-                <label style={{ fontSize: '12px', color: '#aaa', display: 'block', marginBottom: '4px' }}>
+              <div style={{ marginTop: '12px' }}>
+                <label style={{ fontSize: '12px', color: '#5A6169', display: 'block', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
                   Voxel Grid Coloring:
                 </label>
                 <select
@@ -1041,12 +1052,12 @@ function App() {
                   onChange={(e) => setDistanceFieldType(e.target.value as DistanceFieldType)}
                   style={{
                     width: '100%',
-                    padding: '4px 8px',
-                    borderRadius: '4px',
-                    border: '1px solid #555',
-                    backgroundColor: '#2a2a2a',
-                    color: '#fff',
-                    fontSize: '12px',
+                    padding: '10px 14px',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #becad6',
+                    backgroundColor: '#ffffff',
+                    color: '#495057',
+                    fontSize: '13px',
                     cursor: 'pointer'
                   }}
                 >
@@ -1072,7 +1083,7 @@ function App() {
       {/* Column 1: Steps Sidebar (10%) */}
       <div style={styles.stepsSidebar}>
         <div style={styles.sidebarHeader}>
-          <span style={{ fontSize: '16px' }}>🔧</span>
+          <span style={{ fontSize: '20px' }}>🔧</span>
         </div>
         {STEPS.map((step) => {
           const status = getStepStatus(step.id);
@@ -1083,10 +1094,10 @@ function App() {
               onClick={() => status !== 'locked' && setActiveStep(step.id)}
               style={{
                 ...styles.stepIcon,
-                backgroundColor: isActive ? '#00aaff' : status === 'completed' ? '#00aa00' : status === 'needs-recalc' ? '#ff8800' : 'transparent',
-                opacity: status === 'locked' ? 0.3 : 1,
+                backgroundColor: isActive ? 'rgba(0, 123, 255, 0.1)' : status === 'completed' ? 'rgba(23, 198, 113, 0.08)' : status === 'needs-recalc' ? 'rgba(255, 180, 0, 0.08)' : 'transparent',
+                opacity: status === 'locked' ? 0.4 : 1,
                 cursor: status === 'locked' ? 'not-allowed' : 'pointer',
-                borderLeft: isActive ? '3px solid #fff' : '3px solid transparent',
+                borderLeft: isActive ? '3px solid #007bff' : status === 'completed' ? '3px solid #17c671' : status === 'needs-recalc' ? '3px solid #ffb400' : '3px solid transparent',
               }}
               title={step.title + '\n' + step.description}
             >
@@ -1095,7 +1106,7 @@ function App() {
                 <span style={styles.checkMark}>✓</span>
               )}
               {status === 'needs-recalc' && (
-                <span style={styles.checkMark}>⟳</span>
+                <span style={{ ...styles.checkMark, color: '#ffb400' }}>⟳</span>
               )}
             </div>
           );
@@ -1154,7 +1165,7 @@ function App() {
 }
 
 // ============================================================================
-// STYLES
+// STYLES - Shards Dashboard Theme
 // ============================================================================
 
 const styles: Record<string, React.CSSProperties> = {
@@ -1165,26 +1176,30 @@ const styles: Record<string, React.CSSProperties> = {
     margin: 0,
     padding: 0,
     overflow: 'hidden',
-    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontFamily: "'Poppins', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif",
+    backgroundColor: '#f5f6f8',
   },
   stepsSidebar: {
-    width: '10%',
-    minWidth: '60px',
+    width: '80px',
+    minWidth: '80px',
     maxWidth: '80px',
     height: '100%',
-    backgroundColor: '#1a1a2e',
+    backgroundColor: '#ffffff',
     display: 'flex',
     flexDirection: 'column',
     alignItems: 'center',
-    paddingTop: '8px',
-    borderRight: '1px solid #333',
+    paddingTop: '0',
+    borderRight: '1px solid #e1e5eb',
+    boxShadow: '2px 0 10px rgba(90,97,105,0.08)',
   },
   sidebarHeader: {
-    padding: '12px',
+    padding: '20px 12px',
     marginBottom: '8px',
-    borderBottom: '1px solid #333',
+    borderBottom: '1px solid #e1e5eb',
     width: '100%',
     textAlign: 'center',
+    backgroundColor: '#007bff',
+    color: '#ffffff',
   },
   stepIcon: {
     width: '100%',
@@ -1194,14 +1209,16 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: 'center',
     justifyContent: 'center',
     position: 'relative',
-    transition: 'all 0.2s',
+    transition: 'all 250ms cubic-bezier(0.27, 0.01, 0.38, 1.06)',
+    borderLeft: '3px solid transparent',
   },
   checkMark: {
     position: 'absolute',
     bottom: '4px',
-    right: '8px',
+    right: '12px',
     fontSize: '10px',
-    color: '#fff',
+    color: '#17c671',
+    fontWeight: 'bold',
   },
   helpIcon: {
     marginTop: 'auto',
@@ -1209,148 +1226,174 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: '18px',
     cursor: 'help',
     opacity: 0.6,
+    color: '#5A6169',
   },
   contextPanel: {
-    width: '20%',
-    minWidth: '200px',
-    maxWidth: '300px',
+    width: '280px',
+    minWidth: '260px',
+    maxWidth: '320px',
     height: '100%',
-    backgroundColor: '#16213e',
-    borderRight: '1px solid #333',
+    backgroundColor: '#ffffff',
+    borderRight: '1px solid #e1e5eb',
     display: 'flex',
     flexDirection: 'column',
     overflow: 'hidden',
+    boxShadow: '2px 0 10px rgba(90,97,105,0.08)',
   },
   contextHeader: {
-    padding: '16px',
-    fontSize: '14px',
-    fontWeight: 'bold',
-    color: '#fff',
-    borderBottom: '1px solid #333',
-    backgroundColor: '#1a1a2e',
+    padding: '20px 24px',
+    fontSize: '16px',
+    fontWeight: 500,
+    color: '#212529',
+    borderBottom: '1px solid #e1e5eb',
+    backgroundColor: '#ffffff',
+    letterSpacing: '0.5px',
   },
   contextContent: {
     flex: 1,
-    padding: '16px',
+    padding: '20px',
     overflowY: 'auto',
-    color: '#fff',
+    color: '#5A6169',
   },
   contextTitle: {
-    fontSize: '16px',
-    fontWeight: 'bold',
+    fontSize: '15px',
+    fontWeight: 500,
     marginBottom: '8px',
+    color: '#212529',
   },
   contextDescription: {
-    fontSize: '12px',
-    opacity: 0.7,
-    marginBottom: '16px',
-    lineHeight: 1.4,
+    fontSize: '13px',
+    color: '#868e96',
+    marginBottom: '20px',
+    lineHeight: 1.5,
   },
   optionsSection: {
-    marginBottom: '16px',
+    marginBottom: '20px',
   },
   optionLabel: {
-    fontSize: '11px',
-    opacity: 0.8,
-    marginBottom: '6px',
+    fontSize: '12px',
+    color: '#5A6169',
+    marginBottom: '8px',
+    fontWeight: 400,
+    textTransform: 'uppercase',
+    letterSpacing: '0.5px',
   },
   input: {
     width: '100%',
-    padding: '8px 12px',
-    backgroundColor: '#222',
-    border: '1px solid #444',
-    borderRadius: '4px',
-    color: '#fff',
-    fontSize: '13px',
+    padding: '10px 14px',
+    backgroundColor: '#ffffff',
+    border: '1px solid #becad6',
+    borderRadius: '0.375rem',
+    color: '#495057',
+    fontSize: '14px',
+    fontWeight: 300,
     boxSizing: 'border-box',
+    transition: 'box-shadow 250ms cubic-bezier(0.27, 0.01, 0.38, 1.06), border 250ms cubic-bezier(0.27, 0.01, 0.38, 1.06)',
   },
   checkbox: {
     display: 'flex',
     alignItems: 'center',
-    gap: '8px',
-    fontSize: '12px',
+    gap: '10px',
+    fontSize: '13px',
     cursor: 'pointer',
-    marginTop: '8px',
+    marginTop: '10px',
+    color: '#5A6169',
+    fontWeight: 300,
   },
   toggleButton: {
     flex: 1,
-    padding: '8px 12px',
-    border: '2px solid',
-    borderRadius: '4px',
+    padding: '10px 14px',
+    border: '1px solid #becad6',
+    borderRadius: '0.375rem',
     cursor: 'pointer',
-    fontSize: '11px',
-    transition: 'all 0.2s',
+    fontSize: '12px',
+    fontWeight: 400,
+    transition: 'all 250ms cubic-bezier(0.27, 0.01, 0.38, 1.06)',
+    backgroundColor: '#ffffff',
+    color: '#5A6169',
   },
   statsBox: {
-    marginTop: '12px',
-    padding: '10px',
-    backgroundColor: 'rgba(255, 255, 255, 0.05)',
-    borderRadius: '4px',
-    fontSize: '11px',
-    lineHeight: 1.6,
+    marginTop: '16px',
+    padding: '14px',
+    backgroundColor: '#f5f6f8',
+    borderRadius: '0.625rem',
+    fontSize: '12px',
+    lineHeight: 1.7,
+    color: '#5A6169',
+    border: '1px solid #e1e5eb',
   },
   primaryButton: {
-    backgroundColor: '#00aaff',
+    backgroundColor: '#007bff',
     border: 'none',
-    borderRadius: '4px',
-    color: '#000',
-    fontWeight: 'bold',
+    borderRadius: '0.375rem',
+    color: '#ffffff',
+    fontWeight: 400,
     cursor: 'pointer',
-    transition: 'background-color 0.2s',
+    transition: 'all 250ms cubic-bezier(0.27, 0.01, 0.38, 1.06)',
+    boxShadow: '0 2px 8px rgba(0,123,255,0.2)',
   },
   secondaryButton: {
-    backgroundColor: '#333',
-    border: '1px solid #555',
-    borderRadius: '4px',
-    color: '#aaa',
+    backgroundColor: '#ffffff',
+    border: '1px solid #becad6',
+    borderRadius: '0.375rem',
+    color: '#5A6169',
     cursor: 'pointer',
-    transition: 'all 0.2s',
+    transition: 'all 250ms cubic-bezier(0.27, 0.01, 0.38, 1.06)',
   },
   legend: {
-    marginTop: '8px',
-    fontSize: '10px',
-    opacity: 0.7,
+    marginTop: '10px',
+    fontSize: '11px',
+    color: '#868e96',
+    lineHeight: 1.6,
   },
   calculateSection: {
-    marginTop: '20px',
-    paddingTop: '16px',
-    borderTop: '1px solid #333',
+    marginTop: '24px',
+    paddingTop: '20px',
+    borderTop: '1px solid #e1e5eb',
   },
   calculateButton: {
     width: '100%',
-    padding: '12px 16px',
+    padding: '14px 20px',
     border: 'none',
-    borderRadius: '6px',
-    color: '#fff',
+    borderRadius: '0.375rem',
+    color: '#ffffff',
     fontSize: '14px',
-    fontWeight: 'bold',
-    transition: 'background-color 0.2s',
+    fontWeight: 500,
+    transition: 'all 250ms cubic-bezier(0.27, 0.01, 0.38, 1.06)',
+    boxShadow: '0 4px 12px rgba(0,123,255,0.3)',
   },
   progressContainer: {
-    marginTop: '10px',
-    height: '6px',
-    backgroundColor: '#333',
-    borderRadius: '3px',
+    marginTop: '12px',
+    height: '8px',
+    backgroundColor: '#e9ecef',
+    borderRadius: '1rem',
     overflow: 'hidden',
+    boxShadow: 'inset 0 1px 2px rgba(90,97,105,0.15)',
   },
   progressBar: {
     height: '100%',
-    backgroundColor: '#00aaff',
-    transition: 'width 0.1s',
+    backgroundColor: '#007bff',
+    borderRadius: '1rem',
+    transition: 'width 0.3s ease',
   },
   lockedMessage: {
     padding: '16px',
-    backgroundColor: 'rgba(255, 165, 0, 0.1)',
-    borderRadius: '4px',
-    fontSize: '12px',
+    backgroundColor: 'rgba(255, 180, 0, 0.1)',
+    borderRadius: '0.625rem',
+    fontSize: '13px',
     textAlign: 'center',
-    color: '#f90',
+    color: '#ffb400',
+    border: '1px solid rgba(255, 180, 0, 0.3)',
   },
   viewerContainer: {
     flex: 1,
     height: '100%',
     position: 'relative',
-    backgroundColor: '#000',
+    backgroundColor: '#1a1d21',
+    borderRadius: '0.625rem 0 0 0.625rem',
+    overflow: 'hidden',
+    margin: '12px 12px 12px 0',
+    boxShadow: '0 0.46875rem 2.1875rem rgba(90,97,105,0.1), 0 0.9375rem 1.40625rem rgba(90,97,105,0.1)',
   },
 };
 

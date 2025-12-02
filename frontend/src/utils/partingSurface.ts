@@ -345,10 +345,27 @@ function buildVoxelSpatialIndex(
   gridResult: VolumetricGridResult
 ): Map<string, number> {
   const indexMap = new Map<string, number>();
+  const voxelCount = gridResult.moldVolumeCellCount;
   
-  for (let i = 0; i < gridResult.moldVolumeCells.length; i++) {
-    const cell = gridResult.moldVolumeCells[i];
-    const key = `${Math.round(cell.index.x)},${Math.round(cell.index.y)},${Math.round(cell.index.z)}`;
+  // Use flat arrays if available (more memory efficient)
+  const useFlat = gridResult.voxelIndices !== null;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    let gi: number, gj: number, gk: number;
+    
+    if (useFlat) {
+      const i3 = i * 3;
+      gi = gridResult.voxelIndices![i3];
+      gj = gridResult.voxelIndices![i3 + 1];
+      gk = gridResult.voxelIndices![i3 + 2];
+    } else {
+      const cell = gridResult.moldVolumeCells[i];
+      gi = Math.round(cell.index.x);
+      gj = Math.round(cell.index.y);
+      gk = Math.round(cell.index.z);
+    }
+    
+    const key = `${gi},${gj},${gk}`;
     indexMap.set(key, i);
   }
   
@@ -369,6 +386,157 @@ function getVoxelIndex(
 // ============================================================================
 // BOUNDARY VOXEL DETECTION
 // ============================================================================
+
+// Default number of workers for parallel processing
+const DEFAULT_NUM_WORKERS = typeof navigator !== 'undefined' ? (navigator.hardwareConcurrency || 4) : 4;
+
+/**
+ * Extract geometry data for worker transfer
+ */
+function extractGeometryDataForWorker(geometry: THREE.BufferGeometry): {
+  positionArray: Float32Array;
+  indexArray: Uint32Array | null;
+} {
+  const position = geometry.getAttribute('position');
+  const positionArray = new Float32Array(position.array);
+  
+  const index = geometry.getIndex();
+  const indexArray = index ? new Uint32Array(index.array) : null;
+  
+  return { positionArray, indexArray };
+}
+
+/**
+ * Compute volume intersection for all voxels in parallel using Web Workers
+ */
+async function computeVolumeIntersectionParallel(
+  gridResult: VolumetricGridResult,
+  partGeometry: THREE.BufferGeometry,
+  seedVolumeThreshold: number,
+  seedVolumeSamples: number,
+  numWorkers: number = DEFAULT_NUM_WORKERS
+): Promise<{ innerSurfaceMask: Uint8Array; innerSurfaceCount: number }> {
+  const voxelCount = gridResult.moldVolumeCellCount;
+  const innerSurfaceMask = new Uint8Array(voxelCount);
+  
+  // Get voxel centers - use flat array if available
+  let voxelCentersArray: Float32Array;
+  if (gridResult.voxelCenters !== null) {
+    voxelCentersArray = gridResult.voxelCenters;
+  } else {
+    // Fall back to building from moldVolumeCells
+    voxelCentersArray = new Float32Array(voxelCount * 3);
+    for (let i = 0; i < voxelCount; i++) {
+      const center = gridResult.moldVolumeCells[i].center;
+      voxelCentersArray[i * 3] = center.x;
+      voxelCentersArray[i * 3 + 1] = center.y;
+      voxelCentersArray[i * 3 + 2] = center.z;
+    }
+  }
+  
+  const voxelSizeX = gridResult.cellSize.x;
+  const voxelSizeY = gridResult.cellSize.y;
+  const voxelSizeZ = gridResult.cellSize.z;
+  
+  // Extract part geometry data
+  const partData = extractGeometryDataForWorker(partGeometry);
+  
+  // Create workers
+  const workers: Worker[] = [];
+  const workerReadyPromises: Promise<void>[] = [];
+  
+  console.log(`    Initializing ${numWorkers} volume intersection workers...`);
+  
+  for (let i = 0; i < numWorkers; i++) {
+    const worker = new Worker(
+      new URL('./volumeIntersectionWorker.ts', import.meta.url),
+      { type: 'module' }
+    );
+    workers.push(worker);
+    
+    workerReadyPromises.push(new Promise<void>((resolve) => {
+      const handler = (event: MessageEvent) => {
+        if (event.data.type === 'ready') {
+          worker.removeEventListener('message', handler);
+          resolve();
+        }
+      };
+      worker.addEventListener('message', handler);
+    }));
+    
+    // Send init message with geometry
+    const initMsg = {
+      type: 'init',
+      workerId: i,
+      partPositionArray: partData.positionArray.slice(),
+      partIndexArray: partData.indexArray?.slice() ?? null,
+    };
+    
+    const transfers: Transferable[] = [initMsg.partPositionArray.buffer];
+    if (initMsg.partIndexArray) transfers.push(initMsg.partIndexArray.buffer);
+    
+    worker.postMessage(initMsg, transfers);
+  }
+  
+  await Promise.all(workerReadyPromises);
+  console.log(`    Workers initialized`);
+  
+  // Distribute voxels across workers
+  const voxelsPerWorker = Math.ceil(voxelCount / numWorkers);
+  const workerPromises: Promise<{ startIndex: number; seedMask: Uint8Array }>[] = [];
+  
+  for (let w = 0; w < numWorkers; w++) {
+    const startIdx = w * voxelsPerWorker;
+    const endIdx = Math.min(startIdx + voxelsPerWorker, voxelCount);
+    if (endIdx <= startIdx) continue;
+    
+    const voxelCenters = voxelCentersArray.slice(startIdx * 3, endIdx * 3);
+    
+    workerPromises.push(new Promise((resolve) => {
+      const handler = (event: MessageEvent) => {
+        if (event.data.type === 'result' && event.data.workerId === w) {
+          workers[w].removeEventListener('message', handler);
+          resolve({
+            startIndex: event.data.startIndex,
+            seedMask: event.data.seedMask,
+          });
+        }
+      };
+      workers[w].addEventListener('message', handler);
+    }));
+    
+    workers[w].postMessage({
+      type: 'compute',
+      voxelCenters,
+      voxelSizeX,
+      voxelSizeY,
+      voxelSizeZ,
+      samplesPerAxis: seedVolumeSamples,
+      threshold: seedVolumeThreshold,
+      startIndex: startIdx,
+    }, [voxelCenters.buffer]);
+  }
+  
+  // Wait for all workers
+  const results = await Promise.all(workerPromises);
+  
+  // Terminate workers
+  workers.forEach(w => w.terminate());
+  
+  // Merge results
+  let innerSurfaceCount = 0;
+  for (const result of results) {
+    const { startIndex, seedMask } = result;
+    for (let i = 0; i < seedMask.length; i++) {
+      if (seedMask[i]) {
+        innerSurfaceMask[startIndex + i] = 1;
+        innerSurfaceCount++;
+      }
+    }
+  }
+  
+  return { innerSurfaceMask, innerSurfaceCount };
+}
 
 /**
  * Identify which voxels are on the OUTER SURFACE of the silicone volume
@@ -679,6 +847,320 @@ function identifyBoundaryAdjacentVoxels(
       const gi = Math.round(cell.index.x);
       const gj = Math.round(cell.index.y);
       const gk = Math.round(cell.index.z);
+      
+      for (const [di, dj, dk] of faceNeighborOffsets) {
+        const neighborIdx = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
+        if (neighborIdx >= 0 && !boundaryAdjacentMask[neighborIdx]) {
+          boundaryAdjacentMask[neighborIdx] = 1;
+          boundaryAdjacentCount++;
+        }
+      }
+    }
+  }
+  
+  console.log(`  Boundary voxels (outer + 1 level): ${boundaryAdjacentCount}`);
+  
+  return { boundaryLabel, innerSurfaceMask, boundaryAdjacentMask, h1Adjacent, h2Adjacent, innerSurfaceCount };
+}
+
+/**
+ * Async version of identifyBoundaryAdjacentVoxels that uses parallel workers
+ * for volume intersection computation (much faster for large voxel counts)
+ */
+async function identifyBoundaryAdjacentVoxelsAsync(
+  gridResult: VolumetricGridResult,
+  shellGeometry: THREE.BufferGeometry,
+  classification: MoldHalfClassificationResult,
+  _boundaryRadius: number,
+  partGeometry?: THREE.BufferGeometry,
+  seedVolumeThreshold: number = 0.75,
+  seedVolumeSamples: number = 4,
+  numWorkers: number = DEFAULT_NUM_WORKERS
+): Promise<{ 
+  boundaryLabel: Int8Array; 
+  innerSurfaceMask: Uint8Array;
+  boundaryAdjacentMask: Uint8Array;
+  h1Adjacent: number; 
+  h2Adjacent: number;
+  innerSurfaceCount: number;
+}> {
+  const voxelCount = gridResult.moldVolumeCellCount;
+  const cells = gridResult.moldVolumeCells;
+  const voxelDist = gridResult.voxelDist;
+  
+  // Use flat arrays if available
+  const useFlat = gridResult.voxelIndices !== null;
+  
+  if (!voxelDist) {
+    console.error('ERROR: voxelDist is required for boundary detection');
+    return { 
+      boundaryLabel: new Int8Array(voxelCount), 
+      innerSurfaceMask: new Uint8Array(voxelCount),
+      boundaryAdjacentMask: new Uint8Array(voxelCount),
+      h1Adjacent: 0, 
+      h2Adjacent: 0,
+      innerSurfaceCount: 0
+    };
+  }
+  
+  // Build spatial index for neighbor lookups
+  const spatialIndex = buildVoxelSpatialIndex(gridResult);
+  
+  // 6-connected neighbor offsets (face-adjacent only for surface detection)
+  const faceNeighborOffsets: [number, number, number][] = [
+    [1, 0, 0], [-1, 0, 0],
+    [0, 1, 0], [0, -1, 0],
+    [0, 0, 1], [0, 0, -1],
+  ];
+  
+  // Step 1: Find ALL surface voxels
+  const isSurfaceVoxel = new Uint8Array(voxelCount);
+  let totalSurfaceCount = 0;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    let gi: number, gj: number, gk: number;
+    
+    if (useFlat) {
+      const i3 = i * 3;
+      gi = gridResult.voxelIndices![i3];
+      gj = gridResult.voxelIndices![i3 + 1];
+      gk = gridResult.voxelIndices![i3 + 2];
+    } else {
+      const cell = cells[i];
+      gi = Math.round(cell.index.x);
+      gj = Math.round(cell.index.y);
+      gk = Math.round(cell.index.z);
+    }
+    
+    for (const [di, dj, dk] of faceNeighborOffsets) {
+      const neighborIdx = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
+      if (neighborIdx < 0) {
+        isSurfaceVoxel[i] = 1;
+        totalSurfaceCount++;
+        break;
+      }
+    }
+  }
+  
+  console.log(`  Total surface voxels (both inner & outer): ${totalSurfaceCount}`);
+  
+  // Step 2: Compute threshold to distinguish inner vs outer surface
+  const surfaceDistances: number[] = [];
+  const surfaceIndices: number[] = [];
+  for (let i = 0; i < voxelCount; i++) {
+    if (isSurfaceVoxel[i]) {
+      surfaceDistances.push(voxelDist[i]);
+      surfaceIndices.push(i);
+    }
+  }
+  
+  const sortedPairs = surfaceIndices.map((idx, i) => ({ idx, dist: surfaceDistances[i] }));
+  sortedPairs.sort((a, b) => a.dist - b.dist);
+  
+  const minDist = sortedPairs[0]?.dist || 0;
+  const maxDist = sortedPairs[sortedPairs.length - 1]?.dist || 0;
+  
+  console.log(`  Surface distance range: [${minDist.toFixed(4)}, ${maxDist.toFixed(4)}]`);
+  
+  let maxGap = 0;
+  let gapIndex = Math.floor(sortedPairs.length / 2);
+  
+  for (let i = 1; i < sortedPairs.length; i++) {
+    const gap = sortedPairs[i].dist - sortedPairs[i - 1].dist;
+    if (gap > maxGap) {
+      maxGap = gap;
+      gapIndex = i;
+    }
+  }
+  
+  const distanceThreshold = sortedPairs[gapIndex]?.dist || (minDist + maxDist) / 2;
+  
+  console.log(`  Largest gap at index ${gapIndex}/${sortedPairs.length}, gap size: ${maxGap.toFixed(4)}`);
+  console.log(`  Distance threshold: ${distanceThreshold.toFixed(4)}`);
+  console.log(`  Inner candidates: ${gapIndex}, Outer candidates: ${sortedPairs.length - gapIndex}`);
+  
+  // Step 3: Mark outer surface voxels and identify seeds
+  const isOuterSurface = new Uint8Array(voxelCount);
+  let innerSurfaceMask = new Uint8Array(voxelCount);
+  let outerSurfaceCount = 0;
+  let innerSurfaceCount = 0;
+  
+  // First pass: identify outer surface voxels
+  for (let i = 0; i < voxelCount; i++) {
+    if (isSurfaceVoxel[i] && voxelDist[i] >= distanceThreshold) {
+      isOuterSurface[i] = 1;
+      outerSurfaceCount++;
+    }
+  }
+  
+  // Second pass: identify seed voxels using PARALLEL workers
+  if (partGeometry && seedVolumeThreshold > 0) {
+    console.log(`  Using PARALLEL volume intersection approach for seeds (threshold: ${(seedVolumeThreshold * 100).toFixed(0)}%, samples: ${seedVolumeSamples}³)`);
+    const volumeStartTime = performance.now();
+    
+    const result = await computeVolumeIntersectionParallel(
+      gridResult,
+      partGeometry,
+      seedVolumeThreshold,
+      seedVolumeSamples,
+      numWorkers
+    );
+    
+    innerSurfaceMask = new Uint8Array(result.innerSurfaceMask);
+    innerSurfaceCount = result.innerSurfaceCount;
+    
+    console.log(`  Volume intersection computed in ${(performance.now() - volumeStartTime).toFixed(1)}ms`);
+    console.log(`  Seed voxels (≥${(seedVolumeThreshold * 100).toFixed(0)}% volume intersection): ${innerSurfaceCount}`);
+  } else {
+    // Legacy surface distance approach
+    console.log(`  Using legacy surface distance approach for seeds`);
+    for (let i = 0; i < voxelCount; i++) {
+      if (isSurfaceVoxel[i] && voxelDist[i] < distanceThreshold) {
+        innerSurfaceMask[i] = 1;
+        innerSurfaceCount++;
+      }
+    }
+    console.log(`  Inner surface (near part): ${innerSurfaceCount}`);
+  }
+  
+  console.log(`  Outer surface (near shell): ${outerSurfaceCount}`);
+  
+  // Step 4: For each OUTER surface voxel, determine if it's closer to H₁, H₂, or boundary zone
+  console.log('  Building BVH for H₁, H₂, and boundary zone triangles...');
+  const bvhStartTime = performance.now();
+  
+  const position = shellGeometry.getAttribute('position');
+  const shellIndex = shellGeometry.getIndex();
+  
+  const createSubGeometry = (triangleSet: Set<number>): THREE.BufferGeometry => {
+    const triCount = triangleSet.size;
+    if (triCount === 0) {
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
+      return geom;
+    }
+    const positions = new Float32Array(triCount * 9);
+    
+    let writeIdx = 0;
+    for (const triIdx of triangleSet) {
+      let a: number, b: number, c: number;
+      if (shellIndex) {
+        a = shellIndex.getX(triIdx * 3);
+        b = shellIndex.getX(triIdx * 3 + 1);
+        c = shellIndex.getX(triIdx * 3 + 2);
+      } else {
+        a = triIdx * 3;
+        b = triIdx * 3 + 1;
+        c = triIdx * 3 + 2;
+      }
+      
+      positions[writeIdx++] = position.getX(a);
+      positions[writeIdx++] = position.getY(a);
+      positions[writeIdx++] = position.getZ(a);
+      positions[writeIdx++] = position.getX(b);
+      positions[writeIdx++] = position.getY(b);
+      positions[writeIdx++] = position.getZ(b);
+      positions[writeIdx++] = position.getX(c);
+      positions[writeIdx++] = position.getY(c);
+      positions[writeIdx++] = position.getZ(c);
+    }
+    
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    return geom;
+  };
+  
+  const h1Geometry = createSubGeometry(classification.h1Triangles);
+  const h2Geometry = createSubGeometry(classification.h2Triangles);
+  const boundaryZoneGeometry = createSubGeometry(classification.boundaryZoneTriangles);
+  
+  const h1BVH = classification.h1Triangles.size > 0 ? new MeshBVH(h1Geometry) : null;
+  const h2BVH = classification.h2Triangles.size > 0 ? new MeshBVH(h2Geometry) : null;
+  const boundaryZoneBVH = classification.boundaryZoneTriangles.size > 0 ? new MeshBVH(boundaryZoneGeometry) : null;
+  
+  console.log(`  BVH build time: ${(performance.now() - bvhStartTime).toFixed(1)}ms`);
+  console.log(`  H₁ triangles: ${classification.h1Triangles.size}, H₂ triangles: ${classification.h2Triangles.size}, Boundary zone: ${classification.boundaryZoneTriangles.size}`);
+  
+  // Label each OUTER surface voxel based on closest region using BVH
+  const boundaryLabel = new Int8Array(voxelCount);
+  let h1Adjacent = 0;
+  let h2Adjacent = 0;
+  let boundaryZoneAdjacent = 0;
+  
+  const labelStartTime = performance.now();
+  const hitInfoH1 = { point: new THREE.Vector3(), distance: Infinity, faceIndex: 0 };
+  const hitInfoH2 = { point: new THREE.Vector3(), distance: Infinity, faceIndex: 0 };
+  const hitInfoBZ = { point: new THREE.Vector3(), distance: Infinity, faceIndex: 0 };
+  const tempCenter = new THREE.Vector3();
+  
+  for (let i = 0; i < voxelCount; i++) {
+    if (!isOuterSurface[i]) continue;
+    
+    // Get center from flat array or legacy
+    if (useFlat && gridResult.voxelCenters) {
+      const i3 = i * 3;
+      tempCenter.set(
+        gridResult.voxelCenters[i3],
+        gridResult.voxelCenters[i3 + 1],
+        gridResult.voxelCenters[i3 + 2]
+      );
+    } else {
+      tempCenter.copy(cells[i].center);
+    }
+    
+    hitInfoH1.distance = Infinity;
+    hitInfoH2.distance = Infinity;
+    hitInfoBZ.distance = Infinity;
+    
+    const distH1 = h1BVH ? (h1BVH.closestPointToPoint(tempCenter, hitInfoH1), hitInfoH1.distance) : Infinity;
+    const distH2 = h2BVH ? (h2BVH.closestPointToPoint(tempCenter, hitInfoH2), hitInfoH2.distance) : Infinity;
+    const distBZ = boundaryZoneBVH ? (boundaryZoneBVH.closestPointToPoint(tempCenter, hitInfoBZ), hitInfoBZ.distance) : Infinity;
+    
+    if (distBZ <= distH1 && distBZ <= distH2) {
+      boundaryLabel[i] = 0;
+      boundaryZoneAdjacent++;
+    } else if (distH1 <= distH2) {
+      boundaryLabel[i] = 1;
+      h1Adjacent++;
+    } else {
+      boundaryLabel[i] = 2;
+      h2Adjacent++;
+    }
+  }
+  
+  console.log(`  Labeling time: ${(performance.now() - labelStartTime).toFixed(1)}ms`);
+  console.log(`  Outer boundary labeled: H₁=${h1Adjacent}, H₂=${h2Adjacent}, BoundaryZone(unlabeled)=${boundaryZoneAdjacent}`);
+  
+  h1Geometry.dispose();
+  h2Geometry.dispose();
+  boundaryZoneGeometry.dispose();
+  
+  // Step 5: Build boundaryAdjacentMask - outer surface + one level deep
+  const boundaryAdjacentMask = new Uint8Array(voxelCount);
+  let boundaryAdjacentCount = 0;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    if (isOuterSurface[i]) {
+      boundaryAdjacentMask[i] = 1;
+      boundaryAdjacentCount++;
+    }
+  }
+  
+  for (let i = 0; i < voxelCount; i++) {
+    if (isOuterSurface[i]) {
+      let gi: number, gj: number, gk: number;
+      
+      if (useFlat) {
+        const i3 = i * 3;
+        gi = gridResult.voxelIndices![i3];
+        gj = gridResult.voxelIndices![i3 + 1];
+        gk = gridResult.voxelIndices![i3 + 2];
+      } else {
+        const cell = cells[i];
+        gi = Math.round(cell.index.x);
+        gj = Math.round(cell.index.y);
+        gk = Math.round(cell.index.z);
+      }
       
       for (const [di, dj, dk] of faceNeighborOffsets) {
         const neighborIdx = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
@@ -1271,30 +1753,18 @@ export async function computeEscapeLabelingDijkstraAsync(
     throw new Error('Weighting factor is required for escape labeling');
   }
   
-  // Build spatial index (used by identifyBoundaryAdjacentVoxels internally)
-  
-  // Create part mesh tester if geometry is provided
-  let partMeshTester: PartMeshTester | undefined;
-  if (partGeometry && seedVolumeThreshold > 0) {
-    console.log('  Building part mesh BVH for volume intersection...');
-    partMeshTester = new PartMeshTester(partGeometry);
-  }
-  
-  // Step 1: Identify boundary-adjacent voxels (same as sync version)
-  console.log('Identifying boundary-adjacent voxels...');
-  const { boundaryLabel, innerSurfaceMask, h1Adjacent, h2Adjacent, innerSurfaceCount } = identifyBoundaryAdjacentVoxels(
+  // Step 1: Identify boundary-adjacent voxels using PARALLEL volume intersection
+  console.log('Identifying boundary-adjacent voxels (parallel)...');
+  const { boundaryLabel, innerSurfaceMask, h1Adjacent, h2Adjacent, innerSurfaceCount } = await identifyBoundaryAdjacentVoxelsAsync(
     gridResult,
     shellGeometry,
     classification,
     seedRadius,
-    partMeshTester,
+    partGeometry,
     seedVolumeThreshold,
-    seedVolumeSamples
+    seedVolumeSamples,
+    numWorkers ?? DEFAULT_NUM_WORKERS
   );
-  
-  if (partMeshTester) {
-    partMeshTester.dispose();
-  }
   
   console.log(`  H₁ adjacent: ${h1Adjacent}`);
   console.log(`  H₂ adjacent: ${h2Adjacent}`);

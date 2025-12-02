@@ -124,9 +124,12 @@ function initWorker(
 // INSIDE/OUTSIDE TESTING
 // ============================================================================
 
+// Temporary vector for intersection calculations (separate from tempVec used for cell centers)
+const intersectPoint = new Vector3();
+
 /**
  * Test if a point is inside a mesh using ray casting with BVH
- * Uses majority voting across 3 ray directions
+ * Uses majority voting across 3 ray directions for robustness
  */
 function isInsideMesh(bvh: MeshBVH, boundingBox: Box3, point: Vector3): boolean {
   // Quick bounding box check
@@ -136,30 +139,37 @@ function isInsideMesh(bvh: MeshBVH, boundingBox: Box3, point: Vector3): boolean 
   
   let insideVotes = 0;
   
+  // Test with 3 ray directions for robustness against edge cases
   for (const direction of RAY_DIRECTIONS) {
     ray.origin.copy(point);
     ray.direction.copy(direction);
     
-    // Get all intersections using shapecast
+    // Count intersections along this ray (only in positive direction)
     let intersectionCount = 0;
+    
     bvh.shapecast({
-      intersectsBounds: () => true,
+      intersectsBounds: (box) => ray.intersectsBox(box),
       intersectsTriangle: (tri) => {
-        const intersection = ray.intersectTriangle(tri.a, tri.b, tri.c, false, tempVec);
+        const intersection = ray.intersectTriangle(tri.a, tri.b, tri.c, false, intersectPoint);
         if (intersection) {
-          intersectionCount++;
+          // Check if intersection is in positive ray direction (t > 0)
+          // t = distance along ray = (intersectPoint - origin) · direction
+          const t = intersectPoint.clone().sub(point).dot(direction);
+          if (t > 0.00001) {
+            intersectionCount++;
+          }
         }
-        return false; // Continue checking
+        return false; // Continue to find all intersections
       }
     });
     
-    // Odd number of intersections = inside
+    // Odd number of intersections = inside for this ray
     if (intersectionCount % 2 === 1) {
       insideVotes++;
     }
   }
   
-  // Majority voting (2 or more out of 3)
+  // Majority voting: 2 or more rays say inside = inside
   return insideVotes >= 2;
 }
 

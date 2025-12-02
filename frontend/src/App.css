@@ -11,20 +11,35 @@ html, body, #root {
   overflow: hidden;
 }
 
-/* Scrollbar styling for context panel */
+/* Scrollbar styling for context panel - Shards style */
 ::-webkit-scrollbar {
-  width: 6px;
+  width: 8px;
+  height: 8px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #1a1a2e;
+  background: #f5f6f8;
+  border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #444;
-  border-radius: 3px;
+  background: #c1c9d0;
+  border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
+  background: #a8b3bc;
+}
+
+/* Dark scrollbar for viewer area */
+.viewer-scrollbar::-webkit-scrollbar-track {
+  background: #1a1d21;
+}
+
+.viewer-scrollbar::-webkit-scrollbar-thumb {
+  background: #444;
+}
+
+.viewer-scrollbar::-webkit-scrollbar-thumb:hover {
   background: #555;
 }

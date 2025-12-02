@@ -27,6 +27,7 @@ THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 // TYPES
 // ============================================================================
 
+/** @deprecated Use flat typed arrays instead (voxelCenters, voxelIndices) */
 export interface GridCell {
   /** Grid indices (i, j, k) */
   index: THREE.Vector3;
@@ -43,10 +44,23 @@ export interface GridCell {
 }
 
 export interface VolumetricGridResult {
-  /** All grid cells (including non-mold volume for reference) */
+  /** @deprecated Use voxelCenters instead - kept for backward compatibility */
   allCells: GridCell[];
-  /** Only cells that are in the mold volume (inside shell, outside part) */
+  /** @deprecated Use voxelCenters and voxelIndices instead - kept for backward compatibility */
   moldVolumeCells: GridCell[];
+  
+  // ========== NEW FLAT TYPED ARRAYS (memory efficient) ==========
+  /** 
+   * Flat array of voxel center positions [x0,y0,z0, x1,y1,z1, ...]
+   * Length = moldVolumeCellCount * 3
+   */
+  voxelCenters: Float32Array | null;
+  /** 
+   * Flat array of voxel grid indices [i0,j0,k0, i1,j1,k1, ...]
+   * Length = moldVolumeCellCount * 3
+   */
+  voxelIndices: Uint32Array | null;
+  
   /** Grid resolution in each dimension */
   resolution: THREE.Vector3;
   /** Total cell count in grid */
@@ -55,7 +69,7 @@ export interface VolumetricGridResult {
   moldVolumeCellCount: number;
   /** Grid bounding box (from outer shell) */
   boundingBox: THREE.Box3;
-  /** Cell size */
+  /** Cell size (uniform for all voxels) */
   cellSize: THREE.Vector3;
   /** Volume statistics */
   stats: VolumetricGridStats;
@@ -83,6 +97,42 @@ export interface VolumetricGridResult {
   rLineEnd: THREE.Vector3 | null;
   /** Mask indicating which voxels have biased weighting applied (boundary + one level deep) */
   boundaryAdjacentMask: Uint8Array | null;
+}
+
+/**
+ * Helper to get voxel center at index from flat array
+ */
+export function getVoxelCenter(gridResult: VolumetricGridResult, voxelIdx: number, target?: THREE.Vector3): THREE.Vector3 {
+  const result = target ?? new THREE.Vector3();
+  if (gridResult.voxelCenters) {
+    const i3 = voxelIdx * 3;
+    result.set(
+      gridResult.voxelCenters[i3],
+      gridResult.voxelCenters[i3 + 1],
+      gridResult.voxelCenters[i3 + 2]
+    );
+  } else if (gridResult.moldVolumeCells[voxelIdx]) {
+    result.copy(gridResult.moldVolumeCells[voxelIdx].center);
+  }
+  return result;
+}
+
+/**
+ * Helper to get voxel grid index at index from flat array
+ */
+export function getVoxelIndex(gridResult: VolumetricGridResult, voxelIdx: number, target?: THREE.Vector3): THREE.Vector3 {
+  const result = target ?? new THREE.Vector3();
+  if (gridResult.voxelIndices) {
+    const i3 = voxelIdx * 3;
+    result.set(
+      gridResult.voxelIndices[i3],
+      gridResult.voxelIndices[i3 + 1],
+      gridResult.voxelIndices[i3 + 2]
+    );
+  } else if (gridResult.moldVolumeCells[voxelIdx]) {
+    result.copy(gridResult.moldVolumeCells[voxelIdx].index);
+  }
+  return result;
 }
 
 export interface VolumetricGridStats {
@@ -402,6 +452,11 @@ export function generateVolumetricGrid(
   const allCells: GridCell[] = [];
   const moldVolumeCells: GridCell[] = [];
   
+  // For building flat arrays: collect indices and centers in temporary arrays first
+  // (we don't know the final count until we finish iterating)
+  const tempCenters: number[] = [];
+  const tempIndices: number[] = [];
+  
   const totalCellCount = resX * resY * resZ;
   const cellCenter = new THREE.Vector3();
   const cellIndex = new THREE.Vector3();
@@ -470,6 +525,9 @@ export function generateVolumetricGrid(
           
           if (isMoldVolume) {
             moldVolumeCells.push(cell);
+            // Also store in flat arrays
+            tempCenters.push(cellCenter.x, cellCenter.y, cellCenter.z);
+            tempIndices.push(i, j, k);
           }
           
           if (storeAllCells) {
@@ -809,9 +867,15 @@ export function generateVolumetricGrid(
     computeTimeMs: endTime - startTime,
   };
   
+  // Convert temporary arrays to typed arrays
+  const voxelCenters = new Float32Array(tempCenters);
+  const voxelIndices = new Uint32Array(tempIndices);
+  
   return {
     allCells: storeAllCells ? allCells : [],
     moldVolumeCells,
+    voxelCenters,
+    voxelIndices,
     resolution: new THREE.Vector3(resX, resY, resZ),
     totalCellCount,
     moldVolumeCellCount: moldVolumeCells.length,
@@ -1014,16 +1078,20 @@ export async function generateVolumetricGridGPU(
     const moldVolumeCells: GridCell[] = [];
     const allCells: GridCell[] = [];
     
+    // Temporary arrays for flat data (we don't know the count yet)
+    const tempCenters: number[] = [];
+    const tempIndices: number[] = [];
+    
     for (let idx = 0; idx < totalCells; idx++) {
       const i = idx % resolution;
       const j = Math.floor(idx / resolution) % resolution;
       const k = Math.floor(idx / (resolution * resolution));
       
-      const center = new THREE.Vector3(
-        boundingBox.min.x + (i + 0.5) * cellSize.x,
-        boundingBox.min.y + (j + 0.5) * cellSize.y,
-        boundingBox.min.z + (k + 0.5) * cellSize.z
-      );
+      const cx = boundingBox.min.x + (i + 0.5) * cellSize.x;
+      const cy = boundingBox.min.y + (j + 0.5) * cellSize.y;
+      const cz = boundingBox.min.z + (k + 0.5) * cellSize.z;
+      
+      const center = new THREE.Vector3(cx, cy, cz);
       
       const isMoldVolume = resultData[idx] === 1;
       
@@ -1034,6 +1102,9 @@ export async function generateVolumetricGridGPU(
           size: cellSize.clone(),
           isMoldVolume: true,
         });
+        // Also store in flat arrays
+        tempCenters.push(cx, cy, cz);
+        tempIndices.push(i, j, k);
       }
       
       if (storeAllCells) {
@@ -1045,6 +1116,10 @@ export async function generateVolumetricGridGPU(
         });
       }
     }
+    
+    // Convert to typed arrays
+    const voxelCenters = new Float32Array(tempCenters);
+    const voxelIndices = new Uint32Array(tempIndices);
     
     // Clean up GPU resources
     paramsBuffer.destroy();
@@ -1362,6 +1437,8 @@ export async function generateVolumetricGridGPU(
     return {
       allCells: storeAllCells ? allCells : [],
       moldVolumeCells,
+      voxelCenters,
+      voxelIndices,
       resolution: new THREE.Vector3(resolution, resolution, resolution),
       totalCellCount: totalCells,
       moldVolumeCellCount: moldVolumeCells.length,
@@ -1602,9 +1679,12 @@ export function createMoldVolumePointCloud(
   pointSize: number = 2,
   distanceFieldType: DistanceFieldType = 'part'
 ): THREE.Points {
-  const cellCount = gridResult.moldVolumeCells.length;
+  const cellCount = gridResult.moldVolumeCellCount;
   const positions = new Float32Array(cellCount * 3);
   const colors = new Float32Array(cellCount * 3);
+  
+  // Use flat arrays if available (more memory efficient), fall back to deprecated moldVolumeCells
+  const useFlat = gridResult.voxelCenters !== null;
   
   // Get the appropriate distance field data
   const fieldData = getDistanceFieldData(gridResult, distanceFieldType);
@@ -1630,10 +1710,18 @@ export function createMoldVolumePointCloud(
   const tempColor = new THREE.Color();
   
   for (let i = 0; i < cellCount; i++) {
-    const cell = gridResult.moldVolumeCells[i];
-    positions[i * 3] = cell.center.x;
-    positions[i * 3 + 1] = cell.center.y;
-    positions[i * 3 + 2] = cell.center.z;
+    // Get position from flat array or legacy object
+    if (useFlat) {
+      const i3 = i * 3;
+      positions[i3] = gridResult.voxelCenters![i3];
+      positions[i3 + 1] = gridResult.voxelCenters![i3 + 1];
+      positions[i3 + 2] = gridResult.voxelCenters![i3 + 2];
+    } else {
+      const cell = gridResult.moldVolumeCells[i];
+      positions[i * 3] = cell.center.x;
+      positions[i * 3 + 1] = cell.center.y;
+      positions[i * 3 + 2] = cell.center.z;
+    }
     
     if (hasDistanceData) {
       if (isBinaryMask === true) {
@@ -1695,8 +1783,11 @@ export function createMoldVolumeVoxels(
   opacity: number = 0.3,
   distanceFieldType: DistanceFieldType = 'part'
 ): THREE.InstancedMesh {
-  const cellCount = gridResult.moldVolumeCells.length;
+  const cellCount = gridResult.moldVolumeCellCount;
   const { cellSize } = gridResult;
+  
+  // Use flat arrays if available (more memory efficient), fall back to deprecated moldVolumeCells
+  const useFlat = gridResult.voxelCenters !== null;
   
   // Create box geometry for a single cell
   const boxGeometry = new THREE.BoxGeometry(cellSize.x, cellSize.y, cellSize.z);
@@ -1746,10 +1837,22 @@ export function createMoldVolumeVoxels(
   
   // Set transforms and colors for each instance
   const matrix = new THREE.Matrix4();
+  const tempVec = new THREE.Vector3();
   
   for (let i = 0; i < cellCount; i++) {
-    const cell = gridResult.moldVolumeCells[i];
-    matrix.setPosition(cell.center);
+    // Get position from flat array or legacy object
+    if (useFlat) {
+      const i3 = i * 3;
+      tempVec.set(
+        gridResult.voxelCenters![i3],
+        gridResult.voxelCenters![i3 + 1],
+        gridResult.voxelCenters![i3 + 2]
+      );
+      matrix.setPosition(tempVec);
+    } else {
+      const cell = gridResult.moldVolumeCells[i];
+      matrix.setPosition(cell.center);
+    }
     instancedMesh.setMatrixAt(i, matrix);
     
     if (hasDistanceData) {
@@ -2237,9 +2340,13 @@ export async function generateVolumetricGridParallel(
     }
   }
   
-  // Create GridCell objects for mold volume cells
+  // Create GridCell objects for mold volume cells and flat arrays
   const moldVolumeCells: GridCell[] = [];
+  const voxelCount = moldVolumeCellIndexSet.size;
+  const voxelCenters = new Float32Array(voxelCount * 3);
+  const voxelIndices = new Uint32Array(voxelCount * 3);
   
+  let moldIdx = 0;
   for (const cellIdx of moldVolumeCellIndexSet) {
     // Decode cell index back to i, j, k
     const i = Math.floor(cellIdx / (resY * resZ));
@@ -2247,11 +2354,11 @@ export async function generateVolumetricGridParallel(
     const j = Math.floor(remainder / resZ);
     const k = remainder % resZ;
     
-    const center = new THREE.Vector3(
-      boundingBox.min.x + (i + 0.5) * cellSize.x,
-      boundingBox.min.y + (j + 0.5) * cellSize.y,
-      boundingBox.min.z + (k + 0.5) * cellSize.z
-    );
+    const cx = boundingBox.min.x + (i + 0.5) * cellSize.x;
+    const cy = boundingBox.min.y + (j + 0.5) * cellSize.y;
+    const cz = boundingBox.min.z + (k + 0.5) * cellSize.z;
+    
+    const center = new THREE.Vector3(cx, cy, cz);
     
     moldVolumeCells.push({
       index: new THREE.Vector3(i, j, k),
@@ -2259,9 +2366,327 @@ export async function generateVolumetricGridParallel(
       size: cellSize.clone(),
       isMoldVolume: true,
     });
+    
+    // Store in flat arrays
+    const i3 = moldIdx * 3;
+    voxelCenters[i3] = cx;
+    voxelCenters[i3 + 1] = cy;
+    voxelCenters[i3 + 2] = cz;
+    voxelIndices[i3] = i;
+    voxelIndices[i3 + 1] = j;
+    voxelIndices[i3 + 2] = k;
+    
+    moldIdx++;
   }
   
-  // Clean up
+  const voxelizationEndTime = performance.now();
+  console.log(`[Parallel] Voxelization complete: ${moldVolumeCells.length} mold volume cells in ${(voxelizationEndTime - startTime).toFixed(1)}ms`);
+  
+  // ========================================================================
+  // PARALLEL DISTANCE FIELD COMPUTATION
+  // Use workers to compute distances in parallel
+  // ========================================================================
+  
+  const distanceStartTime = performance.now();
+  // voxelCount is already defined above when creating flat arrays
+  const voxelDist = new Float32Array(voxelCount);
+  const voxelDistToShell = new Float32Array(voxelCount);
+  
+  // Create voxel centers array for workers (reuse from flat arrays)
+  const voxelCentersArray = voxelCenters;
+  
+  // Initialize distance workers
+  const distanceWorkers: Worker[] = [];
+  const distanceWorkerReadyPromises: Promise<void>[] = [];
+  
+  console.log(`[Parallel] Initializing ${numWorkers} distance workers...`);
+  
+  for (let i = 0; i < numWorkers; i++) {
+    const worker = new Worker(
+      new URL('./distanceFieldWorker.ts', import.meta.url),
+      { type: 'module' }
+    );
+    distanceWorkers.push(worker);
+    
+    distanceWorkerReadyPromises.push(new Promise<void>((resolve) => {
+      const handler = (event: MessageEvent) => {
+        if (event.data.type === 'ready') {
+          worker.removeEventListener('message', handler);
+          resolve();
+        }
+      };
+      worker.addEventListener('message', handler);
+    }));
+    
+    // Send init message with geometry data
+    const initMsg = {
+      type: 'init',
+      workerId: i,
+      partPositionArray: partData.positionArray.slice(),
+      partIndexArray: partData.indexArray?.slice() ?? null,
+      shellPositionArray: shellData.positionArray.slice(),
+      shellIndexArray: shellData.indexArray?.slice() ?? null,
+    };
+    
+    const transfers: Transferable[] = [initMsg.partPositionArray.buffer, initMsg.shellPositionArray.buffer];
+    if (initMsg.partIndexArray) transfers.push(initMsg.partIndexArray.buffer);
+    if (initMsg.shellIndexArray) transfers.push(initMsg.shellIndexArray.buffer);
+    
+    worker.postMessage(initMsg, transfers);
+  }
+  
+  await Promise.all(distanceWorkerReadyPromises);
+  console.log(`[Parallel] Distance workers initialized`);
+  
+  // Distribute voxels across workers
+  const voxelsPerWorker = Math.ceil(voxelCount / numWorkers);
+  const distancePromises: Promise<{ startIndex: number; partDistances: Float32Array; shellDistances: Float32Array }>[] = [];
+  
+  for (let w = 0; w < numWorkers; w++) {
+    const startIdx = w * voxelsPerWorker;
+    const endIdx = Math.min(startIdx + voxelsPerWorker, voxelCount);
+    if (endIdx <= startIdx) continue;
+    
+    const voxelCenters = voxelCentersArray.slice(startIdx * 3, endIdx * 3);
+    
+    distancePromises.push(new Promise((resolve) => {
+      const handler = (event: MessageEvent) => {
+        if (event.data.type === 'result' && event.data.workerId === w) {
+          distanceWorkers[w].removeEventListener('message', handler);
+          resolve({
+            startIndex: event.data.startIndex,
+            partDistances: event.data.partDistances,
+            shellDistances: event.data.shellDistances,
+          });
+        }
+      };
+      distanceWorkers[w].addEventListener('message', handler);
+    }));
+    
+    distanceWorkers[w].postMessage({
+      type: 'compute',
+      voxelCenters,
+      startIndex: startIdx,
+    }, [voxelCenters.buffer]);
+  }
+  
+  // Wait for all distance computations
+  const distanceResults = await Promise.all(distancePromises);
+  
+  // Terminate distance workers
+  distanceWorkers.forEach(w => w.terminate());
+  
+  // Merge results into the distance arrays
+  for (const result of distanceResults) {
+    const { startIndex, partDistances, shellDistances } = result;
+    for (let i = 0; i < partDistances.length; i++) {
+      voxelDist[startIndex + i] = partDistances[i];
+      voxelDistToShell[startIndex + i] = shellDistances[i];
+    }
+  }
+  
+  // Find min/max and R line visualization data
+  let minDist = Infinity;
+  let maxDist = -Infinity;
+  let maxDistIdx = -1;
+  let rLineStart: THREE.Vector3 | null = null;
+  let rLineEnd: THREE.Vector3 | null = null;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    const dist = voxelDist[i];
+    if (dist < minDist) minDist = dist;
+    if (dist > maxDist) {
+      maxDist = dist;
+      maxDistIdx = i;
+    }
+  }
+  
+  // Get R line endpoints (need to recompute closest point for the max distance voxel)
+  if (maxDistIdx >= 0) {
+    const partTester = new MeshInsideOutsideTester(partGeom, 'part');
+    const center = moldVolumeCells[maxDistIdx].center;
+    const target = { point: new THREE.Vector3(), distance: Infinity, faceIndex: 0 };
+    partTester.closestPointToPoint(center, target);
+    rLineStart = center.clone();
+    rLineEnd = target.point.clone();
+    partTester.dispose();
+  }
+  
+  const R = maxDist;
+  const distanceStats = { min: minDist, max: maxDist };
+  
+  // Shell distance stats
+  let minShellDist = Infinity;
+  let maxShellDist = -Infinity;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    const dist = voxelDistToShell[i];
+    if (dist < minShellDist) minShellDist = dist;
+    if (dist > maxShellDist) maxShellDist = dist;
+  }
+  
+  const shellDistanceStats = { min: minShellDist, max: maxShellDist };
+  
+  const distanceEndTime = performance.now();
+  console.log(`[Parallel] Distance fields computed in ${(distanceEndTime - distanceStartTime).toFixed(1)}ms`);
+  console.log(`  R (max voxel distance to part): ${R.toFixed(6)}`);
+  
+  // ========================================================================
+  // BOUNDARY DETECTION AND BIASED DISTANCE COMPUTATION
+  // ========================================================================
+  
+  // Build spatial index for neighbor lookups
+  const voxelSpatialIndex = new Map<string, number>();
+  for (let i = 0; i < voxelCount; i++) {
+    const cell = moldVolumeCells[i];
+    const key = `${Math.round(cell.index.x)},${Math.round(cell.index.y)},${Math.round(cell.index.z)}`;
+    voxelSpatialIndex.set(key, i);
+  }
+  
+  const getVoxelIdx = (gi: number, gj: number, gk: number): number => {
+    const key = `${gi},${gj},${gk}`;
+    return voxelSpatialIndex.get(key) ?? -1;
+  };
+  
+  // 6-connected neighbor offsets
+  const faceNeighborOffsets: [number, number, number][] = [
+    [1, 0, 0], [-1, 0, 0],
+    [0, 1, 0], [0, -1, 0],
+    [0, 0, 1], [0, 0, -1],
+  ];
+  
+  // Find ALL surface voxels
+  const isSurfaceVoxel = new Uint8Array(voxelCount);
+  let totalSurfaceCount = 0;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    const cell = moldVolumeCells[i];
+    const gi = Math.round(cell.index.x);
+    const gj = Math.round(cell.index.y);
+    const gk = Math.round(cell.index.z);
+    
+    for (const [di, dj, dk] of faceNeighborOffsets) {
+      const neighborIdx = getVoxelIdx(gi + di, gj + dj, gk + dk);
+      if (neighborIdx < 0) {
+        isSurfaceVoxel[i] = 1;
+        totalSurfaceCount++;
+        break;
+      }
+    }
+  }
+  
+  // Distinguish inner vs outer surface using distance-to-part
+  const surfaceDistances: number[] = [];
+  const surfaceIndices: number[] = [];
+  for (let i = 0; i < voxelCount; i++) {
+    if (isSurfaceVoxel[i]) {
+      surfaceDistances.push(voxelDist[i]);
+      surfaceIndices.push(i);
+    }
+  }
+  
+  const sortedPairs = surfaceIndices.map((idx, i) => ({ idx, dist: surfaceDistances[i] }));
+  sortedPairs.sort((a, b) => a.dist - b.dist);
+  
+  const surfaceMinDist = sortedPairs[0]?.dist || 0;
+  const surfaceMaxDist = sortedPairs[sortedPairs.length - 1]?.dist || 0;
+  
+  let maxGap = 0;
+  let gapIndex = Math.floor(sortedPairs.length / 2);
+  
+  for (let i = 1; i < sortedPairs.length; i++) {
+    const gap = sortedPairs[i].dist - sortedPairs[i - 1].dist;
+    if (gap > maxGap) {
+      maxGap = gap;
+      gapIndex = i;
+    }
+  }
+  
+  const distanceThreshold = sortedPairs[gapIndex]?.dist || (surfaceMinDist + surfaceMaxDist) / 2;
+  
+  // Mark OUTER surface voxels
+  const isOuterSurface = new Uint8Array(voxelCount);
+  
+  for (let i = 0; i < voxelCount; i++) {
+    if (isSurfaceVoxel[i] && voxelDist[i] >= distanceThreshold) {
+      isOuterSurface[i] = 1;
+    }
+  }
+  
+  // Build mask for boundary voxels (outer surface + one level deep)
+  const isBoundaryAdjacent = new Uint8Array(voxelCount);
+  let boundaryAdjacentCount = 0;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    if (isOuterSurface[i]) {
+      isBoundaryAdjacent[i] = 1;
+      boundaryAdjacentCount++;
+    }
+  }
+  
+  for (let i = 0; i < voxelCount; i++) {
+    if (isOuterSurface[i]) {
+      const cell = moldVolumeCells[i];
+      const gi = Math.round(cell.index.x);
+      const gj = Math.round(cell.index.y);
+      const gk = Math.round(cell.index.z);
+      
+      for (const [di, dj, dk] of faceNeighborOffsets) {
+        const neighborIdx = getVoxelIdx(gi + di, gj + dj, gk + dk);
+        if (neighborIdx >= 0 && !isBoundaryAdjacent[neighborIdx]) {
+          isBoundaryAdjacent[neighborIdx] = 1;
+          boundaryAdjacentCount++;
+        }
+      }
+    }
+  }
+  
+  // Compute biased distances
+  const w1 = DEFAULT_BIASED_DISTANCE_WEIGHTS.partDistanceWeight;
+  const w2 = DEFAULT_BIASED_DISTANCE_WEIGHTS.shellBiasWeight;
+  
+  const biasedDist = new Float32Array(voxelCount);
+  let minBiasedDist = Infinity;
+  let maxBiasedDist = -Infinity;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    const delta_i = voxelDist[i];
+    
+    let biased: number;
+    if (isBoundaryAdjacent[i]) {
+      const delta_w = voxelDistToShell[i];
+      const lambda_w = R - delta_w;
+      biased = w1 * delta_i + w2 * lambda_w;
+    } else {
+      biased = w1 * delta_i;
+    }
+    
+    biasedDist[i] = biased;
+    
+    if (biased < minBiasedDist) minBiasedDist = biased;
+    if (biased > maxBiasedDist) maxBiasedDist = biased;
+  }
+  
+  const biasedDistanceStats = { min: minBiasedDist, max: maxBiasedDist };
+  
+  // Compute weighting factors
+  const weightingFactor = new Float32Array(voxelCount);
+  let minWeight = Infinity;
+  let maxWeight = -Infinity;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    const bd = biasedDist[i];
+    const wt = 1.0 / (bd * bd + 0.25);
+    
+    weightingFactor[i] = wt;
+    
+    if (wt < minWeight) minWeight = wt;
+    if (wt > maxWeight) maxWeight = wt;
+  }
+  
+  const weightingFactorStats = { min: minWeight, max: maxWeight };
+  
+  // Clean up geometries
   shellGeom.dispose();
   partGeom.dispose();
   
@@ -2279,27 +2704,33 @@ export async function generateVolumetricGridParallel(
     computeTimeMs: endTime - startTime,
   };
   
+  console.log(`[Parallel] Grid generation complete:`);
+  console.log(`  Total time: ${stats.computeTimeMs.toFixed(1)}ms`);
+  console.log(`  Mold volume cells: ${moldVolumeCells.length} / ${totalCellCount}`);
+  
   return {
     allCells: [],
     moldVolumeCells,
+    voxelCenters,
+    voxelIndices,
     resolution: new THREE.Vector3(resX, resY, resZ),
     totalCellCount,
     moldVolumeCellCount: moldVolumeCells.length,
     boundingBox,
     cellSize,
     stats,
-    voxelDist: null,
-    voxelDistToShell: null,
-    biasedDist: null,
-    weightingFactor: null,
-    distanceStats: null,
-    shellDistanceStats: null,
-    biasedDistanceStats: null,
-    weightingFactorStats: null,
-    R: 0, // Not computed in worker-based version
-    rLineStart: null,
-    rLineEnd: null,
-    boundaryAdjacentMask: null, // Not computed in worker-based version
+    voxelDist,
+    voxelDistToShell,
+    biasedDist,
+    weightingFactor,
+    distanceStats,
+    shellDistanceStats,
+    biasedDistanceStats,
+    weightingFactorStats,
+    R,
+    rLineStart,
+    rLineEnd,
+    boundaryAdjacentMask: isBoundaryAdjacent,
   };
 }
 
