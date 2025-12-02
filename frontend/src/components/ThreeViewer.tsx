@@ -55,12 +55,11 @@ import {
 } from '../utils/moldHalfClassification';
 import {
   computeEscapeLabeling,
-  computeEscapeLabelingDijkstra,
+  computeEscapeLabelingDijkstraAsync,
   createEscapeLabelingPointCloud,
   createDebugVisualization,
   type EscapeLabelingResult,
   type AdjacencyType,
-  type PartingSurfaceDebugMode
 } from '../utils/partingSurface';
 
 // ============================================================================
@@ -767,92 +766,123 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
       const needsRecompute = !escapeLabelingRef.current;
       
       if (needsRecompute) {
-        try {
-          console.log('Computing escape labeling (parting surface)...');
+        // Use async IIFE to handle the async computeEscapeLabelingDijkstraAsync call
+        (async () => {
+          try {
+            console.log('Computing escape labeling (parting surface)...');
+            
+            let labeling: EscapeLabelingResult;
+            
+            // Check if we have mold half classification and CSG result for Dijkstra-based labeling
+            if (moldHalfClassificationRef.current && csgResultRef.current) {
+              console.log('Using Dijkstra-based escape labeling with mold half classification');
+              
+              // Get CSG cavity geometry in world space (this is the outer shell ∂H)
+              const shellGeometry = csgResultRef.current.mesh.geometry.clone();
+              shellGeometry.applyMatrix4(csgResultRef.current.mesh.matrixWorld);
+              
+              // Get part geometry in world space for volume intersection seed detection
+              const partGeometry = meshRef.current!.geometry.clone();
+              partGeometry.applyMatrix4(meshRef.current!.matrixWorld);
+              
+              // Compute escape labeling using multi-source Dijkstra
+              // Seeds are voxels with ≥10% volume intersection with part mesh
+              // Uses parallel Web Workers for faster computation on multi-core systems
+              labeling = await computeEscapeLabelingDijkstraAsync(
+                volumetricGridRef.current!,
+                shellGeometry,
+                moldHalfClassificationRef.current,
+                { 
+                  adjacency: partingSurfaceAdjacency, 
+                  seedRadius: 1.5,
+                  seedVolumeThreshold: 0.10,  // 10% volume intersection threshold
+                  seedVolumeSamples: 4,       // 4³ = 64 samples per voxel
+                  parallel: true,             // Enable parallel processing with Web Workers
+                },
+                partGeometry  // Pass part geometry for volume intersection
+              );
+              
+              shellGeometry.dispose();
+              partGeometry.dispose();
+            } else {
+              console.log('Falling back to legacy escape labeling (no mold half classification)');
+              
+              // Get part geometry in world space
+              const partGeometry = meshRef.current!.geometry.clone();
+              partGeometry.applyMatrix4(meshRef.current!.matrixWorld);
+              
+              // Get d1/d2 directions from visibility data
+              const { d1, d2 } = visibilityDataRef.current!;
+              
+              // Compute escape labeling using legacy method
+              labeling = computeEscapeLabeling(
+                volumetricGridRef.current!,
+                partGeometry,
+                d1,
+                d2,
+                { adjacency: partingSurfaceAdjacency }
+              );
+              
+              partGeometry.dispose();
+            }
+            
+            escapeLabelingRef.current = labeling;
+            onEscapeLabelingReady?.(labeling);
+            
+            // Create visualization after labeling is computed
+            if (escapeLabelingRef.current && volumetricGridRef.current) {
+              const labeling = escapeLabelingRef.current;
+              
+              if (partingSurfaceDebugMode !== 'none') {
+                // Debug visualization mode
+                console.log(`Using debug visualization mode: ${partingSurfaceDebugMode}`);
+                escapeLabelingVisualizationRef.current = createDebugVisualization(
+                  volumetricGridRef.current,
+                  labeling,
+                  partingSurfaceDebugMode,
+                  6  // larger point size for visibility
+                );
+              } else {
+                escapeLabelingVisualizationRef.current = createEscapeLabelingPointCloud(
+                  volumetricGridRef.current,
+                  labeling,
+                  3
+                );
+              }
+              
+              if (escapeLabelingVisualizationRef.current) {
+                scene.add(escapeLabelingVisualizationRef.current);
+              }
+            }
+          } catch (error) {
+            console.error('Error computing escape labeling:', error);
+          }
+        })();
+      } else {
+        // Use cached result - create visualization synchronously
+        if (escapeLabelingRef.current && volumetricGridRef.current) {
+          const labeling = escapeLabelingRef.current;
           
-          let labeling: EscapeLabelingResult;
-          
-          // Check if we have mold half classification and CSG result for Dijkstra-based labeling
-          if (moldHalfClassificationRef.current && csgResultRef.current) {
-            console.log('Using Dijkstra-based escape labeling with mold half classification');
-            
-            // Get CSG cavity geometry in world space (this is the outer shell ∂H)
-            const shellGeometry = csgResultRef.current.mesh.geometry.clone();
-            shellGeometry.applyMatrix4(csgResultRef.current.mesh.matrixWorld);
-            
-            // Get part geometry in world space for volume intersection seed detection
-            const partGeometry = meshRef.current.geometry.clone();
-            partGeometry.applyMatrix4(meshRef.current.matrixWorld);
-            
-            // Compute escape labeling using multi-source Dijkstra
-            // Seeds are voxels with ≥10% volume intersection with part mesh
-            labeling = computeEscapeLabelingDijkstra(
+          if (partingSurfaceDebugMode !== 'none') {
+            // Debug visualization mode
+            console.log(`Using debug visualization mode: ${partingSurfaceDebugMode}`);
+            escapeLabelingVisualizationRef.current = createDebugVisualization(
               volumetricGridRef.current,
-              shellGeometry,
-              moldHalfClassificationRef.current,
-              { 
-                adjacency: partingSurfaceAdjacency, 
-                seedRadius: 1.5,
-                seedVolumeThreshold: 0.10,  // 10% volume intersection threshold
-                seedVolumeSamples: 4        // 4³ = 64 samples per voxel
-              },
-              partGeometry  // Pass part geometry for volume intersection
+              labeling,
+              partingSurfaceDebugMode,
+              6  // larger point size for visibility
             );
-            
-            shellGeometry.dispose();
-            partGeometry.dispose();
           } else {
-            console.log('Falling back to legacy escape labeling (no mold half classification)');
-            
-            // Get part geometry in world space
-            const partGeometry = meshRef.current.geometry.clone();
-            partGeometry.applyMatrix4(meshRef.current.matrixWorld);
-            
-            // Get d1/d2 directions from visibility data
-            const { d1, d2 } = visibilityDataRef.current;
-            
-            // Compute escape labeling using legacy method
-            labeling = computeEscapeLabeling(
+            escapeLabelingVisualizationRef.current = createEscapeLabelingPointCloud(
               volumetricGridRef.current,
-              partGeometry,
-              d1,
-              d2,
-              { adjacency: partingSurfaceAdjacency }
+              labeling,
+              3
             );
-            
-            partGeometry.dispose();
           }
           
-          escapeLabelingRef.current = labeling;
-          onEscapeLabelingReady?.(labeling);
-        } catch (error) {
-          console.error('Error computing escape labeling:', error);
-        }
-      }
-      
-      // Create visualization from labeling data (cached or newly computed)
-      if (escapeLabelingRef.current && volumetricGridRef.current) {
-        const labeling = escapeLabelingRef.current;
-        
-        if (partingSurfaceDebugMode !== 'none') {
-          // Debug visualization mode
-          console.log(`Using debug visualization mode: ${partingSurfaceDebugMode}`);
-          escapeLabelingVisualizationRef.current = createDebugVisualization(
-            volumetricGridRef.current,
-            labeling,
-            partingSurfaceDebugMode,
-            6  // larger point size for visibility
-          );
-        } else {
-          escapeLabelingVisualizationRef.current = createEscapeLabelingPointCloud(
-            volumetricGridRef.current,
-            labeling,
-            3
-          );
-        }
-        
-        if (escapeLabelingVisualizationRef.current) {
-          scene.add(escapeLabelingVisualizationRef.current);
+          if (escapeLabelingVisualizationRef.current) {
+            scene.add(escapeLabelingVisualizationRef.current);
+          }
         }
       }
       

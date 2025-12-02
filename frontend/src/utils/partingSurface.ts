@@ -29,6 +29,7 @@ import * as THREE from 'three';
 import { MeshBVH, acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from 'three-mesh-bvh';
 import type { VolumetricGridResult } from './volumetricGrid';
 import type { MoldHalfClassificationResult } from './moldHalfClassification';
+import { runParallelDijkstra, isWebWorkersAvailable } from './parallelDijkstra';
 
 // Extend Three.js with BVH acceleration
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
@@ -75,6 +76,17 @@ export interface EscapeLabelingOptions {
   seedVolumeThreshold?: number;
   /** Number of sample points per axis for volume intersection test (default: 4 = 64 samples) */
   seedVolumeSamples?: number;
+  /** 
+   * Enable parallel processing using Web Workers.
+   * Set to true to automatically use available CPU cores, or a number to specify worker count.
+   * Default: false (single-threaded)
+   */
+  parallel?: boolean | number;
+  /** 
+   * Callback for progress updates during parallel processing.
+   * Only called when parallel=true.
+   */
+  onProgress?: (progress: { completed: number; total: number }) => void;
 }
 
 // ============================================================================
@@ -1202,6 +1214,177 @@ export function computeEscapeLabelingDijkstra(
     unlabeledCount,
     computeTimeMs,
     // DEBUG fields
+    boundaryLabels: boundaryLabel,
+    seedMask: innerSurfaceMask,
+  };
+}
+
+// ============================================================================
+// ASYNC PARALLEL VERSION (Uses Web Workers)
+// ============================================================================
+
+/**
+ * Async version of computeEscapeLabelingDijkstra that supports parallel processing
+ * via Web Workers. When parallel=true, the Dijkstra searches are distributed across
+ * multiple workers for significant speedup on multi-core systems.
+ * 
+ * For single-threaded execution (parallel=false), this delegates to the synchronous version.
+ */
+export async function computeEscapeLabelingDijkstraAsync(
+  gridResult: VolumetricGridResult,
+  shellGeometry: THREE.BufferGeometry,
+  classification: MoldHalfClassificationResult,
+  options: EscapeLabelingOptions = {},
+  partGeometry?: THREE.BufferGeometry
+): Promise<EscapeLabelingResult> {
+  const parallel = options.parallel ?? false;
+  
+  // If not parallel or Web Workers unavailable, use synchronous version
+  if (!parallel || !isWebWorkersAvailable()) {
+    return computeEscapeLabelingDijkstra(gridResult, shellGeometry, classification, options, partGeometry);
+  }
+  
+  const startTime = performance.now();
+  
+  const adjacency = options.adjacency ?? 6;
+  const seedRadius = options.seedRadius ?? 1.5;
+  const seedVolumeThreshold = options.seedVolumeThreshold ?? 0.75;
+  const seedVolumeSamples = options.seedVolumeSamples ?? 4;
+  const numWorkers = typeof parallel === 'number' ? parallel : undefined;
+  
+  const voxelCount = gridResult.moldVolumeCellCount;
+  const voxelSize = gridResult.cellSize.x;
+  
+  console.log('═══════════════════════════════════════════════════════');
+  console.log('ESCAPE LABELING (Parallel Dijkstra with Web Workers)');
+  console.log('═══════════════════════════════════════════════════════');
+  console.log(`  Voxel count: ${voxelCount}`);
+  console.log(`  Workers: ${numWorkers ?? 'auto (' + (navigator.hardwareConcurrency || 4) + ')'}`);
+  console.log(`  Adjacency: ${adjacency}-connected`);
+  console.log(`  Voxel size: ${voxelSize.toFixed(4)}`);
+  
+  if (!gridResult.voxelDist) {
+    throw new Error('Distance field (voxelDist) is required for escape labeling');
+  }
+  
+  if (!gridResult.weightingFactor) {
+    throw new Error('Weighting factor is required for escape labeling');
+  }
+  
+  // Build spatial index (used by identifyBoundaryAdjacentVoxels internally)
+  
+  // Create part mesh tester if geometry is provided
+  let partMeshTester: PartMeshTester | undefined;
+  if (partGeometry && seedVolumeThreshold > 0) {
+    console.log('  Building part mesh BVH for volume intersection...');
+    partMeshTester = new PartMeshTester(partGeometry);
+  }
+  
+  // Step 1: Identify boundary-adjacent voxels (same as sync version)
+  console.log('Identifying boundary-adjacent voxels...');
+  const { boundaryLabel, innerSurfaceMask, h1Adjacent, h2Adjacent, innerSurfaceCount } = identifyBoundaryAdjacentVoxels(
+    gridResult,
+    shellGeometry,
+    classification,
+    seedRadius,
+    partMeshTester,
+    seedVolumeThreshold,
+    seedVolumeSamples
+  );
+  
+  if (partMeshTester) {
+    partMeshTester.dispose();
+  }
+  
+  console.log(`  H₁ adjacent: ${h1Adjacent}`);
+  console.log(`  H₂ adjacent: ${h2Adjacent}`);
+  console.log(`  Seeds: ${innerSurfaceCount}`);
+  
+  // Collect seed indices
+  const seedIndices: number[] = [];
+  for (let i = 0; i < voxelCount; i++) {
+    if (innerSurfaceMask[i]) {
+      seedIndices.push(i);
+    }
+  }
+  console.log(`  Total seeds: ${seedIndices.length}`);
+  
+  // Step 2: Run parallel Dijkstra
+  console.log('Running parallel Dijkstra from each seed to find nearest boundary...');
+  
+  const parallelResult = await runParallelDijkstra(
+    gridResult,
+    seedIndices,
+    boundaryLabel,
+    {
+      numWorkers,
+      maxHopDistance: 5,
+      onProgress: options.onProgress ? (p) => {
+        options.onProgress?.({ completed: p.completed, total: p.total });
+      } : undefined,
+    }
+  );
+  
+  const seedLabel = parallelResult.seedLabel;
+  
+  // Count seed labels
+  let h1Seeds = 0, h2Seeds = 0, unlabeledSeeds = 0;
+  for (const seedIdx of seedIndices) {
+    if (seedLabel[seedIdx] === 1) h1Seeds++;
+    else if (seedLabel[seedIdx] === 2) h2Seeds++;
+    else unlabeledSeeds++;
+  }
+  console.log(`  Seeds after Dijkstra: H₁=${h1Seeds}, H₂=${h2Seeds}, orphaned=${unlabeledSeeds}`);
+  
+  // Step 3: Build final label array
+  const voxelLabel = new Int8Array(voxelCount).fill(-1);
+  
+  // Label seeds
+  for (let i = 0; i < voxelCount; i++) {
+    if (innerSurfaceMask[i]) {
+      voxelLabel[i] = seedLabel[i];
+    }
+  }
+  
+  // Also label boundary voxels
+  for (let i = 0; i < voxelCount; i++) {
+    if (boundaryLabel[i] !== 0) {
+      voxelLabel[i] = boundaryLabel[i];
+    }
+  }
+  
+  // Count results
+  const escapeCost = new Float32Array(voxelCount).fill(0);
+  let d1Count = 0;
+  let d2Count = 0;
+  let unlabeledCount = 0;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    const label = voxelLabel[i];
+    if (label === 1) d1Count++;
+    else if (label === 2) d2Count++;
+    else unlabeledCount++;
+  }
+  
+  const computeTimeMs = performance.now() - startTime;
+  
+  console.log('───────────────────────────────────────────────────────');
+  console.log('PARALLEL ESCAPE LABELING RESULTS:');
+  console.log(`  H₁ (side 1): ${d1Count} (${(d1Count / voxelCount * 100).toFixed(1)}%)`);
+  console.log(`  H₂ (side 2): ${d2Count} (${(d2Count / voxelCount * 100).toFixed(1)}%)`);
+  console.log(`  Unlabeled:   ${unlabeledCount} (${(unlabeledCount / voxelCount * 100).toFixed(1)}%)`);
+  console.log(`  Total time: ${computeTimeMs.toFixed(1)}ms`);
+  console.log(`  Dijkstra time: ${parallelResult.totalTimeMs.toFixed(1)}ms`);
+  console.log('═══════════════════════════════════════════════════════');
+  
+  return {
+    labels: voxelLabel,
+    escapeCost,
+    d1Count,
+    d2Count,
+    interfaceCount: 0,
+    unlabeledCount,
+    computeTimeMs,
     boundaryLabels: boundaryLabel,
     seedMask: innerSurfaceMask,
   };
