@@ -2,10 +2,14 @@
  * Web Worker for parallelized Dijkstra search
  * 
  * OPTIMIZED VERSION:
+ * - Flat array-based priority queue (no object allocation)
  * - Direct 3D array index lookup (no string keys)
  * - 6-connected neighbors only (faster, usually sufficient)
  * - Inlined hot paths
  */
+
+// Maximum heap size to prevent memory exhaustion (16M entries = ~96MB)
+const MAX_HEAP_CAPACITY = 16 * 1024 * 1024;
 
 // ============================================================================
 // OPTIMIZED MIN-HEAP (Flat arrays, no object allocation)
@@ -18,9 +22,9 @@ class FastMinHeap {
   private capacity: number;
 
   constructor(initialCapacity: number = 4096) {
-    this.capacity = initialCapacity;
-    this.indices = new Uint32Array(initialCapacity);
-    this.costs = new Float32Array(initialCapacity);
+    this.capacity = Math.min(initialCapacity, MAX_HEAP_CAPACITY);
+    this.indices = new Uint32Array(this.capacity);
+    this.costs = new Float32Array(this.capacity);
   }
 
   get size(): number {
@@ -33,7 +37,22 @@ class FastMinHeap {
 
   push(index: number, cost: number): void {
     if (this.size_ >= this.capacity) {
-      this.grow();
+      if (!this.grow()) {
+        // Cannot grow further - drop the item with highest cost if new item is better
+        // Find max in heap and replace if this is better
+        if (this.size_ > 0) {
+          let maxPos = 0;
+          for (let i = 1; i < this.size_; i++) {
+            if (this.costs[i] > this.costs[maxPos]) maxPos = i;
+          }
+          if (cost < this.costs[maxPos]) {
+            this.indices[maxPos] = index;
+            this.costs[maxPos] = cost;
+            this.heapify(maxPos);
+          }
+        }
+        return;
+      }
     }
     
     let pos = this.size_++;
@@ -72,25 +91,32 @@ class FastMinHeap {
     return { index: minIdx, cost: minCost };
   }
 
-  private bubbleDown(): void {
-    let pos = 0;
+  private heapify(pos: number): void {
+    // Bubble up first
+    while (pos > 0) {
+      const parent = (pos - 1) >> 1;
+      if (this.costs[pos] >= this.costs[parent]) break;
+      const tmpIdx = this.indices[pos];
+      const tmpCost = this.costs[pos];
+      this.indices[pos] = this.indices[parent];
+      this.costs[pos] = this.costs[parent];
+      this.indices[parent] = tmpIdx;
+      this.costs[parent] = tmpCost;
+      pos = parent;
+    }
+    // Then bubble down
+    this.bubbleDownFrom(pos);
+  }
+
+  private bubbleDownFrom(pos: number): void {
     const n = this.size_;
-    
     while (true) {
       const left = (pos << 1) + 1;
       const right = left + 1;
       let smallest = pos;
-      
-      if (left < n && this.costs[left] < this.costs[smallest]) {
-        smallest = left;
-      }
-      if (right < n && this.costs[right] < this.costs[smallest]) {
-        smallest = right;
-      }
-      
+      if (left < n && this.costs[left] < this.costs[smallest]) smallest = left;
+      if (right < n && this.costs[right] < this.costs[smallest]) smallest = right;
       if (smallest === pos) break;
-      
-      // Swap
       const tmpIdx = this.indices[pos];
       const tmpCost = this.costs[pos];
       this.indices[pos] = this.indices[smallest];
@@ -101,14 +127,31 @@ class FastMinHeap {
     }
   }
 
-  private grow(): void {
-    this.capacity *= 2;
-    const newIndices = new Uint32Array(this.capacity);
-    const newCosts = new Float32Array(this.capacity);
-    newIndices.set(this.indices);
-    newCosts.set(this.costs);
-    this.indices = newIndices;
-    this.costs = newCosts;
+  private bubbleDown(): void {
+    this.bubbleDownFrom(0);
+  }
+
+  private grow(): boolean {
+    const newCapacity = Math.min(this.capacity * 2, MAX_HEAP_CAPACITY);
+    if (newCapacity <= this.capacity) {
+      // Cannot grow further
+      return false;
+    }
+    
+    try {
+      const newIndices = new Uint32Array(newCapacity);
+      const newCosts = new Float32Array(newCapacity);
+      newIndices.set(this.indices);
+      newCosts.set(this.costs);
+      this.indices = newIndices;
+      this.costs = newCosts;
+      this.capacity = newCapacity;
+      return true;
+    } catch (e) {
+      // Memory allocation failed
+      console.warn(`[DijkstraWorker] Failed to grow heap to ${newCapacity}, keeping current size ${this.capacity}`);
+      return false;
+    }
   }
 }
 
@@ -285,7 +328,13 @@ function processSeedBatch(input: DijkstraWorkerInput): DijkstraWorkerOutput {
     let foundBoundary = false;
     let boundaryLabelFound = 0;
     
-    while (pq.size > 0) {
+    // Maximum iterations per seed to prevent runaway searches
+    // With 6-connectivity, this allows searching ~500k voxels which should be plenty
+    const MAX_ITERATIONS_PER_SEED = 500000;
+    let iterations = 0;
+    
+    while (pq.size > 0 && iterations < MAX_ITERATIONS_PER_SEED) {
+      iterations++;
       const current = pq.pop()!;
       const idx = current.index;
       const currentCost = current.cost;
