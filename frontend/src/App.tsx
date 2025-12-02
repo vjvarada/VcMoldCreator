@@ -6,6 +6,7 @@
  */
 
 import React, { useState, useCallback, useRef } from 'react';
+import * as THREE from 'three';
 import './App.css';
 import ThreeViewer, { type GridVisualizationMode, type ThreeViewerHandle } from './components/ThreeViewer';
 import type { VisibilityPaintData } from './utils/partingDirection';
@@ -52,6 +53,7 @@ interface CsgStats {
 
 interface VolumetricGridStats {
   resolution: { x: number; y: number; z: number };
+  cellSize: { x: number; y: number; z: number };
   totalCellCount: number;
   moldVolumeCellCount: number;
   moldVolume: number;
@@ -81,7 +83,8 @@ function App() {
     repairMethod: string;
   } | null>(null);
   const [showVolumetricGrid, setShowVolumetricGrid] = useState(false);
-  const [gridResolution, setGridResolution] = useState(64);
+  // undefined = auto-calculate based on bounding box diagonal
+  const [gridResolution, setGridResolution] = useState<number | undefined>(undefined);
   const [gridVisualizationMode, setGridVisualizationMode] = useState<GridVisualizationMode>('points');
   const [volumetricGridStats, setVolumetricGridStats] = useState<VolumetricGridStats | null>(null);
   const [useGPUGrid, setUseGPUGrid] = useState(true);
@@ -235,7 +238,20 @@ function App() {
     setActiveStep('parting');
   }, [stlUrl]);
 
-  const handleMeshLoaded = useCallback(() => setMeshLoaded(true), []);
+  const handleMeshLoaded = useCallback((mesh: THREE.Mesh) => {
+    setMeshLoaded(true);
+    
+    // Compute bounding box diagonal and set default inflation offset to 15%
+    if (mesh.geometry.boundingBox) {
+      const size = new THREE.Vector3();
+      mesh.geometry.boundingBox.getSize(size);
+      // Apply the mesh scale to get actual world-space size
+      size.multiply(mesh.scale);
+      const diagonal = size.length();
+      const defaultOffset = diagonal * 0.15; // 15% of bounding box diagonal
+      setInflationOffset(defaultOffset);
+    }
+  }, []);
 
   const handleMeshRepaired = useCallback(
     (result: MeshRepairResult) => {
@@ -293,18 +309,20 @@ function App() {
     (result: VolumetricGridResult | null) => {
       setVolumetricGridStats(result ? {
         resolution: { x: result.resolution.x, y: result.resolution.y, z: result.resolution.z },
+        cellSize: { x: result.cellSize.x, y: result.cellSize.y, z: result.cellSize.z },
         totalCellCount: result.totalCellCount,
         moldVolumeCellCount: result.moldVolumeCellCount,
         moldVolume: result.stats.moldVolume,
         fillRatio: result.stats.fillRatio,
         computeTimeMs: result.stats.computeTimeMs,
       } : null);
-      // Track the parameters used for this computation
+      // Track the actual computed resolution (may be auto-calculated)
       if (result) {
-        setLastComputedGridResolution(gridResolution);
+        // Store the actual resolution from the result (handles auto-calculation case)
+        setLastComputedGridResolution(result.resolution.x);
       }
     },
-    [gridResolution]
+    []
   );
 
   const handleMoldHalfClassificationReady = useCallback(
@@ -381,8 +399,9 @@ function App() {
         // Voxel depends on mold-halves (or at least cavity)
         if (getStepStatus('cavity') === 'locked') return 'locked';
         if (volumetricGridStats) {
-          // Check if parameters changed
-          if (lastComputedGridResolution !== null && gridResolution !== lastComputedGridResolution) {
+          // Check if parameters changed - only if user explicitly set a resolution
+          // (gridResolution undefined means auto-calculate, so no recalc needed)
+          if (gridResolution !== undefined && lastComputedGridResolution !== null && gridResolution !== lastComputedGridResolution) {
             return 'needs-recalc';
           }
           return 'completed';
@@ -689,20 +708,26 @@ function App() {
 
         {activeStep === 'voxel' && status !== 'locked' && (
           <div style={styles.optionsSection}>
-            <div style={styles.optionLabel}>Grid Resolution:</div>
+            <div style={styles.optionLabel}>Grid Resolution: {gridResolution === undefined ? '(Auto)' : ''}</div>
             <input
-              type="number"
-              min="8"
-              max="128"
-              step="8"
-              defaultValue={gridResolution}
+              type="text"
+              placeholder="Auto"
+              defaultValue={gridResolution !== undefined ? String(gridResolution) : ''}
               key={`grid-res-${lastComputedGridResolution}`}
               onBlur={(e) => {
-                const val = e.target.value;
-                const num = parseInt(val) || 64;
-                const clamped = Math.max(8, Math.min(128, num));
-                e.target.value = String(clamped);
-                handleGridResolutionChange(clamped);
+                const val = e.target.value.trim();
+                if (val === '' || val.toLowerCase() === 'auto') {
+                  e.target.value = '';
+                  setGridResolution(undefined);
+                  if (volumetricGridStats && lastComputedGridResolution !== null) {
+                    clearFromStep('voxel');
+                  }
+                } else {
+                  const num = parseInt(val) || 64;
+                  const clamped = Math.max(16, Math.min(128, num));
+                  e.target.value = String(clamped);
+                  handleGridResolutionChange(clamped);
+                }
               }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
@@ -711,6 +736,9 @@ function App() {
               }}
               style={styles.input}
             />
+            <div style={{ fontSize: '11px', color: '#868e96', marginTop: '4px' }}>
+              Leave empty for auto (2% of diagonal). Range: 16-128
+            </div>
 
             <div style={{ ...styles.optionLabel, marginTop: '16px' }}>Visualization:</div>
             <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
@@ -755,6 +783,7 @@ function App() {
             {volumetricGridStats && (
               <div style={styles.statsBox}>
                 <div>Resolution: {volumetricGridStats.resolution.x}×{volumetricGridStats.resolution.y}×{volumetricGridStats.resolution.z}</div>
+                <div>Voxel size: {volumetricGridStats.cellSize.x.toFixed(3)} × {volumetricGridStats.cellSize.y.toFixed(3)} × {volumetricGridStats.cellSize.z.toFixed(3)}</div>
                 <div>Mold cells: {volumetricGridStats.moldVolumeCellCount.toLocaleString()}</div>
                 <div>Fill ratio: {(volumetricGridStats.fillRatio * 100).toFixed(1)}%</div>
                 <div>Compute: {volumetricGridStats.computeTimeMs.toFixed(0)} ms</div>

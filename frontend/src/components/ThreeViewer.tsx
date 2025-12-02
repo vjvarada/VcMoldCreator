@@ -655,7 +655,8 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
           partGeometry.applyMatrix4(meshRef.current!.matrixWorld);
           
           const options: VolumetricGridOptions = {
-            resolution: gridResolution,
+            // Only pass resolution if explicitly provided, otherwise auto-calculate
+            ...(gridResolution !== undefined && { resolution: gridResolution }),
             storeAllCells: false,
             marginPercent: 0.02,
             computeDistances: false,
@@ -678,6 +679,7 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
           console.log(`  Mold volume cells: ${gridResult.moldVolumeCellCount} / ${gridResult.totalCellCount}`);
           console.log(`  Fill ratio: ${(gridResult.stats.fillRatio * 100).toFixed(1)}%`);
           console.log(`  Approx mold volume: ${gridResult.stats.moldVolume.toFixed(4)}`);
+          console.log(`  Cell size: ${gridResult.cellSize.x.toFixed(4)} × ${gridResult.cellSize.y.toFixed(4)} × ${gridResult.cellSize.z.toFixed(4)}`);
           console.log(`  Compute time: ${gridResult.stats.computeTimeMs.toFixed(1)} ms`);
           
           // Log memory size of voxel grid data

@@ -218,8 +218,14 @@ export interface VolumetricGridStats {
 }
 
 export interface VolumetricGridOptions {
-  /** Grid resolution (cells per dimension, or specify per-axis) */
+  /** Grid resolution (cells per dimension, or specify per-axis). If not provided, auto-calculated from targetVoxelSizePercent. */
   resolution?: number | THREE.Vector3;
+  /** 
+   * Target voxel size as percentage of bounding box diagonal (default: 1.5% = 0.015).
+   * Used to auto-calculate resolution when resolution is not explicitly provided.
+   * Smaller values = finer grid, better thin wall detection but slower.
+   */
+  targetVoxelSizePercent?: number;
   /** Whether to store all cells or only mold volume cells */
   storeAllCells?: boolean;
   /** Margin to add around bounding box (percentage, default 0.05 = 5%) */
@@ -236,6 +242,25 @@ export interface VolumetricGridOptions {
    * Default: false (only strictly contained voxels)
    */
   includeSurfaceVoxels?: boolean;
+  /**
+   * Maximum volume overlap ratio with the part mesh for a voxel to be considered a boundary voxel.
+   * If a voxel overlaps more than this ratio with the part, it's excluded (inside the part).
+   * Default: 0.10 (10%) - voxels with >10% overlap are considered inside the part.
+   * This helps prevent thin wall bridging issues.
+   */
+  maxPartOverlapRatio?: number;
+  /**
+   * Minimum volume overlap ratio with the part mesh for a voxel to be considered a surface voxel.
+   * Voxels with overlap between minPartOverlapRatio and maxPartOverlapRatio are surface voxels.
+   * Default: 0.01 (1%)
+   */
+  minPartOverlapRatio?: number;
+  /**
+   * Distance threshold as fraction of voxel size for surface voxel detection.
+   * Voxels within this distance of the part surface are considered surface voxels.
+   * Default: 0.5 (50% of voxel size)
+   */
+  surfaceDistanceThreshold?: number;
 }
 
 export interface BiasedDistanceWeights {
@@ -249,8 +274,60 @@ export interface BiasedDistanceWeights {
 // CONSTANTS
 // ============================================================================
 
-/** Default grid resolution (cells per dimension) */
+/** Default grid resolution (cells per dimension) - used as fallback */
 export const DEFAULT_GRID_RESOLUTION = 64;
+
+/** Default target voxel size as percentage of bounding box diagonal (2%) */
+export const DEFAULT_TARGET_VOXEL_SIZE_PERCENT = 0.02;
+
+/** Default maximum overlap ratio with part mesh for boundary voxels (10%) */
+export const DEFAULT_MAX_PART_OVERLAP_RATIO = 0.10;
+
+/** Default minimum overlap ratio with part mesh for surface voxels (1%) */
+export const DEFAULT_MIN_PART_OVERLAP_RATIO = 0.01;
+
+/** Default distance threshold as fraction of voxel size for surface voxels (50%) */
+export const DEFAULT_SURFACE_DISTANCE_THRESHOLD = 0.5;
+
+/** Minimum resolution to use (prevents too coarse grids) */
+export const MIN_GRID_RESOLUTION = 16;
+
+/** Maximum resolution to use (prevents memory issues - 128³ = 2M max voxels) */
+export const MAX_GRID_RESOLUTION = 128;
+
+// ============================================================================
+// AUTO RESOLUTION CALCULATION
+// ============================================================================
+
+/**
+ * Calculate adaptive grid resolution based on bounding box diagonal
+ * 
+ * @param boundingBox - The bounding box of the grid domain
+ * @param targetVoxelSizePercent - Target voxel size as percentage of diagonal (default: 1.5%)
+ * @returns Resolution clamped between MIN and MAX values
+ */
+export function calculateAdaptiveResolution(
+  boundingBox: THREE.Box3,
+  targetVoxelSizePercent: number = DEFAULT_TARGET_VOXEL_SIZE_PERCENT
+): number {
+  const size = new THREE.Vector3();
+  boundingBox.getSize(size);
+  const diagonal = size.length();
+  
+  // Target voxel size based on diagonal
+  const targetVoxelSize = diagonal * targetVoxelSizePercent;
+  
+  // Calculate resolution based on largest dimension
+  const maxDim = Math.max(size.x, size.y, size.z);
+  const calculatedResolution = Math.ceil(maxDim / targetVoxelSize);
+  
+  // Clamp to valid range
+  const resolution = Math.max(MIN_GRID_RESOLUTION, Math.min(MAX_GRID_RESOLUTION, calculatedResolution));
+  
+  logDebug(`Adaptive resolution: diagonal=${diagonal.toFixed(3)}, targetVoxelSize=${targetVoxelSize.toFixed(4)}, resolution=${resolution}`);
+  
+  return resolution;
+}
 
 // ============================================================================
 // GRID GENERATION
@@ -275,23 +352,6 @@ export function generateVolumetricGrid(
 ): VolumetricGridResult {
   const startTime = performance.now();
   
-  // Parse options
-  const resolution = options.resolution ?? DEFAULT_GRID_RESOLUTION;
-  const storeAllCells = options.storeAllCells ?? false;
-  const marginPercent = options.marginPercent ?? 0.05;
-  const computeDistances = options.computeDistances ?? false;
-  const includeSurfaceVoxels = options.includeSurfaceVoxels ?? false;
-  
-  // Determine resolution per axis
-  let resX: number, resY: number, resZ: number;
-  if (typeof resolution === 'number') {
-    resX = resY = resZ = resolution;
-  } else {
-    resX = resolution.x;
-    resY = resolution.y;
-    resZ = resolution.z;
-  }
-  
   // Clone geometries to avoid modifying originals
   const shellGeom = outerShellGeometry.clone();
   const partGeom = partGeometry.clone();
@@ -302,6 +362,35 @@ export function generateVolumetricGrid(
   
   // Get bounding box from outer shell (this defines the grid extent)
   const boundingBox = shellGeom.boundingBox!.clone();
+  
+  // Parse options
+  const marginPercent = options.marginPercent ?? 0.05;
+  const storeAllCells = options.storeAllCells ?? false;
+  const computeDistances = options.computeDistances ?? false;
+  const includeSurfaceVoxels = options.includeSurfaceVoxels ?? false;
+  const maxPartOverlapRatio = options.maxPartOverlapRatio ?? DEFAULT_MAX_PART_OVERLAP_RATIO;
+  const minPartOverlapRatio = options.minPartOverlapRatio ?? DEFAULT_MIN_PART_OVERLAP_RATIO;
+  const surfaceDistanceThreshold = options.surfaceDistanceThreshold ?? DEFAULT_SURFACE_DISTANCE_THRESHOLD;
+  const targetVoxelSizePercent = options.targetVoxelSizePercent ?? DEFAULT_TARGET_VOXEL_SIZE_PERCENT;
+  
+  // Auto-calculate resolution if not provided
+  let resolution: number | THREE.Vector3;
+  if (options.resolution !== undefined) {
+    resolution = options.resolution;
+  } else {
+    // Calculate adaptive resolution based on bounding box diagonal
+    resolution = calculateAdaptiveResolution(boundingBox, targetVoxelSizePercent);
+  }
+  
+  // Determine resolution per axis
+  let resX: number, resY: number, resZ: number;
+  if (typeof resolution === 'number') {
+    resX = resY = resZ = resolution;
+  } else {
+    resX = resolution.x;
+    resY = resolution.y;
+    resZ = resolution.z;
+  }
   
   // Add margin to bounding box
   const boxSize = new THREE.Vector3();
@@ -343,7 +432,7 @@ export function generateVolumetricGrid(
     : 0;
   
   if (includeSurfaceVoxels) {
-    logDebug(`Surface voxel inclusion enabled, tolerance: ${surfaceTolerance.toFixed(6)}`);
+    logDebug(`Surface voxel inclusion enabled, tolerance: ${surfaceTolerance.toFixed(6)}, overlapRange: ${minPartOverlapRatio*100}%-${maxPartOverlapRatio*100}%, distThresh: ${surfaceDistanceThreshold*100}%`);
   }
 
   // Iterate through all grid cells
@@ -361,16 +450,43 @@ export function generateVolumetricGrid(
         
         if (includeSurfaceVoxels) {
           // Include voxels that are inside OR on/near the shell surface
-          // AND outside OR on/near the part surface (but not inside the part)
           const isInsideOrOnShell = shellTester.isInsideOrOnSurface(cellCenter, surfaceTolerance);
           
-          // For part: we want voxels that are outside the part OR touching its surface
-          // but we should NOT include voxels that are deep inside the part
-          const isOutsideOrOnPart = isInsideOrOnShell 
-            ? partTester.isOutsideOrOnSurface(cellCenter, surfaceTolerance)
-            : true;
-          
-          isMoldVolume = isInsideOrOnShell && isOutsideOrOnPart;
+          if (isInsideOrOnShell) {
+            // Check if voxel center is outside the part
+            const isOutsidePart = partTester.isOutside(cellCenter);
+            
+            // Helper function to check if this is a surface voxel
+            // Surface voxels: 1-10% overlap OR within 50% voxel distance of part surface
+            const isSurfaceVoxel = (): boolean => {
+              const avgCellSize = (cellSize.x + cellSize.y + cellSize.z) / 3;
+              const distThreshold = avgCellSize * surfaceDistanceThreshold;
+              
+              // Check distance to part surface
+              const distToPart = partTester.getDistanceToSurface(cellCenter);
+              if (distToPart <= distThreshold) {
+                return true;
+              }
+              
+              // Check volume overlap ratio (1-10%)
+              const overlapRatio = partTester.computeVolumeIntersection(cellCenter, cellSize, 3);
+              if (overlapRatio >= minPartOverlapRatio && overlapRatio <= maxPartOverlapRatio) {
+                return true;
+              }
+              
+              return false;
+            };
+            
+            if (isOutsidePart) {
+              // Outside part - include as mold volume (surface or regular)
+              isMoldVolume = true;
+            } else {
+              // Voxel center is inside part - only include if it's a surface voxel
+              isMoldVolume = isSurfaceVoxel();
+            }
+          } else {
+            isMoldVolume = false;
+          }
         } else {
           // Original strict containment logic
           // Test if point is inside shell first (early exit if outside)
@@ -1944,6 +2060,14 @@ interface WorkerInitMessage {
   partIndexArray: Uint32Array | null;
   /** Surface tolerance for including boundary voxels (0 = strict containment) */
   surfaceTolerance?: number;
+  /** Maximum overlap ratio with part mesh for boundary voxels (default: 0.10 = 10%) */
+  maxPartOverlapRatio?: number;
+  /** Minimum overlap ratio with part mesh for surface voxels (default: 0.01 = 1%) */
+  minPartOverlapRatio?: number;
+  /** Distance threshold as fraction of voxel size for surface voxels (default: 0.5 = 50%) */
+  surfaceDistanceThreshold?: number;
+  /** Cell size for volume intersection calculations [x, y, z] */
+  cellSize?: [number, number, number];
 }
 
 interface WorkerComputeMessage {
@@ -2002,21 +2126,6 @@ export async function generateVolumetricGridParallel(
 ): Promise<VolumetricGridResult> {
   const startTime = performance.now();
   
-  // Parse options
-  const resolution = options.resolution ?? DEFAULT_GRID_RESOLUTION;
-  const marginPercent = options.marginPercent ?? 0.05;
-  const includeSurfaceVoxels = options.includeSurfaceVoxels ?? false;
-  
-  // Determine resolution per axis
-  let resX: number, resY: number, resZ: number;
-  if (typeof resolution === 'number') {
-    resX = resY = resZ = resolution;
-  } else {
-    resX = resolution.x;
-    resY = resolution.y;
-    resZ = resolution.z;
-  }
-  
   // Clone geometries to avoid modifying originals
   const shellGeom = outerShellGeometry.clone();
   const partGeom = partGeometry.clone();
@@ -2027,6 +2136,33 @@ export async function generateVolumetricGridParallel(
   
   // Get bounding box from outer shell
   const boundingBox = shellGeom.boundingBox!.clone();
+  
+  // Parse options
+  const marginPercent = options.marginPercent ?? 0.05;
+  const includeSurfaceVoxels = options.includeSurfaceVoxels ?? false;
+  const maxPartOverlapRatio = options.maxPartOverlapRatio ?? DEFAULT_MAX_PART_OVERLAP_RATIO;
+  const minPartOverlapRatio = options.minPartOverlapRatio ?? DEFAULT_MIN_PART_OVERLAP_RATIO;
+  const surfaceDistanceThreshold = options.surfaceDistanceThreshold ?? DEFAULT_SURFACE_DISTANCE_THRESHOLD;
+  const targetVoxelSizePercent = options.targetVoxelSizePercent ?? DEFAULT_TARGET_VOXEL_SIZE_PERCENT;
+  
+  // Auto-calculate resolution if not provided
+  let resolution: number | THREE.Vector3;
+  if (options.resolution !== undefined) {
+    resolution = options.resolution;
+  } else {
+    // Calculate adaptive resolution based on bounding box diagonal
+    resolution = calculateAdaptiveResolution(boundingBox, targetVoxelSizePercent);
+  }
+  
+  // Determine resolution per axis
+  let resX: number, resY: number, resZ: number;
+  if (typeof resolution === 'number') {
+    resX = resY = resZ = resolution;
+  } else {
+    resX = resolution.x;
+    resY = resolution.y;
+    resZ = resolution.z;
+  }
   
   // Add margin to bounding box
   const boxSize = new THREE.Vector3();
@@ -2051,7 +2187,7 @@ export async function generateVolumetricGridParallel(
     : 0;
   
   if (includeSurfaceVoxels) {
-    logDebug(`[Parallel] Surface voxel inclusion enabled, tolerance: ${surfaceTolerance.toFixed(6)}`);
+    logDebug(`[Parallel] Surface voxel inclusion enabled, tolerance: ${surfaceTolerance.toFixed(6)}, overlapRange: ${minPartOverlapRatio*100}%-${maxPartOverlapRatio*100}%, distThresh: ${surfaceDistanceThreshold*100}%`);
   }
   
   const totalCellCount = resX * resY * resZ;
@@ -2092,6 +2228,10 @@ export async function generateVolumetricGridParallel(
       partPositionArray: partData.positionArray.slice(),
       partIndexArray: partData.indexArray?.slice() ?? null,
       surfaceTolerance,
+      maxPartOverlapRatio,
+      minPartOverlapRatio,
+      surfaceDistanceThreshold,
+      cellSize: [cellSize.x, cellSize.y, cellSize.z] as [number, number, number],
     };
     
     const transfers: Transferable[] = [initMsg.shellPositionArray.buffer, initMsg.partPositionArray.buffer];
