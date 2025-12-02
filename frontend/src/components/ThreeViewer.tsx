@@ -206,8 +206,9 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
       const updatedResult = recalculateBiasedDistances(gridResult, weights);
       volumetricGridRef.current = updatedResult;
       
-      // Update visualization if visible
-      if (gridVisualizationRef.current && !hideVoxelGrid) {
+      // Always update visualization if it exists (regardless of hideVoxelGrid)
+      // This ensures the colors update when viewing the grid with different field types
+      if (gridVisualizationRef.current) {
         // Remove old visualization
         scene.remove(gridVisualizationRef.current);
         if (gridVisualizationRef.current instanceof THREE.Points) {
@@ -225,7 +226,12 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
           gridVisualizationRef.current = createMoldVolumeVoxels(updatedResult, 0x00ffff, 0.2, distanceFieldType);
         }
         scene.add(gridVisualizationRef.current);
-        gridVisualizationRef.current.visible = true;
+        // Respect current visibility setting
+        gridVisualizationRef.current.visible = !hideVoxelGrid;
+        
+        console.log('Visualization updated with new weights, visible:', !hideVoxelGrid);
+      } else {
+        console.log('No visualization to update (gridVisualizationRef.current is null)');
       }
       
       // Notify parent of updated grid result
@@ -631,6 +637,7 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
             storeAllCells: false,
             marginPercent: 0.02,
             computeDistances: false,
+            includeSurfaceVoxels: true, // Include voxels on boundaries and inner surfaces
           };
           
           // Use GPU or CPU version based on availability and preference
@@ -773,15 +780,27 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
             const shellGeometry = csgResultRef.current.mesh.geometry.clone();
             shellGeometry.applyMatrix4(csgResultRef.current.mesh.matrixWorld);
             
+            // Get part geometry in world space for volume intersection seed detection
+            const partGeometry = meshRef.current.geometry.clone();
+            partGeometry.applyMatrix4(meshRef.current.matrixWorld);
+            
             // Compute escape labeling using multi-source Dijkstra
+            // Seeds are voxels with ≥10% volume intersection with part mesh
             labeling = computeEscapeLabelingDijkstra(
               volumetricGridRef.current,
               shellGeometry,
               moldHalfClassificationRef.current,
-              { adjacency: partingSurfaceAdjacency, seedRadius: 1.5 }
+              { 
+                adjacency: partingSurfaceAdjacency, 
+                seedRadius: 1.5,
+                seedVolumeThreshold: 0.10,  // 10% volume intersection threshold
+                seedVolumeSamples: 4        // 4³ = 64 samples per voxel
+              },
+              partGeometry  // Pass part geometry for volume intersection
             );
             
             shellGeometry.dispose();
+            partGeometry.dispose();
           } else {
             console.log('Falling back to legacy escape labeling (no mold half classification)');
             

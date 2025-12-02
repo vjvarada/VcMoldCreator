@@ -26,9 +26,14 @@
  */
 
 import * as THREE from 'three';
-import { MeshBVH } from 'three-mesh-bvh';
+import { MeshBVH, acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from 'three-mesh-bvh';
 import type { VolumetricGridResult } from './volumetricGrid';
 import type { MoldHalfClassificationResult } from './moldHalfClassification';
+
+// Extend Three.js with BVH acceleration
+THREE.Mesh.prototype.raycast = acceleratedRaycast;
+THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
+THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 
 // ============================================================================
 // TYPES
@@ -62,6 +67,14 @@ export interface EscapeLabelingOptions {
   adjacency?: AdjacencyType;
   /** Seed radius: how far from boundary faces to seed voxels (in voxel units, default: 1.5) */
   seedRadius?: number;
+  /** 
+   * Minimum volume intersection ratio with part mesh for a voxel to be considered a seed.
+   * Value between 0 and 1. Default: 0.75 (75% of voxel volume must intersect part).
+   * Set to 0 to use the legacy surface distance approach.
+   */
+  seedVolumeThreshold?: number;
+  /** Number of sample points per axis for volume intersection test (default: 4 = 64 samples) */
+  seedVolumeSamples?: number;
 }
 
 // ============================================================================
@@ -195,6 +208,121 @@ function getNeighborOffsets(adjacency: AdjacencyType): number[][] {
 }
 
 // ============================================================================
+// PART MESH INSIDE/OUTSIDE TESTER
+// ============================================================================
+
+/**
+ * Helper class for fast inside/outside tests on the part mesh
+ * Uses BVH for acceleration and ray casting for inside/outside determination
+ */
+class PartMeshTester {
+  private bvh: MeshBVH;
+  private raycaster: THREE.Raycaster;
+  private mesh: THREE.Mesh;
+  private boundingBox: THREE.Box3;
+  private rayDirection = new THREE.Vector3(1, 0, 0);
+  
+  constructor(geometry: THREE.BufferGeometry) {
+    // Ensure geometry is indexed for BVH
+    let indexedGeometry = geometry;
+    if (!geometry.index) {
+      const posAttr = geometry.getAttribute('position');
+      const indices: number[] = [];
+      for (let i = 0; i < posAttr.count; i++) {
+        indices.push(i);
+      }
+      indexedGeometry = geometry.clone();
+      indexedGeometry.setIndex(indices);
+    }
+    
+    // Compute normals and bounds
+    indexedGeometry.computeVertexNormals();
+    indexedGeometry.computeBoundingBox();
+    this.boundingBox = indexedGeometry.boundingBox!.clone();
+    
+    // Create mesh and BVH
+    const material = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
+    this.mesh = new THREE.Mesh(indexedGeometry, material);
+    this.mesh.updateMatrixWorld(true);
+    
+    this.bvh = new MeshBVH(indexedGeometry, { maxLeafTris: 10 });
+    indexedGeometry.boundsTree = this.bvh;
+    
+    this.raycaster = new THREE.Raycaster();
+    this.raycaster.firstHitOnly = false;
+  }
+  
+  /**
+   * Test if a point is inside the part mesh using ray casting
+   * Odd number of intersections = inside
+   */
+  isInside(point: THREE.Vector3): boolean {
+    // Quick bounding box check
+    if (!this.boundingBox.containsPoint(point)) {
+      return false;
+    }
+    
+    this.raycaster.set(point, this.rayDirection);
+    this.raycaster.far = Infinity;
+    const intersects = this.raycaster.intersectObject(this.mesh, false);
+    
+    return intersects.length % 2 === 1;
+  }
+  
+  /**
+   * Compute volume intersection ratio of a voxel with the part mesh
+   * Uses uniform sampling within the voxel
+   * 
+   * @param center - Voxel center position
+   * @param size - Voxel size in each dimension
+   * @param samplesPerAxis - Number of samples per axis (e.g., 4 = 64 total samples)
+   * @returns Ratio of sample points inside the part (0 to 1)
+   */
+  computeVolumeIntersection(
+    center: THREE.Vector3,
+    size: THREE.Vector3,
+    samplesPerAxis: number = 4
+  ): number {
+    const halfSize = size.clone().multiplyScalar(0.5);
+    const samplePoint = new THREE.Vector3();
+    
+    let insideCount = 0;
+    const totalSamples = samplesPerAxis * samplesPerAxis * samplesPerAxis;
+    
+    // Generate uniform sample points within the voxel
+    for (let i = 0; i < samplesPerAxis; i++) {
+      const tx = (i + 0.5) / samplesPerAxis; // 0.125, 0.375, 0.625, 0.875 for n=4
+      const x = center.x - halfSize.x + tx * size.x;
+      
+      for (let j = 0; j < samplesPerAxis; j++) {
+        const ty = (j + 0.5) / samplesPerAxis;
+        const y = center.y - halfSize.y + ty * size.y;
+        
+        for (let k = 0; k < samplesPerAxis; k++) {
+          const tz = (k + 0.5) / samplesPerAxis;
+          const z = center.z - halfSize.z + tz * size.z;
+          
+          samplePoint.set(x, y, z);
+          
+          if (this.isInside(samplePoint)) {
+            insideCount++;
+          }
+        }
+      }
+    }
+    
+    return insideCount / totalSamples;
+  }
+  
+  dispose(): void {
+    if (this.mesh.geometry.boundsTree) {
+      this.mesh.geometry.disposeBoundsTree();
+    }
+    (this.mesh.material as THREE.Material).dispose();
+  }
+}
+
+// ============================================================================
 // SPATIAL INDEX FOR VOXELS
 // ============================================================================
 
@@ -234,19 +362,25 @@ function getVoxelIndex(
  * Identify which voxels are on the OUTER SURFACE of the silicone volume
  * (near the mold shell ∂H, NOT near the part mesh M).
  * 
- * Also identifies INNER SURFACE voxels (near the part mesh) for seeding.
+ * Also identifies SEED voxels using one of two approaches:
+ * 1. Volume intersection (if partMeshTester provided): voxels with ≥ seedVolumeThreshold 
+ *    of their volume inside the part mesh
+ * 2. Surface distance (legacy): surface voxels with small distance to part
  * 
  * A voxel is a surface voxel if it has at least one 6-connected neighbor 
  * that is NOT a silicone voxel.
  * 
  * - Outer surface = surface voxels with large distance to part
- * - Inner surface = surface voxels with small distance to part
+ * - Inner surface/Seeds = determined by volume intersection or surface distance
  */
 function identifyBoundaryAdjacentVoxels(
   gridResult: VolumetricGridResult,
   shellGeometry: THREE.BufferGeometry,
   classification: MoldHalfClassificationResult,
-  _boundaryRadius: number
+  _boundaryRadius: number,
+  partMeshTester?: PartMeshTester,
+  seedVolumeThreshold: number = 0.75,
+  seedVolumeSamples: number = 4
 ): { 
   boundaryLabel: Int8Array; 
   innerSurfaceMask: Uint8Array;
@@ -349,25 +483,55 @@ function identifyBoundaryAdjacentVoxels(
   console.log(`  Distance threshold: ${distanceThreshold.toFixed(4)}`);
   console.log(`  Inner candidates: ${gapIndex}, Outer candidates: ${sortedPairs.length - gapIndex}`);
   
-  // Step 3: Mark OUTER and INNER surface voxels
+  // Step 3: Mark OUTER surface voxels (using distance threshold)
+  // and identify SEED voxels using either volume intersection or surface distance
   const isOuterSurface = new Uint8Array(voxelCount);
   const innerSurfaceMask = new Uint8Array(voxelCount);
   let outerSurfaceCount = 0;
   let innerSurfaceCount = 0;
   
+  // First pass: identify outer surface voxels
   for (let i = 0; i < voxelCount; i++) {
-    if (isSurfaceVoxel[i]) {
-      if (voxelDist[i] >= distanceThreshold) {
-        isOuterSurface[i] = 1;
-        outerSurfaceCount++;
-      } else {
+    if (isSurfaceVoxel[i] && voxelDist[i] >= distanceThreshold) {
+      isOuterSurface[i] = 1;
+      outerSurfaceCount++;
+    }
+  }
+  
+  // Second pass: identify seed voxels
+  if (partMeshTester && seedVolumeThreshold > 0) {
+    // Volume intersection approach: find voxels with ≥ threshold volume inside part
+    console.log(`  Using volume intersection approach for seeds (threshold: ${(seedVolumeThreshold * 100).toFixed(0)}%, samples: ${seedVolumeSamples}³)`);
+    const volumeStartTime = performance.now();
+    
+    for (let i = 0; i < voxelCount; i++) {
+      const cell = cells[i];
+      const volumeRatio = partMeshTester.computeVolumeIntersection(
+        cell.center,
+        cell.size,
+        seedVolumeSamples
+      );
+      
+      if (volumeRatio >= seedVolumeThreshold) {
         innerSurfaceMask[i] = 1;
         innerSurfaceCount++;
       }
     }
+    
+    console.log(`  Volume intersection computed in ${(performance.now() - volumeStartTime).toFixed(1)}ms`);
+    console.log(`  Seed voxels (≥${(seedVolumeThreshold * 100).toFixed(0)}% volume intersection): ${innerSurfaceCount}`);
+  } else {
+    // Legacy surface distance approach: surface voxels close to part
+    console.log(`  Using legacy surface distance approach for seeds`);
+    for (let i = 0; i < voxelCount; i++) {
+      if (isSurfaceVoxel[i] && voxelDist[i] < distanceThreshold) {
+        innerSurfaceMask[i] = 1;
+        innerSurfaceCount++;
+      }
+    }
+    console.log(`  Inner surface (near part): ${innerSurfaceCount}`);
   }
   
-  console.log(`  Inner surface (near part): ${innerSurfaceCount}`);
   console.log(`  Outer surface (near shell): ${outerSurfaceCount}`);
   
   // Step 4: For each OUTER surface voxel, determine if it's closer to H₁, H₂, or boundary zone
@@ -527,7 +691,7 @@ function identifyBoundaryAdjacentVoxels(
  * Compute escape labeling for mold volume voxels using outward Dijkstra
  * 
  * Algorithm:
- * 1. Seed from voxels closest to the part mesh (small voxelDist values)
+ * 1. Seed from voxels with high volume intersection with part mesh (≥75% default)
  * 2. Flood outward using thickness-weighted edge costs
  * 3. When reaching a boundary-adjacent voxel, assign the label (H₁ or H₂)
  * 4. Propagate labels so each voxel knows which mold half it escapes to
@@ -536,18 +700,22 @@ function identifyBoundaryAdjacentVoxels(
  * @param shellGeometry - The outer shell geometry (∂H) in world space
  * @param classification - The mold half classification (H₁/H₂ triangle sets)
  * @param options - Labeling options
+ * @param partGeometry - Optional part geometry for volume intersection seed detection
  * @returns Escape labeling result
  */
 export function computeEscapeLabelingDijkstra(
   gridResult: VolumetricGridResult,
   shellGeometry: THREE.BufferGeometry,
   classification: MoldHalfClassificationResult,
-  options: EscapeLabelingOptions = {}
+  options: EscapeLabelingOptions = {},
+  partGeometry?: THREE.BufferGeometry
 ): EscapeLabelingResult {
   const startTime = performance.now();
   
   const adjacency = options.adjacency ?? 6;
   const seedRadius = options.seedRadius ?? 1.5;
+  const seedVolumeThreshold = options.seedVolumeThreshold ?? 0.75;
+  const seedVolumeSamples = options.seedVolumeSamples ?? 4;
   
   const voxelCount = gridResult.moldVolumeCellCount;
   const cells = gridResult.moldVolumeCells;
@@ -560,6 +728,8 @@ export function computeEscapeLabelingDijkstra(
   console.log(`  Voxel count: ${voxelCount}`);
   console.log(`  Adjacency: ${adjacency}-connected`);
   console.log(`  Voxel size: ${voxelSize.toFixed(4)}`);
+  console.log(`  Seed volume threshold: ${(seedVolumeThreshold * 100).toFixed(0)}%`);
+  console.log(`  Part geometry provided: ${partGeometry ? 'yes' : 'no'}`);
   
   if (!voxelDist) {
     console.error('ERROR: voxelDist is null - distance field not computed!');
@@ -580,6 +750,13 @@ export function computeEscapeLabelingDijkstra(
   // Get neighbor offsets (used for connectivity checks)
   const neighborOffsets = getNeighborOffsets(adjacency);
   
+  // Create part mesh tester if geometry is provided and threshold > 0
+  let partMeshTester: PartMeshTester | undefined;
+  if (partGeometry && seedVolumeThreshold > 0) {
+    console.log('  Building part mesh BVH for volume intersection...');
+    partMeshTester = new PartMeshTester(partGeometry);
+  }
+  
   // ========================================================================
   // STEP 1: Identify boundary-adjacent voxels (which touch H₁ or H₂)
   // ========================================================================
@@ -589,11 +766,20 @@ export function computeEscapeLabelingDijkstra(
     gridResult,
     shellGeometry,
     classification,
-    seedRadius
+    seedRadius,
+    partMeshTester,
+    seedVolumeThreshold,
+    seedVolumeSamples
   );
+  
+  // Clean up part mesh tester if created
+  if (partMeshTester) {
+    partMeshTester.dispose();
+  }
+  
   console.log(`  H₁ adjacent: ${h1Adjacent}`);
   console.log(`  H₂ adjacent: ${h2Adjacent}`);
-  console.log(`  Inner surface (seeds): ${innerSurfaceCount}`);
+  console.log(`  Seeds: ${innerSurfaceCount}`);
   
   // Diagnostic: Check if there are any boundary voxels at all
   const totalBoundaryVoxels = h1Adjacent + h2Adjacent;

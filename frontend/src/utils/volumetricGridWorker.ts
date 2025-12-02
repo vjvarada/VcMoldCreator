@@ -19,6 +19,8 @@ interface InitMessage {
   shellIndexArray: Uint32Array | null;
   partPositionArray: Float32Array;
   partIndexArray: Uint32Array | null;
+  /** Surface tolerance for including boundary voxels (0 = strict containment) */
+  surfaceTolerance?: number;
 }
 
 interface ComputeMessage {
@@ -49,6 +51,7 @@ let shellGeometry: BufferGeometry | null = null;
 let partGeometry: BufferGeometry | null = null;
 let shellBoundingBox: Box3 | null = null;
 let partBoundingBox: Box3 | null = null;
+let surfaceTolerance = 0; // 0 = strict containment, > 0 = include surface voxels
 
 // Ray casting setup - use 3 directions for faster computation
 const RAY_DIRECTIONS = [
@@ -68,9 +71,11 @@ function initWorker(
   shellPositionArray: Float32Array,
   shellIndexArray: Uint32Array | null,
   partPositionArray: Float32Array,
-  partIndexArray: Uint32Array | null
+  partIndexArray: Uint32Array | null,
+  tolerance: number = 0
 ): void {
   const startTime = performance.now();
+  surfaceTolerance = tolerance;
   
   // Build shell geometry and BVH
   shellGeometry = new BufferGeometry();
@@ -158,6 +163,44 @@ function isInsideMesh(bvh: MeshBVH, boundingBox: Box3, point: Vector3): boolean 
   return insideVotes >= 2;
 }
 
+/**
+ * Get the distance from a point to the nearest surface of a mesh
+ * Uses BVH closestPointToPoint for efficient queries
+ */
+function getDistanceToSurface(bvh: MeshBVH, point: Vector3): number {
+  const target = {
+    point: new Vector3(),
+    distance: Infinity,
+    faceIndex: 0
+  };
+  bvh.closestPointToPoint(point, target);
+  return target.distance;
+}
+
+/**
+ * Test if a point is inside the mesh OR within a tolerance of the surface
+ */
+function isInsideOrOnSurface(bvh: MeshBVH, boundingBox: Box3, point: Vector3, tolerance: number): boolean {
+  if (isInsideMesh(bvh, boundingBox, point)) {
+    return true;
+  }
+  // If outside, check if within tolerance of surface
+  const dist = getDistanceToSurface(bvh, point);
+  return dist <= tolerance;
+}
+
+/**
+ * Test if a point is outside the mesh OR within a tolerance of the surface
+ */
+function isOutsideOrOnSurface(bvh: MeshBVH, boundingBox: Box3, point: Vector3, tolerance: number): boolean {
+  if (!isInsideMesh(bvh, boundingBox, point)) {
+    return true;
+  }
+  // If inside, check if within tolerance of surface (near boundary)
+  const dist = getDistanceToSurface(bvh, point);
+  return dist <= tolerance;
+}
+
 // ============================================================================
 // GRID CELL PROCESSING
 // ============================================================================
@@ -174,22 +217,42 @@ function processCells(cellCenters: Float32Array, cellIndices: Uint32Array): void
   
   const cellCount = cellIndices.length;
   const moldVolumeIndices: number[] = [];
+  const useSurfaceTolerance = surfaceTolerance > 0;
   
   for (let i = 0; i < cellCount; i++) {
     const i3 = i * 3;
     tempVec.set(cellCenters[i3], cellCenters[i3 + 1], cellCenters[i3 + 2]);
     
-    // Test if inside shell
-    const isInsideShell = isInsideMesh(shellBvh, shellBoundingBox, tempVec);
+    let isMoldVolume: boolean;
     
-    if (isInsideShell) {
-      // Only test part if inside shell (optimization)
-      const isInsidePart = isInsideMesh(partBvh, partBoundingBox, tempVec);
+    if (useSurfaceTolerance) {
+      // Include voxels that are inside OR on/near the shell surface
+      const isInsideOrOnShell = isInsideOrOnSurface(shellBvh, shellBoundingBox, tempVec, surfaceTolerance);
       
-      // Mold volume = inside shell AND outside part
-      if (!isInsidePart) {
-        moldVolumeIndices.push(cellIndices[i]);
+      if (isInsideOrOnShell) {
+        // For part: we want voxels that are outside the part OR touching its surface
+        const isOutsideOrOnPart = isOutsideOrOnSurface(partBvh, partBoundingBox, tempVec, surfaceTolerance);
+        isMoldVolume = isOutsideOrOnPart;
+      } else {
+        isMoldVolume = false;
       }
+    } else {
+      // Original strict containment logic
+      // Test if inside shell
+      const isInsideShell = isInsideMesh(shellBvh, shellBoundingBox, tempVec);
+      
+      if (isInsideShell) {
+        // Only test part if inside shell (optimization)
+        const isInsidePart = isInsideMesh(partBvh, partBoundingBox, tempVec);
+        // Mold volume = inside shell AND outside part
+        isMoldVolume = !isInsidePart;
+      } else {
+        isMoldVolume = false;
+      }
+    }
+    
+    if (isMoldVolume) {
+      moldVolumeIndices.push(cellIndices[i]);
     }
   }
   
@@ -213,7 +276,8 @@ self.onmessage = (event: MessageEvent<InitMessage | ComputeMessage>) => {
       data.shellPositionArray,
       data.shellIndexArray,
       data.partPositionArray,
-      data.partIndexArray
+      data.partIndexArray,
+      data.surfaceTolerance ?? 0
     );
   } else if (data.type === 'compute') {
     processCells(data.cellCenters, data.cellIndices);

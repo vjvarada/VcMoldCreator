@@ -107,6 +107,14 @@ export interface VolumetricGridOptions {
   computeDistances?: boolean;
   /** Whether to use GPU acceleration (WebGPU if available, otherwise falls back to CPU) */
   useGPU?: boolean;
+  /** 
+   * Whether to include voxels that touch/intersect the boundary surfaces.
+   * When true, includes voxels whose centers are within half a cell size of:
+   * - The outer shell boundary (∂H) - expands outward
+   * - The inner part surface (M) - expands inward toward the part
+   * Default: false (only strictly contained voxels)
+   */
+  includeSurfaceVoxels?: boolean;
 }
 
 export interface BiasedDistanceWeights {
@@ -264,6 +272,50 @@ class MeshInsideOutsideTester {
   }
   
   /**
+   * Get the unsigned distance from a point to the mesh surface
+   * Uses BVH for efficient closest point query
+   */
+  getDistanceToSurface(point: THREE.Vector3): number {
+    const target = { 
+      point: new THREE.Vector3(), 
+      distance: Infinity,
+      faceIndex: 0
+    };
+    this.bvh.closestPointToPoint(point, target);
+    return target.distance;
+  }
+  
+  /**
+   * Test if a point is inside the mesh OR within a tolerance of the surface
+   * This allows including surface/boundary voxels
+   */
+  isInsideOrOnSurface(point: THREE.Vector3, tolerance: number): boolean {
+    // Quick check: if inside, return true
+    if (this.isInside(point)) {
+      return true;
+    }
+    
+    // If outside, check if within tolerance of surface
+    const dist = this.getDistanceToSurface(point);
+    return dist <= tolerance;
+  }
+  
+  /**
+   * Test if a point is outside the mesh OR within a tolerance of the surface
+   * This allows including surface/boundary voxels near the part
+   */
+  isOutsideOrOnSurface(point: THREE.Vector3, tolerance: number): boolean {
+    // Quick check: if outside, return true
+    if (this.isOutside(point)) {
+      return true;
+    }
+    
+    // If inside, check if within tolerance of surface (i.e., very close to boundary)
+    const dist = this.getDistanceToSurface(point);
+    return dist <= tolerance;
+  }
+  
+  /**
    * Clean up BVH and resources
    */
   dispose(): void {
@@ -302,6 +354,7 @@ export function generateVolumetricGrid(
   const storeAllCells = options.storeAllCells ?? false;
   const marginPercent = options.marginPercent ?? 0.05;
   const computeDistances = options.computeDistances ?? false;
+  const includeSurfaceVoxels = options.includeSurfaceVoxels ?? false;
   
   // Determine resolution per axis
   let resX: number, resY: number, resZ: number;
@@ -352,6 +405,16 @@ export function generateVolumetricGrid(
   const totalCellCount = resX * resY * resZ;
   const cellCenter = new THREE.Vector3();
   const cellIndex = new THREE.Vector3();
+  
+  // Calculate surface tolerance: half the diagonal of a cell
+  // This ensures voxels touching/intersecting surfaces are included
+  const surfaceTolerance = includeSurfaceVoxels 
+    ? Math.sqrt(cellSize.x * cellSize.x + cellSize.y * cellSize.y + cellSize.z * cellSize.z) / 2
+    : 0;
+  
+  if (includeSurfaceVoxels) {
+    console.log(`Surface voxel inclusion enabled with tolerance: ${surfaceTolerance.toFixed(6)}`);
+  }
 
   // Iterate through all grid cells
   for (let k = 0; k < resZ; k++) {
@@ -364,12 +427,29 @@ export function generateVolumetricGrid(
           boundingBox.min.z + (k + 0.5) * cellSize.z
         );
         
-        // Test if point is inside shell first (early exit if outside)
-        const isInsideShell = shellTester.isInside(cellCenter);
+        let isMoldVolume: boolean;
         
-        // Only test part if inside shell (optimization)
-        const isOutsidePart = isInsideShell ? partTester.isOutside(cellCenter) : true;
-        const isMoldVolume = isInsideShell && isOutsidePart;
+        if (includeSurfaceVoxels) {
+          // Include voxels that are inside OR on/near the shell surface
+          // AND outside OR on/near the part surface (but not inside the part)
+          const isInsideOrOnShell = shellTester.isInsideOrOnSurface(cellCenter, surfaceTolerance);
+          
+          // For part: we want voxels that are outside the part OR touching its surface
+          // but we should NOT include voxels that are deep inside the part
+          const isOutsideOrOnPart = isInsideOrOnShell 
+            ? partTester.isOutsideOrOnSurface(cellCenter, surfaceTolerance)
+            : true;
+          
+          isMoldVolume = isInsideOrOnShell && isOutsideOrOnPart;
+        } else {
+          // Original strict containment logic
+          // Test if point is inside shell first (early exit if outside)
+          const isInsideShell = shellTester.isInside(cellCenter);
+          
+          // Only test part if inside shell (optimization)
+          const isOutsidePart = isInsideShell ? partTester.isOutside(cellCenter) : true;
+          isMoldVolume = isInsideShell && isOutsidePart;
+        }
         
         // Only create cell objects when needed
         if (isMoldVolume || storeAllCells) {
@@ -766,13 +846,19 @@ export function isWebGPUAvailable(): boolean {
 
 /**
  * GPU-accelerated volumetric grid generator using WebGPU compute shaders
- * Falls back to CPU if WebGPU is not available
+ * Falls back to CPU if WebGPU is not available or if includeSurfaceVoxels is enabled
  */
 export async function generateVolumetricGridGPU(
   outerShellGeometry: THREE.BufferGeometry,
   partGeometry: THREE.BufferGeometry,
   options: VolumetricGridOptions = {}
 ): Promise<VolumetricGridResult> {
+  // Fall back to CPU if surface voxel inclusion is enabled (requires distance queries)
+  if (options.includeSurfaceVoxels) {
+    console.log('Surface voxel inclusion enabled, using CPU implementation');
+    return generateVolumetricGrid(outerShellGeometry, partGeometry, options);
+  }
+  
   // Check for WebGPU support
   if (!isWebGPUAvailable()) {
     console.log('WebGPU not available, falling back to CPU');
@@ -1923,6 +2009,8 @@ interface WorkerInitMessage {
   shellIndexArray: Uint32Array | null;
   partPositionArray: Float32Array;
   partIndexArray: Uint32Array | null;
+  /** Surface tolerance for including boundary voxels (0 = strict containment) */
+  surfaceTolerance?: number;
 }
 
 interface WorkerComputeMessage {
@@ -1984,6 +2072,7 @@ export async function generateVolumetricGridParallel(
   // Parse options
   const resolution = options.resolution ?? DEFAULT_GRID_RESOLUTION;
   const marginPercent = options.marginPercent ?? 0.05;
+  const includeSurfaceVoxels = options.includeSurfaceVoxels ?? false;
   
   // Determine resolution per axis
   let resX: number, resY: number, resZ: number;
@@ -2023,6 +2112,15 @@ export async function generateVolumetricGridParallel(
     boxSize.z / resZ
   );
   
+  // Calculate surface tolerance: half the diagonal of a cell (when surface voxels are enabled)
+  const surfaceTolerance = includeSurfaceVoxels 
+    ? Math.sqrt(cellSize.x * cellSize.x + cellSize.y * cellSize.y + cellSize.z * cellSize.z) / 2
+    : 0;
+  
+  if (includeSurfaceVoxels) {
+    console.log(`[Parallel] Surface voxel inclusion enabled with tolerance: ${surfaceTolerance.toFixed(6)}`);
+  }
+  
   const totalCellCount = resX * resY * resZ;
   
   // Extract geometry data for workers
@@ -2060,6 +2158,7 @@ export async function generateVolumetricGridParallel(
       shellIndexArray: shellData.indexArray?.slice() ?? null,
       partPositionArray: partData.positionArray.slice(),
       partIndexArray: partData.indexArray?.slice() ?? null,
+      surfaceTolerance,
     };
     
     const transfers: Transferable[] = [initMsg.shellPositionArray.buffer, initMsg.partPositionArray.buffer];
