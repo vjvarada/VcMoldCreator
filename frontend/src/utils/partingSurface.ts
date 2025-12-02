@@ -30,7 +30,7 @@ import { MeshBVH, acceleratedRaycast, computeBoundsTree, disposeBoundsTree } fro
 import type { VolumetricGridResult } from './volumetricGrid';
 import type { MoldHalfClassificationResult } from './moldHalfClassification';
 import { runParallelDijkstra, isWebWorkersAvailable } from './parallelDijkstra';
-import { MeshTester, getNeighborOffsets, type AdjacencyType } from './meshUtils';
+import { MeshTester, getNeighborOffsets, type AdjacencyType, logInfo, logDebug, logResult, logTiming } from './meshUtils';
 
 // Extend Three.js with BVH acceleration
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
@@ -298,7 +298,7 @@ async function computeVolumeIntersectionParallel(
   const workers: Worker[] = [];
   const workerReadyPromises: Promise<void>[] = [];
   
-  console.log(`    Initializing ${numWorkers} volume intersection workers...`);
+  logDebug(`Initializing ${numWorkers} volume intersection workers`);
   
   for (let i = 0; i < numWorkers; i++) {
     const worker = new Worker(
@@ -332,7 +332,7 @@ async function computeVolumeIntersectionParallel(
   }
   
   await Promise.all(workerReadyPromises);
-  console.log(`    Workers initialized`);
+  logDebug(`Workers initialized`);
   
   // Distribute voxels across workers
   const voxelsPerWorker = Math.ceil(voxelCount / numWorkers);
@@ -424,7 +424,7 @@ function identifyBoundaryAdjacentVoxels(
   innerSurfaceCount: number;
 } {
   const voxelCount = gridResult.moldVolumeCellCount;
-  const cells = gridResult.moldVolumeCells;
+  const useFlat = gridResult.voxelIndices !== null;
   const voxelDist = gridResult.voxelDist;
   
   if (!voxelDist) {
@@ -454,10 +454,19 @@ function identifyBoundaryAdjacentVoxels(
   let totalSurfaceCount = 0;
   
   for (let i = 0; i < voxelCount; i++) {
-    const cell = cells[i];
-    const gi = Math.round(cell.index.x);
-    const gj = Math.round(cell.index.y);
-    const gk = Math.round(cell.index.z);
+    let gi: number, gj: number, gk: number;
+    
+    if (useFlat) {
+      const i3 = i * 3;
+      gi = gridResult.voxelIndices![i3];
+      gj = gridResult.voxelIndices![i3 + 1];
+      gk = gridResult.voxelIndices![i3 + 2];
+    } else {
+      const cell = gridResult.moldVolumeCells[i];
+      gi = Math.round(cell.index.x);
+      gj = Math.round(cell.index.y);
+      gk = Math.round(cell.index.z);
+    }
     
     // Check if any 6-connected neighbor is missing (not a silicone voxel)
     for (const [di, dj, dk] of faceNeighborOffsets) {
@@ -471,7 +480,7 @@ function identifyBoundaryAdjacentVoxels(
     }
   }
   
-  console.log(`  Total surface voxels (both inner & outer): ${totalSurfaceCount}`);
+  logDebug(`Total surface voxels (both inner & outer): ${totalSurfaceCount}`);
   
   // Step 2: Compute threshold to distinguish inner vs outer surface
   // Inner surface = close to part (small voxelDist)
@@ -494,7 +503,7 @@ function identifyBoundaryAdjacentVoxels(
   const minDist = sortedPairs[0]?.dist || 0;
   const maxDist = sortedPairs[sortedPairs.length - 1]?.dist || 0;
   
-  console.log(`  Surface distance range: [${minDist.toFixed(4)}, ${maxDist.toFixed(4)}]`);
+  logDebug(`Surface distance range: [${minDist.toFixed(4)}, ${maxDist.toFixed(4)}]`);
   
   // Find the largest gap in the sorted distances
   // This gap should separate inner surface (low distances) from outer surface (high distances)
@@ -512,9 +521,9 @@ function identifyBoundaryAdjacentVoxels(
   // The threshold is at the gap - everything before is inner, everything after is outer
   const distanceThreshold = sortedPairs[gapIndex]?.dist || (minDist + maxDist) / 2;
   
-  console.log(`  Largest gap at index ${gapIndex}/${sortedPairs.length}, gap size: ${maxGap.toFixed(4)}`);
-  console.log(`  Distance threshold: ${distanceThreshold.toFixed(4)}`);
-  console.log(`  Inner candidates: ${gapIndex}, Outer candidates: ${sortedPairs.length - gapIndex}`);
+  logDebug(`Largest gap at index ${gapIndex}/${sortedPairs.length}, gap size: ${maxGap.toFixed(4)}`);
+  logDebug(`Distance threshold: ${distanceThreshold.toFixed(4)}`);
+  logDebug(`Inner candidates: ${gapIndex}, Outer candidates: ${sortedPairs.length - gapIndex}`);
   
   // Step 3: Mark OUTER surface voxels (using distance threshold)
   // and identify SEED voxels using either volume intersection or surface distance
@@ -534,14 +543,27 @@ function identifyBoundaryAdjacentVoxels(
   // Second pass: identify seed voxels
   if (partMeshTester && seedVolumeThreshold > 0) {
     // Volume intersection approach: find voxels with ≥ threshold volume inside part
-    console.log(`  Using volume intersection approach for seeds (threshold: ${(seedVolumeThreshold * 100).toFixed(0)}%, samples: ${seedVolumeSamples}³)`);
+    logDebug(`Using volume intersection approach for seeds (threshold: ${(seedVolumeThreshold * 100).toFixed(0)}%, samples: ${seedVolumeSamples}³)`);
     const volumeStartTime = performance.now();
     
+    const tempCenter = new THREE.Vector3();
+    const cellSize = gridResult.cellSize;
+    
     for (let i = 0; i < voxelCount; i++) {
-      const cell = cells[i];
+      if (useFlat) {
+        const i3 = i * 3;
+        tempCenter.set(
+          gridResult.voxelCenters![i3],
+          gridResult.voxelCenters![i3 + 1],
+          gridResult.voxelCenters![i3 + 2]
+        );
+      } else {
+        tempCenter.copy(gridResult.moldVolumeCells[i].center);
+      }
+      
       const volumeRatio = partMeshTester.computeVolumeIntersection(
-        cell.center,
-        cell.size,
+        tempCenter,
+        cellSize,
         seedVolumeSamples
       );
       
@@ -551,27 +573,27 @@ function identifyBoundaryAdjacentVoxels(
       }
     }
     
-    console.log(`  Volume intersection computed in ${(performance.now() - volumeStartTime).toFixed(1)}ms`);
-    console.log(`  Seed voxels (≥${(seedVolumeThreshold * 100).toFixed(0)}% volume intersection): ${innerSurfaceCount}`);
+    logTiming('Volume intersection', performance.now() - volumeStartTime);
+    logDebug(`Seed voxels (≥${(seedVolumeThreshold * 100).toFixed(0)}% volume intersection): ${innerSurfaceCount}`);
   } else {
     // Legacy surface distance approach: surface voxels close to part
-    console.log(`  Using legacy surface distance approach for seeds`);
+    logDebug(`Using legacy surface distance approach for seeds`);
     for (let i = 0; i < voxelCount; i++) {
       if (isSurfaceVoxel[i] && voxelDist[i] < distanceThreshold) {
         innerSurfaceMask[i] = 1;
         innerSurfaceCount++;
       }
     }
-    console.log(`  Inner surface (near part): ${innerSurfaceCount}`);
+    logDebug(`Inner surface (near part): ${innerSurfaceCount}`);
   }
   
-  console.log(`  Outer surface (near shell): ${outerSurfaceCount}`);
+  logDebug(`Outer surface (near shell): ${outerSurfaceCount}`);
   
   // Step 4: For each OUTER surface voxel, determine if it's closer to H₁, H₂, or boundary zone
   // Use BVH for fast closest-point queries
   // Voxels closest to boundary zone triangles will not receive a label (stay 0)
   
-  console.log('  Building BVH for H₁, H₂, and boundary zone triangles...');
+  logDebug('Building BVH for H₁, H₂, and boundary zone triangles...');
   const bvhStartTime = performance.now();
   
   const position = shellGeometry.getAttribute('position');
@@ -627,8 +649,8 @@ function identifyBoundaryAdjacentVoxels(
   const h2BVH = classification.h2Triangles.size > 0 ? new MeshBVH(h2Geometry) : null;
   const boundaryZoneBVH = classification.boundaryZoneTriangles.size > 0 ? new MeshBVH(boundaryZoneGeometry) : null;
   
-  console.log(`  BVH build time: ${(performance.now() - bvhStartTime).toFixed(1)}ms`);
-  console.log(`  H₁ triangles: ${classification.h1Triangles.size}, H₂ triangles: ${classification.h2Triangles.size}, Boundary zone: ${classification.boundaryZoneTriangles.size}`);
+  logTiming('BVH build', performance.now() - bvhStartTime);
+  logResult('BVH triangles', { H1: classification.h1Triangles.size, H2: classification.h2Triangles.size, boundaryZone: classification.boundaryZoneTriangles.size });
   
   // Label each OUTER surface voxel based on closest region using BVH
   // Voxels closest to boundary zone triangles stay unlabeled (0)
@@ -642,10 +664,22 @@ function identifyBoundaryAdjacentVoxels(
   const hitInfoH2 = { point: new THREE.Vector3(), distance: Infinity, faceIndex: 0 };
   const hitInfoBZ = { point: new THREE.Vector3(), distance: Infinity, faceIndex: 0 };
   
+  // Temp vector for center lookups
+  const tempLabelCenter = new THREE.Vector3();
+  
   for (let i = 0; i < voxelCount; i++) {
     if (!isOuterSurface[i]) continue;
     
-    const center = cells[i].center;
+    if (useFlat) {
+      const i3 = i * 3;
+      tempLabelCenter.set(
+        gridResult.voxelCenters![i3],
+        gridResult.voxelCenters![i3 + 1],
+        gridResult.voxelCenters![i3 + 2]
+      );
+    } else {
+      tempLabelCenter.copy(gridResult.moldVolumeCells[i].center);
+    }
     
     // Use BVH closestPointToPoint for fast queries
     // Reset hit info
@@ -653,9 +687,9 @@ function identifyBoundaryAdjacentVoxels(
     hitInfoH2.distance = Infinity;
     hitInfoBZ.distance = Infinity;
     
-    const distH1 = h1BVH ? (h1BVH.closestPointToPoint(center, hitInfoH1), hitInfoH1.distance) : Infinity;
-    const distH2 = h2BVH ? (h2BVH.closestPointToPoint(center, hitInfoH2), hitInfoH2.distance) : Infinity;
-    const distBZ = boundaryZoneBVH ? (boundaryZoneBVH.closestPointToPoint(center, hitInfoBZ), hitInfoBZ.distance) : Infinity;
+    const distH1 = h1BVH ? (h1BVH.closestPointToPoint(tempLabelCenter, hitInfoH1), hitInfoH1.distance) : Infinity;
+    const distH2 = h2BVH ? (h2BVH.closestPointToPoint(tempLabelCenter, hitInfoH2), hitInfoH2.distance) : Infinity;
+    const distBZ = boundaryZoneBVH ? (boundaryZoneBVH.closestPointToPoint(tempLabelCenter, hitInfoBZ), hitInfoBZ.distance) : Infinity;
     
     // Assign based on which region is closest
     // If closest to boundary zone, leave unlabeled (0)
@@ -672,8 +706,8 @@ function identifyBoundaryAdjacentVoxels(
     }
   }
   
-  console.log(`  Labeling time: ${(performance.now() - labelStartTime).toFixed(1)}ms`);
-  console.log(`  Outer boundary labeled: H₁=${h1Adjacent}, H₂=${h2Adjacent}, BoundaryZone(unlabeled)=${boundaryZoneAdjacent}`);
+  logTiming('Labeling', performance.now() - labelStartTime);
+  logResult('Outer boundary labeled', { H1: h1Adjacent, H2: h2Adjacent, boundaryZoneUnlabeled: boundaryZoneAdjacent });
   
   // Clean up
   h1Geometry.dispose();
@@ -696,10 +730,19 @@ function identifyBoundaryAdjacentVoxels(
   // Mark level 1: immediate neighbors of outer surface voxels
   for (let i = 0; i < voxelCount; i++) {
     if (isOuterSurface[i]) {
-      const cell = cells[i];
-      const gi = Math.round(cell.index.x);
-      const gj = Math.round(cell.index.y);
-      const gk = Math.round(cell.index.z);
+      let gi: number, gj: number, gk: number;
+      
+      if (useFlat) {
+        const i3 = i * 3;
+        gi = gridResult.voxelIndices![i3];
+        gj = gridResult.voxelIndices![i3 + 1];
+        gk = gridResult.voxelIndices![i3 + 2];
+      } else {
+        const cell = gridResult.moldVolumeCells[i];
+        gi = Math.round(cell.index.x);
+        gj = Math.round(cell.index.y);
+        gk = Math.round(cell.index.z);
+      }
       
       for (const [di, dj, dk] of faceNeighborOffsets) {
         const neighborIdx = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
@@ -711,7 +754,7 @@ function identifyBoundaryAdjacentVoxels(
     }
   }
   
-  console.log(`  Boundary voxels (outer + 1 level): ${boundaryAdjacentCount}`);
+  logDebug(`Boundary voxels (outer + 1 level): ${boundaryAdjacentCount}`);
   
   return { boundaryLabel, innerSurfaceMask, boundaryAdjacentMask, h1Adjacent, h2Adjacent, innerSurfaceCount };
 }
@@ -745,7 +788,7 @@ async function identifyBoundaryAdjacentVoxelsAsync(
   const useFlat = gridResult.voxelIndices !== null;
   
   if (!voxelDist) {
-    console.error('ERROR: voxelDist is required for boundary detection');
+    logInfo('ERROR: voxelDist is required for boundary detection');
     return { 
       boundaryLabel: new Int8Array(voxelCount), 
       innerSurfaceMask: new Uint8Array(voxelCount),
@@ -795,7 +838,7 @@ async function identifyBoundaryAdjacentVoxelsAsync(
     }
   }
   
-  console.log(`  Total surface voxels (both inner & outer): ${totalSurfaceCount}`);
+  logDebug(`Total surface voxels (both inner & outer): ${totalSurfaceCount}`);
   
   // Step 2: Compute threshold to distinguish inner vs outer surface
   const surfaceDistances: number[] = [];
@@ -813,7 +856,7 @@ async function identifyBoundaryAdjacentVoxelsAsync(
   const minDist = sortedPairs[0]?.dist || 0;
   const maxDist = sortedPairs[sortedPairs.length - 1]?.dist || 0;
   
-  console.log(`  Surface distance range: [${minDist.toFixed(4)}, ${maxDist.toFixed(4)}]`);
+  logDebug(`Surface distance range: [${minDist.toFixed(4)}, ${maxDist.toFixed(4)}]`);
   
   let maxGap = 0;
   let gapIndex = Math.floor(sortedPairs.length / 2);
@@ -828,9 +871,9 @@ async function identifyBoundaryAdjacentVoxelsAsync(
   
   const distanceThreshold = sortedPairs[gapIndex]?.dist || (minDist + maxDist) / 2;
   
-  console.log(`  Largest gap at index ${gapIndex}/${sortedPairs.length}, gap size: ${maxGap.toFixed(4)}`);
-  console.log(`  Distance threshold: ${distanceThreshold.toFixed(4)}`);
-  console.log(`  Inner candidates: ${gapIndex}, Outer candidates: ${sortedPairs.length - gapIndex}`);
+  logDebug(`Largest gap at index ${gapIndex}/${sortedPairs.length}, gap size: ${maxGap.toFixed(4)}`);
+  logDebug(`Distance threshold: ${distanceThreshold.toFixed(4)}`);
+  logDebug(`Inner candidates: ${gapIndex}, Outer candidates: ${sortedPairs.length - gapIndex}`);
   
   // Step 3: Mark outer surface voxels and identify seeds
   const isOuterSurface = new Uint8Array(voxelCount);
@@ -848,7 +891,7 @@ async function identifyBoundaryAdjacentVoxelsAsync(
   
   // Second pass: identify seed voxels using PARALLEL workers
   if (partGeometry && seedVolumeThreshold > 0) {
-    console.log(`  Using PARALLEL volume intersection approach for seeds (threshold: ${(seedVolumeThreshold * 100).toFixed(0)}%, samples: ${seedVolumeSamples}³)`);
+    logDebug(`Using PARALLEL volume intersection approach for seeds (threshold: ${(seedVolumeThreshold * 100).toFixed(0)}%, samples: ${seedVolumeSamples}³)`);
     const volumeStartTime = performance.now();
     
     const result = await computeVolumeIntersectionParallel(
@@ -862,24 +905,24 @@ async function identifyBoundaryAdjacentVoxelsAsync(
     innerSurfaceMask = new Uint8Array(result.innerSurfaceMask);
     innerSurfaceCount = result.innerSurfaceCount;
     
-    console.log(`  Volume intersection computed in ${(performance.now() - volumeStartTime).toFixed(1)}ms`);
-    console.log(`  Seed voxels (≥${(seedVolumeThreshold * 100).toFixed(0)}% volume intersection): ${innerSurfaceCount}`);
+    logTiming('Volume intersection (parallel)', performance.now() - volumeStartTime);
+    logDebug(`Seed voxels (≥${(seedVolumeThreshold * 100).toFixed(0)}% volume intersection): ${innerSurfaceCount}`);
   } else {
     // Legacy surface distance approach
-    console.log(`  Using legacy surface distance approach for seeds`);
+    logDebug(`Using legacy surface distance approach for seeds`);
     for (let i = 0; i < voxelCount; i++) {
       if (isSurfaceVoxel[i] && voxelDist[i] < distanceThreshold) {
         innerSurfaceMask[i] = 1;
         innerSurfaceCount++;
       }
     }
-    console.log(`  Inner surface (near part): ${innerSurfaceCount}`);
+    logDebug(`Inner surface (near part): ${innerSurfaceCount}`);
   }
   
-  console.log(`  Outer surface (near shell): ${outerSurfaceCount}`);
+  logDebug(`Outer surface (near shell): ${outerSurfaceCount}`);
   
   // Step 4: For each OUTER surface voxel, determine if it's closer to H₁, H₂, or boundary zone
-  console.log('  Building BVH for H₁, H₂, and boundary zone triangles...');
+  logDebug('Building BVH for H₁, H₂, and boundary zone triangles...');
   const bvhStartTime = performance.now();
   
   const position = shellGeometry.getAttribute('position');
@@ -931,8 +974,8 @@ async function identifyBoundaryAdjacentVoxelsAsync(
   const h2BVH = classification.h2Triangles.size > 0 ? new MeshBVH(h2Geometry) : null;
   const boundaryZoneBVH = classification.boundaryZoneTriangles.size > 0 ? new MeshBVH(boundaryZoneGeometry) : null;
   
-  console.log(`  BVH build time: ${(performance.now() - bvhStartTime).toFixed(1)}ms`);
-  console.log(`  H₁ triangles: ${classification.h1Triangles.size}, H₂ triangles: ${classification.h2Triangles.size}, Boundary zone: ${classification.boundaryZoneTriangles.size}`);
+  logTiming('BVH build', performance.now() - bvhStartTime);
+  logResult('BVH triangles', { H1: classification.h1Triangles.size, H2: classification.h2Triangles.size, boundaryZone: classification.boundaryZoneTriangles.size });
   
   // Label each OUTER surface voxel based on closest region using BVH
   const boundaryLabel = new Int8Array(voxelCount);
@@ -981,8 +1024,8 @@ async function identifyBoundaryAdjacentVoxelsAsync(
     }
   }
   
-  console.log(`  Labeling time: ${(performance.now() - labelStartTime).toFixed(1)}ms`);
-  console.log(`  Outer boundary labeled: H₁=${h1Adjacent}, H₂=${h2Adjacent}, BoundaryZone(unlabeled)=${boundaryZoneAdjacent}`);
+  logTiming('Labeling', performance.now() - labelStartTime);
+  logResult('Outer boundary labeled', { H1: h1Adjacent, H2: h2Adjacent, boundaryZoneUnlabeled: boundaryZoneAdjacent });
   
   h1Geometry.dispose();
   h2Geometry.dispose();
@@ -1025,7 +1068,7 @@ async function identifyBoundaryAdjacentVoxelsAsync(
     }
   }
   
-  console.log(`  Boundary voxels (outer + 1 level): ${boundaryAdjacentCount}`);
+  logDebug(`Boundary voxels (outer + 1 level): ${boundaryAdjacentCount}`);
   
   return { boundaryLabel, innerSurfaceMask, boundaryAdjacentMask, h1Adjacent, h2Adjacent, innerSurfaceCount };
 }
@@ -1069,27 +1112,27 @@ export function computeEscapeLabelingDijkstra(
   const voxelDist = gridResult.voxelDist;
   const voxelSize = gridResult.cellSize.x;
   
-  console.log('═══════════════════════════════════════════════════════');
-  console.log('ESCAPE LABELING (Outward Dijkstra from Part)');
-  console.log('═══════════════════════════════════════════════════════');
-  console.log(`  Voxel count: ${voxelCount}`);
-  console.log(`  Adjacency: ${adjacency}-connected`);
-  console.log(`  Voxel size: ${voxelSize.toFixed(4)}`);
-  console.log(`  Seed volume threshold: ${(seedVolumeThreshold * 100).toFixed(0)}%`);
-  console.log(`  Part geometry provided: ${partGeometry ? 'yes' : 'no'}`);
+  logInfo('ESCAPE LABELING (Outward Dijkstra from Part)');
+  logResult('Escape labeling params', {
+    voxelCount,
+    adjacency: `${adjacency}-connected`,
+    voxelSize: voxelSize.toFixed(4),
+    seedVolumeThreshold: `${(seedVolumeThreshold * 100).toFixed(0)}%`,
+    partGeometryProvided: partGeometry ? 'yes' : 'no'
+  });
   
   if (!voxelDist) {
-    console.error('ERROR: voxelDist is null - distance field not computed!');
+    logInfo('ERROR: voxelDist is null - distance field not computed!');
     throw new Error('Distance field (voxelDist) is required for escape labeling');
   }
   
   const weightingFactor = gridResult.weightingFactor;
   if (!weightingFactor) {
-    console.error('ERROR: weightingFactor is null - weighting factor not computed!');
+    logInfo('ERROR: weightingFactor is null - weighting factor not computed!');
     throw new Error('Weighting factor is required for escape labeling');
   }
   
-  console.log(`  Weighting factor range: [${gridResult.weightingFactorStats?.min.toFixed(6)}, ${gridResult.weightingFactorStats?.max.toFixed(6)}]`);
+  logDebug(`Weighting factor range: [${gridResult.weightingFactorStats?.min.toFixed(6)}, ${gridResult.weightingFactorStats?.max.toFixed(6)}]`);
   
   // Build spatial index for neighbor lookups
   const spatialIndex = buildVoxelSpatialIndex(gridResult);
@@ -1100,7 +1143,7 @@ export function computeEscapeLabelingDijkstra(
   // Create part mesh tester if geometry is provided and threshold > 0
   let partMeshTester: MeshTester | undefined;
   if (partGeometry && seedVolumeThreshold > 0) {
-    console.log('  Building part mesh BVH for volume intersection...');
+    logDebug('Building part mesh BVH for volume intersection...');
     partMeshTester = new MeshTester(partGeometry, 'part');
   }
   
@@ -1108,7 +1151,7 @@ export function computeEscapeLabelingDijkstra(
   // STEP 1: Identify boundary-adjacent voxels (which touch H₁ or H₂)
   // ========================================================================
   
-  console.log('Identifying boundary-adjacent voxels...');
+  logDebug('Identifying boundary-adjacent voxels...');
   const { boundaryLabel, innerSurfaceMask, h1Adjacent, h2Adjacent, innerSurfaceCount } = identifyBoundaryAdjacentVoxels(
     gridResult,
     shellGeometry,
@@ -1124,14 +1167,12 @@ export function computeEscapeLabelingDijkstra(
     partMeshTester.dispose();
   }
   
-  console.log(`  H₁ adjacent: ${h1Adjacent}`);
-  console.log(`  H₂ adjacent: ${h2Adjacent}`);
-  console.log(`  Seeds: ${innerSurfaceCount}`);
+  logResult('Boundary adjacent', { H1: h1Adjacent, H2: h2Adjacent, seeds: innerSurfaceCount });
   
   // Diagnostic: Check if there are any boundary voxels at all
   const totalBoundaryVoxels = h1Adjacent + h2Adjacent;
   if (totalBoundaryVoxels === 0) {
-    console.error('ERROR: No boundary voxels found! All seeds will be unlabeled.');
+    logInfo('ERROR: No boundary voxels found! All seeds will be unlabeled.');
   }
   
   // Diagnostic: Quick connectivity check - count how many voxels have at least one neighbor
@@ -1155,7 +1196,7 @@ export function computeEscapeLabelingDijkstra(
     if (hasNeighbor) connectedVoxels++;
     else isolatedVoxels++;
   }
-  console.log(`  Connectivity check: ${connectedVoxels} connected, ${isolatedVoxels} isolated voxels`);
+  logDebug(`Connectivity check: ${connectedVoxels} connected, ${isolatedVoxels} isolated voxels`);
   
   // ========================================================================
   // STEP 2: Independent Dijkstra from each seed to find nearest boundary
@@ -1171,7 +1212,7 @@ export function computeEscapeLabelingDijkstra(
   // larger hops (up to 5 voxels) in the same direction.
   // ========================================================================
   
-  console.log('Running independent Dijkstra from each seed to find nearest boundary...');
+  logDebug('Running independent Dijkstra from each seed to find nearest boundary...');
   
   // Use 26-connectivity for better coverage (diagonal neighbors)
   const fullNeighborOffsets = getNeighborOffsets(26);
@@ -1186,7 +1227,7 @@ export function computeEscapeLabelingDijkstra(
       seedIndices.push(i);
     }
   }
-  console.log(`  Total seeds: ${seedIndices.length}`);
+  logDebug(`Total seeds: ${seedIndices.length}`);
   
   // Count how many boundary voxels exist
   let boundaryVoxelCount = 0;
@@ -1195,7 +1236,7 @@ export function computeEscapeLabelingDijkstra(
       boundaryVoxelCount++;
     }
   }
-  console.log(`  Total boundary voxels (H₁ + H₂): ${boundaryVoxelCount}`);
+  logDebug(`Total boundary voxels (H₁ + H₂): ${boundaryVoxelCount}`);
   
   // Seed labels array
   const seedLabel = new Int8Array(voxelCount).fill(-1);
@@ -1227,7 +1268,7 @@ export function computeEscapeLabelingDijkstra(
     // Progress logging
     if (seedNum % progressInterval === 0) {
       const pct = Math.round(100 * seedNum / seedIndices.length);
-      console.log(`  Processing seed ${seedNum}/${seedIndices.length} (${pct}%)...`);
+      logDebug(`Processing seed ${seedNum}/${seedIndices.length} (${pct}%)...`);
     }
     
     // Increment version to "clear" arrays without actually clearing them
@@ -1314,10 +1355,13 @@ export function computeEscapeLabelingDijkstra(
   }
   
   const dijkstraElapsed = performance.now() - dijkstraStartTime;
-  console.log(`  Independent Dijkstra completed in ${dijkstraElapsed.toFixed(1)}ms`);
-  console.log(`  Total visited: ${totalVisited}, Total expanded: ${totalExpanded}`);
-  console.log(`  Average voxels visited per seed: ${(totalVisited / seedIndices.length).toFixed(1)}`);
-  console.log(`  Seeds labeled: ${labeledCount} / ${seedIndices.length}`);
+  logTiming('Independent Dijkstra', dijkstraElapsed);
+  logResult('Dijkstra stats', {
+    totalVisited,
+    totalExpanded,
+    avgVoxelsPerSeed: (totalVisited / seedIndices.length).toFixed(1),
+    seedsLabeled: `${labeledCount} / ${seedIndices.length}`
+  });
   
   // Count results
   let h1Seeds = 0, h2Seeds = 0, unlabeledSeeds = 0;
@@ -1326,7 +1370,7 @@ export function computeEscapeLabelingDijkstra(
     else if (seedLabel[seedIdx] === 2) h2Seeds++;
     else unlabeledSeeds++;
   }
-  console.log(`  Seeds after Dijkstra: H₁=${h1Seeds}, H₂=${h2Seeds}, orphaned=${unlabeledSeeds}`);
+  logResult('Seeds after Dijkstra', { H1: h1Seeds, H2: h2Seeds, orphaned: unlabeledSeeds });
   
   // ========================================================================
   // STEP 3: Build final label array
@@ -1355,7 +1399,7 @@ export function computeEscapeLabelingDijkstra(
       interiorCount++;
     }
   }
-  console.log(`  Interior voxels (intentionally unlabeled): ${interiorCount}`);
+  logDebug(`Interior voxels (intentionally unlabeled): ${interiorCount}`);
   
   // ========================================================================
   // COUNT RESULTS
@@ -1377,13 +1421,13 @@ export function computeEscapeLabelingDijkstra(
   
   const computeTimeMs = performance.now() - startTime;
   
-  console.log('───────────────────────────────────────────────────────');
-  console.log('ESCAPE LABELING RESULTS:');
-  console.log(`  H₁ (side 1): ${d1Count} (${(d1Count / voxelCount * 100).toFixed(1)}%)`);
-  console.log(`  H₂ (side 2): ${d2Count} (${(d2Count / voxelCount * 100).toFixed(1)}%)`);
-  console.log(`  Unlabeled:   ${unlabeledCount} (${(unlabeledCount / voxelCount * 100).toFixed(1)}%)`);
-  console.log(`  Time: ${computeTimeMs.toFixed(1)}ms`);
-  console.log('═══════════════════════════════════════════════════════');
+  logInfo('ESCAPE LABELING RESULTS');
+  logResult('Escape labeling', {
+    H1: `${d1Count} (${(d1Count / voxelCount * 100).toFixed(1)}%)`,
+    H2: `${d2Count} (${(d2Count / voxelCount * 100).toFixed(1)}%)`,
+    unlabeled: `${unlabeledCount} (${(unlabeledCount / voxelCount * 100).toFixed(1)}%)`
+  });
+  logTiming('Escape labeling', computeTimeMs);
   
   // DEBUG: Log boundary label distribution
   let boundaryH1 = 0, boundaryH2 = 0, boundaryNone = 0;
@@ -1392,10 +1436,7 @@ export function computeEscapeLabelingDijkstra(
     else if (boundaryLabel[i] === 2) boundaryH2++;
     else boundaryNone++;
   }
-  console.log('DEBUG - Boundary voxel labels:');
-  console.log(`  Boundary H₁: ${boundaryH1}`);
-  console.log(`  Boundary H₂: ${boundaryH2}`);
-  console.log(`  Not boundary: ${boundaryNone}`);
+  logDebug('DEBUG - Boundary voxel labels', { boundaryH1, boundaryH2, notBoundary: boundaryNone });
   
   // DEBUG: Analyze seed label neighbor consistency (detect mixing/orphans)
   let consistentSeeds = 0;
@@ -1439,13 +1480,9 @@ export function computeEscapeLabelingDijkstra(
     }
   }
   
-  console.log('DEBUG - Seed neighbor consistency:');
-  console.log(`  Consistent (all neighbors same label): ${consistentSeeds}`);
-  console.log(`  Mixed (has neighbors with different label): ${mixedSeeds}`);
-  console.log(`  Isolated (no seed neighbors): ${isolatedSeeds}`);
+  logDebug('DEBUG - Seed neighbor consistency', { consistent: consistentSeeds, mixed: mixedSeeds, isolated: isolatedSeeds });
   if (mixedExamples.length > 0) {
-    console.log('  Examples of mixed seeds:');
-    mixedExamples.forEach(ex => console.log(`    ${ex}`));
+    logDebug('Examples of mixed seeds', mixedExamples);
   }
   
   // DEBUG: Analyze boundary voxel neighbor consistency
@@ -1484,10 +1521,7 @@ export function computeEscapeLabelingDijkstra(
     }
   }
   
-  console.log('DEBUG - Boundary voxel neighbor consistency:');
-  console.log(`  Consistent: ${consistentBoundary}`);
-  console.log(`  At H₁/H₂ interface: ${mixedBoundary}`);
-  console.log(`  Isolated: ${isolatedBoundary}`);
+  logDebug('DEBUG - Boundary voxel neighbor consistency', { consistent: consistentBoundary, atH1H2Interface: mixedBoundary, isolated: isolatedBoundary });
   
   return {
     labels: voxelLabel,
@@ -1539,13 +1573,13 @@ export async function computeEscapeLabelingDijkstraAsync(
   const voxelCount = gridResult.moldVolumeCellCount;
   const voxelSize = gridResult.cellSize.x;
   
-  console.log('═══════════════════════════════════════════════════════');
-  console.log('ESCAPE LABELING (Parallel Dijkstra with Web Workers)');
-  console.log('═══════════════════════════════════════════════════════');
-  console.log(`  Voxel count: ${voxelCount}`);
-  console.log(`  Workers: ${numWorkers ?? 'auto (' + (navigator.hardwareConcurrency || 4) + ')'}`);
-  console.log(`  Adjacency: ${adjacency}-connected`);
-  console.log(`  Voxel size: ${voxelSize.toFixed(4)}`);
+  logInfo('ESCAPE LABELING (Parallel Dijkstra with Web Workers)');
+  logResult('Parallel escape labeling params', {
+    voxelCount,
+    workers: numWorkers ?? `auto (${navigator.hardwareConcurrency || 4})`,
+    adjacency: `${adjacency}-connected`,
+    voxelSize: voxelSize.toFixed(4)
+  });
   
   if (!gridResult.voxelDist) {
     throw new Error('Distance field (voxelDist) is required for escape labeling');
@@ -1556,7 +1590,7 @@ export async function computeEscapeLabelingDijkstraAsync(
   }
   
   // Step 1: Identify boundary-adjacent voxels using PARALLEL volume intersection
-  console.log('Identifying boundary-adjacent voxels (parallel)...');
+  logDebug('Identifying boundary-adjacent voxels (parallel)...');
   const { boundaryLabel, innerSurfaceMask, h1Adjacent, h2Adjacent, innerSurfaceCount } = await identifyBoundaryAdjacentVoxelsAsync(
     gridResult,
     shellGeometry,
@@ -1568,9 +1602,7 @@ export async function computeEscapeLabelingDijkstraAsync(
     numWorkers ?? DEFAULT_NUM_WORKERS
   );
   
-  console.log(`  H₁ adjacent: ${h1Adjacent}`);
-  console.log(`  H₂ adjacent: ${h2Adjacent}`);
-  console.log(`  Seeds: ${innerSurfaceCount}`);
+  logResult('Boundary adjacent (parallel)', { H1: h1Adjacent, H2: h2Adjacent, seeds: innerSurfaceCount });
   
   // Collect seed indices
   const seedIndices: number[] = [];
@@ -1579,10 +1611,10 @@ export async function computeEscapeLabelingDijkstraAsync(
       seedIndices.push(i);
     }
   }
-  console.log(`  Total seeds: ${seedIndices.length}`);
+  logDebug(`Total seeds: ${seedIndices.length}`);
   
   // Step 2: Run parallel Dijkstra
-  console.log('Running parallel Dijkstra from each seed to find nearest boundary...');
+  logDebug('Running parallel Dijkstra from each seed to find nearest boundary...');
   
   const parallelResult = await runParallelDijkstra(
     gridResult,
@@ -1606,7 +1638,7 @@ export async function computeEscapeLabelingDijkstraAsync(
     else if (seedLabel[seedIdx] === 2) h2Seeds++;
     else unlabeledSeeds++;
   }
-  console.log(`  Seeds after Dijkstra: H₁=${h1Seeds}, H₂=${h2Seeds}, orphaned=${unlabeledSeeds}`);
+  logResult('Seeds after Dijkstra (parallel)', { H1: h1Seeds, H2: h2Seeds, orphaned: unlabeledSeeds });
   
   // Step 3: Build final label array
   const voxelLabel = new Int8Array(voxelCount).fill(-1);
@@ -1640,14 +1672,14 @@ export async function computeEscapeLabelingDijkstraAsync(
   
   const computeTimeMs = performance.now() - startTime;
   
-  console.log('───────────────────────────────────────────────────────');
-  console.log('PARALLEL ESCAPE LABELING RESULTS:');
-  console.log(`  H₁ (side 1): ${d1Count} (${(d1Count / voxelCount * 100).toFixed(1)}%)`);
-  console.log(`  H₂ (side 2): ${d2Count} (${(d2Count / voxelCount * 100).toFixed(1)}%)`);
-  console.log(`  Unlabeled:   ${unlabeledCount} (${(unlabeledCount / voxelCount * 100).toFixed(1)}%)`);
-  console.log(`  Total time: ${computeTimeMs.toFixed(1)}ms`);
-  console.log(`  Dijkstra time: ${parallelResult.totalTimeMs.toFixed(1)}ms`);
-  console.log('═══════════════════════════════════════════════════════');
+  logInfo('PARALLEL ESCAPE LABELING RESULTS');
+  logResult('Parallel escape labeling', {
+    H1: `${d1Count} (${(d1Count / voxelCount * 100).toFixed(1)}%)`,
+    H2: `${d2Count} (${(d2Count / voxelCount * 100).toFixed(1)}%)`,
+    unlabeled: `${unlabeledCount} (${(unlabeledCount / voxelCount * 100).toFixed(1)}%)`
+  });
+  logTiming('Total time', computeTimeMs);
+  logTiming('Dijkstra time', parallelResult.totalTimeMs);
   
   return {
     labels: voxelLabel,
@@ -1689,9 +1721,23 @@ export function computeEscapeLabeling(
   let d1Count = 0;
   let d2Count = 0;
   
+  const useFlat = gridResult.voxelCenters !== null;
+  const tempVec = new THREE.Vector3();
+  
   for (let i = 0; i < voxelCount; i++) {
-    const cell = gridResult.moldVolumeCells[i];
-    const pos = cell.center;
+    let pos: THREE.Vector3;
+    if (useFlat) {
+      const i3 = i * 3;
+      tempVec.set(
+        gridResult.voxelCenters![i3],
+        gridResult.voxelCenters![i3 + 1],
+        gridResult.voxelCenters![i3 + 2]
+      );
+      pos = tempVec;
+    } else {
+      const cell = gridResult.moldVolumeCells[i];
+      pos = cell.center;
+    }
     
     const dot1 = pos.dot(d1);
     const dot2 = pos.dot(d2);
@@ -1741,11 +1787,20 @@ export function createEscapeLabelingPointCloud(
   const colorD2 = new THREE.Color(0xff6600);    // Orange (H₂)
   const colorUnlabeled = new THREE.Color(0x888888); // Gray
   
+  const useFlat = gridResult.voxelCenters !== null;
+  
   for (let i = 0; i < voxelCount; i++) {
-    const cell = gridResult.moldVolumeCells[i];
-    positions[i * 3] = cell.center.x;
-    positions[i * 3 + 1] = cell.center.y;
-    positions[i * 3 + 2] = cell.center.z;
+    if (useFlat) {
+      const i3 = i * 3;
+      positions[i3] = gridResult.voxelCenters![i3];
+      positions[i3 + 1] = gridResult.voxelCenters![i3 + 1];
+      positions[i3 + 2] = gridResult.voxelCenters![i3 + 2];
+    } else {
+      const cell = gridResult.moldVolumeCells[i];
+      positions[i * 3] = cell.center.x;
+      positions[i * 3 + 1] = cell.center.y;
+      positions[i * 3 + 2] = cell.center.z;
+    }
     
     const label = labeling.labels[i];
     let color: THREE.Color;
@@ -1860,7 +1915,7 @@ export function createPartingSurfaceInterfaceCloud(
       vertexColors: true,
     });
     
-    console.log(`Labeled seed cloud: ${count} voxels (H₁: ${h1Count}, H₂: ${h2Count}, unlabeled: ${unlabeledCount})`);
+    logDebug(`Labeled seed cloud: ${count} voxels (H₁: ${h1Count}, H₂: ${h2Count}, unlabeled: ${unlabeledCount})`);
     
     return new THREE.Points(geometry, material);
   } else {
@@ -1914,7 +1969,7 @@ export function createPartingSurfaceInterfaceCloud(
       vertexColors: true,
     });
     
-    console.log(`Boundary/Seed cloud: ${count} voxels`);
+    logDebug(`Boundary/Seed cloud: ${count} voxels`);
     
     return new THREE.Points(geometry, material);
   }
@@ -1939,7 +1994,7 @@ export function createBoundaryDebugPointCloud(
   const seedMask = labeling.seedMask;
   
   if (!boundaryLabels) {
-    console.error('DEBUG: boundaryLabels not available in labeling result');
+    logDebug('DEBUG: boundaryLabels not available in labeling result');
     // Fallback to regular visualization
     return createEscapeLabelingPointCloud(gridResult, labeling, pointSize);
   }
@@ -1955,14 +2010,14 @@ export function createBoundaryDebugPointCloud(
     if (seedMask && seedMask[i]) seedCount++;
   }
   
-  console.log('═══════════════════════════════════════════════════════');
-  console.log('DEBUG: Boundary Voxel Visualization');
-  console.log('═══════════════════════════════════════════════════════');
-  console.log(`  Total voxels: ${voxelCount}`);
-  console.log(`  H₁ boundary voxels: ${h1BoundaryCount}`);
-  console.log(`  H₂ boundary voxels: ${h2BoundaryCount}`);
-  console.log(`  Seed voxels: ${seedCount}`);
-  console.log(`  Non-boundary: ${voxelCount - h1BoundaryCount - h2BoundaryCount}`);
+  logDebug('DEBUG: Boundary Voxel Visualization');
+  logResult('Boundary voxel viz', {
+    totalVoxels: voxelCount,
+    H1BoundaryVoxels: h1BoundaryCount,
+    H2BoundaryVoxels: h2BoundaryCount,
+    seedVoxels: seedCount,
+    nonBoundary: voxelCount - h1BoundaryCount - h2BoundaryCount
+  });
   
   // Create arrays for all voxels
   const positions = new Float32Array(voxelCount * 3);
@@ -1975,11 +2030,20 @@ export function createBoundaryDebugPointCloud(
   const colorNonBoundary = new THREE.Color(0x333333);   // Dark gray
   const colorSeed = new THREE.Color(0x0066ff);          // Blue for seeds
   
+  const useFlat = gridResult.voxelCenters !== null;
+  
   for (let i = 0; i < voxelCount; i++) {
-    const cell = gridResult.moldVolumeCells[i];
-    positions[i * 3] = cell.center.x;
-    positions[i * 3 + 1] = cell.center.y;
-    positions[i * 3 + 2] = cell.center.z;
+    if (useFlat) {
+      const i3 = i * 3;
+      positions[i3] = gridResult.voxelCenters![i3];
+      positions[i3 + 1] = gridResult.voxelCenters![i3 + 1];
+      positions[i3 + 2] = gridResult.voxelCenters![i3 + 2];
+    } else {
+      const cell = gridResult.moldVolumeCells[i];
+      positions[i * 3] = cell.center.x;
+      positions[i * 3 + 1] = cell.center.y;
+      positions[i * 3 + 2] = cell.center.z;
+    }
     
     let color: THREE.Color;
     const bLabel = boundaryLabels[i];
@@ -2040,10 +2104,10 @@ export function createBoundaryOnlyPointCloud(
   }
   
   const count = boundaryIndices.length;
-  console.log(`DEBUG: Creating boundary-only cloud with ${count} voxels`);
+  logDebug(`DEBUG: Creating boundary-only cloud with ${count} voxels`);
   
   if (count === 0) {
-    console.warn('DEBUG: No boundary voxels found!');
+    logDebug('DEBUG: No boundary voxels found!');
     return null;
   }
   
@@ -2053,13 +2117,22 @@ export function createBoundaryOnlyPointCloud(
   const colorH1 = new THREE.Color(0x00ff00);  // Green
   const colorH2 = new THREE.Color(0xff6600);  // Orange
   
+  const useFlat = gridResult.voxelCenters !== null;
+  
   for (let i = 0; i < count; i++) {
     const voxelIdx = boundaryIndices[i];
-    const cell = gridResult.moldVolumeCells[voxelIdx];
     
-    positions[i * 3] = cell.center.x;
-    positions[i * 3 + 1] = cell.center.y;
-    positions[i * 3 + 2] = cell.center.z;
+    if (useFlat) {
+      const i3 = voxelIdx * 3;
+      positions[i * 3] = gridResult.voxelCenters![i3];
+      positions[i * 3 + 1] = gridResult.voxelCenters![i3 + 1];
+      positions[i * 3 + 2] = gridResult.voxelCenters![i3 + 2];
+    } else {
+      const cell = gridResult.moldVolumeCells[voxelIdx];
+      positions[i * 3] = cell.center.x;
+      positions[i * 3 + 1] = cell.center.y;
+      positions[i * 3 + 2] = cell.center.z;
+    }
     
     const color = boundaryLabels[voxelIdx] === 1 ? colorH1 : colorH2;
     colors[i * 3] = color.r;
@@ -2108,15 +2181,13 @@ export function createDebugVisualization(
   }
   
   const voxelCount = gridResult.moldVolumeCellCount;
-  const cells = gridResult.moldVolumeCells;
+  const useFlat = gridResult.voxelCenters !== null;
   const seedMask = labeling.seedMask;
   const boundaryLabels = labeling.boundaryLabels;
   const labels = labeling.labels;
   
   if (!seedMask || !boundaryLabels) {
-    console.error('DEBUG: seedMask or boundaryLabels not available');
-    console.error('  seedMask:', seedMask);
-    console.error('  boundaryLabels:', boundaryLabels);
+    logDebug('DEBUG: seedMask or boundaryLabels not available', { seedMask: !!seedMask, boundaryLabels: !!boundaryLabels });
     return null;
   }
   
@@ -2125,7 +2196,7 @@ export function createDebugVisualization(
   for (let i = 0; i < voxelCount; i++) {
     if (seedMask[i]) seedMaskCount++;
   }
-  console.log(`DEBUG: seedMask has ${seedMaskCount} seeds out of ${voxelCount} voxels`);
+  logDebug(`DEBUG: seedMask has ${seedMaskCount} seeds out of ${voxelCount} voxels`);
   
   // Colors
   const colorInnerSurface = new THREE.Color(0x00ffff);   // Cyan - inner surface (seeds)
@@ -2142,7 +2213,7 @@ export function createDebugVisualization(
   if (mode === 'surface-detection') {
     // Show ONLY surface voxels: inner (seeds) and outer (boundary)
     // Inner surface = cyan, Outer surface = yellow
-    console.log('DEBUG MODE: Surface Detection (Inner=Cyan, Outer=Yellow)');
+    logDebug('DEBUG MODE: Surface Detection (Inner=Cyan, Outer=Yellow)');
     
     let innerCount = 0;
     let outerCount = 0;
@@ -2158,14 +2229,12 @@ export function createDebugVisualization(
       // Bulk volume voxels are NOT added
     }
     
-    console.log(`  Inner surface (seeds): ${innerCount}`);
-    console.log(`  Outer surface (boundary): ${outerCount}`);
-    console.log(`  Total displayed: ${displayVoxels.length} / ${voxelCount}`);
+    logResult('Surface detection', { innerSurface: innerCount, outerSurface: outerCount, totalDisplayed: `${displayVoxels.length} / ${voxelCount}` });
     
   } else if (mode === 'boundary-labels') {
     // Show outer surface (boundary) voxels with H₁/H₂ colors AND seed voxels in cyan
     // This shows the state BEFORE Dijkstra runs
-    console.log('DEBUG MODE: Boundary Labels + Seeds (H₁=Green, H₂=Orange, Seeds=Cyan)');
+    logDebug('DEBUG MODE: Boundary Labels + Seeds (H₁=Green, H₂=Orange, Seeds=Cyan)');
     
     let h1Count = 0;
     let h2Count = 0;
@@ -2185,14 +2254,11 @@ export function createDebugVisualization(
       }
     }
     
-    console.log(`  H₁ boundary: ${h1Count}`);
-    console.log(`  H₂ boundary: ${h2Count}`);
-    console.log(`  Seeds (unlabeled): ${seedCount}`);
-    console.log(`  Total displayed: ${displayVoxels.length}`);
+    logResult('Boundary labels', { H1Boundary: h1Count, H2Boundary: h2Count, seedsUnlabeled: seedCount, totalDisplayed: displayVoxels.length });
     
   } else if (mode === 'seed-labels') {
     // Show ALL voxels with their Dijkstra-assigned labels
-    console.log('DEBUG MODE: All Voxel Labels (H₁=Green, H₂=Orange, Unlabeled=Grey)');
+    logDebug('DEBUG MODE: All Voxel Labels (H₁=Green, H₂=Orange, Unlabeled=Grey)');
     
     let h1Count = 0;
     let h2Count = 0;
@@ -2212,14 +2278,11 @@ export function createDebugVisualization(
       }
     }
     
-    console.log(`  H₁ voxels: ${h1Count}`);
-    console.log(`  H₂ voxels: ${h2Count}`);
-    console.log(`  Unlabeled: ${unlabeledCount}`);
-    console.log(`  Total displayed: ${displayVoxels.length}`);
+    logResult('All voxel labels', { H1Voxels: h1Count, H2Voxels: h2Count, unlabeled: unlabeledCount, totalDisplayed: displayVoxels.length });
     
   } else if (mode === 'seed-labels-only') {
     // Show ONLY seed voxels with their Dijkstra-assigned labels
-    console.log('DEBUG MODE: Seed Labels Only (H₁=Green, H₂=Orange, Unlabeled=Grey)');
+    logDebug('DEBUG MODE: Seed Labels Only (H₁=Green, H₂=Orange, Unlabeled=Grey)');
     
     let h1Count = 0;
     let h2Count = 0;
@@ -2241,10 +2304,7 @@ export function createDebugVisualization(
       }
     }
     
-    console.log(`  Seeds → H₁: ${h1Count}`);
-    console.log(`  Seeds → H₂: ${h2Count}`);
-    console.log(`  Seeds unlabeled: ${unlabeledCount}`);
-    console.log(`  Total displayed: ${displayVoxels.length}`);
+    logResult('Seed labels only', { SeedsH1: h1Count, SeedsH2: h2Count, seedsUnlabeled: unlabeledCount, totalDisplayed: displayVoxels.length });
   }
   
   if (displayVoxels.length === 0) {
@@ -2267,11 +2327,18 @@ export function createDebugVisualization(
     
     for (let i = 0; i < count; i++) {
       const { idx, color } = labeledVoxels[i];
-      const cell = cells[idx];
       
-      positions[i * 3] = cell.center.x;
-      positions[i * 3 + 1] = cell.center.y;
-      positions[i * 3 + 2] = cell.center.z;
+      if (useFlat) {
+        const i3 = idx * 3;
+        positions[i * 3] = gridResult.voxelCenters![i3];
+        positions[i * 3 + 1] = gridResult.voxelCenters![i3 + 1];
+        positions[i * 3 + 2] = gridResult.voxelCenters![i3 + 2];
+      } else {
+        const cell = gridResult.moldVolumeCells[idx];
+        positions[i * 3] = cell.center.x;
+        positions[i * 3 + 1] = cell.center.y;
+        positions[i * 3 + 2] = cell.center.z;
+      }
       
       colors[i * 3] = color.r;
       colors[i * 3 + 1] = color.g;
@@ -2301,11 +2368,18 @@ export function createDebugVisualization(
     
     for (let i = 0; i < count; i++) {
       const { idx, color } = unlabeledVoxels[i];
-      const cell = cells[idx];
       
-      positions[i * 3] = cell.center.x;
-      positions[i * 3 + 1] = cell.center.y;
-      positions[i * 3 + 2] = cell.center.z;
+      if (useFlat) {
+        const i3 = idx * 3;
+        positions[i * 3] = gridResult.voxelCenters![i3];
+        positions[i * 3 + 1] = gridResult.voxelCenters![i3 + 1];
+        positions[i * 3 + 2] = gridResult.voxelCenters![i3 + 2];
+      } else {
+        const cell = gridResult.moldVolumeCells[idx];
+        positions[i * 3] = cell.center.x;
+        positions[i * 3 + 1] = cell.center.y;
+        positions[i * 3 + 2] = cell.center.z;
+      }
       
       colors[i * 3] = color.r;
       colors[i * 3 + 1] = color.g;

@@ -13,6 +13,7 @@
 
 import * as THREE from 'three';
 import { MeshBVH, acceleratedRaycast } from 'three-mesh-bvh';
+import { logInfo, logDebug, logResult } from './meshUtils';
 
 // Extend Three.js Mesh to use accelerated raycasting
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
@@ -159,11 +160,7 @@ export async function findPartingDirectionsParallel(
   k: number = 64,
   numWorkers: number = navigator.hardwareConcurrency || 4
 ): Promise<{ d1: THREE.Vector3; d2: THREE.Vector3 }> {
-  console.log('═══════════════════════════════════════════════════════');
-  console.log('PARALLEL VISIBILITY ALGORITHM');
-  console.log('═══════════════════════════════════════════════════════');
-  console.log(`  Direction samples: ${k}`);
-  console.log(`  Worker threads: ${numWorkers}`);
+  logInfo(`Parallel Visibility: ${k} directions, ${numWorkers} workers`);
   
   const startTime = performance.now();
   
@@ -183,8 +180,7 @@ export async function findPartingDirectionsParallel(
   const areas = new Float32Array(triangles.map(t => t.area));
   const totalSurfaceArea = areas.reduce((sum, a) => sum + a, 0);
   
-  console.log(`  Triangles: ${triangles.length}`);
-  console.log(`  Total surface area: ${totalSurfaceArea.toFixed(4)}`);
+  logDebug(`Triangles: ${triangles.length}, Area: ${totalSurfaceArea.toFixed(4)}`);
   
   const directions = fibonacciSphere(k);
   
@@ -222,7 +218,7 @@ export async function findPartingDirectionsParallel(
   }
   
   await Promise.all(workerReadyPromises);
-  console.log('  Workers initialized');
+  logDebug('Workers initialized');
   
   // Distribute work
   const directionsPerWorker = Math.ceil(k / numWorkers);
@@ -297,15 +293,13 @@ export async function findPartingDirectionsParallel(
   
   const elapsed = performance.now() - startTime;
   
-  console.log('\n═══════════════════════════════════════════════════════');
-  console.log('RESULTS');
-  console.log('═══════════════════════════════════════════════════════');
-  console.log(`  d1: [${d1.toArray().map(v => v.toFixed(3)).join(', ')}] - ${(bestD1.visibleArea / totalSurfaceArea * 100).toFixed(1)}%`);
-  console.log(`  d2: [${d2.toArray().map(v => v.toFixed(3)).join(', ')}] - ${(d2UniqueArea / totalSurfaceArea * 100).toFixed(1)}%`);
-  console.log(`  Total coverage: ${totalCoverage.toFixed(1)}%`);
-  console.log(`  Angle: ${angleDeg.toFixed(1)}°`);
-  console.log(`  Time: ${(elapsed / 1000).toFixed(2)}s`);
-  console.log('═══════════════════════════════════════════════════════');
+  logResult('Parting directions', {
+    d1: `[${d1.toArray().map(v => v.toFixed(3)).join(', ')}] (${(bestD1.visibleArea / totalSurfaceArea * 100).toFixed(1)}%)`,
+    d2: `[${d2.toArray().map(v => v.toFixed(3)).join(', ')}] (${(d2UniqueArea / totalSurfaceArea * 100).toFixed(1)}%)`,
+    coverage: `${totalCoverage.toFixed(1)}%`,
+    angle: `${angleDeg.toFixed(1)}°`,
+    timeMs: elapsed.toFixed(0)
+  });
   
   geomClone.dispose();
   
@@ -318,7 +312,7 @@ export async function findPartingDirectionsParallel(
 function findBestPair(
   scores: Map<number, DirectionScore>,
   areas: Float32Array,
-  totalArea: number
+  _totalArea: number
 ): { bestD1: DirectionScore; bestD2: DirectionScore } {
   const sortedScores = Array.from(scores.values()).sort((a, b) => b.visibleArea - a.visibleArea);
   
@@ -438,7 +432,7 @@ export async function computeAndShowPartingDirectionsParallel(
   mesh.parent?.add(arrow1);
   mesh.parent?.add(arrow2);
   
-  console.log('\nComputing visibility for triangle painting...');
+  logDebug('Computing visibility for triangle painting...');
   
   worldGeometry.dispose();
   
@@ -466,7 +460,7 @@ export function applyVisibilityPaint(
   const geometry = mesh.geometry as THREE.BufferGeometry;
   if (!geometry) return;
   
-  console.log('Applying visibility paint...');
+  logDebug('Applying visibility paint...');
   const startTime = performance.now();
   
   // Apply world transform for raycasting
@@ -552,7 +546,7 @@ export function applyVisibilityPaint(
     }
     
     // Determine color
-    let color = PAINT_COLORS.NEUTRAL;
+    let color: { r: number; g: number; b: number } = PAINT_COLORS.NEUTRAL;
     if (isD1Visible && isD2Visible) {
       color = PAINT_COLORS.OVERLAP;
       overlapCount++;
@@ -576,9 +570,7 @@ export function applyVisibilityPaint(
   }
   
   const elapsed = performance.now() - startTime;
-  console.log(`  Painted: D1=${d1Count}, D2=${d2Count}, Overlap=${overlapCount}, Neutral=${neutralCount}`);
-  console.log(`  Coverage: ${((d1Count + d2Count + overlapCount) / triangleCount * 100).toFixed(1)}%`);
-  console.log(`  Time: ${elapsed.toFixed(0)}ms`);
+  logResult('Visibility paint', { D1: d1Count, D2: d2Count, Overlap: overlapCount, Neutral: neutralCount, coverage: `${((d1Count + d2Count + overlapCount) / triangleCount * 100).toFixed(1)}%`, timeMs: elapsed.toFixed(0) });
   
   colorAttr.needsUpdate = true;
   

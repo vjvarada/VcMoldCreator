@@ -18,6 +18,7 @@ import {
   extractVertexTuples,
   type Manifold,
 } from './manifoldUtils';
+import { logDebug, logResult } from './meshUtils';
 
 // ============================================================================
 // CONSTANTS
@@ -733,7 +734,7 @@ export function generateInflatedBoundingVolume(
   const originalFaceCount = inflatedHullGeometry.getAttribute('position').count / 3;
   inflatedHullGeometry = subdivideGeometry(inflatedHullGeometry, SUBDIVISION_ITERATIONS);
   const subdividedFaceCount = inflatedHullGeometry.getAttribute('position').count / 3;
-  console.log(`Hull subdivision: ${originalFaceCount} → ${subdividedFaceCount} faces (${SUBDIVISION_ITERATIONS} iterations)`);
+  logDebug(`Hull subdivision: ${originalFaceCount} → ${subdividedFaceCount} faces (${SUBDIVISION_ITERATIONS} iterations)`);
   
   // Extract the final geometry info
   const { vertices: finalVertices, positionToIndex: finalPosToIndex } = extractUniqueVerticesWithMap(inflatedHullGeometry);
@@ -780,7 +781,7 @@ export function generateInflatedBoundingVolume(
     smoothNormalsArray[i * 3 + 2] = smoothNormals[i].z;
   }
 
-  console.log(`Inflated Hull: ${inputVertices.length} input vertices → ${finalVertices.length} hull vertices, ${faceCount} faces`);
+  logResult('Inflated Hull', { inputVertices: inputVertices.length, hullVertices: finalVertices.length, faces: faceCount });
 
   return {
     mesh: inflatedMesh,

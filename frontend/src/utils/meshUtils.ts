@@ -19,22 +19,118 @@ THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 
 // ============================================================================
-// DEBUG LOGGING
+// LOGGING SYSTEM
 // ============================================================================
 
-/** Enable/disable verbose debug logging for mold analysis */
+/**
+ * Log levels for filtering output
+ * - NONE: No logging
+ * - ERROR: Only errors
+ * - WARN: Errors and warnings
+ * - INFO: Core timing and results (recommended for production)
+ * - DEBUG: Detailed intermediate steps
+ * - TRACE: Very verbose, all internal operations
+ */
+export const LogLevel = {
+  NONE: 0,
+  ERROR: 1,
+  WARN: 2,
+  INFO: 3,
+  DEBUG: 4,
+  TRACE: 5,
+} as const;
+
+export type LogLevel = typeof LogLevel[keyof typeof LogLevel];
+
+/** Current log level - set to INFO for production */
+let currentLogLevel: LogLevel = LogLevel.INFO;
+
+/** Get current log level */
+export function getLogLevel(): LogLevel {
+  return currentLogLevel;
+}
+
+/** Set log level */
+export function setLogLevel(level: LogLevel): void {
+  currentLogLevel = level;
+}
+
+/** Log an error message */
+export function logError(...args: unknown[]): void {
+  if (currentLogLevel >= LogLevel.ERROR) {
+    console.error('[MOLD ERROR]', ...args);
+  }
+}
+
+/** Log a warning message */
+export function logWarn(...args: unknown[]): void {
+  if (currentLogLevel >= LogLevel.WARN) {
+    console.warn('[MOLD WARN]', ...args);
+  }
+}
+
+/** Log an info message (timing, results, key steps) */
+export function logInfo(...args: unknown[]): void {
+  if (currentLogLevel >= LogLevel.INFO) {
+    console.log('[MOLD]', ...args);
+  }
+}
+
+/** Log a debug message (intermediate details) */
+export function logDebug(...args: unknown[]): void {
+  if (currentLogLevel >= LogLevel.DEBUG) {
+    console.log('[MOLD DEBUG]', ...args);
+  }
+}
+
+/** Log a trace message (very verbose) */
+export function logTrace(...args: unknown[]): void {
+  if (currentLogLevel >= LogLevel.TRACE) {
+    console.log('[MOLD TRACE]', ...args);
+  }
+}
+
+/** 
+ * Log timing information for a step
+ * @param step - Name of the step
+ * @param timeMs - Time in milliseconds
+ * @param extra - Optional extra info to include
+ */
+export function logTiming(step: string, timeMs: number, extra?: string): void {
+  if (currentLogLevel >= LogLevel.INFO) {
+    const msg = extra ? `${step}: ${timeMs.toFixed(1)}ms (${extra})` : `${step}: ${timeMs.toFixed(1)}ms`;
+    console.log('[MOLD]', msg);
+  }
+}
+
+/** 
+ * Log step results (counts, statistics)
+ */
+export function logResult(step: string, data: Record<string, unknown>): void {
+  if (currentLogLevel >= LogLevel.INFO) {
+    const parts = Object.entries(data).map(([k, v]) => {
+      if (typeof v === 'number') {
+        return `${k}=${Number.isInteger(v) ? v : v.toFixed(4)}`;
+      }
+      return `${k}=${v}`;
+    });
+    console.log('[MOLD]', `${step}:`, parts.join(', '));
+  }
+}
+
+// Legacy compatibility
+/** @deprecated Use setLogLevel(LogLevel.DEBUG) instead */
 export let DEBUG_LOGGING = true;
 
-/** Set debug logging on or off */
+/** @deprecated Use setLogLevel instead */
 export function setDebugLogging(enabled: boolean): void {
+  currentLogLevel = enabled ? LogLevel.DEBUG : LogLevel.INFO;
   DEBUG_LOGGING = enabled;
 }
 
-/** Conditional debug log - only logs if DEBUG_LOGGING is true */
+/** @deprecated Use logDebug instead */
 export function debugLog(...args: unknown[]): void {
-  if (DEBUG_LOGGING) {
-    console.log(...args);
-  }
+  logDebug(...args);
 }
 
 // ============================================================================

@@ -107,7 +107,7 @@ interface ThreeViewerProps {
   /** Adjacency type for parting surface computation (6 or 26) */
   partingSurfaceAdjacency?: AdjacencyType;
   /** Debug visualization mode for parting surface */
-  partingSurfaceDebugMode?: 'none' | 'surface-detection' | 'boundary-labels' | 'seed-labels';
+  partingSurfaceDebugMode?: 'none' | 'surface-detection' | 'boundary-labels' | 'seed-labels' | 'seed-labels-only';
   onMeshLoaded?: (mesh: THREE.Mesh) => void;
   onMeshRepaired?: (result: MeshRepairResult) => void;
   onVisibilityDataReady?: (data: VisibilityPaintData | null) => void;
@@ -687,32 +687,26 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
           const voxelCentersMemory = gridResult.voxelCenters?.byteLength ?? 0;
           const voxelIndicesMemory = gridResult.voxelIndices?.byteLength ?? 0;
           
-          // Legacy cells array (deprecated but still populated for backward compatibility)
-          const cellsMemory = voxelCount * 120; // ~120 bytes per GridCell (3 Vector3s + overhead)
-          
           const voxelDistMemory = gridResult.voxelDist?.byteLength ?? 0;
           const voxelDistToShellMemory = gridResult.voxelDistToShell?.byteLength ?? 0;
           const biasedDistMemory = gridResult.biasedDist?.byteLength ?? 0;
           const weightingFactorMemory = gridResult.weightingFactor?.byteLength ?? 0;
           const boundaryMaskMemory = gridResult.boundaryAdjacentMask?.byteLength ?? 0;
           
-          // Total includes both flat arrays and legacy cells for now
+          // Total memory for flat arrays (legacy moldVolumeCells no longer populated)
           const flatArraysTotal = voxelCentersMemory + voxelIndicesMemory + voxelDistMemory + voxelDistToShellMemory + biasedDistMemory + weightingFactorMemory + boundaryMaskMemory;
-          const legacyTotal = cellsMemory + voxelDistMemory + voxelDistToShellMemory + biasedDistMemory + weightingFactorMemory + boundaryMaskMemory;
           
           console.log(`  📊 Memory footprint:`);
           console.log(`    voxelCenters (flat Float32): ${(voxelCentersMemory / 1024 / 1024).toFixed(2)} MB`);
           console.log(`    voxelIndices (flat Uint32): ${(voxelIndicesMemory / 1024 / 1024).toFixed(2)} MB`);
-          console.log(`    moldVolumeCells (legacy): ${(cellsMemory / 1024 / 1024).toFixed(2)} MB (${voxelCount} cells × ~120 bytes) [DEPRECATED]`);
           console.log(`    voxelDist: ${(voxelDistMemory / 1024 / 1024).toFixed(2)} MB`);
           console.log(`    voxelDistToShell: ${(voxelDistToShellMemory / 1024 / 1024).toFixed(2)} MB`);
           console.log(`    biasedDist: ${(biasedDistMemory / 1024 / 1024).toFixed(2)} MB`);
           console.log(`    weightingFactor: ${(weightingFactorMemory / 1024 / 1024).toFixed(2)} MB`);
           console.log(`    boundaryAdjacentMask: ${(boundaryMaskMemory / 1024 / 1024).toFixed(2)} MB`);
           console.log(`    --- `);
-          console.log(`    Flat arrays only: ${(flatArraysTotal / 1024 / 1024).toFixed(2)} MB`);
-          console.log(`    With legacy cells: ${((flatArraysTotal + cellsMemory) / 1024 / 1024).toFixed(2)} MB`);
-          console.log(`    ⚡ Savings when legacy removed: ${(cellsMemory / 1024 / 1024).toFixed(2)} MB (${((1 - flatArraysTotal / legacyTotal) * 100).toFixed(1)}% reduction)`);
+          console.log(`    ✅ Total (flat arrays only): ${(flatArraysTotal / 1024 / 1024).toFixed(2)} MB`);
+          console.log(`    💾 Memory saved vs legacy: ~${(voxelCount * 120 / 1024 / 1024).toFixed(2)} MB (moldVolumeCells no longer populated)`);
           
           volumetricGridRef.current = gridResult;
           onVolumetricGridReady?.(gridResult);

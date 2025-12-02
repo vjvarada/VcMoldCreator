@@ -6,6 +6,7 @@
  */
 
 import type { VolumetricGridResult } from './volumetricGrid';
+import { logDebug, logResult } from './meshUtils';
 
 export interface DijkstraWorkerInput {
   type: 'process';
@@ -19,6 +20,10 @@ export interface DijkstraWorkerInput {
   weightingFactor: Float32Array;
   spatialIndexKeys: string[];
   spatialIndexValues: Int32Array;
+  // Grid dimensions for fast 3D lookup (optional for backward compatibility)
+  gridResX?: number;
+  gridResY?: number;
+  gridResZ?: number;
 }
 
 export interface DijkstraWorkerOutput {
@@ -74,6 +79,13 @@ function serializeSpatialIndex(
  * Format: [i0, j0, k0, i1, j1, k1, ...] for all voxels
  */
 function buildGridIndicesArray(gridResult: VolumetricGridResult): Int32Array {
+  // Use flat arrays if available
+  if (gridResult.voxelIndices) {
+    // Already in the right format, just need to convert to Int32Array
+    return new Int32Array(gridResult.voxelIndices);
+  }
+  
+  // Fallback to building from moldVolumeCells
   const cells = gridResult.moldVolumeCells;
   const indices = new Int32Array(cells.length * 3);
   
@@ -91,11 +103,25 @@ function buildGridIndicesArray(gridResult: VolumetricGridResult): Int32Array {
  */
 function buildVoxelSpatialIndex(gridResult: VolumetricGridResult): Map<string, number> {
   const indexMap = new Map<string, number>();
+  const voxelCount = gridResult.voxelIndices ? gridResult.voxelIndices.length / 3 : gridResult.moldVolumeCells.length;
   
-  for (let i = 0; i < gridResult.moldVolumeCells.length; i++) {
-    const cell = gridResult.moldVolumeCells[i];
-    const key = `${Math.round(cell.index.x)},${Math.round(cell.index.y)},${Math.round(cell.index.z)}`;
-    indexMap.set(key, i);
+  if (gridResult.voxelIndices) {
+    // Use flat array
+    for (let i = 0; i < voxelCount; i++) {
+      const i3 = i * 3;
+      const gi = gridResult.voxelIndices[i3];
+      const gj = gridResult.voxelIndices[i3 + 1];
+      const gk = gridResult.voxelIndices[i3 + 2];
+      const key = `${gi},${gj},${gk}`;
+      indexMap.set(key, i);
+    }
+  } else {
+    // Fallback to moldVolumeCells
+    for (let i = 0; i < voxelCount; i++) {
+      const cell = gridResult.moldVolumeCells[i];
+      const key = `${Math.round(cell.index.x)},${Math.round(cell.index.y)},${Math.round(cell.index.z)}`;
+      indexMap.set(key, i);
+    }
   }
   
   return indexMap;
@@ -117,7 +143,7 @@ export async function runParallelDijkstra(
   const voxelCount = gridResult.moldVolumeCellCount;
   const voxelSize = gridResult.cellSize.x;
   
-  console.log(`[ParallelDijkstra] Starting with ${numWorkers} workers for ${seedIndices.length} seeds`);
+  logDebug(`[ParallelDijkstra] Starting: ${numWorkers} workers, ${seedIndices.length} seeds`);
   
   // Prepare shared data
   const spatialIndex = buildVoxelSpatialIndex(gridResult);
@@ -125,20 +151,30 @@ export async function runParallelDijkstra(
   const gridIndices = buildGridIndicesArray(gridResult);
   const weightingFactor = gridResult.weightingFactor!;
   
-  // Split seeds among workers
-  const seedsPerWorker = Math.ceil(seedIndices.length / numWorkers);
-  const workerSeedBatches: number[][] = [];
+  // Extract grid dimensions for fast 3D lookup in workers
+  const gridResX = gridResult.resolution?.x ?? 0;
+  const gridResY = gridResult.resolution?.y ?? 0;
+  const gridResZ = gridResult.resolution?.z ?? 0;
   
-  for (let w = 0; w < numWorkers; w++) {
-    const start = w * seedsPerWorker;
-    const end = Math.min(start + seedsPerWorker, seedIndices.length);
-    if (start < end) {
-      workerSeedBatches.push(seedIndices.slice(start, end));
-    }
+  // ========================================================================
+  // SMART SEED ORDERING: Sort seeds by weighting factor (distance to part)
+  // Seeds with higher weighting factor (closer to part) will have smaller
+  // propagation areas, so we interleave them to balance load
+  // ========================================================================
+  const sortedSeeds = seedIndices.slice().sort((a, b) => {
+    return (weightingFactor[b] || 0) - (weightingFactor[a] || 0); // High weight first
+  });
+  
+  // Interleave seeds across workers for better load balancing
+  // Round-robin distribution ensures each worker gets a mix of easy/hard seeds
+  const workerSeedBatches: number[][] = Array.from({ length: numWorkers }, () => []);
+  for (let i = 0; i < sortedSeeds.length; i++) {
+    workerSeedBatches[i % numWorkers].push(sortedSeeds[i]);
   }
   
-  const actualWorkerCount = workerSeedBatches.length;
-  console.log(`[ParallelDijkstra] Using ${actualWorkerCount} workers, ~${seedsPerWorker} seeds each`);
+  const actualWorkerCount = workerSeedBatches.filter(b => b.length > 0).length;
+  const avgSeeds = Math.round(seedIndices.length / actualWorkerCount);
+  logDebug(`[ParallelDijkstra] Using ${actualWorkerCount} workers, ~${avgSeeds} seeds each (interleaved by weight)`);
   
   // Create workers and process batches
   const workers: Worker[] = [];
@@ -187,6 +223,10 @@ export async function runParallelDijkstra(
       weightingFactor: weightingFactor.slice(),
       spatialIndexKeys,
       spatialIndexValues: spatialIndexValues.slice(),
+      // Pass grid dimensions for fast 3D lookup
+      gridResX,
+      gridResY,
+      gridResZ,
     };
     
     // Transfer arrays to worker
@@ -229,11 +269,14 @@ export async function runParallelDijkstra(
   
   const totalTimeMs = performance.now() - startTime;
   
-  console.log(`[ParallelDijkstra] Completed in ${totalTimeMs.toFixed(1)}ms`);
-  console.log(`  Total visited: ${totalVisited}, Total expanded: ${totalExpanded}`);
-  console.log(`  Seeds labeled: ${labeledCount} / ${seedIndices.length}`);
-  console.log(`  Worker times: [${workerTimesMs.map(t => t.toFixed(0)).join(', ')}]ms`);
-  console.log(`  Speedup estimate: ${(Math.max(...workerTimesMs) / (totalTimeMs || 1) * actualWorkerCount).toFixed(2)}x`);
+  logResult('ParallelDijkstra', {
+    timeMs: totalTimeMs.toFixed(1),
+    visited: totalVisited,
+    expanded: totalExpanded,
+    labeled: `${labeledCount}/${seedIndices.length}`,
+    workerTimes: `[${workerTimesMs.map(t => t.toFixed(0)).join(', ')}]ms`,
+    speedup: `${(Math.max(...workerTimesMs) / (totalTimeMs || 1) * actualWorkerCount).toFixed(2)}x`
+  });
   
   return {
     seedLabel,

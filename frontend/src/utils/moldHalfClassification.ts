@@ -19,6 +19,7 @@
  */
 
 import * as THREE from 'three';
+import { logDebug, logResult } from './meshUtils';
 
 // ============================================================================
 // TYPES
@@ -646,13 +647,13 @@ export function classifyMoldHalves(
     }
   }
   
-  console.log(`  Interface triangles (H₁/H₂ border): ${interfaceTriangles.size}`);
+  logDebug(`Interface triangles (H₁/H₂ border): ${interfaceTriangles.size}`);
   
   // Step 6: Expand boundary zone using BFS from interface triangles
   // Scale: 0% = 0 hops (just interface), 15% = 3 hops, 30% = 8 hops
   // Using quadratic scaling for better control: hops = threshold^2 * 180
   const boundaryZoneHops = Math.round(boundaryZoneThreshold * boundaryZoneThreshold * 180);
-  console.log(`  Boundary zone threshold: ${(boundaryZoneThreshold * 100).toFixed(0)}% → ${boundaryZoneHops} hops`);
+  logDebug(`Boundary zone threshold: ${(boundaryZoneThreshold * 100).toFixed(0)}% → ${boundaryZoneHops} hops`);
   
   const boundaryZoneTriangles = new Set<number>(interfaceTriangles);
   const distance = new Map<number, number>();
@@ -681,7 +682,7 @@ export function classifyMoldHalves(
     }
   }
   
-  console.log(`  Boundary zone triangles: ${boundaryZoneTriangles.size}`);
+  logDebug(`Boundary zone triangles: ${boundaryZoneTriangles.size}`);
   
   // Remove boundary zone triangles from H₁ and H₂ sets, and from sideMap
   const h1Triangles = new Set<number>();
@@ -701,7 +702,7 @@ export function classifyMoldHalves(
   const elapsed = performance.now() - startTime;
   
   // Summary logging
-  console.log(`Mold Half Classification: H₁=${h1Triangles.size}, H₂=${h2Triangles.size}, BoundaryZone=${boundaryZoneTriangles.size}, Inner=${innerBoundaryTriangles.size} [${elapsed.toFixed(0)}ms]`);
+  logResult('Mold Half Classification', { H1: h1Triangles.size, H2: h2Triangles.size, boundaryZone: boundaryZoneTriangles.size, inner: innerBoundaryTriangles.size, timeMs: elapsed.toFixed(0) });
   
   return {
     sideMap: side,
