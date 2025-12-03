@@ -5,7 +5,7 @@
  * Computes optimal parting directions and visualizes surface visibility.
  */
 
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import * as THREE from 'three';
 import './App.css';
 import ThreeViewer, { type GridVisualizationMode, type ThreeViewerHandle } from './components/ThreeViewer';
@@ -83,14 +83,13 @@ function App() {
     repairMethod: string;
   } | null>(null);
   const [showVolumetricGrid, setShowVolumetricGrid] = useState(false);
-  // undefined = auto-calculate based on bounding box diagonal
-  const [gridResolution, setGridResolution] = useState<number | undefined>(undefined);
+  // Voxel density: 0.5 = 0.5 voxels per mm (2mm voxel size, assuming STL is in mm)
+  const [voxelsPerUnit, setVoxelsPerUnit] = useState<number>(0.5);
   const [gridVisualizationMode, setGridVisualizationMode] = useState<GridVisualizationMode>('points');
   const [volumetricGridStats, setVolumetricGridStats] = useState<VolumetricGridStats | null>(null);
-  const [useGPUGrid, setUseGPUGrid] = useState(true);
   const [hideVoxelGrid, setHideVoxelGrid] = useState(false);
   const [showRLine, setShowRLine] = useState(true);
-  const [distanceFieldType, setDistanceFieldType] = useState<DistanceFieldType>('part');
+  const [distanceFieldType, setDistanceFieldType] = useState<DistanceFieldType>('weight');
   // Biased distance weights
   const [biasedDistanceWeights, setBiasedDistanceWeights] = useState<BiasedDistanceWeights>({
     partDistanceWeight: 1.0,
@@ -123,11 +122,54 @@ function App() {
 
   // Track parameters used for last computation (to detect changes)
   const [lastComputedInflationOffset, setLastComputedInflationOffset] = useState<number | null>(null);
-  const [lastComputedGridResolution, setLastComputedGridResolution] = useState<number | null>(null);
+  const [lastComputedVoxelsPerUnit, setLastComputedVoxelsPerUnit] = useState<number | null>(null);
   const [lastComputedAdjacency, setLastComputedAdjacency] = useState<AdjacencyType | null>(null);
 
   // Ref for ThreeViewer component to call methods like recalculateBiasedDistances
   const threeViewerRef = useRef<ThreeViewerHandle | null>(null);
+
+  // Track if this is the first render after grid computation (to skip initial trigger)
+  const initialGridRenderRef = useRef<boolean>(true);
+  
+  // Track last applied weights to avoid redundant updates
+  const lastAppliedWeightsRef = useRef<{ part: number; shell: number } | null>(null);
+
+  // Auto-recalculate biased distances when slider values change
+  // Use primitive values in dependency array to avoid object reference issues
+  useEffect(() => {
+    const currentPart = biasedDistanceWeights.partDistanceWeight;
+    const currentShell = biasedDistanceWeights.shellBiasWeight;
+    
+    // Skip if weights haven't actually changed
+    if (lastAppliedWeightsRef.current &&
+        lastAppliedWeightsRef.current.part === currentPart &&
+        lastAppliedWeightsRef.current.shell === currentShell) {
+      return;
+    }
+    
+    // Skip on initial grid computation - the grid already has correct weights
+    if (initialGridRenderRef.current && volumetricGridStats) {
+      initialGridRenderRef.current = false;
+      lastAppliedWeightsRef.current = { part: currentPart, shell: currentShell };
+      return;
+    }
+    
+    if (volumetricGridStats && threeViewerRef.current) {
+      console.log('App: Triggering recalculation with weights:', currentPart, currentShell);
+      threeViewerRef.current.recalculateBiasedDistances({
+        partDistanceWeight: currentPart,
+        shellBiasWeight: currentShell,
+      });
+      lastAppliedWeightsRef.current = { part: currentPart, shell: currentShell };
+    }
+  }, [biasedDistanceWeights.partDistanceWeight, biasedDistanceWeights.shellBiasWeight, volumetricGridStats]);
+
+  // Reset the initial render flag when grid stats are cleared
+  useEffect(() => {
+    if (!volumetricGridStats) {
+      initialGridRenderRef.current = true;
+    }
+  }, [volumetricGridStats]);
 
   // Helper to clear downstream steps (clears steps AFTER the given step, not the step itself)
   const clearFromStep = useCallback((step: Step) => {
@@ -143,7 +185,7 @@ function App() {
         setMoldHalfStats(null);
         setShowVolumetricGrid(false);
         setVolumetricGridStats(null);
-        setLastComputedGridResolution(null);
+        setLastComputedVoxelsPerUnit(null);
         setShowPartingSurface(false);
         setEscapeLabelingStats(null);
         setLastComputedAdjacency(null);
@@ -156,7 +198,7 @@ function App() {
         setMoldHalfStats(null);
         setShowVolumetricGrid(false);
         setVolumetricGridStats(null);
-        setLastComputedGridResolution(null);
+        setLastComputedVoxelsPerUnit(null);
         setShowPartingSurface(false);
         setEscapeLabelingStats(null);
         setLastComputedAdjacency(null);
@@ -167,7 +209,7 @@ function App() {
         setMoldHalfStats(null);
         setShowVolumetricGrid(false);
         setVolumetricGridStats(null);
-        setLastComputedGridResolution(null);
+        setLastComputedVoxelsPerUnit(null);
         setShowPartingSurface(false);
         setEscapeLabelingStats(null);
         setLastComputedAdjacency(null);
@@ -176,7 +218,7 @@ function App() {
         // Clear voxel and parting-surface (downstream from mold-halves)
         setShowVolumetricGrid(false);
         setVolumetricGridStats(null);
-        setLastComputedGridResolution(null);
+        setLastComputedVoxelsPerUnit(null);
         setShowPartingSurface(false);
         setEscapeLabelingStats(null);
         setLastComputedAdjacency(null);
@@ -202,13 +244,13 @@ function App() {
     }
   }, [hullStats, lastComputedInflationOffset, clearFromStep]);
 
-  const handleGridResolutionChange = useCallback((value: number) => {
-    setGridResolution(value);
-    // If grid was computed with different resolution, clear grid
-    if (volumetricGridStats && lastComputedGridResolution !== null && value !== lastComputedGridResolution) {
+  const handleVoxelsPerUnitChange = useCallback((value: number) => {
+    setVoxelsPerUnit(value);
+    // If grid was computed with different density, clear grid
+    if (volumetricGridStats && lastComputedVoxelsPerUnit !== null && value !== lastComputedVoxelsPerUnit) {
       clearFromStep('voxel');
     }
-  }, [volumetricGridStats, lastComputedGridResolution, clearFromStep]);
+  }, [volumetricGridStats, lastComputedVoxelsPerUnit, clearFromStep]);
 
   // Handlers
   const handleFileLoad = useCallback((url: string, fileName: string) => {
@@ -316,13 +358,12 @@ function App() {
         fillRatio: result.stats.fillRatio,
         computeTimeMs: result.stats.computeTimeMs,
       } : null);
-      // Track the actual computed resolution (may be auto-calculated)
+      // Track the voxelsPerUnit that was used for this computation
       if (result) {
-        // Store the actual resolution from the result (handles auto-calculation case)
-        setLastComputedGridResolution(result.resolution.x);
+        setLastComputedVoxelsPerUnit(voxelsPerUnit);
       }
     },
-    []
+    [voxelsPerUnit]
   );
 
   const handleMoldHalfClassificationReady = useCallback(
@@ -399,9 +440,8 @@ function App() {
         // Voxel depends on mold-halves (or at least cavity)
         if (getStepStatus('cavity') === 'locked') return 'locked';
         if (volumetricGridStats) {
-          // Check if parameters changed - only if user explicitly set a resolution
-          // (gridResolution undefined means auto-calculate, so no recalc needed)
-          if (gridResolution !== undefined && lastComputedGridResolution !== null && gridResolution !== lastComputedGridResolution) {
+          // Check if voxel density changed
+          if (lastComputedVoxelsPerUnit !== null && voxelsPerUnit !== lastComputedVoxelsPerUnit) {
             return 'needs-recalc';
           }
           return 'completed';
@@ -708,26 +748,19 @@ function App() {
 
         {activeStep === 'voxel' && status !== 'locked' && (
           <div style={styles.optionsSection}>
-            <div style={styles.optionLabel}>Grid Resolution: {gridResolution === undefined ? '(Auto)' : ''}</div>
+            <div style={styles.optionLabel}>Voxel Density (voxels/mm):</div>
             <input
               type="text"
-              placeholder="Auto"
-              defaultValue={gridResolution !== undefined ? String(gridResolution) : ''}
-              key={`grid-res-${lastComputedGridResolution}`}
+              placeholder="0.5"
+              defaultValue={String(voxelsPerUnit)}
+              key={`voxels-per-unit-${lastComputedVoxelsPerUnit}`}
               onBlur={(e) => {
                 const val = e.target.value.trim();
-                if (val === '' || val.toLowerCase() === 'auto') {
-                  e.target.value = '';
-                  setGridResolution(undefined);
-                  if (volumetricGridStats && lastComputedGridResolution !== null) {
-                    clearFromStep('voxel');
-                  }
-                } else {
-                  const num = parseInt(val) || 64;
-                  const clamped = Math.max(16, Math.min(128, num));
-                  e.target.value = String(clamped);
-                  handleGridResolutionChange(clamped);
-                }
+                const num = parseFloat(val) || 0.5;
+                // Allow fractional values down to 0.01 (100mm voxels) up to 50 (0.02mm voxels)
+                const clamped = Math.max(0.01, Math.min(50, num));
+                e.target.value = String(clamped);
+                handleVoxelsPerUnitChange(clamped);
               }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
@@ -737,7 +770,10 @@ function App() {
               style={styles.input}
             />
             <div style={{ fontSize: '11px', color: '#868e96', marginTop: '4px' }}>
-              Leave empty for auto (2% of diagonal). Range: 16-128
+              Voxel size: {(1 / voxelsPerUnit).toFixed(3)}mm. Range: 0.01-50 voxels/mm
+            </div>
+            <div style={{ fontSize: '10px', color: '#adb5bd', marginTop: '2px' }}>
+              Examples: 0.5 = 2mm voxels, 1 = 1mm, 5 = 0.2mm, 10 = 0.1mm
             </div>
 
             <div style={{ ...styles.optionLabel, marginTop: '16px' }}>Visualization:</div>
@@ -767,18 +803,6 @@ function App() {
                 Voxels
               </button>
             </div>
-
-            <label style={styles.checkbox}>
-              <input
-                type="checkbox"
-                checked={useGPUGrid}
-                onChange={(e) => setUseGPUGrid(e.target.checked)}
-              />
-              Use GPU (WebGPU)
-              <span style={{ fontSize: '11px', marginLeft: '4px', color: typeof navigator !== 'undefined' && 'gpu' in navigator ? '#17c671' : '#c4183c' }}>
-                {typeof navigator !== 'undefined' && 'gpu' in navigator ? '✅' : '❌'}
-              </span>
-            </label>
 
             {volumetricGridStats && (
               <div style={styles.statsBox}>
@@ -830,24 +854,6 @@ function App() {
                     style={{ width: '100%', cursor: 'pointer' }}
                   />
                 </div>
-                
-                <button
-                  onClick={() => {
-                    // Trigger recalculation via ThreeViewer ref
-                    if (threeViewerRef.current) {
-                      threeViewerRef.current.recalculateBiasedDistances(biasedDistanceWeights);
-                    }
-                  }}
-                  style={{
-                    ...styles.primaryButton,
-                    marginTop: '8px',
-                    width: '100%',
-                    padding: '10px 14px',
-                    fontSize: '13px',
-                  }}
-                >
-                  🔄 Recalculate Biased Distances
-                </button>
                 
                 <button
                   onClick={() => {
@@ -1177,9 +1183,8 @@ function App() {
           showVolumetricGrid={showVolumetricGrid}
           hideVoxelGrid={hideVoxelGrid}
           showRLine={showRLine}
-          gridResolution={gridResolution}
+          voxelsPerUnit={voxelsPerUnit}
           gridVisualizationMode={gridVisualizationMode}
-          useGPUGrid={useGPUGrid}
           distanceFieldType={distanceFieldType}
           showMoldHalfClassification={showMoldHalfClassification}
           boundaryZoneThreshold={boundaryZoneThreshold}

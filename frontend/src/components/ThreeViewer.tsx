@@ -33,18 +33,17 @@ import {
   type MeshRepairResult
 } from '../utils/meshRepairManifold';
 import {
-  generateVolumetricGrid,
-  generateVolumetricGridGPU,
-  generateVolumetricGridParallel,
-  isWebGPUAvailable,
+  generateAdaptiveVoxelGrid,
   createMoldVolumePointCloud,
   createMoldVolumeVoxels,
   createGridBoundingBoxHelper,
   createRLineVisualization,
+  createDimensionLabels,
+  removeDimensionLabels,
   removeGridVisualization,
   recalculateBiasedDistances,
   type VolumetricGridResult,
-  type VolumetricGridOptions,
+  type AdaptiveVoxelGridResult,
   type DistanceFieldType,
   type BiasedDistanceWeights
 } from '../utils/volumetricGrid';
@@ -55,7 +54,6 @@ import {
   type MoldHalfClassificationResult
 } from '../utils/moldHalfClassification';
 import {
-  computeEscapeLabeling,
   computeEscapeLabelingDijkstraAsync,
   createEscapeLabelingPointCloud,
   createDebugVisualization,
@@ -88,14 +86,12 @@ interface ThreeViewerProps {
   hideVoxelGrid?: boolean;
   /** Show R line visualization (max distance from voxel to part) */
   showRLine?: boolean;
-  /** Grid resolution (cells per dimension) */
-  gridResolution?: number;
+  /** Voxel density in voxels per unit (default: 5.0 = 5 voxels/mm assuming STL is in mm) */
+  voxelsPerUnit?: number;
+  /** Number of LOD levels for adaptive voxelization (default: 3) */
+  adaptiveLodLevels?: number;
   /** Grid visualization mode: 'points', 'voxels', or 'none' */
   gridVisualizationMode?: GridVisualizationMode;
-  /** Use GPU acceleration for grid generation (WebGPU if available) */
-  useGPUGrid?: boolean;
-  /** Use parallel Web Workers for grid generation (faster for high resolutions) */
-  useParallelGrid?: boolean;
   /** Which distance field to use for voxel coloring: 'part' (distance to part) or 'biased' (biased distance) */
   distanceFieldType?: DistanceFieldType;
   /** Show mold half classification (H₁/H₂ coloring on cavity) */
@@ -127,7 +123,8 @@ export interface ThreeViewerHandle {
 // CONSTANTS
 // ============================================================================
 
-const FRUSTUM_SIZE = 10;
+// Initial frustum size - will be adjusted based on loaded mesh
+let currentFrustumSize = 200; // Default for typical mechanical parts (mm)
 const BACKGROUND_COLOR = 0x1a1a1a;
 const GRID_COLOR_CENTER = 0x444444;
 const GRID_COLOR_LINES = 0x333333;
@@ -150,11 +147,10 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
   showVolumetricGrid = false,
   hideVoxelGrid = false,
   showRLine = true,
-  gridResolution = 64,
+  voxelsPerUnit = 0.5,
+  adaptiveLodLevels = 3,
   gridVisualizationMode = 'points',
-  useGPUGrid = true,
-  useParallelGrid = false,
-  distanceFieldType = 'part',
+  distanceFieldType = 'weight',
   showMoldHalfClassification = false,
   boundaryZoneThreshold = 0.15,
   showPartingSurface = false,
@@ -188,6 +184,11 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
   const rLineVisualizationRef = useRef<THREE.Group | null>(null);
   const escapeLabelingRef = useRef<EscapeLabelingResult | null>(null);
   const escapeLabelingVisualizationRef = useRef<THREE.Object3D | null>(null);
+  const dimensionLabelsRef = useRef<THREE.Group | null>(null);
+  const gridHelperRef = useRef<THREE.GridHelper | null>(null);
+  const lightsRef = useRef<THREE.DirectionalLight[]>([]);
+  // Store original bounding box (in mm) - no scaling applied (1:1 scale)
+  const originalBoundingBoxRef = useRef<THREE.Box3 | null>(null);
 
   // ============================================================================
   // IMPERATIVE HANDLE - Expose methods to parent component
@@ -197,6 +198,8 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
     recalculateBiasedDistances: (weights: BiasedDistanceWeights) => {
       const gridResult = volumetricGridRef.current;
       const scene = sceneRef.current;
+      const renderer = rendererRef.current;
+      const camera = cameraRef.current;
       
       if (!gridResult || !scene) {
         console.warn('Cannot recalculate: no volumetric grid or scene available');
@@ -232,6 +235,11 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
         // Respect current visibility setting
         gridVisualizationRef.current.visible = !hideVoxelGrid;
         
+        // Force a render to show the updated visualization
+        if (renderer && camera) {
+          renderer.render(scene, camera);
+        }
+        
         console.log('Visualization updated with new weights, visible:', !hideVoxelGrid);
       } else {
         console.log('No visualization to update (gridVisualizationRef.current is null)');
@@ -256,20 +264,22 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
     scene.background = new THREE.Color(BACKGROUND_COLOR);
     sceneRef.current = scene;
 
-    // Add grid
-    scene.add(new THREE.GridHelper(10, 10, GRID_COLOR_CENTER, GRID_COLOR_LINES));
+    // Add grid (will be updated when mesh is loaded)
+    const gridHelper = new THREE.GridHelper(200, 20, GRID_COLOR_CENTER, GRID_COLOR_LINES);
+    scene.add(gridHelper);
+    gridHelperRef.current = gridHelper;
 
-    // Create orthographic camera
+    // Create orthographic camera (will be adjusted when mesh is loaded)
     const aspect = container.clientWidth / container.clientHeight;
     const camera = new THREE.OrthographicCamera(
-      -FRUSTUM_SIZE * aspect / 2,
-      FRUSTUM_SIZE * aspect / 2,
-      FRUSTUM_SIZE / 2,
-      -FRUSTUM_SIZE / 2,
+      -currentFrustumSize * aspect / 2,
+      currentFrustumSize * aspect / 2,
+      currentFrustumSize / 2,
+      -currentFrustumSize / 2,
       0.1,
-      1000
+      10000  // Far plane extended for larger scenes
     );
-    camera.position.set(5, 5, 5);
+    camera.position.set(150, 100, 150);
     cameraRef.current = camera;
 
     // Create renderer
@@ -279,23 +289,32 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    // Add lights
+    // Add lights (positions will be adjusted when mesh is loaded)
     scene.add(new THREE.AmbientLight(0xffffff, 0.6));
     
     const light1 = new THREE.DirectionalLight(0xffffff, 0.8);
-    light1.position.set(10, 10, 10);
+    light1.position.set(200, 200, 200);
     scene.add(light1);
     
     const light2 = new THREE.DirectionalLight(0xffffff, 0.4);
-    light2.position.set(-10, -10, -10);
+    light2.position.set(-200, -200, -200);
     scene.add(light2);
+    
+    lightsRef.current = [light1, light2];
 
     // Add controls
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.05;
-    controls.minDistance = 0.5;
-    controls.maxDistance = 100;
+    controls.minDistance = 1;
+    controls.maxDistance = 5000;  // Extended for larger models
+    // Configure mouse buttons: LEFT=rotate, MIDDLE=pan, RIGHT=dolly (zoom)
+    controls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.PAN,
+      RIGHT: THREE.MOUSE.DOLLY
+    };
+    controls.enablePan = true;
     controlsRef.current = controls;
 
     // Handle resize
@@ -303,10 +322,10 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
       if (!cameraRef.current || !rendererRef.current) return;
       
       const aspect = container.clientWidth / container.clientHeight;
-      cameraRef.current.left = -FRUSTUM_SIZE * aspect / 2;
-      cameraRef.current.right = FRUSTUM_SIZE * aspect / 2;
-      cameraRef.current.top = FRUSTUM_SIZE / 2;
-      cameraRef.current.bottom = -FRUSTUM_SIZE / 2;
+      cameraRef.current.left = -currentFrustumSize * aspect / 2;
+      cameraRef.current.right = currentFrustumSize * aspect / 2;
+      cameraRef.current.top = currentFrustumSize / 2;
+      cameraRef.current.bottom = -currentFrustumSize / 2;
       cameraRef.current.updateProjectionMatrix();
       rendererRef.current.setSize(container.clientWidth, container.clientHeight);
     };
@@ -380,19 +399,21 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
         
         if (!geometry.boundingBox) return;
 
-        // Center geometry with bottom at Z=0
+        // Store original bounding box (in mm) before any transformations
+        originalBoundingBoxRef.current = geometry.boundingBox.clone();
+
+        // Center geometry with bottom at Z=0 (1:1 scale, no scaling applied)
         const center = new THREE.Vector3();
         geometry.boundingBox.getCenter(center);
         geometry.translate(-center.x, -center.y, -geometry.boundingBox.min.z);
         geometry.computeBoundingBox();
         
-        // Scale to fit
+        // Get size in mm (1:1 scale)
         const size = new THREE.Vector3();
         geometry.boundingBox!.getSize(size);
         const maxDim = Math.max(size.x, size.y, size.z);
-        const scale = maxDim > 0 ? 4 / maxDim : 1;
 
-        // Create mesh
+        // Create mesh at 1:1 scale (1 unit = 1 mm)
         const material = new THREE.MeshPhongMaterial({
           color: COLORS.MESH_DEFAULT,
           specular: 0x333333,
@@ -400,19 +421,66 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
         });
         
         const mesh = new THREE.Mesh(geometry, material);
-        mesh.scale.setScalar(scale);
+        // No scaling - mesh.scale stays at (1, 1, 1)
         mesh.rotation.x = -Math.PI / 2; // Z-up to Y-up
         
         scene.add(mesh);
         meshRef.current = mesh;
 
         console.log('STL loaded:', geometry.attributes.position.count, 'vertices');
+        console.log(`Size (mm): ${size.x.toFixed(1)} x ${size.y.toFixed(1)} x ${size.z.toFixed(1)}`);
+        console.log('Scale: 1:1 (1 unit = 1 mm)');
         onMeshLoaded?.(mesh);
 
-        // Position camera
-        const scaledHeight = size.z * scale;
-        camera.position.set(8, 5.6, 8);
-        controls.target.set(0, scaledHeight / 2, 0);
+        // Update camera frustum based on mesh size
+        const frustumPadding = 1.5; // Add 50% padding around the mesh
+        currentFrustumSize = maxDim * frustumPadding;
+        
+        if (cameraRef.current && containerRef.current) {
+          const aspect = containerRef.current.clientWidth / containerRef.current.clientHeight;
+          cameraRef.current.left = -currentFrustumSize * aspect / 2;
+          cameraRef.current.right = currentFrustumSize * aspect / 2;
+          cameraRef.current.top = currentFrustumSize / 2;
+          cameraRef.current.bottom = -currentFrustumSize / 2;
+          cameraRef.current.updateProjectionMatrix();
+        }
+
+        // Update grid to match mesh size (grid lines every 10mm, with major lines)
+        if (gridHelperRef.current) {
+          scene.remove(gridHelperRef.current);
+        }
+        const gridSize = Math.ceil(maxDim * 1.5 / 10) * 10; // Round up to nearest 10mm
+        const gridDivisions = gridSize / 10; // 10mm per division
+        const newGrid = new THREE.GridHelper(gridSize, gridDivisions, GRID_COLOR_CENTER, GRID_COLOR_LINES);
+        scene.add(newGrid);
+        gridHelperRef.current = newGrid;
+
+        // Update light positions based on mesh size
+        const lightDistance = maxDim * 2;
+        if (lightsRef.current.length >= 2) {
+          lightsRef.current[0].position.set(lightDistance, lightDistance, lightDistance);
+          lightsRef.current[1].position.set(-lightDistance, -lightDistance, -lightDistance);
+        }
+
+        // Remove existing dimension labels
+        if (dimensionLabelsRef.current) {
+          removeDimensionLabels(scene, dimensionLabelsRef.current);
+          dimensionLabelsRef.current = null;
+        }
+
+        // Create dimension labels at 1:1 scale
+        const dimensionLabels = createDimensionLabels(
+          originalBoundingBoxRef.current,
+          1.0  // No scaling
+        );
+        scene.add(dimensionLabels);
+        dimensionLabelsRef.current = dimensionLabels;
+
+        // Position camera based on mesh size
+        const cameraDistance = maxDim * 1.2;
+        const meshHeight = size.z; // Height in scene Y after rotation
+        camera.position.set(cameraDistance, cameraDistance * 0.7, cameraDistance);
+        controls.target.set(0, meshHeight / 2, 0);
         controls.update();
       })
       .catch(error => console.error('Error loading STL:', error));
@@ -615,37 +683,13 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
 
     // Generate volumetric grid if requested and we have both hull and mesh
     if (showVolumetricGrid && inflatedHullRef.current && meshRef.current) {
-      // Use async IIFE for GPU version
+      // Use async IIFE for potential future async operations
       (async () => {
         try {
-          // Check WebGPU availability
-          const gpuAvailable = isWebGPUAvailable();
-          
-          // Auto-select best method based on resolution
-          // When surface voxels are included, GPU falls back to CPU anyway, so use parallel workers
-          const totalCells = gridResolution ** 3;
-          const includeSurfaceVoxels = true; // We always include surface voxels
-          
-          // Force parallel when surface voxels are enabled (GPU can't handle this efficiently)
-          // or when explicitly requested, or for very high resolutions
-          const shouldUseParallel = useParallelGrid || includeSurfaceVoxels || totalCells >= 500000;
-          
-          // Only use GPU if not using parallel AND GPU is available AND surface voxels disabled
-          const useGPU = !shouldUseParallel && useGPUGrid && gpuAvailable && !includeSurfaceVoxels;
-          
-          // Determine which method to use
-          let method: string;
-          if (shouldUseParallel) {
-            method = `Parallel Web Workers (${navigator.hardwareConcurrency || 4} cores)`;
-          } else if (useGPU) {
-            method = 'WebGPU (GPU)';
-          } else {
-            method = 'CPU (single-threaded)';
-          }
-          
           console.log('Generating volumetric grid...');
-          console.log(`  Using: ${method}`);
-          console.log(`  Total cells to process: ${totalCells.toLocaleString()}`);
+          console.log(`  Method: Adaptive LOD voxelization`);
+          console.log(`  Base voxel density: ${voxelsPerUnit} voxels/mm`);
+          console.log(`  LOD levels: ${adaptiveLodLevels}`);
           
           // Get geometries in world space
           const shellGeometry = inflatedHullRef.current!.mesh.geometry.clone();
@@ -654,33 +698,43 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
           const partGeometry = meshRef.current!.geometry.clone();
           partGeometry.applyMatrix4(meshRef.current!.matrixWorld);
           
-          const options: VolumetricGridOptions = {
-            // Only pass resolution if explicitly provided, otherwise auto-calculate
-            ...(gridResolution !== undefined && { resolution: gridResolution }),
-            storeAllCells: false,
+          // Use adaptive LOD voxelization with linear scaling for better Dijkstra traversal
+          const adaptiveOptions = {
+            baseVoxelsPerUnit: voxelsPerUnit,
+            lodLevels: adaptiveLodLevels,
             marginPercent: 0.02,
-            computeDistances: false,
-            includeSurfaceVoxels, // Include voxels on boundaries and inner surfaces
+            // Linear scaling is better for Dijkstra walk algorithms:
+            // - More uniform voxel size transitions
+            // - Fewer discretization artifacts at LOD boundaries
+            // - Better path continuity in escape labeling
+            distanceScalingMode: 'linear' as const,
+            sizeFactor: 1.5, // Gentler than 2.0 for smoother transitions
           };
+          const gridResult = await generateAdaptiveVoxelGrid(shellGeometry, partGeometry, adaptiveOptions);
           
-          // Use parallel, GPU, or CPU version based on selection
-          let gridResult: VolumetricGridResult;
-          if (shouldUseParallel) {
-            // Parallel workers - best for high resolutions and surface voxel inclusion
-            gridResult = await generateVolumetricGridParallel(shellGeometry, partGeometry, options);
-          } else if (useGPU) {
-            gridResult = await generateVolumetricGridGPU(shellGeometry, partGeometry, options);
-          } else {
-            gridResult = generateVolumetricGrid(shellGeometry, partGeometry, options);
+          // Log adaptive-specific info
+          const adaptiveResult = gridResult as AdaptiveVoxelGridResult;
+          if (adaptiveResult.lodStats) {
+            console.log(`  LOD Statistics:`);
+            for (let l = 0; l < adaptiveResult.lodStats.voxelCountPerLevel.length; l++) {
+              console.log(`    LOD ${l}: ${adaptiveResult.lodStats.voxelCountPerLevel[l]} voxels, size=${adaptiveResult.lodStats.voxelSizePerLevel[l].toFixed(4)}mm`);
+            }
           }
           
           console.log(`Volumetric grid generated:`);
           console.log(`  Resolution: ${gridResult.resolution.x}×${gridResult.resolution.y}×${gridResult.resolution.z}`);
           console.log(`  Mold volume cells: ${gridResult.moldVolumeCellCount} / ${gridResult.totalCellCount}`);
           console.log(`  Fill ratio: ${(gridResult.stats.fillRatio * 100).toFixed(1)}%`);
-          console.log(`  Approx mold volume: ${gridResult.stats.moldVolume.toFixed(4)}`);
-          console.log(`  Cell size: ${gridResult.cellSize.x.toFixed(4)} × ${gridResult.cellSize.y.toFixed(4)} × ${gridResult.cellSize.z.toFixed(4)}`);
+          console.log(`  Approx mold volume: ${gridResult.stats.moldVolume.toFixed(4)} mm³`);
+          console.log(`  Base cell size: ${gridResult.cellSize.x.toFixed(4)} × ${gridResult.cellSize.y.toFixed(4)} × ${gridResult.cellSize.z.toFixed(4)} mm`);
           console.log(`  Compute time: ${gridResult.stats.computeTimeMs.toFixed(1)} ms`);
+          if (gridResult.seedVoxelMask) {
+            let seedCount = 0;
+            for (let i = 0; i < gridResult.seedVoxelMask.length; i++) {
+              if (gridResult.seedVoxelMask[i]) seedCount++;
+            }
+            console.log(`  Seed voxels (vertices + edges): ${seedCount}`);
+          }
           
           // Log memory size of voxel grid data
           const voxelCount = gridResult.moldVolumeCellCount;
@@ -714,11 +768,14 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
           onVolumetricGridReady?.(gridResult);
           
           // Create initial visualization based on mode
+          // For adaptive grids, pass the voxelSizes array for variable-size rendering
+          const voxelSizes = adaptiveResult.voxelSizes || null;
+          
           if (gridVisualizationMode !== 'none' && gridResult.moldVolumeCellCount > 0) {
             if (gridVisualizationMode === 'points') {
-              gridVisualizationRef.current = createMoldVolumePointCloud(gridResult, 0x00ffff, 3, distanceFieldType);
+              gridVisualizationRef.current = createMoldVolumePointCloud(gridResult, 0x00ffff, 3, distanceFieldType, voxelSizes);
             } else if (gridVisualizationMode === 'voxels') {
-              gridVisualizationRef.current = createMoldVolumeVoxels(gridResult, 0x00ffff, 0.2, distanceFieldType);
+              gridVisualizationRef.current = createMoldVolumeVoxels(gridResult, 0x00ffff, 0.2, distanceFieldType, voxelSizes);
             }
             
             if (gridVisualizationRef.current) {
@@ -746,7 +803,7 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
         }
       })();
     }
-  }, [showVolumetricGrid, gridResolution, useGPUGrid, useParallelGrid, showRLine, onVolumetricGridReady]);
+  }, [showVolumetricGrid, voxelsPerUnit, adaptiveLodLevels, showRLine, onVolumetricGridReady]);
 
   // ============================================================================
   // VOLUMETRIC GRID VISUALIZATION MODE UPDATE
@@ -830,60 +887,41 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
           try {
             console.log('Computing escape labeling (parting surface)...');
             
-            let labeling: EscapeLabelingResult;
-            
-            // Check if we have mold half classification and CSG result for Dijkstra-based labeling
-            if (moldHalfClassificationRef.current && csgResultRef.current) {
-              console.log('Using Dijkstra-based escape labeling with mold half classification');
-              
-              // Get CSG cavity geometry in world space (this is the outer shell ∂H)
-              const shellGeometry = csgResultRef.current.mesh.geometry.clone();
-              shellGeometry.applyMatrix4(csgResultRef.current.mesh.matrixWorld);
-              
-              // Get part geometry in world space for volume intersection seed detection
-              const partGeometry = meshRef.current!.geometry.clone();
-              partGeometry.applyMatrix4(meshRef.current!.matrixWorld);
-              
-              // Compute escape labeling using multi-source Dijkstra
-              // Seeds are voxels with ≥10% volume intersection with part mesh
-              // Uses parallel Web Workers for faster computation on multi-core systems
-              labeling = await computeEscapeLabelingDijkstraAsync(
-                volumetricGridRef.current!,
-                shellGeometry,
-                moldHalfClassificationRef.current,
-                { 
-                  adjacency: partingSurfaceAdjacency, 
-                  seedRadius: 1.5,
-                  seedVolumeThreshold: 0.10,  // 10% volume intersection threshold
-                  seedVolumeSamples: 4,       // 4³ = 64 samples per voxel
-                  parallel: true,             // Enable parallel processing with Web Workers
-                },
-                partGeometry  // Pass part geometry for volume intersection
-              );
-              
-              shellGeometry.dispose();
-              partGeometry.dispose();
-            } else {
-              console.log('Falling back to legacy escape labeling (no mold half classification)');
-              
-              // Get part geometry in world space
-              const partGeometry = meshRef.current!.geometry.clone();
-              partGeometry.applyMatrix4(meshRef.current!.matrixWorld);
-              
-              // Get d1/d2 directions from visibility data
-              const { d1, d2 } = visibilityDataRef.current!;
-              
-              // Compute escape labeling using legacy method
-              labeling = computeEscapeLabeling(
-                volumetricGridRef.current!,
-                partGeometry,
-                d1,
-                d2,
-                { adjacency: partingSurfaceAdjacency }
-              );
-              
-              partGeometry.dispose();
+            // Ensure we have required dependencies for Dijkstra-based labeling
+            if (!moldHalfClassificationRef.current || !csgResultRef.current) {
+              console.warn('Skipping parting surface: mold half classification or CSG result not available');
+              return;
             }
+            
+            console.log('Using Dijkstra-based escape labeling with mold half classification');
+            
+            // Get CSG cavity geometry in world space (this is the outer shell ∂H)
+            const shellGeometry = csgResultRef.current.mesh.geometry.clone();
+            shellGeometry.applyMatrix4(csgResultRef.current.mesh.matrixWorld);
+            
+            // Get part geometry in world space for volume intersection seed detection
+            const partGeometry = meshRef.current!.geometry.clone();
+            partGeometry.applyMatrix4(meshRef.current!.matrixWorld);
+            
+            // Compute escape labeling using multi-source Dijkstra
+            // Seeds are voxels with ≥10% volume intersection with part mesh
+            // Uses parallel Web Workers for faster computation on multi-core systems
+            const labeling = await computeEscapeLabelingDijkstraAsync(
+              volumetricGridRef.current!,
+              shellGeometry,
+              moldHalfClassificationRef.current,
+              { 
+                adjacency: partingSurfaceAdjacency, 
+                seedRadius: 1.5,
+                seedVolumeThreshold: 0.10,  // 10% volume intersection threshold
+                seedVolumeSamples: 4,       // 4³ = 64 samples per voxel
+                parallel: true,             // Enable parallel processing with Web Workers
+              },
+              partGeometry  // Pass part geometry for volume intersection
+            );
+            
+            shellGeometry.dispose();
+            partGeometry.dispose();
             
             escapeLabelingRef.current = labeling;
             onEscapeLabelingReady?.(labeling);
@@ -1034,7 +1072,7 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
     }
   }, [hideVoxelGrid]);
 
-  // Cleanup arrows, hull, CSG result, grid, and escape labeling on unmount
+  // Cleanup arrows, hull, CSG result, grid, dimension labels, and escape labeling on unmount
   useEffect(() => {
     return () => {
       if (partingArrowsRef.current.length > 0) {
@@ -1051,6 +1089,9 @@ const ThreeViewer = forwardRef<ThreeViewerHandle, ThreeViewerProps>(({
       }
       if (gridBoundingBoxRef.current && sceneRef.current) {
         removeGridVisualization(sceneRef.current, gridBoundingBoxRef.current);
+      }
+      if (dimensionLabelsRef.current && sceneRef.current) {
+        removeDimensionLabels(sceneRef.current, dimensionLabelsRef.current);
       }
       if (escapeLabelingVisualizationRef.current && sceneRef.current) {
         sceneRef.current.remove(escapeLabelingVisualizationRef.current);

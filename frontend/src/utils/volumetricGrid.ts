@@ -25,6 +25,22 @@ THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 
 // ============================================================================
+// ASYNC YIELD UTILITIES
+// ============================================================================
+
+/**
+ * Yield to the event loop to prevent UI blocking during heavy computation.
+ * Uses setTimeout(0) which is more reliable than requestAnimationFrame for background work.
+ */
+const yieldToEventLoop = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 0));
+
+/**
+ * Batch size for yielding during heavy computation loops.
+ * Yield every N iterations to keep UI responsive.
+ */
+const YIELD_BATCH_SIZE = 500;
+
+// ============================================================================
 // TYPES
 // ============================================================================
 
@@ -98,6 +114,12 @@ export interface VolumetricGridResult {
   rLineEnd: THREE.Vector3 | null;
   /** Mask indicating which voxels have biased weighting applied (boundary + one level deep) */
   boundaryAdjacentMask: Uint8Array | null;
+  /** 
+   * Mask indicating which voxels are seed voxels (at part mesh vertices).
+   * Only populated when using generateVolumetricGridWithVertexSeeds.
+   * Length = moldVolumeCellCount
+   */
+  seedVoxelMask: Uint8Array | null;
 }
 
 /**
@@ -218,12 +240,20 @@ export interface VolumetricGridStats {
 }
 
 export interface VolumetricGridOptions {
-  /** Grid resolution (cells per dimension, or specify per-axis). If not provided, auto-calculated from targetVoxelSizePercent. */
+  /** Grid resolution (cells per dimension, or specify per-axis). If not provided, auto-calculated from voxelsPerUnit or targetVoxelSizePercent. */
   resolution?: number | THREE.Vector3;
+  /**
+   * Voxel density in voxels per unit length (assuming STL is in mm, this is voxels/mm).
+   * Default: 1.0 (1 voxel per mm).
+   * Higher values = finer grid, better thin wall detection but slower.
+   * This takes precedence over targetVoxelSizePercent when both are specified.
+   */
+  voxelsPerUnit?: number;
   /** 
-   * Target voxel size as percentage of bounding box diagonal (default: 1.5% = 0.015).
-   * Used to auto-calculate resolution when resolution is not explicitly provided.
+   * Target voxel size as percentage of bounding box diagonal (default: 2% = 0.02).
+   * Used to auto-calculate resolution when resolution and voxelsPerUnit are not provided.
    * Smaller values = finer grid, better thin wall detection but slower.
+   * @deprecated Use voxelsPerUnit instead for more intuitive control.
    */
   targetVoxelSizePercent?: number;
   /** Whether to store all cells or only mold volume cells */
@@ -270,12 +300,108 @@ export interface BiasedDistanceWeights {
   shellBiasWeight: number;
 }
 
+/**
+ * Options for adaptive voxelization with distance-based LOD
+ */
+export interface AdaptiveVoxelizationOptions extends VolumetricGridOptions {
+  /**
+   * Base voxel density at the part surface (voxels per mm).
+   * This is the finest resolution, used for seed voxels at vertices/edges.
+   * Default: Uses voxelsPerUnit from parent options or DEFAULT_VOXELS_PER_UNIT
+   */
+  baseVoxelsPerUnit?: number;
+  
+  /**
+   * Number of levels of detail (LOD).
+   * Each level multiplies the voxel size by sizeFactor.
+   * Default: 3 (with sizeFactor=1.5, gives ~2.25x voxel size at coarsest level)
+   * Use 4 for finer gradation, 2 for faster processing
+   */
+  lodLevels?: number;
+  
+  /**
+   * Distance thresholds for each LOD level (in mm from part surface).
+   * The array length should be lodLevels - 1.
+   * If not provided, thresholds are calculated based on the bounding box diagonal.
+   * Example: [2, 5, 10] means:
+   *   - LOD 0 (finest): 0-2mm from part
+   *   - LOD 1: 2-5mm from part
+   *   - LOD 2: 5-10mm from part
+   *   - LOD 3 (coarsest): >10mm from part
+   */
+  lodDistanceThresholds?: number[];
+  
+  /**
+   * Size growth factor per LOD level.
+   * Each successive LOD multiplies voxel size by this factor.
+   * - Default: 1.5 (gentler scaling, better for Dijkstra continuity)
+   * - Use 2.0 for aggressive octree-style halving (more memory savings)
+   */
+  sizeFactor?: number;
+  
+  /**
+   * Distance scaling mode for automatic threshold calculation.
+   * - 'linear': threshold[n] = baseThreshold * (n+1) × distanceScale
+   *   Better for Dijkstra - more uniform voxel size transitions
+   * - 'quadratic': threshold[n] = baseThreshold * (n+1)² × distanceScale  
+   *   More aggressive memory savings, but larger jumps in voxel size
+   * Default: 'linear'
+   */
+  distanceScalingMode?: 'linear' | 'quadratic';
+  
+  /**
+   * Distance scale factor for automatic threshold calculation.
+   * Multiplied by the base threshold (2% of bbox diagonal) to set LOD boundaries.
+   * Default: 1.0
+   */
+  distanceScale?: number;
+  
+  /**
+   * Minimum distance from part surface for a mold volume voxel to be included.
+   * Default: 0 (include voxels that touch the surface)
+   */
+  minDistanceFromPart?: number;
+}
+
+/**
+ * Result for adaptive voxelization, extends the base result with LOD info
+ */
+export interface AdaptiveVoxelGridResult extends VolumetricGridResult {
+  /**
+   * LOD level for each voxel (0 = finest, higher = coarser).
+   * Length = moldVolumeCellCount
+   */
+  voxelLOD: Uint8Array | null;
+  
+  /**
+   * Size (in mm) for each voxel. Since voxels have different sizes in adaptive mode,
+   * this stores the actual size for each voxel.
+   * Length = moldVolumeCellCount
+   */
+  voxelSizes: Float32Array | null;
+  
+  /**
+   * LOD level statistics
+   */
+  lodStats: {
+    /** Number of voxels at each LOD level */
+    voxelCountPerLevel: number[];
+    /** Voxel size at each LOD level */
+    voxelSizePerLevel: number[];
+    /** Distance threshold for each LOD transition */
+    distanceThresholds: number[];
+  } | null;
+}
+
 // ============================================================================
 // CONSTANTS
 // ============================================================================
 
 /** Default grid resolution (cells per dimension) - used as fallback */
 export const DEFAULT_GRID_RESOLUTION = 64;
+
+/** Default voxel density in voxels per unit (assuming mm units, 10 voxels/mm = 0.1mm voxel size) */
+export const DEFAULT_VOXELS_PER_UNIT = 10.0;
 
 /** Default target voxel size as percentage of bounding box diagonal (2%) */
 export const DEFAULT_TARGET_VOXEL_SIZE_PERCENT = 0.02;
@@ -289,22 +415,65 @@ export const DEFAULT_MIN_PART_OVERLAP_RATIO = 0.01;
 /** Default distance threshold as fraction of voxel size for surface voxels (50%) */
 export const DEFAULT_SURFACE_DISTANCE_THRESHOLD = 0.5;
 
-/** Minimum resolution to use (prevents too coarse grids) */
+/** 
+ * Number of voxel levels deep from shell boundary to apply biased weighting.
+ * Level 0 = outer surface voxels (touching shell)
+ * Level 1 = immediate neighbors of outer surface
+ * Default: 1 (outer surface + 1 level deep = 2 total layers)
+ */
+export const BOUNDARY_DEPTH_LEVELS = 1;
+
+/** Minimum resolution to use per axis (prevents too coarse grids) */
 export const MIN_GRID_RESOLUTION = 16;
 
-/** Maximum resolution to use (prevents memory issues - 128³ = 2M max voxels) */
-export const MAX_GRID_RESOLUTION = 128;
+/** Maximum resolution to use per axis (prevents memory issues - 256³ = 16M max voxels) */
+export const MAX_GRID_RESOLUTION = 256;
 
 // ============================================================================
 // AUTO RESOLUTION CALCULATION
 // ============================================================================
 
 /**
+ * Calculate grid resolution from voxel density (voxels per unit length).
+ * 
+ * @param boundingBox - The bounding box of the grid domain
+ * @param voxelsPerUnit - Voxel density (e.g., 1.0 = 1 voxel/mm if STL is in mm)
+ * @returns Resolution per axis as Vector3, clamped between MIN and MAX values
+ */
+export function calculateResolutionFromDensity(
+  boundingBox: THREE.Box3,
+  voxelsPerUnit: number = DEFAULT_VOXELS_PER_UNIT
+): THREE.Vector3 {
+  const size = new THREE.Vector3();
+  boundingBox.getSize(size);
+  
+  // Calculate resolution for each axis based on voxel density
+  // voxelsPerUnit = 1 means 1 voxel per mm (if units are mm)
+  // voxel size = 1 / voxelsPerUnit
+  const voxelSize = 1.0 / voxelsPerUnit;
+  
+  const resX = Math.ceil(size.x / voxelSize);
+  const resY = Math.ceil(size.y / voxelSize);
+  const resZ = Math.ceil(size.z / voxelSize);
+  
+  // Clamp each dimension to valid range
+  const clampedX = Math.max(MIN_GRID_RESOLUTION, Math.min(MAX_GRID_RESOLUTION, resX));
+  const clampedY = Math.max(MIN_GRID_RESOLUTION, Math.min(MAX_GRID_RESOLUTION, resY));
+  const clampedZ = Math.max(MIN_GRID_RESOLUTION, Math.min(MAX_GRID_RESOLUTION, resZ));
+  
+  logDebug(`Resolution from density: voxelsPerUnit=${voxelsPerUnit}, voxelSize=${voxelSize.toFixed(4)}mm, size=(${size.x.toFixed(2)}, ${size.y.toFixed(2)}, ${size.z.toFixed(2)})`);
+  logDebug(`  Calculated: (${resX}, ${resY}, ${resZ}) -> clamped: (${clampedX}, ${clampedY}, ${clampedZ})`);
+  
+  return new THREE.Vector3(clampedX, clampedY, clampedZ);
+}
+
+/**
  * Calculate adaptive grid resolution based on bounding box diagonal
  * 
  * @param boundingBox - The bounding box of the grid domain
- * @param targetVoxelSizePercent - Target voxel size as percentage of diagonal (default: 1.5%)
+ * @param targetVoxelSizePercent - Target voxel size as percentage of diagonal (default: 2%)
  * @returns Resolution clamped between MIN and MAX values
+ * @deprecated Use calculateResolutionFromDensity for more intuitive control
  */
 export function calculateAdaptiveResolution(
   boundingBox: THREE.Box3,
@@ -707,11 +876,12 @@ export function generateVolumetricGrid(
   
   logDebug(`Surface voxels: outer=${outerSurfaceCount}, inner=${totalSurfaceCount - outerSurfaceCount}`);
   
-  // Step 4: Build mask for boundary voxels (outer surface + one level deep)
+  // Step 4: Build mask for boundary voxels (outer surface + BOUNDARY_DEPTH_LEVELS levels deep)
+  // This limits the biased weighting to voxels near the shell boundary
   const isBoundaryAdjacent = new Uint8Array(voxelCount);
   let boundaryAdjacentCount = 0;
   
-  // First, mark all outer surface voxels
+  // First, mark all outer surface voxels (level 0)
   for (let i = 0; i < voxelCount; i++) {
     if (isOuterSurface[i]) {
       isBoundaryAdjacent[i] = 1;
@@ -719,25 +889,31 @@ export function generateVolumetricGrid(
     }
   }
   
-  // Mark level 1: immediate neighbors of outer surface voxels
-  for (let i = 0; i < voxelCount; i++) {
-    if (isOuterSurface[i]) {
-      const i3 = i * 3;
-      const gi = voxelIndices[i3];
-      const gj = voxelIndices[i3 + 1];
-      const gk = voxelIndices[i3 + 2];
-      
-      for (const [di, dj, dk] of faceNeighborOffsets) {
-        const neighborIdx = getVoxelIdx(gi + di, gj + dj, gk + dk);
-        if (neighborIdx >= 0 && !isBoundaryAdjacent[neighborIdx]) {
-          isBoundaryAdjacent[neighborIdx] = 1;
-          boundaryAdjacentCount++;
+  // Expand outward for each level (1 to BOUNDARY_DEPTH_LEVELS)
+  for (let level = 1; level <= BOUNDARY_DEPTH_LEVELS; level++) {
+    // Track which voxels were marked in previous iteration
+    const previouslyMarked = new Uint8Array(isBoundaryAdjacent);
+    
+    for (let i = 0; i < voxelCount; i++) {
+      // Only expand from voxels marked in previous level
+      if (previouslyMarked[i] && (level === 1 ? isOuterSurface[i] : true)) {
+        const i3 = i * 3;
+        const gi = voxelIndices[i3];
+        const gj = voxelIndices[i3 + 1];
+        const gk = voxelIndices[i3 + 2];
+        
+        for (const [di, dj, dk] of faceNeighborOffsets) {
+          const neighborIdx = getVoxelIdx(gi + di, gj + dj, gk + dk);
+          if (neighborIdx >= 0 && !isBoundaryAdjacent[neighborIdx]) {
+            isBoundaryAdjacent[neighborIdx] = 1;
+            boundaryAdjacentCount++;
+          }
         }
       }
     }
   }
   
-  logResult('Boundary detection', { boundaryVoxels: boundaryAdjacentCount, interiorVoxels: voxelCount - boundaryAdjacentCount });
+  logResult('Boundary detection', { boundaryVoxels: boundaryAdjacentCount, interiorVoxels: voxelCount - boundaryAdjacentCount, depthLevels: BOUNDARY_DEPTH_LEVELS });
   
   // ========================================================================
   // BIASED DISTANCE FIELD COMPUTATION
@@ -846,6 +1022,7 @@ export function generateVolumetricGrid(
     rLineStart,
     rLineEnd,
     boundaryAdjacentMask: isBoundaryAdjacent,
+    seedVoxelMask: null,
   };
 }
 
@@ -1246,11 +1423,11 @@ export async function generateVolumetricGridGPU(
     
     logDebug(`Outer surface voxels (GPU): ${outerSurfaceCount}`);
     
-    // Step 4: Build mask for boundary voxels (outer surface + one level deep)
+    // Step 4: Build mask for boundary voxels (outer surface + BOUNDARY_DEPTH_LEVELS levels deep)
     const isBoundaryAdjacent = new Uint8Array(voxelCount);
     let boundaryAdjacentCount = 0;
     
-    // First, mark all outer surface voxels
+    // First, mark all outer surface voxels (level 0)
     for (let i = 0; i < voxelCount; i++) {
       if (isOuterSurface[i]) {
         isBoundaryAdjacent[i] = 1;
@@ -1258,25 +1435,29 @@ export async function generateVolumetricGridGPU(
       }
     }
     
-    // Mark level 1: immediate neighbors of outer surface voxels
-    for (let i = 0; i < voxelCount; i++) {
-      if (isOuterSurface[i]) {
-        const i3 = i * 3;
-        const gi = voxelIndices[i3];
-        const gj = voxelIndices[i3 + 1];
-        const gk = voxelIndices[i3 + 2];
-        
-        for (const [di, dj, dk] of faceNeighborOffsets) {
-          const neighborIdx = getVoxelIdx(gi + di, gj + dj, gk + dk);
-          if (neighborIdx >= 0 && !isBoundaryAdjacent[neighborIdx]) {
-            isBoundaryAdjacent[neighborIdx] = 1;
-            boundaryAdjacentCount++;
+    // Expand outward for each level (1 to BOUNDARY_DEPTH_LEVELS)
+    for (let level = 1; level <= BOUNDARY_DEPTH_LEVELS; level++) {
+      const previouslyMarked = new Uint8Array(isBoundaryAdjacent);
+      
+      for (let i = 0; i < voxelCount; i++) {
+        if (previouslyMarked[i] && (level === 1 ? isOuterSurface[i] : true)) {
+          const i3 = i * 3;
+          const gi = voxelIndices[i3];
+          const gj = voxelIndices[i3 + 1];
+          const gk = voxelIndices[i3 + 2];
+          
+          for (const [di, dj, dk] of faceNeighborOffsets) {
+            const neighborIdx = getVoxelIdx(gi + di, gj + dj, gk + dk);
+            if (neighborIdx >= 0 && !isBoundaryAdjacent[neighborIdx]) {
+              isBoundaryAdjacent[neighborIdx] = 1;
+              boundaryAdjacentCount++;
+            }
           }
         }
       }
     }
     
-    logResult('Boundary detection (GPU)', { boundaryVoxels: boundaryAdjacentCount, interiorVoxels: voxelCount - boundaryAdjacentCount });
+    logResult('Boundary detection (GPU)', { boundaryVoxels: boundaryAdjacentCount, interiorVoxels: voxelCount - boundaryAdjacentCount, depthLevels: BOUNDARY_DEPTH_LEVELS });
     
     // ========================================================================
     // BIASED DISTANCE FIELD COMPUTATION
@@ -1382,6 +1563,7 @@ export async function generateVolumetricGridGPU(
       rLineStart,
       rLineEnd,
       boundaryAdjacentMask: isBoundaryAdjacent,
+      seedVoxelMask: null,
     };
     
   } catch (error) {
@@ -1596,17 +1778,20 @@ function getDistanceFieldData(
  * @param color - Fallback color for points if no distance data (default: cyan)
  * @param pointSize - Size of each point (default: 2)
  * @param distanceFieldType - Which distance field to use for coloring: 'part' or 'biased' (default: 'part')
+ * @param voxelSizes - Optional array of per-voxel sizes for adaptive grids (scales point size)
  * @returns THREE.Points object for adding to scene
  */
 export function createMoldVolumePointCloud(
   gridResult: VolumetricGridResult,
   color: THREE.ColorRepresentation = 0x00ffff,
   pointSize: number = 2,
-  distanceFieldType: DistanceFieldType = 'part'
+  distanceFieldType: DistanceFieldType = 'part',
+  voxelSizes: Float32Array | null = null
 ): THREE.Points {
   const cellCount = gridResult.moldVolumeCellCount;
   const positions = new Float32Array(cellCount * 3);
   const colors = new Float32Array(cellCount * 3);
+  const sizes = new Float32Array(cellCount); // Per-point sizes for adaptive grids
   
   // Use flat arrays if available (more memory efficient), fall back to deprecated moldVolumeCells
   const useFlat = gridResult.voxelCenters !== null;
@@ -1627,12 +1812,18 @@ export function createMoldVolumePointCloud(
   }
   
   // Color gradient: red (close to part) -> teal (far from part)
+  // For weighting factor: red (high cost) -> blue (low cost) [inverted]
   // For boundary mask: orange (biased/boundary) vs blue (unbiased/interior)
   const colorClose = new THREE.Color(0xff0000); // Red
   const colorFar = new THREE.Color(0x00ffff);   // Teal (cyan)
+  const colorWeightHigh = new THREE.Color(0xff0000); // Red - high cost (costly to walk)
+  const colorWeightLow = new THREE.Color(0x0088ff);  // Blue - low cost (cheap to walk)
   const colorBiased = new THREE.Color(0xff8800);   // Orange - biased (boundary-adjacent)
   const colorUnbiased = new THREE.Color(0x0088ff); // Blue - unbiased (interior)
   const tempColor = new THREE.Color();
+  
+  // Base size for point scaling (from uniform grid cell size)
+  const baseCellSize = gridResult.cellSize.x;
   
   for (let i = 0; i < cellCount; i++) {
     // Get position from flat array or legacy object
@@ -1648,12 +1839,30 @@ export function createMoldVolumePointCloud(
       positions[i * 3 + 2] = cell.center.z;
     }
     
+    // Set point size based on voxel size (for adaptive grids)
+    if (voxelSizes) {
+      // Scale point size proportionally to voxel size
+      sizes[i] = pointSize * (voxelSizes[i] / baseCellSize);
+    } else {
+      sizes[i] = pointSize;
+    }
+    
     if (hasDistanceData) {
       if (isBinaryMask === true) {
         // Binary mask: use distinct colors for biased vs unbiased
         const maskValue = distData![i];
         const isBiased = maskValue === 1;
         tempColor.copy(isBiased ? colorBiased : colorUnbiased);
+      } else if (distanceFieldType === 'weight') {
+        // Weighting factor: red (high cost) -> blue (low cost)
+        // High weight = close to boundary = costly to traverse
+        const dist = distData![i];
+        const { min, max } = distStats!;
+        const range = max - min;
+        const t = range > 0 ? (dist - min) / range : 0;
+        
+        // Interpolate: low weight (t=0) -> blue, high weight (t=1) -> red
+        tempColor.lerpColors(colorWeightLow, colorWeightHigh, t);
       } else {
         // Continuous field: interpolate based on normalized value
         const dist = distData![i];
@@ -1679,14 +1888,51 @@ export function createMoldVolumePointCloud(
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
   
-  const material = new THREE.PointsMaterial({
-    size: pointSize,
-    sizeAttenuation: true,
-    transparent: true,
-    opacity: 0.6,
-    vertexColors: true, // Enable per-vertex coloring
-  });
+  // Use shader material for variable point sizes
+  const hasVariableSizes = voxelSizes !== null;
+  
+  let material: THREE.PointsMaterial | THREE.ShaderMaterial;
+  
+  if (hasVariableSizes) {
+    // Custom shader material for per-point sizes
+    material = new THREE.ShaderMaterial({
+      uniforms: {
+        opacity: { value: 0.6 }
+      },
+      vertexShader: `
+        attribute float size;
+        varying vec3 vColor;
+        void main() {
+          vColor = color;
+          vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+          gl_PointSize = size * (300.0 / -mvPosition.z);
+          gl_Position = projectionMatrix * mvPosition;
+        }
+      `,
+      fragmentShader: `
+        uniform float opacity;
+        varying vec3 vColor;
+        void main() {
+          float r = distance(gl_PointCoord, vec2(0.5, 0.5));
+          if (r > 0.5) discard;
+          gl_FragColor = vec4(vColor, opacity);
+        }
+      `,
+      transparent: true,
+      vertexColors: true,
+      depthWrite: false
+    });
+  } else {
+    material = new THREE.PointsMaterial({
+      size: pointSize,
+      sizeAttenuation: true,
+      transparent: true,
+      opacity: 0.6,
+      vertexColors: true, // Enable per-vertex coloring
+    });
+  }
   
   return new THREE.Points(geometry, material);
 }
@@ -1700,13 +1946,15 @@ export function createMoldVolumePointCloud(
  * @param color - Fallback color for the boxes if no distance data (default: cyan)
  * @param opacity - Opacity of boxes (default: 0.3)
  * @param distanceFieldType - Which distance field to use for coloring: 'part' or 'biased' (default: 'part')
+ * @param voxelSizes - Optional array of per-voxel sizes for adaptive grids
  * @returns THREE.InstancedMesh for adding to scene
  */
 export function createMoldVolumeVoxels(
   gridResult: VolumetricGridResult,
   color: THREE.ColorRepresentation = 0x00ffff,
   opacity: number = 0.3,
-  distanceFieldType: DistanceFieldType = 'part'
+  distanceFieldType: DistanceFieldType = 'part',
+  voxelSizes: Float32Array | null = null
 ): THREE.InstancedMesh {
   const cellCount = gridResult.moldVolumeCellCount;
   const { cellSize } = gridResult;
@@ -1714,8 +1962,12 @@ export function createMoldVolumeVoxels(
   // Use flat arrays if available (more memory efficient), fall back to deprecated moldVolumeCells
   const useFlat = gridResult.voxelCenters !== null;
   
-  // Create box geometry for a single cell
-  const boxGeometry = new THREE.BoxGeometry(cellSize.x, cellSize.y, cellSize.z);
+  // For adaptive grids with variable voxel sizes, use a unit box and scale per instance
+  // For uniform grids, use the cell size directly for better performance
+  const hasVariableSizes = voxelSizes !== null;
+  const boxGeometry = hasVariableSizes 
+    ? new THREE.BoxGeometry(1, 1, 1) // Unit box, will be scaled per instance
+    : new THREE.BoxGeometry(cellSize.x, cellSize.y, cellSize.z);
   
   const material = new THREE.MeshPhongMaterial({
     transparent: true,
@@ -1752,9 +2004,12 @@ export function createMoldVolumeVoxels(
   }
   
   // Color gradient: red (close/low) -> teal (far/high)
+  // For weighting factor: red (high cost) -> blue (low cost) [inverted]
   // For boundary mask: orange (biased/boundary) vs blue (unbiased/interior)
   const colorClose = new THREE.Color(0xff0000); // Red
   const colorFar = new THREE.Color(0x00ffff);   // Teal (cyan)
+  const colorWeightHigh = new THREE.Color(0xff0000); // Red - high cost (costly to walk)
+  const colorWeightLow = new THREE.Color(0x0088ff);  // Blue - low cost (cheap to walk)
   const colorBiased = new THREE.Color(0xff8800);   // Orange - biased (boundary-adjacent)
   const colorUnbiased = new THREE.Color(0x0088ff); // Blue - unbiased (interior)
   const fallbackColor = new THREE.Color(color);
@@ -1763,6 +2018,8 @@ export function createMoldVolumeVoxels(
   // Set transforms and colors for each instance
   const matrix = new THREE.Matrix4();
   const tempVec = new THREE.Vector3();
+  const tempScale = new THREE.Vector3();
+  const quaternion = new THREE.Quaternion(); // Identity quaternion (no rotation)
   
   for (let i = 0; i < cellCount; i++) {
     // Get position from flat array or legacy object
@@ -1773,10 +2030,18 @@ export function createMoldVolumeVoxels(
         gridResult.voxelCenters![i3 + 1],
         gridResult.voxelCenters![i3 + 2]
       );
-      matrix.setPosition(tempVec);
     } else {
       const cell = gridResult.moldVolumeCells[i];
-      matrix.setPosition(cell.center);
+      tempVec.copy(cell.center);
+    }
+    
+    // For adaptive grids, set scale based on voxel size
+    if (hasVariableSizes && voxelSizes) {
+      const voxelSize = voxelSizes[i];
+      tempScale.set(voxelSize, voxelSize, voxelSize);
+      matrix.compose(tempVec, quaternion, tempScale);
+    } else {
+      matrix.setPosition(tempVec);
     }
     instancedMesh.setMatrixAt(i, matrix);
     
@@ -1786,6 +2051,16 @@ export function createMoldVolumeVoxels(
         const maskValue = distData![i];
         const isBiased = maskValue === 1;
         tempColor.copy(isBiased ? colorBiased : colorUnbiased);
+      } else if (distanceFieldType === 'weight') {
+        // Weighting factor: red (high cost) -> blue (low cost)
+        // High weight = close to boundary = costly to traverse
+        const dist = distData![i];
+        const { min, max } = distStats!;
+        const range = max - min;
+        const t = range > 0 ? (dist - min) / range : 0;
+        
+        // Interpolate: low weight (t=0) -> blue, high weight (t=1) -> red
+        tempColor.lerpColors(colorWeightLow, colorWeightHigh, t);
       } else {
         // Continuous field: interpolate based on normalized value
         const dist = distData![i];
@@ -1836,6 +2111,372 @@ export function createGridBoundingBoxHelper(
   wireframe.position.copy(center);
   
   return wireframe;
+}
+
+// ============================================================================
+// DIMENSION LABELS AND SCALE BAR
+// ============================================================================
+
+/** Subtle gray color for scale elements */
+const SCALE_COLOR = 0x888888;
+const SCALE_COLOR_HEX = '#888888';
+
+/**
+ * Create a flat text mesh on the XY plane (non-billboard)
+ * 
+ * @param text - The text to display
+ * @param fontSize - Font size in pixels (default: 32)
+ * @param color - Text color (default: gray)
+ * @param worldScale - Size multiplier for the plane in world units (default: 1.0 for ~1mm height)
+ * @returns THREE.Mesh with the text texture on a plane
+ */
+function createFlatTextLabel(
+  text: string,
+  fontSize: number = 32,
+  color: string = SCALE_COLOR_HEX,
+  worldScale: number = 1.0
+): THREE.Mesh {
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d')!;
+  
+  // Set font to measure text
+  const font = `${fontSize}px Arial, sans-serif`;
+  context.font = font;
+  const textMetrics = context.measureText(text);
+  
+  // Add padding
+  const padding = fontSize * 0.2;
+  const width = Math.ceil(textMetrics.width + padding * 2);
+  const height = Math.ceil(fontSize * 1.2 + padding * 2);
+  
+  // Resize canvas (power of 2 for better texture quality)
+  canvas.width = Math.pow(2, Math.ceil(Math.log2(width)));
+  canvas.height = Math.pow(2, Math.ceil(Math.log2(height)));
+  
+  // Clear with transparency
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  
+  // Draw text
+  context.font = font;
+  context.fillStyle = color;
+  context.textAlign = 'center';
+  context.textBaseline = 'middle';
+  context.fillText(text, canvas.width / 2, canvas.height / 2);
+  
+  // Create texture
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  
+  // Create plane geometry - base size scaled by worldScale
+  const aspectRatio = width / height;
+  const planeHeight = 5.0 * worldScale; // Base height of 5 units, scaled
+  const planeWidth = planeHeight * aspectRatio;
+  const geometry = new THREE.PlaneGeometry(planeWidth, planeHeight);
+  
+  const material = new THREE.MeshBasicMaterial({ 
+    map: texture,
+    transparent: true,
+    side: THREE.DoubleSide,
+    depthTest: true,  // Allow occlusion
+    depthWrite: false,
+    opacity: 0.9
+  });
+  
+  const mesh = new THREE.Mesh(geometry, material);
+  
+  return mesh;
+}
+
+/**
+ * Create a scale ruler with 1mm tick marks
+ * 
+ * @param lengthMM - Total length of the ruler in mm
+ * @param scaleFactor - Scale factor applied to the mesh (scene units per mm)
+ * @param position - Position of the ruler start in scene coordinates
+ * @param direction - Direction vector for the ruler (normalized)
+ * @param label - Axis label (e.g., "X", "Y")
+ * @returns THREE.Group containing the ruler
+ */
+function createScaleRuler(
+  lengthMM: number,
+  scaleFactor: number,
+  position: THREE.Vector3,
+  direction: THREE.Vector3,
+  label: string
+): THREE.Group {
+  const group = new THREE.Group();
+  group.name = `ScaleRuler_${label}`;
+  
+  const sceneLength = lengthMM * scaleFactor;
+  const mmInScene = scaleFactor; // 1mm in scene units
+  
+  // For 1:1 scale (scaleFactor=1), lengthMM is also the scene length
+  // Scale tick marks and labels based on the ruler length for visibility
+  const rulerScale = Math.max(1, lengthMM / 50); // Minimum scale of 1, grows for larger parts
+  
+  const lineMaterial = new THREE.LineBasicMaterial({ 
+    color: SCALE_COLOR, 
+    transparent: true,
+    opacity: 0.6
+  });
+  
+  // Main ruler line
+  const start = position.clone();
+  const end = position.clone().add(direction.clone().multiplyScalar(sceneLength));
+  const mainLineGeometry = new THREE.BufferGeometry().setFromPoints([start, end]);
+  const mainLine = new THREE.Line(mainLineGeometry, lineMaterial);
+  group.add(mainLine);
+  
+  // Perpendicular direction for ticks (on the ground plane)
+  const up = new THREE.Vector3(0, 1, 0);
+  const perpendicular = new THREE.Vector3().crossVectors(direction, up).normalize();
+  if (perpendicular.length() < 0.1) {
+    // If direction is vertical, use X as perpendicular
+    perpendicular.set(1, 0, 0);
+  }
+  
+  // Tick marks - adaptive spacing based on length
+  // For small parts (<20mm): every 1mm, major every 5mm
+  // For medium parts (20-100mm): every 5mm, major every 10mm  
+  // For large parts (>100mm): every 10mm, major every 50mm
+  let tickInterval = 1;
+  let majorTickInterval = 5;
+  if (lengthMM > 100) {
+    tickInterval = 10;
+    majorTickInterval = 50;
+  } else if (lengthMM > 20) {
+    tickInterval = 5;
+    majorTickInterval = 10;
+  }
+  
+  const tickPoints: THREE.Vector3[] = [];
+  
+  for (let mm = 0; mm <= lengthMM; mm += tickInterval) {
+    const tickPos = position.clone().add(direction.clone().multiplyScalar(mm * mmInScene));
+    const isMajor = mm % majorTickInterval === 0;
+    const tickLength = isMajor ? rulerScale * 2 : rulerScale * 1;
+    
+    const tickStart = tickPos.clone().add(perpendicular.clone().multiplyScalar(-tickLength / 2));
+    const tickEnd = tickPos.clone().add(perpendicular.clone().multiplyScalar(tickLength / 2));
+    
+    tickPoints.push(tickStart, tickEnd);
+  }
+  
+  if (tickPoints.length > 0) {
+    const tickGeometry = new THREE.BufferGeometry().setFromPoints(tickPoints);
+    const tickLines = new THREE.LineSegments(tickGeometry, lineMaterial);
+    group.add(tickLines);
+  }
+  
+  // End caps (vertical lines at start and end)
+  const capHeight = rulerScale * 3;
+  const startCap1 = start.clone().add(perpendicular.clone().multiplyScalar(-capHeight / 2));
+  const startCap2 = start.clone().add(perpendicular.clone().multiplyScalar(capHeight / 2));
+  const endCap1 = end.clone().add(perpendicular.clone().multiplyScalar(-capHeight / 2));
+  const endCap2 = end.clone().add(perpendicular.clone().multiplyScalar(capHeight / 2));
+  
+  const capGeometry = new THREE.BufferGeometry().setFromPoints([startCap1, startCap2, endCap1, endCap2]);
+  const capLines = new THREE.LineSegments(capGeometry, lineMaterial);
+  group.add(capLines);
+  
+  // Dimension label at the end - scale based on ruler length
+  const dimensionText = `${lengthMM.toFixed(1)} mm`;
+  const dimensionLabel = createFlatTextLabel(dimensionText, 32, SCALE_COLOR_HEX, rulerScale);
+  const labelOffset = perpendicular.clone().multiplyScalar(rulerScale * 4);
+  dimensionLabel.position.copy(end).add(labelOffset);
+  // Rotate to lie flat on XZ plane (ground)
+  dimensionLabel.rotation.x = -Math.PI / 2;
+  // Align with direction
+  if (Math.abs(direction.z) > 0.5) {
+    dimensionLabel.rotation.z = Math.PI / 2;
+  }
+  group.add(dimensionLabel);
+  
+  // Axis label at start
+  const axisLabel = createFlatTextLabel(label, 36, SCALE_COLOR_HEX, rulerScale);
+  const axisLabelOffset = perpendicular.clone().multiplyScalar(-rulerScale * 4);
+  axisLabel.position.copy(start).add(axisLabelOffset);
+  axisLabel.rotation.x = -Math.PI / 2;
+  if (Math.abs(direction.z) > 0.5) {
+    axisLabel.rotation.z = Math.PI / 2;
+  }
+  group.add(axisLabel);
+  
+  return group;
+}
+
+/**
+ * Create an axis indicator (like CAD software origin indicator)
+ * 
+ * @param meshSize - Maximum dimension of the mesh in mm (for scaling the indicator)
+ * @param position - Position of the origin
+ * @returns THREE.Group containing axis arrows
+ */
+function createAxisIndicator(
+  meshSize: number,
+  position: THREE.Vector3
+): THREE.Group {
+  const group = new THREE.Group();
+  group.name = 'AxisIndicator';
+  
+  // Scale axis indicator based on mesh size (5% of max dimension, min 3mm)
+  const axisLength = Math.max(3, meshSize * 0.05);
+  const arrowHeadLength = axisLength * 0.2;
+  const arrowHeadWidth = axisLength * 0.1;
+  
+  // X axis (red) - subtle
+  const xDir = new THREE.Vector3(1, 0, 0);
+  const xArrow = new THREE.ArrowHelper(xDir, position, axisLength, 0xff4444, arrowHeadLength, arrowHeadWidth);
+  (xArrow.line.material as THREE.LineBasicMaterial).transparent = true;
+  (xArrow.line.material as THREE.LineBasicMaterial).opacity = 0.5;
+  (xArrow.cone.material as THREE.MeshBasicMaterial).transparent = true;
+  (xArrow.cone.material as THREE.MeshBasicMaterial).opacity = 0.5;
+  group.add(xArrow);
+  
+  // Y axis (green) - pointing up in scene (STL Z)
+  const yDir = new THREE.Vector3(0, 1, 0);
+  const yArrow = new THREE.ArrowHelper(yDir, position, axisLength, 0x44ff44, arrowHeadLength, arrowHeadWidth);
+  (yArrow.line.material as THREE.LineBasicMaterial).transparent = true;
+  (yArrow.line.material as THREE.LineBasicMaterial).opacity = 0.5;
+  (yArrow.cone.material as THREE.MeshBasicMaterial).transparent = true;
+  (yArrow.cone.material as THREE.MeshBasicMaterial).opacity = 0.5;
+  group.add(yArrow);
+  
+  // Z axis (blue) - STL Y direction
+  const zDir = new THREE.Vector3(0, 0, 1);
+  const zArrow = new THREE.ArrowHelper(zDir, position, axisLength, 0x4444ff, arrowHeadLength, arrowHeadWidth);
+  (zArrow.line.material as THREE.LineBasicMaterial).transparent = true;
+  (zArrow.line.material as THREE.LineBasicMaterial).opacity = 0.5;
+  (zArrow.cone.material as THREE.MeshBasicMaterial).transparent = true;
+  (zArrow.cone.material as THREE.MeshBasicMaterial).opacity = 0.5;
+  group.add(zArrow);
+  
+  return group;
+}
+
+/**
+ * Create dimension labels showing the bounding box size in mm
+ * 
+ * This creates a subtle industry-standard visualization with:
+ * - Scale rulers on X and Y axes (on ground plane) with adaptive tick marks
+ * - Small axis indicator at origin
+ * - All elements can be occluded by scene objects
+ * 
+ * @param boundingBox - Original bounding box in mm (before scaling)
+ * @param scaleFactor - Scale factor applied to the mesh (1.0 for 1:1 scale)
+ * @returns THREE.Group containing all dimension labels and scale bar
+ */
+export function createDimensionLabels(
+  boundingBox: THREE.Box3,
+  scaleFactor: number
+): THREE.Group {
+  const group = new THREE.Group();
+  group.name = 'DimensionLabels';
+  
+  // Get original size in mm
+  const sizeInMM = new THREE.Vector3();
+  boundingBox.getSize(sizeInMM);
+  const maxDimension = Math.max(sizeInMM.x, sizeInMM.y, sizeInMM.z);
+  
+  // The mesh is rotated -90° around X, so:
+  // STL X -> Scene X
+  // STL Y -> Scene -Z (but we treat it as +Z for simplicity)
+  // STL Z -> Scene Y
+  // And scaled uniformly
+  
+  const scaledSize = new THREE.Vector3(
+    sizeInMM.x * scaleFactor,
+    sizeInMM.z * scaleFactor, // STL Z becomes scene Y (height)
+    sizeInMM.y * scaleFactor  // STL Y becomes scene Z (depth)
+  );
+  
+  // Position at the base of the mesh (assuming centered at origin, bottom at Y=0)
+  const baseY = 0.01; // Slightly above ground to avoid z-fighting (larger for 1:1 scale)
+  const halfX = scaledSize.x / 2;
+  const halfZ = scaledSize.z / 2;
+  
+  // Offset for scale rulers (outside the bounding box) - scale with mesh size
+  const rulerOffset = Math.max(2, maxDimension * 0.05) * scaleFactor; // 5% of max dimension, min 2mm
+  
+  // X scale ruler (along X axis, at -Z edge)
+  const xRulerStart = new THREE.Vector3(-halfX, baseY, -halfZ - rulerOffset);
+  const xRuler = createScaleRuler(
+    sizeInMM.x,
+    scaleFactor,
+    xRulerStart,
+    new THREE.Vector3(1, 0, 0),
+    'X'
+  );
+  group.add(xRuler);
+  
+  // Y scale ruler (STL Y = scene Z, along Z axis at -X edge)
+  // Note: In STL, Y is depth, which becomes scene Z after rotation
+  const yRulerStart = new THREE.Vector3(-halfX - rulerOffset, baseY, -halfZ);
+  const yRuler = createScaleRuler(
+    sizeInMM.y, // STL Y dimension
+    scaleFactor,
+    yRulerStart,
+    new THREE.Vector3(0, 0, 1),
+    'Y'
+  );
+  group.add(yRuler);
+  
+  // Axis indicator at corner (origin reference)
+  const axisOrigin = new THREE.Vector3(-halfX - rulerOffset * 0.5, baseY, -halfZ - rulerOffset * 0.5);
+  const axisIndicator = createAxisIndicator(maxDimension, axisOrigin);
+  group.add(axisIndicator);
+  
+  return group;
+}
+
+/**
+ * Remove dimension labels from the scene
+ * 
+ * @param scene - The THREE.js scene
+ * @param labelsGroup - The dimension labels group to remove
+ */
+export function removeDimensionLabels(
+  scene: THREE.Scene,
+  labelsGroup: THREE.Group
+): void {
+  scene.remove(labelsGroup);
+  
+  // Dispose of all geometries, materials, and textures
+  labelsGroup.traverse((child) => {
+    if (child instanceof THREE.Line || child instanceof THREE.LineSegments) {
+      child.geometry.dispose();
+      if (child.material instanceof THREE.Material) {
+        child.material.dispose();
+      }
+    }
+    if (child instanceof THREE.Mesh) {
+      child.geometry.dispose();
+      if (child.material instanceof THREE.Material) {
+        if ((child.material as THREE.MeshBasicMaterial).map) {
+          (child.material as THREE.MeshBasicMaterial).map!.dispose();
+        }
+        child.material.dispose();
+      }
+    }
+    if (child instanceof THREE.Sprite) {
+      if (child.material.map) {
+        child.material.map.dispose();
+      }
+      child.material.dispose();
+    }
+    // ArrowHelper cleanup
+    if (child instanceof THREE.ArrowHelper) {
+      if (child.line) {
+        child.line.geometry.dispose();
+        (child.line.material as THREE.Material).dispose();
+      }
+      if (child.cone) {
+        child.cone.geometry.dispose();
+        (child.cone.material as THREE.Material).dispose();
+      }
+    }
+  });
 }
 
 /**
@@ -2544,10 +3185,11 @@ export async function generateVolumetricGridParallel(
     }
   }
   
-  // Build mask for boundary voxels (outer surface + one level deep)
+  // Build mask for boundary voxels (outer surface + BOUNDARY_DEPTH_LEVELS levels deep)
   const isBoundaryAdjacent = new Uint8Array(voxelCount);
   let boundaryAdjacentCount = 0;
   
+  // Mark outer surface (level 0)
   for (let i = 0; i < voxelCount; i++) {
     if (isOuterSurface[i]) {
       isBoundaryAdjacent[i] = 1;
@@ -2555,18 +3197,23 @@ export async function generateVolumetricGridParallel(
     }
   }
   
-  for (let i = 0; i < voxelCount; i++) {
-    if (isOuterSurface[i]) {
-      const i3 = i * 3;
-      const gi = voxelIndices[i3];
-      const gj = voxelIndices[i3 + 1];
-      const gk = voxelIndices[i3 + 2];
-      
-      for (const [di, dj, dk] of faceNeighborOffsets) {
-        const neighborIdx = getVoxelIdx(gi + di, gj + dj, gk + dk);
-        if (neighborIdx >= 0 && !isBoundaryAdjacent[neighborIdx]) {
-          isBoundaryAdjacent[neighborIdx] = 1;
-          boundaryAdjacentCount++;
+  // Expand outward for each level
+  for (let level = 1; level <= BOUNDARY_DEPTH_LEVELS; level++) {
+    const previouslyMarked = new Uint8Array(isBoundaryAdjacent);
+    
+    for (let i = 0; i < voxelCount; i++) {
+      if (previouslyMarked[i] && (level === 1 ? isOuterSurface[i] : true)) {
+        const i3 = i * 3;
+        const gi = voxelIndices[i3];
+        const gj = voxelIndices[i3 + 1];
+        const gk = voxelIndices[i3 + 2];
+        
+        for (const [di, dj, dk] of faceNeighborOffsets) {
+          const neighborIdx = getVoxelIdx(gi + di, gj + dj, gk + dk);
+          if (neighborIdx >= 0 && !isBoundaryAdjacent[neighborIdx]) {
+            isBoundaryAdjacent[neighborIdx] = 1;
+            boundaryAdjacentCount++;
+          }
         }
       }
     }
@@ -2660,6 +3307,7 @@ export async function generateVolumetricGridParallel(
     rLineStart,
     rLineEnd,
     boundaryAdjacentMask: isBoundaryAdjacent,
+    seedVoxelMask: null,
   };
 }
 
@@ -2769,5 +3417,1335 @@ export function recalculateBiasedDistances(
     weightingFactor,
     biasedDistanceStats,
     weightingFactorStats,
+  };
+}
+
+// ============================================================================
+// VERTEX AND EDGE SEED VOXELIZATION
+// ============================================================================
+
+export interface VertexSeedVoxelizationOptions extends VolumetricGridOptions {
+  /**
+   * Minimum distance from part surface for a mold volume voxel to be included.
+   * Voxels closer than this distance are excluded from the mold volume (but seeds are always included).
+   * Default: 0 (include voxels that touch the surface)
+   */
+  minDistanceFromPart?: number;
+}
+
+/**
+ * Generate a volumetric grid using vertex and edge-based seed placement.
+ * 
+ * This approach places seed voxels at:
+ * 1. Every vertex of the part mesh
+ * 2. Along every edge of the part mesh (sampled at intervals smaller than voxel size)
+ * 
+ * The rest of the mold volume is voxelized normally, ensuring all non-seed voxels
+ * are strictly outside the part surface.
+ * 
+ * Benefits:
+ * - Guaranteed seed coverage at all part surface features
+ * - No volume intersection computation needed for seed detection
+ * - Edge sampling ensures continuous seed coverage along mesh edges
+ * - More robust for complex geometry with thin features
+ * 
+ * @param outerShellGeometry - Geometry of the inflated outer shell (∂H)
+ * @param partGeometry - Geometry of the original part mesh (M)
+ * @param options - Grid generation options
+ * @returns Promise<VolumetricGridResult> with seedVoxelMask populated
+ */
+export async function generateVolumetricGridWithVertexSeeds(
+  outerShellGeometry: THREE.BufferGeometry,
+  partGeometry: THREE.BufferGeometry,
+  options: VertexSeedVoxelizationOptions = {}
+): Promise<VolumetricGridResult> {
+  const startTime = performance.now();
+  
+  // Clone geometries to avoid modifying originals
+  const shellGeom = outerShellGeometry.clone();
+  const partGeom = partGeometry.clone();
+  
+  // Ensure geometries have computed bounds
+  shellGeom.computeBoundingBox();
+  partGeom.computeBoundingBox();
+  
+  // Get bounding box from outer shell (this defines the grid extent)
+  const boundingBox = shellGeom.boundingBox!.clone();
+  
+  // Parse options
+  const marginPercent = options.marginPercent ?? 0.05;
+  const voxelsPerUnit = options.voxelsPerUnit ?? DEFAULT_VOXELS_PER_UNIT;
+  const minDistanceFromPart = options.minDistanceFromPart ?? 0;
+  
+  // Add margin to bounding box FIRST (before calculating resolution)
+  const boxSize = new THREE.Vector3();
+  boundingBox.getSize(boxSize);
+  const margin = boxSize.clone().multiplyScalar(marginPercent);
+  boundingBox.min.sub(margin);
+  boundingBox.max.add(margin);
+  
+  // Recompute size after margin
+  boundingBox.getSize(boxSize);
+  
+  // Auto-calculate resolution if not provided
+  // Priority: resolution > voxelsPerUnit > targetVoxelSizePercent
+  let resX: number, resY: number, resZ: number;
+  if (options.resolution !== undefined) {
+    // Use explicit resolution
+    if (typeof options.resolution === 'number') {
+      resX = resY = resZ = options.resolution;
+    } else {
+      resX = options.resolution.x;
+      resY = options.resolution.y;
+      resZ = options.resolution.z;
+    }
+  } else {
+    // Use voxelsPerUnit to calculate resolution (default: 1 voxel/mm)
+    const resolution = calculateResolutionFromDensity(boundingBox, voxelsPerUnit);
+    resX = resolution.x;
+    resY = resolution.y;
+    resZ = resolution.z;
+  }
+  
+  // Calculate cell size
+  const cellSize = new THREE.Vector3(
+    boxSize.x / resX,
+    boxSize.y / resY,
+    boxSize.z / resZ
+  );
+  
+  logInfo(`Vertex/Edge Seed Grid: resolution=${resX}x${resY}x${resZ}, cellSize=(${cellSize.x.toFixed(4)}, ${cellSize.y.toFixed(4)}, ${cellSize.z.toFixed(4)})`);
+  
+  // Create BVH testers for both meshes
+  const shellTester = new MeshTester(shellGeom, 'shell');
+  const partTester = new MeshTester(partGeom, 'part');
+  
+  const totalCellCount = resX * resY * resZ;
+  
+  // ========================================================================
+  // STEP 1: Create seed voxels at part mesh vertices AND along edges
+  // ========================================================================
+  
+  logDebug('Creating seed voxels at part mesh vertices and edges...');
+  
+  const seedPositions = partGeom.getAttribute('position');
+  const seedIndex = partGeom.getIndex();
+  const numVertices = seedPositions.count;
+  
+  // Map from grid index key to seed voxel data
+  // Using a Map to deduplicate voxels when multiple vertices/edge points map to same grid cell
+  const seedVoxelMap = new Map<string, { center: THREE.Vector3; gridIndex: THREE.Vector3 }>();
+  
+  // Helper to add a seed voxel at a world position
+  const addSeedVoxel = (worldX: number, worldY: number, worldZ: number): void => {
+    // Convert world position to grid indices
+    const gi = Math.floor((worldX - boundingBox.min.x) / cellSize.x);
+    const gj = Math.floor((worldY - boundingBox.min.y) / cellSize.y);
+    const gk = Math.floor((worldZ - boundingBox.min.z) / cellSize.z);
+    
+    // Clamp to valid range
+    const clampedI = Math.max(0, Math.min(resX - 1, gi));
+    const clampedJ = Math.max(0, Math.min(resY - 1, gj));
+    const clampedK = Math.max(0, Math.min(resZ - 1, gk));
+    
+    const key = `${clampedI},${clampedJ},${clampedK}`;
+    
+    // Only add if not already present
+    if (!seedVoxelMap.has(key)) {
+      // Calculate voxel center position
+      const centerX = boundingBox.min.x + (clampedI + 0.5) * cellSize.x;
+      const centerY = boundingBox.min.y + (clampedJ + 0.5) * cellSize.y;
+      const centerZ = boundingBox.min.z + (clampedK + 0.5) * cellSize.z;
+      
+      seedVoxelMap.set(key, {
+        center: new THREE.Vector3(centerX, centerY, centerZ),
+        gridIndex: new THREE.Vector3(clampedI, clampedJ, clampedK)
+      });
+    }
+  };
+  
+  // Add seed voxels at all vertices
+  for (let v = 0; v < numVertices; v++) {
+    addSeedVoxel(
+      seedPositions.getX(v),
+      seedPositions.getY(v),
+      seedPositions.getZ(v)
+    );
+  }
+  
+  const vertexSeedCount = seedVoxelMap.size;
+  logDebug(`Vertex seeds: ${vertexSeedCount} from ${numVertices} vertices`);
+  
+  // Add seed voxels along all edges
+  // Calculate step size based on voxel diagonal to ensure no gaps
+  const voxelDiagonal = Math.sqrt(cellSize.x * cellSize.x + cellSize.y * cellSize.y + cellSize.z * cellSize.z);
+  const edgeStepSize = voxelDiagonal * 0.5; // Half diagonal ensures overlap
+  
+  // Track unique edges to avoid processing duplicates
+  const processedEdges = new Set<string>();
+  
+  const v0 = new THREE.Vector3();
+  const v1 = new THREE.Vector3();
+  const edgeDir = new THREE.Vector3();
+  const samplePoint = new THREE.Vector3();
+  
+  if (seedIndex) {
+    // Indexed geometry - iterate through triangles
+    const numTriangles = seedIndex.count / 3;
+    
+    for (let t = 0; t < numTriangles; t++) {
+      const i0 = seedIndex.getX(t * 3);
+      const i1 = seedIndex.getX(t * 3 + 1);
+      const i2 = seedIndex.getX(t * 3 + 2);
+      
+      // Process each edge of the triangle
+      const edges: [number, number][] = [[i0, i1], [i1, i2], [i2, i0]];
+      
+      for (const [a, b] of edges) {
+        // Create canonical edge key (smaller index first)
+        const edgeKey = a < b ? `${a}-${b}` : `${b}-${a}`;
+        
+        if (processedEdges.has(edgeKey)) continue;
+        processedEdges.add(edgeKey);
+        
+        // Get edge vertices
+        v0.set(seedPositions.getX(a), seedPositions.getY(a), seedPositions.getZ(a));
+        v1.set(seedPositions.getX(b), seedPositions.getY(b), seedPositions.getZ(b));
+        
+        // Calculate edge length and direction
+        edgeDir.subVectors(v1, v0);
+        const edgeLength = edgeDir.length();
+        
+        if (edgeLength < edgeStepSize) continue; // Skip very short edges
+        
+        edgeDir.normalize();
+        
+        // Sample points along the edge (excluding endpoints - they're already added as vertices)
+        const numSamples = Math.floor(edgeLength / edgeStepSize);
+        for (let s = 1; s < numSamples; s++) {
+          const t = s / numSamples;
+          samplePoint.copy(v0).addScaledVector(edgeDir, t * edgeLength);
+          addSeedVoxel(samplePoint.x, samplePoint.y, samplePoint.z);
+        }
+      }
+    }
+  } else {
+    // Non-indexed geometry - every 3 vertices form a triangle
+    const numTriangles = numVertices / 3;
+    
+    for (let t = 0; t < numTriangles; t++) {
+      const i0 = t * 3;
+      const i1 = t * 3 + 1;
+      const i2 = t * 3 + 2;
+      
+      // Process each edge of the triangle
+      const edges: [number, number][] = [[i0, i1], [i1, i2], [i2, i0]];
+      
+      for (const [a, b] of edges) {
+        // Get edge vertices
+        v0.set(seedPositions.getX(a), seedPositions.getY(a), seedPositions.getZ(a));
+        v1.set(seedPositions.getX(b), seedPositions.getY(b), seedPositions.getZ(b));
+        
+        // Calculate edge length and direction
+        edgeDir.subVectors(v1, v0);
+        const edgeLength = edgeDir.length();
+        
+        if (edgeLength < edgeStepSize) continue;
+        
+        edgeDir.normalize();
+        
+        // Sample points along the edge
+        const numSamples = Math.floor(edgeLength / edgeStepSize);
+        for (let s = 1; s < numSamples; s++) {
+          const t = s / numSamples;
+          samplePoint.copy(v0).addScaledVector(edgeDir, t * edgeLength);
+          addSeedVoxel(samplePoint.x, samplePoint.y, samplePoint.z);
+        }
+      }
+    }
+  }
+  
+  const totalSeedCount = seedVoxelMap.size;
+  const edgeSeedCount = totalSeedCount - vertexSeedCount;
+  logDebug(`Edge seeds: ${edgeSeedCount} from ${processedEdges.size} edges`);
+  logDebug(`Total seed voxels: ${totalSeedCount}`);
+  
+  // ========================================================================
+  // STEP 2: Create mold volume voxels (outside part surface)
+  // ========================================================================
+  
+  logDebug('Creating mold volume voxels...');
+  
+  // Temporary arrays for collecting voxels
+  const tempCenters: number[] = [];
+  const tempIndices: number[] = [];
+  const tempIsSeed: number[] = []; // 1 if seed, 0 if mold volume
+  
+  const cellCenter = new THREE.Vector3();
+  
+  // First, add all seed voxels
+  for (const [_key, seedData] of seedVoxelMap) {
+    tempCenters.push(seedData.center.x, seedData.center.y, seedData.center.z);
+    tempIndices.push(seedData.gridIndex.x, seedData.gridIndex.y, seedData.gridIndex.z);
+    tempIsSeed.push(1);
+  }
+  
+  const seedCount = seedVoxelMap.size;
+  
+  // Iterate through all grid cells for mold volume
+  let moldVolumeCount = 0;
+  let skippedInsidePart = 0;
+  let skippedOutsideShell = 0;
+  let skippedTooCloseToPart = 0;
+  let skippedDuplicateSeed = 0;
+  let processedCells = 0;
+  
+  for (let k = 0; k < resZ; k++) {
+    // Yield to event loop once per Z-slice to keep UI responsive
+    if (k > 0) {
+      await yieldToEventLoop();
+    }
+    
+    for (let j = 0; j < resY; j++) {
+      for (let i = 0; i < resX; i++) {
+        processedCells++;
+        const key = `${i},${j},${k}`;
+        
+        // Skip if this is already a seed voxel
+        if (seedVoxelMap.has(key)) {
+          skippedDuplicateSeed++;
+          continue;
+        }
+        
+        // Calculate cell center position
+        cellCenter.set(
+          boundingBox.min.x + (i + 0.5) * cellSize.x,
+          boundingBox.min.y + (j + 0.5) * cellSize.y,
+          boundingBox.min.z + (k + 0.5) * cellSize.z
+        );
+        
+        // Check if inside shell
+        const isInsideShell = shellTester.isInside(cellCenter);
+        if (!isInsideShell) {
+          skippedOutsideShell++;
+          continue;
+        }
+        
+        // Check if outside part (must be strictly outside)
+        const isOutsidePart = partTester.isOutside(cellCenter);
+        if (!isOutsidePart) {
+          skippedInsidePart++;
+          continue;
+        }
+        
+        // Optional: Check minimum distance from part surface
+        if (minDistanceFromPart > 0) {
+          const distToPart = partTester.getDistanceToSurface(cellCenter);
+          if (distToPart < minDistanceFromPart) {
+            skippedTooCloseToPart++;
+            continue;
+          }
+        }
+        
+        // This is a valid mold volume voxel
+        tempCenters.push(cellCenter.x, cellCenter.y, cellCenter.z);
+        tempIndices.push(i, j, k);
+        tempIsSeed.push(0);
+        moldVolumeCount++;
+      }
+    }
+  }
+  
+  logDebug(`Mold volume voxels: ${moldVolumeCount}`);
+  logDebug(`Skipped: ${skippedInsidePart} inside part, ${skippedOutsideShell} outside shell, ${skippedTooCloseToPart} too close to part, ${skippedDuplicateSeed} duplicate seeds`);
+  
+  // Convert to typed arrays
+  const voxelCenters = new Float32Array(tempCenters);
+  const voxelIndices = new Uint32Array(tempIndices);
+  const seedVoxelMask = new Uint8Array(tempIsSeed);
+  const voxelCount = voxelCenters.length / 3;
+  
+  logResult('Vertex seed grid', { totalVoxels: voxelCount, seeds: seedCount, moldVolume: moldVolumeCount });
+  
+  // ========================================================================
+  // STEP 3: Compute distance fields
+  // ========================================================================
+  
+  logDebug('Computing distance fields...');
+  
+  const voxelDist = new Float32Array(voxelCount);
+  const voxelDistToShell = new Float32Array(voxelCount);
+  
+  let minDist = Infinity;
+  let maxDist = -Infinity;
+  let minShellDist = Infinity;
+  let maxShellDist = -Infinity;
+  let rLineStart: THREE.Vector3 | null = null;
+  let rLineEnd: THREE.Vector3 | null = null;
+  
+  const closestPoint = new THREE.Vector3();
+  const target = { 
+    point: closestPoint, 
+    distance: Infinity,
+    faceIndex: 0
+  };
+  const tempCenter = new THREE.Vector3();
+  
+  for (let i = 0; i < voxelCount; i++) {
+    // Yield periodically to keep UI responsive
+    if (i % YIELD_BATCH_SIZE === 0 && i > 0) {
+      await yieldToEventLoop();
+    }
+    
+    const i3 = i * 3;
+    tempCenter.set(voxelCenters[i3], voxelCenters[i3 + 1], voxelCenters[i3 + 2]);
+    
+    // Distance to part
+    target.distance = Infinity;
+    partTester.closestPointToPoint(tempCenter, target);
+    const distPart = target.distance;
+    voxelDist[i] = distPart;
+    
+    if (distPart < minDist) minDist = distPart;
+    if (distPart > maxDist) {
+      maxDist = distPart;
+      rLineStart = tempCenter.clone();
+      rLineEnd = target.point.clone();
+    }
+    
+    // Distance to shell
+    target.distance = Infinity;
+    shellTester.closestPointToPoint(tempCenter, target);
+    const distShell = target.distance;
+    voxelDistToShell[i] = distShell;
+    
+    if (distShell < minShellDist) minShellDist = distShell;
+    if (distShell > maxShellDist) maxShellDist = distShell;
+  }
+  
+  const R = maxDist;
+  const distanceStats = { min: minDist, max: maxDist };
+  const shellDistanceStats = { min: minShellDist, max: maxShellDist };
+  
+  logResult('Distance field δ_i', { minDist, maxDist, R });
+  logResult('Distance field δ_w (to shell)', { minShellDist, maxShellDist });
+  
+  // ========================================================================
+  // STEP 4: Identify boundary voxels (outer surface + one level deep)
+  // ========================================================================
+  
+  logDebug('Identifying boundary voxels for biased weighting...');
+  
+  // Build spatial index
+  const voxelSpatialIndex = new Map<string, number>();
+  for (let i = 0; i < voxelCount; i++) {
+    const i3 = i * 3;
+    const gi = voxelIndices[i3];
+    const gj = voxelIndices[i3 + 1];
+    const gk = voxelIndices[i3 + 2];
+    voxelSpatialIndex.set(`${gi},${gj},${gk}`, i);
+  }
+  
+  const getVoxelIdx = (gi: number, gj: number, gk: number): number => {
+    return voxelSpatialIndex.get(`${gi},${gj},${gk}`) ?? -1;
+  };
+  
+  // 6-connected neighbor offsets
+  const faceNeighborOffsets: [number, number, number][] = [
+    [1, 0, 0], [-1, 0, 0],
+    [0, 1, 0], [0, -1, 0],
+    [0, 0, 1], [0, 0, -1],
+  ];
+  
+  // Find all surface voxels (those with at least one missing 6-neighbor)
+  const isSurfaceVoxel = new Uint8Array(voxelCount);
+  let totalSurfaceCount = 0;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    const i3 = i * 3;
+    const gi = voxelIndices[i3];
+    const gj = voxelIndices[i3 + 1];
+    const gk = voxelIndices[i3 + 2];
+    
+    for (const [di, dj, dk] of faceNeighborOffsets) {
+      const neighborIdx = getVoxelIdx(gi + di, gj + dj, gk + dk);
+      if (neighborIdx < 0) {
+        isSurfaceVoxel[i] = 1;
+        totalSurfaceCount++;
+        break;
+      }
+    }
+  }
+  
+  // Distinguish inner vs outer surface using distance to part
+  // Seed voxels (at part surface) should have low distance
+  // Outer surface voxels (near shell) should have high distance
+  const surfaceDistances: number[] = [];
+  const surfaceIndices: number[] = [];
+  for (let i = 0; i < voxelCount; i++) {
+    if (isSurfaceVoxel[i]) {
+      surfaceDistances.push(voxelDist[i]);
+      surfaceIndices.push(i);
+    }
+  }
+  
+  const sortedPairs = surfaceIndices.map((idx, i) => ({ idx, dist: surfaceDistances[i] }));
+  sortedPairs.sort((a, b) => a.dist - b.dist);
+  
+  // Find largest gap to separate inner from outer
+  let maxGap = 0;
+  let gapIndex = Math.floor(sortedPairs.length / 2);
+  for (let i = 1; i < sortedPairs.length; i++) {
+    const gap = sortedPairs[i].dist - sortedPairs[i - 1].dist;
+    if (gap > maxGap) {
+      maxGap = gap;
+      gapIndex = i;
+    }
+  }
+  
+  const distanceThreshold = sortedPairs[gapIndex]?.dist || (minDist + maxDist) / 2;
+  
+  // Mark outer surface voxels
+  const isOuterSurface = new Uint8Array(voxelCount);
+  let outerSurfaceCount = 0;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    if (isSurfaceVoxel[i] && voxelDist[i] >= distanceThreshold) {
+      isOuterSurface[i] = 1;
+      outerSurfaceCount++;
+    }
+  }
+  
+  logDebug(`Surface voxels: ${totalSurfaceCount} total, ${outerSurfaceCount} outer (near shell)`);
+  
+  // Build boundary adjacent mask (outer surface + BOUNDARY_DEPTH_LEVELS levels deep)
+  const isBoundaryAdjacent = new Uint8Array(voxelCount);
+  let boundaryAdjacentCount = 0;
+  
+  // Mark outer surface voxels (level 0)
+  for (let i = 0; i < voxelCount; i++) {
+    if (isOuterSurface[i]) {
+      isBoundaryAdjacent[i] = 1;
+      boundaryAdjacentCount++;
+    }
+  }
+  
+  // Expand outward for each level (1 to BOUNDARY_DEPTH_LEVELS)
+  for (let level = 1; level <= BOUNDARY_DEPTH_LEVELS; level++) {
+    const previouslyMarked = new Uint8Array(isBoundaryAdjacent);
+    
+    for (let i = 0; i < voxelCount; i++) {
+      if (previouslyMarked[i] && (level === 1 ? isOuterSurface[i] : true)) {
+        const i3 = i * 3;
+        const gi = voxelIndices[i3];
+        const gj = voxelIndices[i3 + 1];
+        const gk = voxelIndices[i3 + 2];
+        
+        for (const [di, dj, dk] of faceNeighborOffsets) {
+          const neighborIdx = getVoxelIdx(gi + di, gj + dj, gk + dk);
+          if (neighborIdx >= 0 && !isBoundaryAdjacent[neighborIdx]) {
+            isBoundaryAdjacent[neighborIdx] = 1;
+            boundaryAdjacentCount++;
+          }
+        }
+      }
+    }
+  }
+  
+  logResult('Boundary detection', { boundaryVoxels: boundaryAdjacentCount, interiorVoxels: voxelCount - boundaryAdjacentCount, depthLevels: BOUNDARY_DEPTH_LEVELS });
+  
+  // ========================================================================
+  // STEP 5: Compute biased distance and weighting factors
+  // ========================================================================
+  
+  const w1 = DEFAULT_BIASED_DISTANCE_WEIGHTS.partDistanceWeight;
+  const w2 = DEFAULT_BIASED_DISTANCE_WEIGHTS.shellBiasWeight;
+  
+  const biasedDist = new Float32Array(voxelCount);
+  let minBiasedDist = Infinity;
+  let maxBiasedDist = -Infinity;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    const delta_i = voxelDist[i];
+    
+    let biased: number;
+    if (isBoundaryAdjacent[i]) {
+      const delta_w = voxelDistToShell[i];
+      const lambda_w = R - delta_w;
+      biased = w1 * delta_i + w2 * lambda_w;
+    } else {
+      biased = w1 * delta_i;
+    }
+    
+    biasedDist[i] = biased;
+    
+    if (biased < minBiasedDist) minBiasedDist = biased;
+    if (biased > maxBiasedDist) maxBiasedDist = biased;
+  }
+  
+  const biasedDistanceStats = { min: minBiasedDist, max: maxBiasedDist };
+  
+  // Weighting factors
+  const weightingFactor = new Float32Array(voxelCount);
+  let minWeight = Infinity;
+  let maxWeight = -Infinity;
+  
+  for (let i = 0; i < voxelCount; i++) {
+    const bd = biasedDist[i];
+    const wt = 1.0 / (bd * bd + 0.25);
+    
+    weightingFactor[i] = wt;
+    
+    if (wt < minWeight) minWeight = wt;
+    if (wt > maxWeight) maxWeight = wt;
+  }
+  
+  const weightingFactorStats = { min: minWeight, max: maxWeight };
+  
+  logResult('Biased distance field', { minBiasedDist, maxBiasedDist });
+  logResult('Weighting factor', { minWeight, maxWeight });
+  
+  // Clean up
+  shellTester.dispose();
+  partTester.dispose();
+  shellGeom.dispose();
+  partGeom.dispose();
+  
+  const endTime = performance.now();
+  
+  // Calculate statistics
+  const cellVolume = cellSize.x * cellSize.y * cellSize.z;
+  const moldVolume = voxelCount * cellVolume;
+  const totalVolume = totalCellCount * cellVolume;
+  
+  const stats: VolumetricGridStats = {
+    moldVolume,
+    totalVolume,
+    fillRatio: moldVolume / totalVolume,
+    computeTimeMs: endTime - startTime,
+  };
+  
+  logTiming('Vertex seed grid generation', endTime - startTime);
+  
+  return {
+    allCells: [],
+    moldVolumeCells: [],
+    voxelCenters,
+    voxelIndices,
+    resolution: new THREE.Vector3(resX, resY, resZ),
+    totalCellCount,
+    moldVolumeCellCount: voxelCount,
+    boundingBox,
+    cellSize,
+    stats,
+    voxelDist,
+    voxelDistToShell,
+    biasedDist,
+    weightingFactor,
+    distanceStats,
+    shellDistanceStats,
+    biasedDistanceStats,
+    weightingFactorStats,
+    R,
+    rLineStart,
+    rLineEnd,
+    boundaryAdjacentMask: isBoundaryAdjacent,
+    seedVoxelMask,
+  };
+}
+
+// ============================================================================
+// ADAPTIVE LOD VOXELIZATION
+// ============================================================================
+
+/**
+ * Generate an adaptive volumetric grid with distance-based Level of Detail (LOD).
+ * 
+ * This approach uses fine voxels near the part surface and progressively coarser
+ * voxels as distance from the part increases. This dramatically reduces memory
+ * usage while maintaining precision where it matters most.
+ * 
+ * Algorithm:
+ * 1. Place seed voxels at part vertices/edges at the finest LOD (base voxel size)
+ * 2. For the rest of the volume, determine LOD level based on distance to part
+ * 3. Voxel size at each LOD level doubles: size_n = baseSize * 2^n
+ * 4. Distance thresholds grow exponentially: threshold_n = baseThreshold * growthFactor^n
+ * 
+ * Benefits:
+ * - Dramatically reduced voxel count (typically 80-90% reduction)
+ * - Maintains fine detail near part surface
+ * - Coarse voxels far from part where precision is less critical
+ * - Still computes proper distance fields for all voxels
+ * 
+ * @param outerShellGeometry - Geometry of the inflated outer shell (∂H)
+ * @param partGeometry - Geometry of the original part mesh (M)
+ * @param options - Adaptive grid generation options
+ * @returns Promise<AdaptiveVoxelGridResult> with LOD information
+ */
+export async function generateAdaptiveVoxelGrid(
+  outerShellGeometry: THREE.BufferGeometry,
+  partGeometry: THREE.BufferGeometry,
+  options: AdaptiveVoxelizationOptions = {}
+): Promise<AdaptiveVoxelGridResult> {
+  const startTime = performance.now();
+  
+  // Clone geometries to avoid modifying originals
+  const shellGeom = outerShellGeometry.clone();
+  const partGeom = partGeometry.clone();
+  
+  // Ensure geometries have computed bounds
+  shellGeom.computeBoundingBox();
+  partGeom.computeBoundingBox();
+  
+  // Get bounding box from outer shell (this defines the grid extent)
+  const boundingBox = shellGeom.boundingBox!.clone();
+  
+  // Parse options with new linear-friendly defaults
+  const marginPercent = options.marginPercent ?? 0.02;
+  const baseVoxelsPerUnit = options.baseVoxelsPerUnit ?? options.voxelsPerUnit ?? DEFAULT_VOXELS_PER_UNIT;
+  const lodLevels = options.lodLevels ?? 3; // Default to 3 for faster processing
+  const sizeFactor = options.sizeFactor ?? 1.5; // Gentler than 2.0 for better Dijkstra continuity
+  const distanceScalingMode = options.distanceScalingMode ?? 'linear'; // Linear is better for walk algorithms
+  const distanceScale = options.distanceScale ?? 1.0;
+  const minDistanceFromPart = options.minDistanceFromPart ?? 0;
+  
+  // Add margin to bounding box
+  const boxSize = new THREE.Vector3();
+  boundingBox.getSize(boxSize);
+  const margin = boxSize.clone().multiplyScalar(marginPercent);
+  boundingBox.min.sub(margin);
+  boundingBox.max.add(margin);
+  
+  // Recompute size after margin
+  boundingBox.getSize(boxSize);
+  const bboxDiagonal = boxSize.length();
+  
+  // Calculate base cell size (finest level)
+  const baseCellSize = 1.0 / baseVoxelsPerUnit;
+  
+  // Calculate LOD cell sizes using sizeFactor (gentler scaling for better continuity)
+  const lodCellSizes: number[] = [];
+  for (let level = 0; level < lodLevels; level++) {
+    lodCellSizes.push(baseCellSize * Math.pow(sizeFactor, level));
+  }
+  
+  // Calculate or use provided distance thresholds
+  let lodDistanceThresholds: number[];
+  if (options.lodDistanceThresholds && options.lodDistanceThresholds.length === lodLevels - 1) {
+    lodDistanceThresholds = options.lodDistanceThresholds;
+  } else {
+    // Auto-calculate thresholds based on bounding box diagonal and scaling mode
+    // Base threshold is roughly 2% of diagonal
+    const baseThreshold = bboxDiagonal * 0.02 * distanceScale;
+    lodDistanceThresholds = [];
+    
+    for (let level = 0; level < lodLevels - 1; level++) {
+      const levelNum = level + 1; // 1, 2, 3, ... for the threshold boundaries
+      
+      if (distanceScalingMode === 'linear') {
+        // Linear: thresholds grow linearly with level
+        // This gives more uniform voxel density transitions, better for Dijkstra
+        lodDistanceThresholds.push(baseThreshold * levelNum);
+      } else {
+        // Quadratic: thresholds grow quadratically (more aggressive far from part)
+        // Saves more memory but creates larger voxel size jumps
+        lodDistanceThresholds.push(baseThreshold * levelNum * levelNum);
+      }
+    }
+  }
+  
+  logInfo(`Adaptive Grid: ${lodLevels} LOD levels, sizeFactor=${sizeFactor}, mode=${distanceScalingMode}`);
+  logInfo(`Base cell size=${baseCellSize.toFixed(4)}mm, coarsest=${lodCellSizes[lodLevels-1].toFixed(4)}mm`);
+  logInfo(`LOD thresholds (mm from part): ${lodDistanceThresholds.map(t => t.toFixed(2)).join(', ')}`);
+  logInfo(`LOD cell sizes (mm): ${lodCellSizes.map(s => s.toFixed(4)).join(', ')}`);
+  
+  // Create BVH testers for both meshes
+  const shellTester = new MeshTester(shellGeom, 'shell');
+  const partTester = new MeshTester(partGeom, 'part');
+  
+  // ========================================================================
+  // STEP 1: Create seed voxels at part mesh vertices AND along edges (LOD 0)
+  // ========================================================================
+  
+  logDebug('Creating seed voxels at part mesh vertices and edges (LOD 0)...');
+  
+  const seedPositions = partGeom.getAttribute('position');
+  const seedIndex = partGeom.getIndex();
+  const numVertices = seedPositions.count;
+  
+  // Storage for all voxels across all LOD levels
+  // Using arrays initially, will convert to typed arrays at the end
+  interface VoxelData {
+    center: THREE.Vector3;
+    lodLevel: number;
+    cellSize: number;
+    distToPart: number;
+    distToShell: number;
+    isSeed: boolean;
+  }
+  
+  const allVoxels: VoxelData[] = [];
+  
+  // Map from position key to voxel index (for deduplication)
+  // Using spatial hashing at each LOD level
+  const voxelMaps: Map<string, number>[] = [];
+  for (let level = 0; level < lodLevels; level++) {
+    voxelMaps.push(new Map<string, number>());
+  }
+  
+  // Helper to get position key for a given LOD level
+  const getPosKey = (x: number, y: number, z: number, cellSize: number): string => {
+    const gi = Math.floor((x - boundingBox.min.x) / cellSize);
+    const gj = Math.floor((y - boundingBox.min.y) / cellSize);
+    const gk = Math.floor((z - boundingBox.min.z) / cellSize);
+    return `${gi},${gj},${gk}`;
+  };
+  
+  // Helper to get voxel center for a grid position at a given LOD level
+  const getVoxelCenterForGrid = (gi: number, gj: number, gk: number, cellSize: number): THREE.Vector3 => {
+    return new THREE.Vector3(
+      boundingBox.min.x + (gi + 0.5) * cellSize,
+      boundingBox.min.y + (gj + 0.5) * cellSize,
+      boundingBox.min.z + (gk + 0.5) * cellSize
+    );
+  };
+  
+  // Helper to add a seed voxel at a world position (always LOD 0)
+  const addSeedVoxel = (worldX: number, worldY: number, worldZ: number): void => {
+    const cellSize = lodCellSizes[0];
+    const key = getPosKey(worldX, worldY, worldZ, cellSize);
+    
+    // Only add if not already present at LOD 0
+    if (!voxelMaps[0].has(key)) {
+      const gi = Math.floor((worldX - boundingBox.min.x) / cellSize);
+      const gj = Math.floor((worldY - boundingBox.min.y) / cellSize);
+      const gk = Math.floor((worldZ - boundingBox.min.z) / cellSize);
+      
+      const center = getVoxelCenterForGrid(gi, gj, gk, cellSize);
+      
+      // Get distances (needed for later calculations)
+      const target = { point: new THREE.Vector3(), distance: Infinity, faceIndex: 0 };
+      partTester.closestPointToPoint(center, target);
+      const distToPart = target.distance;
+      
+      target.distance = Infinity;
+      shellTester.closestPointToPoint(center, target);
+      const distToShell = target.distance;
+      
+      const voxelIdx = allVoxels.length;
+      voxelMaps[0].set(key, voxelIdx);
+      
+      allVoxels.push({
+        center,
+        lodLevel: 0,
+        cellSize,
+        distToPart,
+        distToShell,
+        isSeed: true
+      });
+    }
+  };
+  
+  // Add seed voxels at all vertices
+  for (let v = 0; v < numVertices; v++) {
+    addSeedVoxel(
+      seedPositions.getX(v),
+      seedPositions.getY(v),
+      seedPositions.getZ(v)
+    );
+  }
+  
+  const vertexSeedCount = allVoxels.length;
+  logDebug(`Vertex seeds: ${vertexSeedCount} from ${numVertices} vertices`);
+  
+  // Add seed voxels along all edges
+  const voxelDiagonal = Math.sqrt(3) * baseCellSize;
+  const edgeStepSize = voxelDiagonal * 0.5;
+  
+  const processedEdges = new Set<string>();
+  const v0 = new THREE.Vector3();
+  const v1 = new THREE.Vector3();
+  const edgeDir = new THREE.Vector3();
+  const samplePoint = new THREE.Vector3();
+  
+  if (seedIndex) {
+    const numTriangles = seedIndex.count / 3;
+    
+    for (let t = 0; t < numTriangles; t++) {
+      const i0 = seedIndex.getX(t * 3);
+      const i1 = seedIndex.getX(t * 3 + 1);
+      const i2 = seedIndex.getX(t * 3 + 2);
+      
+      const edges: [number, number][] = [[i0, i1], [i1, i2], [i2, i0]];
+      
+      for (const [a, b] of edges) {
+        const edgeKey = a < b ? `${a}-${b}` : `${b}-${a}`;
+        
+        if (processedEdges.has(edgeKey)) continue;
+        processedEdges.add(edgeKey);
+        
+        v0.set(seedPositions.getX(a), seedPositions.getY(a), seedPositions.getZ(a));
+        v1.set(seedPositions.getX(b), seedPositions.getY(b), seedPositions.getZ(b));
+        
+        edgeDir.subVectors(v1, v0);
+        const edgeLength = edgeDir.length();
+        
+        if (edgeLength < edgeStepSize) continue;
+        
+        edgeDir.normalize();
+        
+        const numSamples = Math.floor(edgeLength / edgeStepSize);
+        for (let s = 1; s < numSamples; s++) {
+          const t = s / numSamples;
+          samplePoint.copy(v0).addScaledVector(edgeDir, t * edgeLength);
+          addSeedVoxel(samplePoint.x, samplePoint.y, samplePoint.z);
+        }
+      }
+    }
+  } else {
+    const numTriangles = numVertices / 3;
+    
+    for (let t = 0; t < numTriangles; t++) {
+      const i0 = t * 3;
+      const i1 = t * 3 + 1;
+      const i2 = t * 3 + 2;
+      
+      const edges: [number, number][] = [[i0, i1], [i1, i2], [i2, i0]];
+      
+      for (const [a, b] of edges) {
+        v0.set(seedPositions.getX(a), seedPositions.getY(a), seedPositions.getZ(a));
+        v1.set(seedPositions.getX(b), seedPositions.getY(b), seedPositions.getZ(b));
+        
+        edgeDir.subVectors(v1, v0);
+        const edgeLength = edgeDir.length();
+        
+        if (edgeLength < edgeStepSize) continue;
+        
+        edgeDir.normalize();
+        
+        const numSamples = Math.floor(edgeLength / edgeStepSize);
+        for (let s = 1; s < numSamples; s++) {
+          const t = s / numSamples;
+          samplePoint.copy(v0).addScaledVector(edgeDir, t * edgeLength);
+          addSeedVoxel(samplePoint.x, samplePoint.y, samplePoint.z);
+        }
+      }
+    }
+  }
+  
+  const totalSeedCount = allVoxels.length;
+  const edgeSeedCount = totalSeedCount - vertexSeedCount;
+  logDebug(`Edge seeds: ${edgeSeedCount} from ${processedEdges.size} edges`);
+  logDebug(`Total seed voxels (LOD 0): ${totalSeedCount}`);
+  
+  // ========================================================================
+  // STEP 2: Fill mold volume with adaptive LOD voxels
+  // ========================================================================
+  
+  logDebug('Creating adaptive LOD voxels for mold volume...');
+  
+  // We'll process from coarsest LOD to finest, skipping cells that are already
+  // Determine LOD level based on distance to part
+  const getLODLevel = (distToPart: number): number => {
+    for (let level = 0; level < lodLevels - 1; level++) {
+      if (distToPart < lodDistanceThresholds[level]) {
+        return level;
+      }
+    }
+    return lodLevels - 1; // Coarsest level
+  };
+  
+  const target = { point: new THREE.Vector3(), distance: Infinity, faceIndex: 0 };
+  const cellCenter = new THREE.Vector3();
+  
+  // ========================================================================
+  // STEP 2: Flood-fill outward from seed voxels to fill the mold volume
+  // This is MUCH faster than iterating all cells because we only visit
+  // neighbors of existing voxels, and most of the grid is empty space.
+  // ========================================================================
+  
+  logDebug('Flood-filling mold volume from seed voxels...');
+  
+  const voxelCountPerLevel: number[] = new Array(lodLevels).fill(0);
+  voxelCountPerLevel[0] = totalSeedCount;
+  
+  // Use a queue for BFS flood-fill, starting from all seed voxels
+  // Each queue entry: [worldX, worldY, worldZ, sourceVoxelIdx]
+  const fillQueue: Array<[number, number, number, number]> = [];
+  
+  // 6-connected neighbor offsets (face neighbors only for efficiency)
+  const neighborOffsets: [number, number, number][] = [
+    [1, 0, 0], [-1, 0, 0],
+    [0, 1, 0], [0, -1, 0],
+    [0, 0, 1], [0, 0, -1]
+  ];
+  
+  // Initialize queue with all seed voxel neighbors
+  const baseCellSizeLOD0 = lodCellSizes[0];
+  for (let seedIdx = 0; seedIdx < totalSeedCount; seedIdx++) {
+    const seedVoxel = allVoxels[seedIdx];
+    const cx = seedVoxel.center.x;
+    const cy = seedVoxel.center.y;
+    const cz = seedVoxel.center.z;
+    
+    for (const [dx, dy, dz] of neighborOffsets) {
+      fillQueue.push([
+        cx + dx * baseCellSizeLOD0,
+        cy + dy * baseCellSizeLOD0,
+        cz + dz * baseCellSizeLOD0,
+        seedIdx
+      ]);
+    }
+  }
+  
+  // Track visited positions at each LOD level to avoid reprocessing
+  const visitedAtLevel: Set<string>[] = [];
+  for (let level = 0; level < lodLevels; level++) {
+    visitedAtLevel.push(new Set<string>());
+  }
+  // Mark all seed positions as visited at LOD 0
+  for (const key of voxelMaps[0].keys()) {
+    visitedAtLevel[0].add(key);
+  }
+  
+  let addedCount = 0;
+  let skippedInsidePart = 0;
+  let skippedOutsideShell = 0;
+  let skippedVisited = 0;
+  let processedCount = 0;
+  
+  // Pre-compute bounds
+  const minX = boundingBox.min.x;
+  const minY = boundingBox.min.y;
+  const minZ = boundingBox.min.z;
+  const maxX = boundingBox.max.x;
+  const maxY = boundingBox.max.y;
+  const maxZ = boundingBox.max.z;
+  
+  while (fillQueue.length > 0) {
+    // Yield to event loop periodically to keep UI responsive
+    processedCount++;
+    if (processedCount % YIELD_BATCH_SIZE === 0) {
+      await yieldToEventLoop();
+    }
+    
+    const [wx, wy, wz, _sourceIdx] = fillQueue.shift()!;
+    
+    // Skip if outside bounding box
+    if (wx < minX || wx > maxX || wy < minY || wy > maxY || wz < minZ || wz > maxZ) {
+      continue;
+    }
+    
+    // First, get distance to part to determine LOD level
+    cellCenter.set(wx, wy, wz);
+    target.distance = Infinity;
+    partTester.closestPointToPoint(cellCenter, target);
+    const distToPart = target.distance;
+    
+    // Determine appropriate LOD level for this distance
+    const level = getLODLevel(distToPart);
+    const cellSize = lodCellSizes[level];
+    
+    // Get grid key at this LOD level
+    const gi = Math.floor((wx - minX) / cellSize);
+    const gj = Math.floor((wy - minY) / cellSize);
+    const gk = Math.floor((wz - minZ) / cellSize);
+    const key = `${gi},${gj},${gk}`;
+    
+    // Skip if already visited at this LOD level
+    if (visitedAtLevel[level].has(key)) {
+      skippedVisited++;
+      continue;
+    }
+    visitedAtLevel[level].add(key);
+    
+    // Calculate actual voxel center for this grid cell
+    const voxelCx = minX + (gi + 0.5) * cellSize;
+    const voxelCy = minY + (gj + 0.5) * cellSize;
+    const voxelCz = minZ + (gk + 0.5) * cellSize;
+    cellCenter.set(voxelCx, voxelCy, voxelCz);
+    
+    // Check if inside shell (BVH accelerated)
+    const isInsideShell = shellTester.isInside(cellCenter);
+    if (!isInsideShell) {
+      skippedOutsideShell++;
+      continue;
+    }
+    
+    // Check if outside part (BVH accelerated)
+    const isOutsidePart = partTester.isOutside(cellCenter);
+    if (!isOutsidePart) {
+      skippedInsidePart++;
+      continue;
+    }
+    
+    // Re-compute distance at the actual voxel center
+    target.distance = Infinity;
+    partTester.closestPointToPoint(cellCenter, target);
+    const actualDistToPart = target.distance;
+    
+    // Check minimum distance requirement
+    if (actualDistToPart < minDistanceFromPart) {
+      continue;
+    }
+    
+    // Get distance to shell
+    target.distance = Infinity;
+    shellTester.closestPointToPoint(cellCenter, target);
+    const distToShell = target.distance;
+    
+    // Add the voxel
+    const voxelIdx = allVoxels.length;
+    voxelMaps[level].set(key, voxelIdx);
+    
+    allVoxels.push({
+      center: cellCenter.clone(),
+      lodLevel: level,
+      cellSize,
+      distToPart: actualDistToPart,
+      distToShell,
+      isSeed: false
+    });
+    
+    addedCount++;
+    voxelCountPerLevel[level]++;
+    
+    // Add neighbors to queue (at current LOD level's cell size)
+    for (const [dx, dy, dz] of neighborOffsets) {
+      fillQueue.push([
+        voxelCx + dx * cellSize,
+        voxelCy + dy * cellSize,
+        voxelCz + dz * cellSize,
+        voxelIdx
+      ]);
+    }
+  }
+  
+  logDebug(`Flood-fill complete: added ${addedCount}, skipped (inside part: ${skippedInsidePart}, outside shell: ${skippedOutsideShell}, visited: ${skippedVisited})`);
+  
+  const totalVoxels = allVoxels.length;
+  logResult('Adaptive voxel grid', { 
+    totalVoxels, 
+    lodLevels,
+    voxelCountPerLevel: voxelCountPerLevel.join(', ')
+  });
+  
+  // ========================================================================
+  // STEP 3: Convert to typed arrays
+  // ========================================================================
+  
+  logDebug('Converting to typed arrays...');
+  
+  const voxelCenters = new Float32Array(totalVoxels * 3);
+  const voxelIndices = new Uint32Array(totalVoxels * 3);
+  const seedVoxelMask = new Uint8Array(totalVoxels);
+  const voxelLOD = new Uint8Array(totalVoxels);
+  const voxelSizes = new Float32Array(totalVoxels);
+  const voxelDist = new Float32Array(totalVoxels);
+  const voxelDistToShell = new Float32Array(totalVoxels);
+  
+  let minDist = Infinity;
+  let maxDist = -Infinity;
+  let minShellDist = Infinity;
+  let maxShellDist = -Infinity;
+  let rLineStart: THREE.Vector3 | null = null;
+  let rLineEnd: THREE.Vector3 | null = null;
+  
+  for (let i = 0; i < totalVoxels; i++) {
+    // Yield periodically to keep UI responsive
+    if (i % YIELD_BATCH_SIZE === 0 && i > 0) {
+      await yieldToEventLoop();
+    }
+    
+    const voxel = allVoxels[i];
+    const i3 = i * 3;
+    
+    voxelCenters[i3] = voxel.center.x;
+    voxelCenters[i3 + 1] = voxel.center.y;
+    voxelCenters[i3 + 2] = voxel.center.z;
+    
+    // Calculate grid indices at the base (finest) resolution for compatibility
+    const baseGi = Math.floor((voxel.center.x - boundingBox.min.x) / baseCellSize);
+    const baseGj = Math.floor((voxel.center.y - boundingBox.min.y) / baseCellSize);
+    const baseGk = Math.floor((voxel.center.z - boundingBox.min.z) / baseCellSize);
+    voxelIndices[i3] = baseGi;
+    voxelIndices[i3 + 1] = baseGj;
+    voxelIndices[i3 + 2] = baseGk;
+    
+    seedVoxelMask[i] = voxel.isSeed ? 1 : 0;
+    voxelLOD[i] = voxel.lodLevel;
+    voxelSizes[i] = voxel.cellSize;
+    
+    voxelDist[i] = voxel.distToPart;
+    voxelDistToShell[i] = voxel.distToShell;
+    
+    if (voxel.distToPart < minDist) minDist = voxel.distToPart;
+    if (voxel.distToPart > maxDist) {
+      maxDist = voxel.distToPart;
+      rLineStart = voxel.center.clone();
+      // Get the closest point on part for R line visualization
+      target.distance = Infinity;
+      partTester.closestPointToPoint(voxel.center, target);
+      rLineEnd = target.point.clone();
+    }
+    
+    if (voxel.distToShell < minShellDist) minShellDist = voxel.distToShell;
+    if (voxel.distToShell > maxShellDist) maxShellDist = voxel.distToShell;
+  }
+  
+  const R = maxDist;
+  const distanceStats = { min: minDist, max: maxDist };
+  const shellDistanceStats = { min: minShellDist, max: maxShellDist };
+  
+  logResult('Distance field δ_i', { minDist, maxDist, R });
+  logResult('Distance field δ_w (to shell)', { minShellDist, maxShellDist });
+  
+  // ========================================================================
+  // STEP 4: Compute biased distance and weighting factors
+  // ========================================================================
+  
+  logDebug('Computing biased distances and weighting factors...');
+  
+  // For adaptive grid, boundary voxels are those close to the shell (outer surface)
+  // We use a distance threshold based on BOUNDARY_DEPTH_LEVELS × voxel size
+  const boundaryAdjacentMask = new Uint8Array(totalVoxels);
+  
+  // Boundary threshold: voxels within BOUNDARY_DEPTH_LEVELS voxel-widths from shell
+  // Use baseCellSize as reference since outer boundary voxels are typically LOD 0
+  const shellBoundaryThreshold = baseCellSize * (BOUNDARY_DEPTH_LEVELS + 1);
+  
+  let boundaryCount = 0;
+  for (let i = 0; i < totalVoxels; i++) {
+    // Mark as boundary if close to shell (within threshold distance)
+    if (voxelDistToShell[i] < shellBoundaryThreshold) {
+      boundaryAdjacentMask[i] = 1;
+      boundaryCount++;
+    }
+  }
+  
+  logResult('Boundary detection (adaptive)', { boundaryVoxels: boundaryCount, interiorVoxels: totalVoxels - boundaryCount, depthLevels: BOUNDARY_DEPTH_LEVELS });
+  
+  const w1 = DEFAULT_BIASED_DISTANCE_WEIGHTS.partDistanceWeight;
+  const w2 = DEFAULT_BIASED_DISTANCE_WEIGHTS.shellBiasWeight;
+  
+  const biasedDist = new Float32Array(totalVoxels);
+  let minBiasedDist = Infinity;
+  let maxBiasedDist = -Infinity;
+  
+  for (let i = 0; i < totalVoxels; i++) {
+    const delta_i = voxelDist[i];
+    
+    let biased: number;
+    if (boundaryAdjacentMask[i]) {
+      const delta_w = voxelDistToShell[i];
+      const lambda_w = R - delta_w;
+      biased = w1 * delta_i + w2 * lambda_w;
+    } else {
+      biased = w1 * delta_i;
+    }
+    
+    biasedDist[i] = biased;
+    
+    if (biased < minBiasedDist) minBiasedDist = biased;
+    if (biased > maxBiasedDist) maxBiasedDist = biased;
+  }
+  
+  const biasedDistanceStats = { min: minBiasedDist, max: maxBiasedDist };
+  
+  // Weighting factors
+  const weightingFactor = new Float32Array(totalVoxels);
+  let minWeight = Infinity;
+  let maxWeight = -Infinity;
+  
+  for (let i = 0; i < totalVoxels; i++) {
+    const bd = biasedDist[i];
+    const wt = 1.0 / (bd * bd + 0.25);
+    
+    weightingFactor[i] = wt;
+    
+    if (wt < minWeight) minWeight = wt;
+    if (wt > maxWeight) maxWeight = wt;
+  }
+  
+  const weightingFactorStats = { min: minWeight, max: maxWeight };
+  
+  logResult('Biased distance field', { minBiasedDist, maxBiasedDist });
+  logResult('Weighting factor', { minWeight, maxWeight });
+  
+  // Clean up
+  shellTester.dispose();
+  partTester.dispose();
+  shellGeom.dispose();
+  partGeom.dispose();
+  
+  const endTime = performance.now();
+  
+  // Calculate statistics
+  // For adaptive grid, volume is the sum of individual voxel volumes
+  let moldVolume = 0;
+  for (let i = 0; i < totalVoxels; i++) {
+    const size = voxelSizes[i];
+    moldVolume += size * size * size;
+  }
+  
+  // Calculate base resolution (for compatibility)
+  const baseResX = Math.ceil(boxSize.x / baseCellSize);
+  const baseResY = Math.ceil(boxSize.y / baseCellSize);
+  const baseResZ = Math.ceil(boxSize.z / baseCellSize);
+  const totalCellCount = baseResX * baseResY * baseResZ;
+  const totalVolume = boxSize.x * boxSize.y * boxSize.z;
+  
+  const stats: VolumetricGridStats = {
+    moldVolume,
+    totalVolume,
+    fillRatio: moldVolume / totalVolume,
+    computeTimeMs: endTime - startTime,
+  };
+  
+  const lodStats = {
+    voxelCountPerLevel,
+    voxelSizePerLevel: lodCellSizes,
+    distanceThresholds: lodDistanceThresholds
+  };
+  
+  logTiming('Adaptive voxel grid generation', endTime - startTime);
+  
+  // Calculate reduction compared to uniform grid
+  const uniformVoxelCount = totalCellCount;
+  const reductionPercent = ((uniformVoxelCount - totalVoxels) / uniformVoxelCount * 100).toFixed(1);
+  logResult('Voxel reduction', { 
+    uniformWouldBe: uniformVoxelCount, 
+    adaptive: totalVoxels, 
+    reduction: `${reductionPercent}%` 
+  });
+  
+  return {
+    allCells: [],
+    moldVolumeCells: [],
+    voxelCenters,
+    voxelIndices,
+    resolution: new THREE.Vector3(baseResX, baseResY, baseResZ),
+    totalCellCount,
+    moldVolumeCellCount: totalVoxels,
+    boundingBox,
+    cellSize: new THREE.Vector3(baseCellSize, baseCellSize, baseCellSize), // Base cell size
+    stats,
+    voxelDist,
+    voxelDistToShell,
+    biasedDist,
+    weightingFactor,
+    distanceStats,
+    shellDistanceStats,
+    biasedDistanceStats,
+    weightingFactorStats,
+    R,
+    rLineStart,
+    rLineEnd,
+    boundaryAdjacentMask,
+    seedVoxelMask,
+    // Adaptive-specific fields
+    voxelLOD,
+    voxelSizes,
+    lodStats
   };
 }

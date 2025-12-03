@@ -27,10 +27,34 @@
 
 import * as THREE from 'three';
 import { MeshBVH, acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from 'three-mesh-bvh';
-import type { VolumetricGridResult } from './volumetricGrid';
+import type { VolumetricGridResult, AdaptiveVoxelGridResult } from './volumetricGrid';
 import type { MoldHalfClassificationResult } from './moldHalfClassification';
 import { runParallelDijkstra, isWebWorkersAvailable } from './parallelDijkstra';
 import { MeshTester, getNeighborOffsets, type AdjacencyType, logInfo, logDebug, logResult, logTiming } from './meshUtils';
+
+// ============================================================================
+// ASYNC YIELD UTILITIES
+// ============================================================================
+
+/**
+ * Yield to the event loop to prevent UI blocking during heavy computation.
+ * Uses setTimeout(0) which is more reliable than requestAnimationFrame for background work.
+ */
+const yieldToEventLoop = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 0));
+
+/**
+ * Batch size for yielding during heavy computation loops.
+ * Yield every N iterations to keep UI responsive.
+ */
+const YIELD_BATCH_SIZE = 100;
+
+/**
+ * Check if a grid result is from adaptive voxelization (has variable-size voxels)
+ */
+function isAdaptiveGrid(gridResult: VolumetricGridResult): gridResult is VolumetricGridResult & AdaptiveVoxelGridResult {
+  return (gridResult as AdaptiveVoxelGridResult).voxelSizes !== null && 
+         (gridResult as AdaptiveVoxelGridResult).voxelSizes !== undefined;
+}
 
 // Extend Three.js with BVH acceleration
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
@@ -192,17 +216,40 @@ class MinHeap {
 // ============================================================================
 
 /**
- * Build a spatial hash map from grid indices to voxel array index
+ * Spatial index structure that handles both uniform and adaptive grids.
+ * For uniform grids: uses simple grid-index-based lookup (fast)
+ * For adaptive grids: uses position-based spatial hashing with variable cell sizes
+ */
+interface VoxelSpatialIndex {
+  /** Map from grid key to voxel index */
+  indexMap: Map<string, number>;
+  /** Whether the grid is adaptive (has variable-size voxels) */
+  isAdaptive: boolean;
+  /** For adaptive grids: map from position bin to list of voxel indices */
+  positionBins?: Map<string, number[]>;
+  /** For adaptive grids: size of position bins for spatial hashing */
+  binSize?: number;
+  /** Bounding box minimum for position-based calculations */
+  bboxMin?: THREE.Vector3;
+  /** Base cell size for calculating neighbor search radius */
+  baseCellSize?: number;
+}
+
+/**
+ * Build a spatial hash map from grid indices to voxel array index.
+ * For adaptive grids, also builds a position-based spatial index.
  */
 function buildVoxelSpatialIndex(
   gridResult: VolumetricGridResult
-): Map<string, number> {
+): VoxelSpatialIndex {
   const indexMap = new Map<string, number>();
   const voxelCount = gridResult.moldVolumeCellCount;
+  const isAdaptive = isAdaptiveGrid(gridResult);
   
   // Use flat arrays if available (more memory efficient)
   const useFlat = gridResult.voxelIndices !== null;
   
+  // Build the grid-index-based map (always needed)
   for (let i = 0; i < voxelCount; i++) {
     let gi: number, gj: number, gk: number;
     
@@ -222,18 +269,374 @@ function buildVoxelSpatialIndex(
     indexMap.set(key, i);
   }
   
-  return indexMap;
+  // For uniform grids, just return the simple index
+  if (!isAdaptive) {
+    return { indexMap, isAdaptive: false };
+  }
+  
+  // For adaptive grids, build position-based spatial hashing
+  logDebug('Building position-based spatial index for adaptive grid...');
+  
+  // Cast to adaptive grid type (used below for accessing voxelSizes)
+  void (gridResult as VolumetricGridResult & AdaptiveVoxelGridResult);
+  
+  // Use 2× the base cell size as bin size (allows finding neighbors across LOD levels)
+  const baseCellSize = gridResult.cellSize.x; // Assume uniform base cell
+  const binSize = baseCellSize * 2;
+  const bboxMin = gridResult.boundingBox.min.clone();
+  
+  const positionBins = new Map<string, number[]>();
+  
+  // Helper to get position bin key
+  const getPosKey = (x: number, y: number, z: number): string => {
+    const bi = Math.floor((x - bboxMin.x) / binSize);
+    const bj = Math.floor((y - bboxMin.y) / binSize);
+    const bk = Math.floor((z - bboxMin.z) / binSize);
+    return `${bi},${bj},${bk}`;
+  };
+  
+  // Populate position bins
+  const tempCenter = new THREE.Vector3();
+  for (let i = 0; i < voxelCount; i++) {
+    if (gridResult.voxelCenters) {
+      const i3 = i * 3;
+      tempCenter.set(
+        gridResult.voxelCenters[i3],
+        gridResult.voxelCenters[i3 + 1],
+        gridResult.voxelCenters[i3 + 2]
+      );
+    } else {
+      tempCenter.copy(gridResult.moldVolumeCells[i].center);
+    }
+    
+    const key = getPosKey(tempCenter.x, tempCenter.y, tempCenter.z);
+    if (!positionBins.has(key)) {
+      positionBins.set(key, []);
+    }
+    positionBins.get(key)!.push(i);
+  }
+  
+  logDebug(`Position bins created: ${positionBins.size}`);
+  
+  return { 
+    indexMap, 
+    isAdaptive: true, 
+    positionBins, 
+    binSize, 
+    bboxMin,
+    baseCellSize
+  };
 }
 
 /**
  * Get voxel index from grid coordinates, or -1 if not found
+ * For uniform grids only.
  */
 function getVoxelIndex(
   i: number, j: number, k: number,
-  spatialIndex: Map<string, number>
+  spatialIndex: Map<string, number> | VoxelSpatialIndex
 ): number {
+  // Handle both old Map type and new VoxelSpatialIndex type
+  const map = spatialIndex instanceof Map ? spatialIndex : spatialIndex.indexMap;
   const key = `${i},${j},${k}`;
-  return spatialIndex.get(key) ?? -1;
+  return map.get(key) ?? -1;
+}
+
+/**
+ * Find face-adjacent neighbors for a voxel in an adaptive grid.
+ * Uses position-based search with variable search radius based on voxel size.
+ * 
+ * @param _neighborOffsets - Not used for adaptive grids (position-based search), kept for API compatibility
+ * @returns Array of neighbor voxel indices (may be empty for surface voxels)
+ */
+function findAdaptiveNeighbors(
+  voxelIdx: number,
+  gridResult: VolumetricGridResult,
+  spatialIndex: VoxelSpatialIndex,
+  _neighborOffsets: [number, number, number][]
+): number[] {
+  if (!spatialIndex.positionBins || !spatialIndex.binSize || !spatialIndex.bboxMin || !spatialIndex.baseCellSize) {
+    return [];
+  }
+  
+  const adaptiveGrid = gridResult as VolumetricGridResult & AdaptiveVoxelGridResult;
+  
+  // Get this voxel's center and size
+  const tempCenter = new THREE.Vector3();
+  if (gridResult.voxelCenters) {
+    const i3 = voxelIdx * 3;
+    tempCenter.set(
+      gridResult.voxelCenters[i3],
+      gridResult.voxelCenters[i3 + 1],
+      gridResult.voxelCenters[i3 + 2]
+    );
+  } else {
+    tempCenter.copy(gridResult.moldVolumeCells[voxelIdx].center);
+  }
+  
+  const voxelSize = adaptiveGrid.voxelSizes![voxelIdx];
+  const searchRadius = voxelSize * 1.5; // Search 1.5× voxel size to catch neighbors
+  
+  const neighbors: number[] = [];
+  const binSize = spatialIndex.binSize;
+  const bboxMin = spatialIndex.bboxMin;
+  
+  // Calculate bin coordinates
+  const bi = Math.floor((tempCenter.x - bboxMin.x) / binSize);
+  const bj = Math.floor((tempCenter.y - bboxMin.y) / binSize);
+  const bk = Math.floor((tempCenter.z - bboxMin.z) / binSize);
+  
+  // Search neighboring bins
+  const binRange = Math.ceil(searchRadius / binSize);
+  
+  const candidateCenter = new THREE.Vector3();
+  
+  for (let dbi = -binRange; dbi <= binRange; dbi++) {
+    for (let dbj = -binRange; dbj <= binRange; dbj++) {
+      for (let dbk = -binRange; dbk <= binRange; dbk++) {
+        const binKey = `${bi + dbi},${bj + dbj},${bk + dbk}`;
+        const binVoxels = spatialIndex.positionBins.get(binKey);
+        if (!binVoxels) continue;
+        
+        for (const candidateIdx of binVoxels) {
+          if (candidateIdx === voxelIdx) continue;
+          
+          // Get candidate center
+          if (gridResult.voxelCenters) {
+            const c3 = candidateIdx * 3;
+            candidateCenter.set(
+              gridResult.voxelCenters[c3],
+              gridResult.voxelCenters[c3 + 1],
+              gridResult.voxelCenters[c3 + 2]
+            );
+          } else {
+            candidateCenter.copy(gridResult.moldVolumeCells[candidateIdx].center);
+          }
+          
+          // Check if this is a face-adjacent neighbor
+          // For face adjacency, we check if the candidate is approximately 1 voxel away
+          // along one axis and close to zero on the other two axes
+          const dx = candidateCenter.x - tempCenter.x;
+          const dy = candidateCenter.y - tempCenter.y;
+          const dz = candidateCenter.z - tempCenter.z;
+          
+          const candidateSize = adaptiveGrid.voxelSizes![candidateIdx];
+          const avgSize = (voxelSize + candidateSize) / 2;
+          const axisTolerance = avgSize * 0.6; // Allow some tolerance for size differences
+          const neighborDist = avgSize; // Expected distance between face-adjacent voxels
+          
+          // Check for face adjacency along each axis
+          let isFaceAdjacent = false;
+          
+          // X-axis neighbor
+          if (Math.abs(Math.abs(dx) - neighborDist) < axisTolerance &&
+              Math.abs(dy) < axisTolerance && Math.abs(dz) < axisTolerance) {
+            isFaceAdjacent = true;
+          }
+          // Y-axis neighbor
+          else if (Math.abs(dx) < axisTolerance &&
+                   Math.abs(Math.abs(dy) - neighborDist) < axisTolerance &&
+                   Math.abs(dz) < axisTolerance) {
+            isFaceAdjacent = true;
+          }
+          // Z-axis neighbor
+          else if (Math.abs(dx) < axisTolerance && Math.abs(dy) < axisTolerance &&
+                   Math.abs(Math.abs(dz) - neighborDist) < axisTolerance) {
+            isFaceAdjacent = true;
+          }
+          
+          if (isFaceAdjacent && !neighbors.includes(candidateIdx)) {
+            neighbors.push(candidateIdx);
+          }
+        }
+      }
+    }
+  }
+  
+  return neighbors;
+}
+
+/**
+ * Find all neighbors for a voxel (for Dijkstra) with their distances.
+ * Works correctly for both uniform and adaptive grids.
+ * Returns array of { index, distance } for all accessible neighbors.
+ */
+function findAllNeighborsWithDistance(
+  voxelIdx: number,
+  gridResult: VolumetricGridResult,
+  spatialIndex: VoxelSpatialIndex,
+  neighborOffsets: readonly [number, number, number][],
+  uniformVoxelSize: number,
+  maxHopDistance: number = 5
+): Array<{ index: number; distance: number }> {
+  const results: Array<{ index: number; distance: number }> = [];
+  
+  if (spatialIndex.isAdaptive) {
+    // For adaptive grids: use position-based neighbor search with extended range
+    if (!spatialIndex.positionBins || !spatialIndex.binSize || !spatialIndex.bboxMin) {
+      return results;
+    }
+    
+    const adaptiveGrid = gridResult as VolumetricGridResult & AdaptiveVoxelGridResult;
+    
+    // Get this voxel's center and size
+    const voxelCenter = new THREE.Vector3();
+    if (gridResult.voxelCenters) {
+      const i3 = voxelIdx * 3;
+      voxelCenter.set(
+        gridResult.voxelCenters[i3],
+        gridResult.voxelCenters[i3 + 1],
+        gridResult.voxelCenters[i3 + 2]
+      );
+    } else {
+      voxelCenter.copy(gridResult.moldVolumeCells[voxelIdx].center);
+    }
+    
+    const voxelSize = adaptiveGrid.voxelSizes![voxelIdx];
+    // Search radius: use a larger search to find neighbors across LOD transitions
+    // The coarsest voxel could be up to sizeFactor^(lodLevels-1) times larger
+    // With sizeFactor=1.5 and 3 LOD levels, that's 2.25× larger
+    // Use 4× the current voxel size to catch all possible neighbors
+    const searchRadius = voxelSize * 4;
+    
+    const binSize = spatialIndex.binSize;
+    const bboxMin = spatialIndex.bboxMin;
+    
+    // Calculate bin coordinates
+    const bi = Math.floor((voxelCenter.x - bboxMin.x) / binSize);
+    const bj = Math.floor((voxelCenter.y - bboxMin.y) / binSize);
+    const bk = Math.floor((voxelCenter.z - bboxMin.z) / binSize);
+    
+    // Search neighboring bins
+    const binRange = Math.ceil(searchRadius / binSize);
+    const foundIndices = new Set<number>();
+    
+    const candidateCenter = new THREE.Vector3();
+    
+    for (let dbi = -binRange; dbi <= binRange; dbi++) {
+      for (let dbj = -binRange; dbj <= binRange; dbj++) {
+        for (let dbk = -binRange; dbk <= binRange; dbk++) {
+          const binKey = `${bi + dbi},${bj + dbj},${bk + dbk}`;
+          const binVoxels = spatialIndex.positionBins.get(binKey);
+          if (!binVoxels) continue;
+          
+          for (const candidateIdx of binVoxels) {
+            if (candidateIdx === voxelIdx) continue;
+            if (foundIndices.has(candidateIdx)) continue;
+            
+            // Get candidate center
+            if (gridResult.voxelCenters) {
+              const c3 = candidateIdx * 3;
+              candidateCenter.set(
+                gridResult.voxelCenters[c3],
+                gridResult.voxelCenters[c3 + 1],
+                gridResult.voxelCenters[c3 + 2]
+              );
+            } else {
+              candidateCenter.copy(gridResult.moldVolumeCells[candidateIdx].center);
+            }
+            
+            const distance = voxelCenter.distanceTo(candidateCenter);
+            
+            // Include if close enough to be a neighbor
+            // For two adjacent voxels, center-to-center distance is approximately:
+            // (size1 + size2) / 2 for face-adjacent
+            // (size1 + size2) / 2 * sqrt(2) for edge-adjacent
+            // (size1 + size2) / 2 * sqrt(3) for corner-adjacent
+            // We use a generous threshold to handle LOD transitions
+            const candidateSize = adaptiveGrid.voxelSizes![candidateIdx];
+            const largerSize = Math.max(voxelSize, candidateSize);
+            // Max neighbor distance: 1.8× the larger voxel size (generous for LOD transitions)
+            const maxNeighborDist = largerSize * 1.8;
+            
+            if (distance <= maxNeighborDist) {
+              foundIndices.add(candidateIdx);
+              results.push({ index: candidateIdx, distance });
+            }
+          }
+        }
+      }
+    }
+  } else {
+    // For uniform grids: use grid-index-based lookup with hop distance
+    const useFlat = gridResult.voxelIndices !== null;
+    let gi: number, gj: number, gk: number;
+    
+    if (useFlat) {
+      const i3 = voxelIdx * 3;
+      gi = gridResult.voxelIndices![i3];
+      gj = gridResult.voxelIndices![i3 + 1];
+      gk = gridResult.voxelIndices![i3 + 2];
+    } else {
+      const cell = gridResult.moldVolumeCells[voxelIdx];
+      gi = Math.round(cell.index.x);
+      gj = Math.round(cell.index.y);
+      gk = Math.round(cell.index.z);
+    }
+    
+    for (const [di, dj, dk] of neighborOffsets) {
+      const baseDistance = Math.sqrt(di*di + dj*dj + dk*dk) * uniformVoxelSize;
+      
+      // Try hop distances from 1 to maxHopDistance
+      for (let hopDistance = 1; hopDistance <= maxHopDistance; hopDistance++) {
+        const neighborIdx = getVoxelIndex(
+          gi + hopDistance * di,
+          gj + hopDistance * dj,
+          gk + hopDistance * dk,
+          spatialIndex
+        );
+        
+        if (neighborIdx >= 0) {
+          results.push({ index: neighborIdx, distance: baseDistance * hopDistance });
+          break; // Found a neighbor in this direction
+        }
+      }
+    }
+  }
+  
+  return results;
+}
+
+/**
+ * Check if a voxel is a surface voxel (has at least one missing face-neighbor)
+ * Works correctly for both uniform and adaptive grids.
+ */
+function checkIsSurfaceVoxel(
+  voxelIdx: number,
+  gridResult: VolumetricGridResult,
+  spatialIndex: VoxelSpatialIndex,
+  faceNeighborOffsets: [number, number, number][]
+): boolean {
+  if (spatialIndex.isAdaptive) {
+    // For adaptive grids: use position-based neighbor search
+    // A voxel is a surface voxel if it has fewer than 6 face neighbors
+    const neighbors = findAdaptiveNeighbors(voxelIdx, gridResult, spatialIndex, faceNeighborOffsets);
+    return neighbors.length < 6;
+  } else {
+    // For uniform grids: use grid-index-based lookup
+    const useFlat = gridResult.voxelIndices !== null;
+    let gi: number, gj: number, gk: number;
+    
+    if (useFlat) {
+      const i3 = voxelIdx * 3;
+      gi = gridResult.voxelIndices![i3];
+      gj = gridResult.voxelIndices![i3 + 1];
+      gk = gridResult.voxelIndices![i3 + 2];
+    } else {
+      const cell = gridResult.moldVolumeCells[voxelIdx];
+      gi = Math.round(cell.index.x);
+      gj = Math.round(cell.index.y);
+      gk = Math.round(cell.index.z);
+    }
+    
+    for (const [di, dj, dk] of faceNeighborOffsets) {
+      const neighborIdx = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
+      if (neighborIdx < 0) {
+        return true; // Missing neighbor = surface voxel
+      }
+    }
+    return false;
+  }
 }
 
 // ============================================================================
@@ -442,6 +845,11 @@ function identifyBoundaryAdjacentVoxels(
   // Build spatial index for neighbor lookups
   const spatialIndex = buildVoxelSpatialIndex(gridResult);
   
+  // Log if using adaptive grid
+  if (spatialIndex.isAdaptive) {
+    logDebug('Using position-based neighbor search for adaptive grid');
+  }
+  
   // 6-connected neighbor offsets (face-adjacent only for surface detection)
   const faceNeighborOffsets: [number, number, number][] = [
     [1, 0, 0], [-1, 0, 0],
@@ -454,29 +862,9 @@ function identifyBoundaryAdjacentVoxels(
   let totalSurfaceCount = 0;
   
   for (let i = 0; i < voxelCount; i++) {
-    let gi: number, gj: number, gk: number;
-    
-    if (useFlat) {
-      const i3 = i * 3;
-      gi = gridResult.voxelIndices![i3];
-      gj = gridResult.voxelIndices![i3 + 1];
-      gk = gridResult.voxelIndices![i3 + 2];
-    } else {
-      const cell = gridResult.moldVolumeCells[i];
-      gi = Math.round(cell.index.x);
-      gj = Math.round(cell.index.y);
-      gk = Math.round(cell.index.z);
-    }
-    
-    // Check if any 6-connected neighbor is missing (not a silicone voxel)
-    for (const [di, dj, dk] of faceNeighborOffsets) {
-      const neighborIdx = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
-      if (neighborIdx < 0) {
-        // Missing neighbor = this is a surface voxel
-        isSurfaceVoxel[i] = 1;
-        totalSurfaceCount++;
-        break;
-      }
+    if (checkIsSurfaceVoxel(i, gridResult, spatialIndex, faceNeighborOffsets)) {
+      isSurfaceVoxel[i] = 1;
+      totalSurfaceCount++;
     }
   }
   
@@ -526,7 +914,10 @@ function identifyBoundaryAdjacentVoxels(
   logDebug(`Inner candidates: ${gapIndex}, Outer candidates: ${sortedPairs.length - gapIndex}`);
   
   // Step 3: Mark OUTER surface voxels (using distance threshold)
-  // and identify SEED voxels using either volume intersection or surface distance
+  // and identify SEED voxels using either:
+  // 1. Pre-computed seedVoxelMask (from vertex-based grid generation) - fastest
+  // 2. Volume intersection (if partMeshTester provided) - accurate but slow
+  // 3. Surface distance (legacy) - fallback
   const isOuterSurface = new Uint8Array(voxelCount);
   const innerSurfaceMask = new Uint8Array(voxelCount);
   let outerSurfaceCount = 0;
@@ -541,7 +932,18 @@ function identifyBoundaryAdjacentVoxels(
   }
   
   // Second pass: identify seed voxels
-  if (partMeshTester && seedVolumeThreshold > 0) {
+  // Check if seedVoxelMask is already provided (from vertex-based grid generation)
+  if (gridResult.seedVoxelMask !== null && gridResult.seedVoxelMask !== undefined) {
+    // Use pre-computed seed mask from vertex-based grid generation
+    logDebug(`Using pre-computed seedVoxelMask from grid (vertex-based seeds)`);
+    for (let i = 0; i < voxelCount; i++) {
+      if (gridResult.seedVoxelMask[i]) {
+        innerSurfaceMask[i] = 1;
+        innerSurfaceCount++;
+      }
+    }
+    logDebug(`Seed voxels (from vertex-based grid): ${innerSurfaceCount}`);
+  } else if (partMeshTester && seedVolumeThreshold > 0) {
     // Volume intersection approach: find voxels with ≥ threshold volume inside part
     logDebug(`Using volume intersection approach for seeds (threshold: ${(seedVolumeThreshold * 100).toFixed(0)}%, samples: ${seedVolumeSamples}³)`);
     const volumeStartTime = performance.now();
@@ -730,25 +1132,37 @@ function identifyBoundaryAdjacentVoxels(
   // Mark level 1: immediate neighbors of outer surface voxels
   for (let i = 0; i < voxelCount; i++) {
     if (isOuterSurface[i]) {
-      let gi: number, gj: number, gk: number;
-      
-      if (useFlat) {
-        const i3 = i * 3;
-        gi = gridResult.voxelIndices![i3];
-        gj = gridResult.voxelIndices![i3 + 1];
-        gk = gridResult.voxelIndices![i3 + 2];
+      if (spatialIndex.isAdaptive) {
+        // For adaptive grids: use position-based neighbor search
+        const neighbors = findAdaptiveNeighbors(i, gridResult, spatialIndex, faceNeighborOffsets);
+        for (const neighborIdx of neighbors) {
+          if (!boundaryAdjacentMask[neighborIdx]) {
+            boundaryAdjacentMask[neighborIdx] = 1;
+            boundaryAdjacentCount++;
+          }
+        }
       } else {
-        const cell = gridResult.moldVolumeCells[i];
-        gi = Math.round(cell.index.x);
-        gj = Math.round(cell.index.y);
-        gk = Math.round(cell.index.z);
-      }
-      
-      for (const [di, dj, dk] of faceNeighborOffsets) {
-        const neighborIdx = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
-        if (neighborIdx >= 0 && !boundaryAdjacentMask[neighborIdx]) {
-          boundaryAdjacentMask[neighborIdx] = 1;
-          boundaryAdjacentCount++;
+        // For uniform grids: use grid-index-based lookup
+        let gi: number, gj: number, gk: number;
+        
+        if (useFlat) {
+          const i3 = i * 3;
+          gi = gridResult.voxelIndices![i3];
+          gj = gridResult.voxelIndices![i3 + 1];
+          gk = gridResult.voxelIndices![i3 + 2];
+        } else {
+          const cell = gridResult.moldVolumeCells[i];
+          gi = Math.round(cell.index.x);
+          gj = Math.round(cell.index.y);
+          gk = Math.round(cell.index.z);
+        }
+        
+        for (const [di, dj, dk] of faceNeighborOffsets) {
+          const neighborIdx = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
+          if (neighborIdx >= 0 && !boundaryAdjacentMask[neighborIdx]) {
+            boundaryAdjacentMask[neighborIdx] = 1;
+            boundaryAdjacentCount++;
+          }
         }
       }
     }
@@ -802,6 +1216,11 @@ async function identifyBoundaryAdjacentVoxelsAsync(
   // Build spatial index for neighbor lookups
   const spatialIndex = buildVoxelSpatialIndex(gridResult);
   
+  // Log if using adaptive grid
+  if (spatialIndex.isAdaptive) {
+    logDebug('Using position-based neighbor search for adaptive grid (async)');
+  }
+  
   // 6-connected neighbor offsets (face-adjacent only for surface detection)
   const faceNeighborOffsets: [number, number, number][] = [
     [1, 0, 0], [-1, 0, 0],
@@ -814,27 +1233,9 @@ async function identifyBoundaryAdjacentVoxelsAsync(
   let totalSurfaceCount = 0;
   
   for (let i = 0; i < voxelCount; i++) {
-    let gi: number, gj: number, gk: number;
-    
-    if (useFlat) {
-      const i3 = i * 3;
-      gi = gridResult.voxelIndices![i3];
-      gj = gridResult.voxelIndices![i3 + 1];
-      gk = gridResult.voxelIndices![i3 + 2];
-    } else {
-      const cell = cells[i];
-      gi = Math.round(cell.index.x);
-      gj = Math.round(cell.index.y);
-      gk = Math.round(cell.index.z);
-    }
-    
-    for (const [di, dj, dk] of faceNeighborOffsets) {
-      const neighborIdx = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
-      if (neighborIdx < 0) {
-        isSurfaceVoxel[i] = 1;
-        totalSurfaceCount++;
-        break;
-      }
+    if (checkIsSurfaceVoxel(i, gridResult, spatialIndex, faceNeighborOffsets)) {
+      isSurfaceVoxel[i] = 1;
+      totalSurfaceCount++;
     }
   }
   
@@ -889,8 +1290,20 @@ async function identifyBoundaryAdjacentVoxelsAsync(
     }
   }
   
-  // Second pass: identify seed voxels using PARALLEL workers
-  if (partGeometry && seedVolumeThreshold > 0) {
+  // Second pass: identify seed voxels
+  // Check if seedVoxelMask is already provided (from vertex-based grid generation)
+  if (gridResult.seedVoxelMask !== null && gridResult.seedVoxelMask !== undefined) {
+    // Use pre-computed seed mask from vertex-based grid generation
+    logDebug(`Using pre-computed seedVoxelMask from grid (vertex-based seeds)`);
+    for (let i = 0; i < voxelCount; i++) {
+      if (gridResult.seedVoxelMask[i]) {
+        innerSurfaceMask[i] = 1;
+        innerSurfaceCount++;
+      }
+    }
+    logDebug(`Seed voxels (from vertex-based grid): ${innerSurfaceCount}`);
+  } else if (partGeometry && seedVolumeThreshold > 0) {
+    // Use PARALLEL volume intersection approach for seeds
     logDebug(`Using PARALLEL volume intersection approach for seeds (threshold: ${(seedVolumeThreshold * 100).toFixed(0)}%, samples: ${seedVolumeSamples}³)`);
     const volumeStartTime = performance.now();
     
@@ -1044,25 +1457,37 @@ async function identifyBoundaryAdjacentVoxelsAsync(
   
   for (let i = 0; i < voxelCount; i++) {
     if (isOuterSurface[i]) {
-      let gi: number, gj: number, gk: number;
-      
-      if (useFlat) {
-        const i3 = i * 3;
-        gi = gridResult.voxelIndices![i3];
-        gj = gridResult.voxelIndices![i3 + 1];
-        gk = gridResult.voxelIndices![i3 + 2];
+      if (spatialIndex.isAdaptive) {
+        // For adaptive grids: use position-based neighbor search
+        const neighbors = findAdaptiveNeighbors(i, gridResult, spatialIndex, faceNeighborOffsets);
+        for (const neighborIdx of neighbors) {
+          if (!boundaryAdjacentMask[neighborIdx]) {
+            boundaryAdjacentMask[neighborIdx] = 1;
+            boundaryAdjacentCount++;
+          }
+        }
       } else {
-        const cell = cells[i];
-        gi = Math.round(cell.index.x);
-        gj = Math.round(cell.index.y);
-        gk = Math.round(cell.index.z);
-      }
-      
-      for (const [di, dj, dk] of faceNeighborOffsets) {
-        const neighborIdx = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
-        if (neighborIdx >= 0 && !boundaryAdjacentMask[neighborIdx]) {
-          boundaryAdjacentMask[neighborIdx] = 1;
-          boundaryAdjacentCount++;
+        // For uniform grids: use grid-index-based lookup
+        let gi: number, gj: number, gk: number;
+        
+        if (useFlat) {
+          const i3 = i * 3;
+          gi = gridResult.voxelIndices![i3];
+          gj = gridResult.voxelIndices![i3 + 1];
+          gk = gridResult.voxelIndices![i3 + 2];
+        } else {
+          const cell = cells[i];
+          gi = Math.round(cell.index.x);
+          gj = Math.round(cell.index.y);
+          gk = Math.round(cell.index.z);
+        }
+        
+        for (const [di, dj, dk] of faceNeighborOffsets) {
+          const neighborIdx = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
+          if (neighborIdx >= 0 && !boundaryAdjacentMask[neighborIdx]) {
+            boundaryAdjacentMask[neighborIdx] = 1;
+            boundaryAdjacentCount++;
+          }
         }
       }
     }
@@ -1093,13 +1518,13 @@ async function identifyBoundaryAdjacentVoxelsAsync(
  * @param partGeometry - Optional part geometry for volume intersection seed detection
  * @returns Escape labeling result
  */
-export function computeEscapeLabelingDijkstra(
+export async function computeEscapeLabelingDijkstra(
   gridResult: VolumetricGridResult,
   shellGeometry: THREE.BufferGeometry,
   classification: MoldHalfClassificationResult,
   options: EscapeLabelingOptions = {},
   partGeometry?: THREE.BufferGeometry
-): EscapeLabelingResult {
+): Promise<EscapeLabelingResult> {
   const startTime = performance.now();
   
   const adjacency = options.adjacency ?? 6;
@@ -1136,6 +1561,12 @@ export function computeEscapeLabelingDijkstra(
   
   // Build spatial index for neighbor lookups
   const spatialIndex = buildVoxelSpatialIndex(gridResult);
+  
+  // Log grid type for debugging
+  logDebug(`Grid type: ${spatialIndex.isAdaptive ? 'ADAPTIVE' : 'UNIFORM'}`);
+  if (spatialIndex.isAdaptive) {
+    logDebug(`Position bins: ${spatialIndex.positionBins?.size ?? 0}, binSize: ${spatialIndex.binSize?.toFixed(4) ?? 'N/A'}`);
+  }
   
   // Get neighbor offsets (used for connectivity checks)
   const neighborOffsets = getNeighborOffsets(adjacency);
@@ -1176,27 +1607,30 @@ export function computeEscapeLabelingDijkstra(
   }
   
   // Diagnostic: Quick connectivity check - count how many voxels have at least one neighbor
-  let connectedVoxels = 0;
-  let isolatedVoxels = 0;
-  for (let i = 0; i < voxelCount; i++) {
-    const cell = cells[i];
-    const gi = Math.round(cell.index.x);
-    const gj = Math.round(cell.index.y);
-    const gk = Math.round(cell.index.z);
-    
-    let hasNeighbor = false;
-    for (const [di, dj, dk] of neighborOffsets) {
-      const j = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
-      if (j >= 0) {
-        hasNeighbor = true;
-        break;
+  // Skip for adaptive grids since they use position-based neighbor search
+  if (!spatialIndex.isAdaptive) {
+    let connectedVoxels = 0;
+    let isolatedVoxels = 0;
+    for (let i = 0; i < voxelCount; i++) {
+      const cell = cells[i];
+      const gi = Math.round(cell.index.x);
+      const gj = Math.round(cell.index.y);
+      const gk = Math.round(cell.index.z);
+      
+      let hasNeighbor = false;
+      for (const [di, dj, dk] of neighborOffsets) {
+        const j = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
+        if (j >= 0) {
+          hasNeighbor = true;
+          break;
+        }
       }
+      
+      if (hasNeighbor) connectedVoxels++;
+      else isolatedVoxels++;
     }
-    
-    if (hasNeighbor) connectedVoxels++;
-    else isolatedVoxels++;
+    logDebug(`Connectivity check: ${connectedVoxels} connected, ${isolatedVoxels} isolated voxels`);
   }
-  logDebug(`Connectivity check: ${connectedVoxels} connected, ${isolatedVoxels} isolated voxels`);
   
   // ========================================================================
   // STEP 2: Independent Dijkstra from each seed to find nearest boundary
@@ -1216,9 +1650,11 @@ export function computeEscapeLabelingDijkstra(
   
   // Use 26-connectivity for better coverage (diagonal neighbors)
   const fullNeighborOffsets = getNeighborOffsets(26);
-  const fullNeighborDistances = fullNeighborOffsets.map(([di, dj, dk]) => 
-    Math.sqrt(di * di + dj * dj + dk * dk) * voxelSize
-  );
+  // Note: fullNeighborDistances removed - findAllNeighborsWithDistance computes distances directly
+  
+  // For each seed, run Dijkstra until we hit a boundary
+  // Use a reusable cost array and visited set per seed
+  const MAX_HOP_DISTANCE = 5;
   
   // Collect seed indices
   const seedIndices: number[] = [];
@@ -1238,12 +1674,36 @@ export function computeEscapeLabelingDijkstra(
   }
   logDebug(`Total boundary voxels (H₁ + H₂): ${boundaryVoxelCount}`);
   
+  // DEBUG: Test connectivity from a few seeds
+  if (seedIndices.length > 0 && spatialIndex.isAdaptive) {
+    const testSeedIdx = seedIndices[0];
+    const testNeighbors = findAllNeighborsWithDistance(
+      testSeedIdx, gridResult, spatialIndex, fullNeighborOffsets, voxelSize, MAX_HOP_DISTANCE
+    );
+    logDebug(`DEBUG: First seed (idx=${testSeedIdx}) has ${testNeighbors.length} neighbors`);
+    if (testNeighbors.length > 0) {
+      const dists = testNeighbors.map(n => n.distance.toFixed(2));
+      logDebug(`DEBUG: Neighbor distances: ${dists.slice(0, 10).join(', ')}${dists.length > 10 ? '...' : ''}`);
+    }
+    
+    // Also test a boundary voxel
+    let testBoundaryIdx = -1;
+    for (let i = 0; i < voxelCount; i++) {
+      if (boundaryLabel[i] !== 0) {
+        testBoundaryIdx = i;
+        break;
+      }
+    }
+    if (testBoundaryIdx >= 0) {
+      const boundaryNeighbors = findAllNeighborsWithDistance(
+        testBoundaryIdx, gridResult, spatialIndex, fullNeighborOffsets, voxelSize, MAX_HOP_DISTANCE
+      );
+      logDebug(`DEBUG: First boundary voxel (idx=${testBoundaryIdx}) has ${boundaryNeighbors.length} neighbors`);
+    }
+  }
+  
   // Seed labels array
   const seedLabel = new Int8Array(voxelCount).fill(-1);
-  
-  // For each seed, run Dijkstra until we hit a boundary
-  // Use a reusable cost array and visited set per seed
-  const MAX_HOP_DISTANCE = 5;
   
   let labeledCount = 0;
   let totalVisited = 0;
@@ -1265,10 +1725,16 @@ export function computeEscapeLabelingDijkstra(
   for (let seedNum = 0; seedNum < seedIndices.length; seedNum++) {
     const seedIdx = seedIndices[seedNum];
     
-    // Progress logging
+    // Yield to event loop periodically to keep UI responsive
+    if (seedNum % YIELD_BATCH_SIZE === 0 && seedNum > 0) {
+      await yieldToEventLoop();
+    }
+    
+    // Progress logging and callback
     if (seedNum % progressInterval === 0) {
       const pct = Math.round(100 * seedNum / seedIndices.length);
       logDebug(`Processing seed ${seedNum}/${seedIndices.length} (${pct}%)...`);
+      options.onProgress?.({ completed: seedNum, total: seedIndices.length });
     }
     
     // Increment version to "clear" arrays without actually clearing them
@@ -1287,6 +1753,8 @@ export function computeEscapeLabelingDijkstra(
     
     let foundBoundary = false;
     let boundaryLabelFound = 0;
+    let seedNeighborSum = 0;
+    let seedExpansionCount = 0;
     
     while (pq.size > 0 && !foundBoundary) {
       const current = pq.pop()!;
@@ -1308,41 +1776,29 @@ export function computeEscapeLabelingDijkstra(
       }
       
       totalExpanded++;
+      seedExpansionCount++;
       
-      // Get current voxel's grid coordinates
-      const cell = cells[i];
-      const gi = Math.round(cell.index.x);
-      const gj = Math.round(cell.index.y);
-      const gk = Math.round(cell.index.z);
+      // Find all neighbors with their distances (works for both uniform and adaptive grids)
+      const neighbors = findAllNeighborsWithDistance(
+        i, gridResult, spatialIndex, fullNeighborOffsets, voxelSize, MAX_HOP_DISTANCE
+      );
+      
+      seedNeighborSum += neighbors.length;
       
       // Expand to neighbors
-      for (let n = 0; n < fullNeighborOffsets.length; n++) {
-        const [di, dj, dk] = fullNeighborOffsets[n];
+      for (const { index: j, distance: L } of neighbors) {
+        // Skip if already visited in this version
+        if (visitedSet[j] === currentVersion) continue;
         
-        // Try hop distances from 1 to MAX_HOP_DISTANCE
-        for (let hopDistance = 1; hopDistance <= MAX_HOP_DISTANCE; hopDistance++) {
-          const j = getVoxelIndex(gi + hopDistance*di, gj + hopDistance*dj, gk + hopDistance*dk, spatialIndex);
-          
-          if (j < 0) continue;  // No voxel at this hop distance, try next
-          
-          // Skip if already visited in this version
-          if (visitedSet[j] === currentVersion) {
-            break;  // Found a neighbor, don't try larger hops
-          }
-          
-          const L = fullNeighborDistances[n] * hopDistance;
-          const wt_j = weightingFactor[j];
-          const edgeCost = L * wt_j;
-          const candidateCost = currentCost + edgeCost;
-          
-          // Check if this is a better path (or first path in this version)
-          if (versionArray[j] !== currentVersion || candidateCost < costArray[j]) {
-            costArray[j] = candidateCost;
-            versionArray[j] = currentVersion;
-            pq.push(j, candidateCost);
-          }
-          
-          break;  // Found a neighbor at this hop distance, don't try larger hops
+        const wt_j = weightingFactor[j];
+        const edgeCost = L * wt_j;
+        const candidateCost = currentCost + edgeCost;
+        
+        // Check if this is a better path (or first path in this version)
+        if (versionArray[j] !== currentVersion || candidateCost < costArray[j]) {
+          costArray[j] = candidateCost;
+          versionArray[j] = currentVersion;
+          pq.push(j, candidateCost);
         }
       }
     }
@@ -1351,6 +1807,10 @@ export function computeEscapeLabelingDijkstra(
     if (foundBoundary) {
       seedLabel[seedIdx] = boundaryLabelFound;
       labeledCount++;
+    } else if (seedNum < 5) {
+      // Log first few failed seeds for debugging
+      const avgNeighbors = seedExpansionCount > 0 ? (seedNeighborSum / seedExpansionCount).toFixed(1) : '0';
+      logDebug(`DEBUG: Seed ${seedNum} (idx=${seedIdx}) failed - expanded ${seedExpansionCount} voxels, avg ${avgNeighbors} neighbors each`);
     }
   }
   
@@ -1439,89 +1899,95 @@ export function computeEscapeLabelingDijkstra(
   logDebug('DEBUG - Boundary voxel labels', { boundaryH1, boundaryH2, notBoundary: boundaryNone });
   
   // DEBUG: Analyze seed label neighbor consistency (detect mixing/orphans)
-  let consistentSeeds = 0;
-  let mixedSeeds = 0;
-  let isolatedSeeds = 0;
-  const mixedExamples: string[] = [];
-  
-  for (let i = 0; i < voxelCount; i++) {
-    if (!innerSurfaceMask[i]) continue;
+  // Skip for adaptive grids since they use position-based neighbor search
+  if (!spatialIndex.isAdaptive) {
+    let consistentSeeds = 0;
+    let mixedSeeds = 0;
+    let isolatedSeeds = 0;
+    const mixedExamples: string[] = [];
     
-    const myLabel = seedLabel[i];
-    if (myLabel === -1) continue;
-    
-    const cell = cells[i];
-    const gi = Math.round(cell.index.x);
-    const gj = Math.round(cell.index.y);
-    const gk = Math.round(cell.index.z);
-    
-    let sameCount = 0;
-    let diffCount = 0;
-    let neighborLabels: number[] = [];
-    
-    for (const [di, dj, dk] of neighborOffsets) {
-      const j = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
-      if (j >= 0 && innerSurfaceMask[j] && seedLabel[j] !== -1) {
-        neighborLabels.push(seedLabel[j]);
-        if (seedLabel[j] === myLabel) sameCount++;
-        else diffCount++;
+    for (let i = 0; i < voxelCount; i++) {
+      if (!innerSurfaceMask[i]) continue;
+      
+      const myLabel = seedLabel[i];
+      if (myLabel === -1) continue;
+      
+      const cell = cells[i];
+      const gi = Math.round(cell.index.x);
+      const gj = Math.round(cell.index.y);
+      const gk = Math.round(cell.index.z);
+      
+      let sameCount = 0;
+      let diffCount = 0;
+      let neighborLabels: number[] = [];
+      
+      for (const [di, dj, dk] of neighborOffsets) {
+        const j = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
+        if (j >= 0 && innerSurfaceMask[j] && seedLabel[j] !== -1) {
+          neighborLabels.push(seedLabel[j]);
+          if (seedLabel[j] === myLabel) sameCount++;
+          else diffCount++;
+        }
+      }
+      
+      if (neighborLabels.length === 0) {
+        isolatedSeeds++;
+      } else if (diffCount === 0) {
+        consistentSeeds++;
+      } else {
+        mixedSeeds++;
+        if (mixedExamples.length < 5) {
+          mixedExamples.push(`Seed ${i}: label=${myLabel}, neighbors=[${neighborLabels.join(',')}]`);
+        }
       }
     }
     
-    if (neighborLabels.length === 0) {
-      isolatedSeeds++;
-    } else if (diffCount === 0) {
-      consistentSeeds++;
-    } else {
-      mixedSeeds++;
-      if (mixedExamples.length < 5) {
-        mixedExamples.push(`Seed ${i}: label=${myLabel}, neighbors=[${neighborLabels.join(',')}]`);
-      }
+    logDebug('DEBUG - Seed neighbor consistency', { consistent: consistentSeeds, mixed: mixedSeeds, isolated: isolatedSeeds });
+    if (mixedExamples.length > 0) {
+      logDebug('Examples of mixed seeds', mixedExamples);
     }
-  }
-  
-  logDebug('DEBUG - Seed neighbor consistency', { consistent: consistentSeeds, mixed: mixedSeeds, isolated: isolatedSeeds });
-  if (mixedExamples.length > 0) {
-    logDebug('Examples of mixed seeds', mixedExamples);
   }
   
   // DEBUG: Analyze boundary voxel neighbor consistency
-  let consistentBoundary = 0;
-  let mixedBoundary = 0;
-  let isolatedBoundary = 0;
-  
-  for (let i = 0; i < voxelCount; i++) {
-    if (boundaryLabel[i] === 0) continue;
+  // Skip for adaptive grids since they use position-based neighbor search
+  if (!spatialIndex.isAdaptive) {
+    let consistentBoundary = 0;
+    let mixedBoundary = 0;
+    let isolatedBoundary = 0;
     
-    const myLabel = boundaryLabel[i];
-    const cell = cells[i];
-    const gi = Math.round(cell.index.x);
-    const gj = Math.round(cell.index.y);
-    const gk = Math.round(cell.index.z);
-    
-    let sameCount = 0;
-    let diffCount = 0;
-    let neighborCount = 0;
-    
-    for (const [di, dj, dk] of neighborOffsets) {
-      const j = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
-      if (j >= 0 && boundaryLabel[j] !== 0) {
-        neighborCount++;
-        if (boundaryLabel[j] === myLabel) sameCount++;
-        else diffCount++;
+    for (let i = 0; i < voxelCount; i++) {
+      if (boundaryLabel[i] === 0) continue;
+      
+      const myLabel = boundaryLabel[i];
+      const cell = cells[i];
+      const gi = Math.round(cell.index.x);
+      const gj = Math.round(cell.index.y);
+      const gk = Math.round(cell.index.z);
+      
+      let sameCount = 0;
+      let diffCount = 0;
+      let neighborCount = 0;
+      
+      for (const [di, dj, dk] of neighborOffsets) {
+        const j = getVoxelIndex(gi + di, gj + dj, gk + dk, spatialIndex);
+        if (j >= 0 && boundaryLabel[j] !== 0) {
+          neighborCount++;
+          if (boundaryLabel[j] === myLabel) sameCount++;
+          else diffCount++;
+        }
+      }
+      
+      if (neighborCount === 0) {
+        isolatedBoundary++;
+      } else if (diffCount === 0) {
+        consistentBoundary++;
+      } else {
+        mixedBoundary++;
       }
     }
     
-    if (neighborCount === 0) {
-      isolatedBoundary++;
-    } else if (diffCount === 0) {
-      consistentBoundary++;
-    } else {
-      mixedBoundary++;
-    }
+    logDebug('DEBUG - Boundary voxel neighbor consistency', { consistent: consistentBoundary, atH1H2Interface: mixedBoundary, isolated: isolatedBoundary });
   }
-  
-  logDebug('DEBUG - Boundary voxel neighbor consistency', { consistent: consistentBoundary, atH1H2Interface: mixedBoundary, isolated: isolatedBoundary });
   
   return {
     labels: voxelLabel,
@@ -1557,8 +2023,15 @@ export async function computeEscapeLabelingDijkstraAsync(
 ): Promise<EscapeLabelingResult> {
   const parallel = options.parallel ?? false;
   
-  // If not parallel or Web Workers unavailable, use synchronous version
-  if (!parallel || !isWebWorkersAvailable()) {
+  // Check if this is an adaptive grid (variable-size voxels)
+  const isAdaptive = isAdaptiveGrid(gridResult);
+  
+  // If not parallel, Web Workers unavailable, or adaptive grid, use synchronous version
+  // Adaptive grids require position-based neighbor search which the parallel workers don't support
+  if (!parallel || !isWebWorkersAvailable() || isAdaptive) {
+    if (isAdaptive && parallel) {
+      logDebug('Adaptive grid detected - falling back to synchronous Dijkstra (parallel workers use grid-index lookup)');
+    }
     return computeEscapeLabelingDijkstra(gridResult, shellGeometry, classification, options, partGeometry);
   }
   
@@ -1691,78 +2164,6 @@ export async function computeEscapeLabelingDijkstraAsync(
     computeTimeMs,
     boundaryLabels: boundaryLabel,
     seedMask: innerSurfaceMask,
-  };
-}
-
-// ============================================================================
-// LEGACY API (for backwards compatibility with ThreeViewer)
-// ============================================================================
-
-/**
- * Legacy wrapper that accepts partGeometry and d1/d2 directions
- * This is a fallback if mold half classification is not available
- */
-export function computeEscapeLabeling(
-  gridResult: VolumetricGridResult,
-  _partGeometry: THREE.BufferGeometry,
-  d1: THREE.Vector3,
-  d2: THREE.Vector3,
-  _options: EscapeLabelingOptions = {}
-): EscapeLabelingResult {
-  console.warn('Using legacy escape labeling (simple directional heuristic)');
-  console.warn('For proper Dijkstra-based labeling, use computeEscapeLabelingDijkstra with mold half classification');
-  
-  const startTime = performance.now();
-  const voxelCount = gridResult.moldVolumeCellCount;
-  
-  const labels = new Int8Array(voxelCount);
-  const escapeCost = new Float32Array(voxelCount);
-  
-  let d1Count = 0;
-  let d2Count = 0;
-  
-  const useFlat = gridResult.voxelCenters !== null;
-  const tempVec = new THREE.Vector3();
-  
-  for (let i = 0; i < voxelCount; i++) {
-    let pos: THREE.Vector3;
-    if (useFlat) {
-      const i3 = i * 3;
-      tempVec.set(
-        gridResult.voxelCenters![i3],
-        gridResult.voxelCenters![i3 + 1],
-        gridResult.voxelCenters![i3 + 2]
-      );
-      pos = tempVec;
-    } else {
-      const cell = gridResult.moldVolumeCells[i];
-      pos = cell.center;
-    }
-    
-    const dot1 = pos.dot(d1);
-    const dot2 = pos.dot(d2);
-    
-    if (dot1 >= dot2) {
-      labels[i] = 1;
-      escapeCost[i] = Math.abs(dot1);
-      d1Count++;
-    } else {
-      labels[i] = 2;
-      escapeCost[i] = Math.abs(dot2);
-      d2Count++;
-    }
-  }
-  
-  const computeTimeMs = performance.now() - startTime;
-  
-  return {
-    labels,
-    escapeCost,
-    d1Count,
-    d2Count,
-    interfaceCount: 0,
-    unlabeledCount: 0,
-    computeTimeMs,
   };
 }
 
