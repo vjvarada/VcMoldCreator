@@ -21,6 +21,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Silence noisy third-party loggers
+logging.getLogger('trimesh').setLevel(logging.WARNING)
+logging.getLogger('matplotlib').setLevel(logging.WARNING)
+logging.getLogger('PIL').setLevel(logging.WARNING)
+logging.getLogger('pyvista').setLevel(logging.WARNING)
+logging.getLogger('vtkmodules').setLevel(logging.WARNING)
+
 # Global exception handler
 def exception_hook(exc_type, exc_value, exc_tb):
     """Global exception handler to log uncaught exceptions."""
