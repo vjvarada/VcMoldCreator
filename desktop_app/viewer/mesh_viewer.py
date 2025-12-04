@@ -55,6 +55,11 @@ class MeshViewer(QWidget):
     PARTING_D1_COLOR = "#00ff00"  # Green - Primary direction
     PARTING_D2_COLOR = "#ff6600"  # Orange - Secondary direction
     
+    # Inflated hull colors (matching React frontend)
+    HULL_COLOR = "#9966ff"        # Purple - Inflated hull
+    ORIGINAL_HULL_COLOR = "#666666"  # Gray - Original hull wireframe
+    HULL_OPACITY = 0.3            # Transparency for hull
+    
     # Feature edge detection angle (degrees) - edges sharper than this are shown
     # This is the dihedral angle threshold - faces meeting at angles > (180 - this) are detected
     # 45° means edges where faces meet at 135°+ (i.e., 45° corners and sharper)
@@ -79,6 +84,13 @@ class MeshViewer(QWidget):
         self._parting_d2: Optional[np.ndarray] = None
         self._visibility_paint_active = False
         self._original_scalars = None  # Store original mesh colors
+        
+        # Inflated hull visualization
+        self._hull_mesh: Optional[trimesh.Trimesh] = None
+        self._hull_actor = None
+        self._original_hull_actor = None
+        self._hull_visible = True
+        self._original_hull_visible = False  # Wireframe of original hull
         
         self._setup_ui()
     
@@ -114,11 +126,39 @@ class MeshViewer(QWidget):
         # Set interaction style for smoother orbiting
         self.plotter.interactor.SetInteractorStyle(None)  # Reset first
         
-        # Use trackball camera style for smoother rotation
+        # Use trackball camera style with remapped controls:
+        # - Left click: Rotate (default)
+        # - Middle click: Zoom (remapped from pan)
+        # - Right click: Pan (remapped from zoom)
         try:
             import vtkmodules.vtkInteractionStyle as vtk_style
             style = vtk_style.vtkInteractorStyleTrackballCamera()
             self.plotter.interactor.SetInteractorStyle(style)
+            
+            # Remap mouse buttons using VTK's observer pattern
+            # Store reference to style for the callbacks
+            self._vtk_style = style
+            
+            def on_middle_button_down(obj, event):
+                # Middle button does zoom/dolly instead of pan
+                style.StartDolly()
+            
+            def on_middle_button_up(obj, event):
+                style.EndDolly()
+            
+            def on_right_button_down(obj, event):
+                # Right button does pan instead of zoom/dolly
+                style.StartPan()
+            
+            def on_right_button_up(obj, event):
+                style.EndPan()
+            
+            # Remove default middle and right button behavior and add our own
+            style.AddObserver("MiddleButtonPressEvent", on_middle_button_down)
+            style.AddObserver("MiddleButtonReleaseEvent", on_middle_button_up)
+            style.AddObserver("RightButtonPressEvent", on_right_button_down)
+            style.AddObserver("RightButtonReleaseEvent", on_right_button_up)
+            
         except ImportError:
             pass  # Fall back to default
         
@@ -1182,3 +1222,136 @@ class MeshViewer(QWidget):
         if not PYVISTA_AVAILABLE:
             return True
         return self.plotter.camera.parallel_projection
+
+    # =========================================================================
+    # INFLATED HULL VISUALIZATION
+    # =========================================================================
+    
+    def set_hull_mesh(
+        self, 
+        hull_mesh: trimesh.Trimesh, 
+        original_hull: Optional[trimesh.Trimesh] = None
+    ):
+        """
+        Set and display the inflated hull mesh.
+        
+        Args:
+            hull_mesh: The inflated convex hull mesh
+            original_hull: Optional original (non-inflated) hull for reference
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        self._hull_mesh = hull_mesh
+        
+        # Convert hull to PyVista
+        pv_hull = self._trimesh_to_pyvista(hull_mesh)
+        
+        # Remove existing hull actors
+        self.clear_hull()
+        
+        # Add inflated hull mesh (semi-transparent)
+        self._hull_actor = self.plotter.add_mesh(
+            pv_hull,
+            color=self.HULL_COLOR,
+            opacity=self.HULL_OPACITY,
+            smooth_shading=True,
+            show_edges=False,
+            style='surface',
+            render_points_as_spheres=False,
+        )
+        
+        # Make hull render behind the main mesh
+        if self._hull_actor is not None:
+            prop = self._hull_actor.GetProperty()
+            if prop:
+                prop.SetInterpolationToPhong()
+        
+        # Optionally add original hull wireframe
+        if original_hull is not None and len(original_hull.vertices) > 0:
+            pv_orig_hull = self._trimesh_to_pyvista(original_hull)
+            self._original_hull_actor = self.plotter.add_mesh(
+                pv_orig_hull,
+                color=self.ORIGINAL_HULL_COLOR,
+                opacity=0.2,
+                style='wireframe',
+                line_width=1,
+                render_lines_as_tubes=False,
+            )
+            # Hide by default
+            if self._original_hull_actor is not None:
+                self._original_hull_actor.SetVisibility(self._original_hull_visible)
+        
+        self.plotter.update()
+        logger.info(f"Hull mesh displayed: {len(hull_mesh.vertices)} vertices, {len(hull_mesh.faces)} faces")
+    
+    def clear_hull(self):
+        """Remove hull visualization from the scene."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        if self._hull_actor is not None:
+            try:
+                self.plotter.remove_actor(self._hull_actor)
+            except Exception:
+                pass
+            self._hull_actor = None
+        
+        if self._original_hull_actor is not None:
+            try:
+                self.plotter.remove_actor(self._original_hull_actor)
+            except Exception:
+                pass
+            self._original_hull_actor = None
+        
+        self._hull_mesh = None
+        self.plotter.update()
+        logger.info("Hull mesh cleared")
+    
+    def set_hull_visible(self, visible: bool):
+        """
+        Set visibility of the inflated hull.
+        
+        Args:
+            visible: True to show hull, False to hide
+        """
+        self._hull_visible = visible
+        if self._hull_actor is not None:
+            self._hull_actor.SetVisibility(visible)
+            self.plotter.update()
+    
+    def set_original_hull_visible(self, visible: bool):
+        """
+        Set visibility of the original hull wireframe.
+        
+        Args:
+            visible: True to show original hull, False to hide
+        """
+        self._original_hull_visible = visible
+        if self._original_hull_actor is not None:
+            self._original_hull_actor.SetVisibility(visible)
+            self.plotter.update()
+    
+    def set_hull_opacity(self, opacity: float):
+        """
+        Set the opacity of the inflated hull.
+        
+        Args:
+            opacity: Opacity value from 0.0 (transparent) to 1.0 (opaque)
+        """
+        if self._hull_actor is not None:
+            prop = self._hull_actor.GetProperty()
+            if prop:
+                prop.SetOpacity(opacity)
+            self.plotter.update()
+    
+    @property
+    def hull_mesh(self) -> Optional[trimesh.Trimesh]:
+        """Get the current hull mesh."""
+        return self._hull_mesh
+    
+    @property
+    def has_hull(self) -> bool:
+        """Check if a hull has been computed."""
+        return self._hull_mesh is not None
+

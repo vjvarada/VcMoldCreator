@@ -18,7 +18,8 @@ from PyQt6.QtWidgets import (
     QFrame, QLabel, QProgressBar, QPushButton, 
     QMessageBox, QFileDialog, QScrollArea, QCheckBox,
     QPlainTextEdit, QSplitter, QDialog, QSlider, QSpinBox,
-    QRadioButton, QButtonGroup, QGroupBox
+    QRadioButton, QButtonGroup, QGroupBox, QSizePolicy,
+    QDoubleSpinBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QTextCharFormat, QColor, QFont
@@ -40,6 +41,12 @@ from core.parting_direction import (
     VisibilityPaintData,
     PartingColors,
 )
+from core.inflated_hull import (
+    generate_inflated_hull,
+    compute_default_offset,
+    InflatedHullResult,
+    ManifoldValidation,
+)
 from viewer import MeshViewer
 
 logger = logging.getLogger(__name__)
@@ -52,8 +59,8 @@ logger = logging.getLogger(__name__)
 class Step(Enum):
     IMPORT = 'import'
     PARTING = 'parting'
+    HULL = 'hull'
     # Future steps will be added here as we implement more features
-    # HULL = 'hull'
     # CAVITY = 'cavity'
     # MOLD_HALVES = 'mold-halves'
     # VOXEL = 'voxel'
@@ -63,6 +70,7 @@ class Step(Enum):
 STEPS = [
     {'id': Step.IMPORT, 'icon': '📁', 'title': 'Import STL', 'description': 'Load a 3D model file in STL format for mold analysis'},
     {'id': Step.PARTING, 'icon': '🔀', 'title': 'Parting Direction', 'description': 'Compute optimal parting directions for mold separation'},
+    {'id': Step.HULL, 'icon': '📦', 'title': 'Bounding Hull', 'description': 'Generate inflated convex hull for mold cavity creation'},
     # Future steps will be added here
 ]
 
@@ -690,9 +698,305 @@ class VisibilityPaintWorker(QThread):
             self.error.emit(str(e))
 
 
+class HullWorker(QThread):
+    """Background worker for computing inflated convex hull."""
+    
+    progress = pyqtSignal(str)
+    complete = pyqtSignal(object)  # InflatedHullResult
+    error = pyqtSignal(str)
+    
+    def __init__(self, mesh, offset: float, subdivisions: int = 2):
+        """
+        Initialize hull worker.
+        
+        Args:
+            mesh: The trimesh mesh to create hull around
+            offset: Distance to inflate outward
+            subdivisions: Number of subdivision iterations (default: 2)
+        """
+        super().__init__()
+        self.mesh = mesh
+        self.offset = offset
+        self.subdivisions = subdivisions
+    
+    def run(self):
+        try:
+            logger.info(f"Computing inflated hull with offset={self.offset}, subdivisions={self.subdivisions}...")
+            self.progress.emit(f"Computing smooth vertex normals...")
+            
+            result = generate_inflated_hull(
+                self.mesh,
+                offset=self.offset,
+                subdivisions=self.subdivisions
+            )
+            
+            self.progress.emit(f"Hull generated: {result.vertex_count} vertices, {result.face_count} faces")
+            self.complete.emit(result)
+            
+        except Exception as e:
+            logger.exception(f"Error computing inflated hull: {e}")
+            self.error.emit(str(e))
+
+
 # ============================================================================
 # STYLED WIDGETS
 # ============================================================================
+
+class TitleBar(QFrame):
+    """Custom title bar with logo, file info, and view controls matching the React frontend."""
+    
+    # Signals
+    reset_clicked = pyqtSignal()
+    undo_clicked = pyqtSignal()
+    redo_clicked = pyqtSignal()
+    view_changed = pyqtSignal(str)  # Emits view name: 'front', 'back', 'left', 'right', 'top', 'bottom', 'iso'
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(44)
+        self.setStyleSheet(f"""
+            TitleBar {{
+                background-color: {Colors.WHITE};
+                border-bottom: 1px solid {Colors.BORDER};
+            }}
+        """)
+        self._setup_ui()
+    
+    def _setup_ui(self):
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 0, 8, 0)
+        layout.setSpacing(0)
+        
+        # === LEFT SECTION: Logo + Reset/Undo/Redo ===
+        left_section = QHBoxLayout()
+        left_section.setSpacing(4)
+        
+        # App logo
+        logo_label = QLabel("🔧")
+        logo_label.setStyleSheet(f"""
+            font-size: 18px;
+            padding-right: 8px;
+        """)
+        left_section.addWidget(logo_label)
+        
+        # Separator after logo
+        sep1 = self._create_separator()
+        left_section.addWidget(sep1)
+        
+        # Reset button with icon and label
+        self.reset_btn = self._create_labeled_button("↻", "Reset", "Reset All")
+        self.reset_btn.clicked.connect(self.reset_clicked.emit)
+        left_section.addWidget(self.reset_btn)
+        
+        # Undo button (icon only)
+        self.undo_btn = self._create_icon_button("↶", "Undo (Ctrl+Z)")
+        self.undo_btn.clicked.connect(self.undo_clicked.emit)
+        self.undo_btn.setEnabled(False)
+        left_section.addWidget(self.undo_btn)
+        
+        # Redo button (icon only)
+        self.redo_btn = self._create_icon_button("↷", "Redo (Ctrl+Y)")
+        self.redo_btn.clicked.connect(self.redo_clicked.emit)
+        self.redo_btn.setEnabled(False)
+        left_section.addWidget(self.redo_btn)
+        
+        layout.addLayout(left_section)
+        
+        # === CENTER SECTION: File Info ===
+        layout.addStretch()
+        
+        center_section = QHBoxLayout()
+        center_section.setSpacing(12)
+        
+        # File icon and name
+        self.file_icon = QLabel("⊙")
+        self.file_icon.setStyleSheet(f"""
+            font-size: 14px;
+            color: {Colors.GRAY};
+        """)
+        self.file_icon.hide()
+        center_section.addWidget(self.file_icon)
+        
+        self.file_label = QLabel("")
+        self.file_label.setStyleSheet(f"""
+            font-size: 13px;
+            font-weight: 500;
+            color: {Colors.DARK};
+        """)
+        self.file_label.hide()
+        center_section.addWidget(self.file_label)
+        
+        # Triangle count badge
+        self.triangle_label = QLabel("")
+        self.triangle_label.setStyleSheet(f"""
+            font-size: 12px;
+            color: {Colors.GRAY};
+        """)
+        self.triangle_label.hide()
+        center_section.addWidget(self.triangle_label)
+        
+        # File size
+        self.size_label = QLabel("")
+        self.size_label.setStyleSheet(f"""
+            font-size: 12px;
+            color: {Colors.GRAY};
+        """)
+        self.size_label.hide()
+        center_section.addWidget(self.size_label)
+        
+        layout.addLayout(center_section)
+        
+        layout.addStretch()
+        
+        # === RIGHT SECTION: View Controls ===
+        right_section = QHBoxLayout()
+        right_section.setSpacing(2)
+        
+        # View buttons - using cube face symbols
+        # Front, Back, Left, Right, Top, Bottom views (cube faces)
+        views = [
+            ("▣", "front", "Front View"),      # Front face highlighted
+            ("▢", "back", "Back View"),        # Back face  
+            ("◧", "left", "Left View"),        # Left face
+            ("◨", "right", "Right View"),      # Right face
+            ("⬒", "top", "Top View"),          # Top face
+            ("⬓", "bottom", "Bottom View"),    # Bottom face
+            ("●", "iso", "Reset View"),        # Center/reset dot
+        ]
+        
+        for label, view_name, tooltip in views:
+            btn = self._create_view_button(label, tooltip)
+            btn.clicked.connect(lambda checked, v=view_name: self.view_changed.emit(v))
+            right_section.addWidget(btn)
+        
+        layout.addLayout(right_section)
+    
+    def _create_separator(self) -> QFrame:
+        """Create a vertical separator line."""
+        sep = QFrame()
+        sep.setFixedWidth(1)
+        sep.setFixedHeight(24)
+        sep.setStyleSheet(f"background-color: {Colors.BORDER}; margin: 0 8px;")
+        return sep
+    
+    def _create_labeled_button(self, icon: str, label: str, tooltip: str) -> QPushButton:
+        """Create a button with icon and label (like Import, Reset)."""
+        btn = QPushButton(f" {icon}  {label}")
+        btn.setFixedHeight(32)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip(tooltip)
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                border: none;
+                border-radius: 4px;
+                font-size: 13px;
+                color: {Colors.GRAY_DARK};
+                padding: 0 12px;
+            }}
+            QPushButton:hover {{
+                background-color: {Colors.LIGHT};
+            }}
+            QPushButton:pressed {{
+                background-color: {Colors.GRAY_LIGHT};
+            }}
+        """)
+        return btn
+    
+    def _create_icon_button(self, icon: str, tooltip: str) -> QPushButton:
+        """Create an icon-only button (like Undo, Redo)."""
+        btn = QPushButton(icon)
+        btn.setFixedSize(32, 32)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip(tooltip)
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                border: none;
+                border-radius: 4px;
+                font-size: 16px;
+                color: {Colors.GRAY_DARK};
+            }}
+            QPushButton:hover {{
+                background-color: {Colors.LIGHT};
+            }}
+            QPushButton:pressed {{
+                background-color: {Colors.GRAY_LIGHT};
+            }}
+            QPushButton:disabled {{
+                color: {Colors.GRAY_LIGHT};
+            }}
+        """)
+        return btn
+    
+    def _create_tool_button(self, icon: str, tooltip: str) -> QPushButton:
+        """Create a tool button (legacy, for compatibility)."""
+        return self._create_icon_button(icon, tooltip)
+    
+    def _create_view_button(self, label: str, tooltip: str) -> QPushButton:
+        """Create a view control button (cube face icons)."""
+        btn = QPushButton(label)
+        btn.setFixedSize(28, 28)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip(tooltip)
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                border: none;
+                border-radius: 4px;
+                font-size: 14px;
+                color: {Colors.GRAY};
+            }}
+            QPushButton:hover {{
+                background-color: {Colors.LIGHT};
+                color: {Colors.DARK};
+            }}
+            QPushButton:pressed {{
+                background-color: {Colors.GRAY_LIGHT};
+            }}
+        """)
+        return btn
+    
+    def set_file_info(self, filename: str, triangle_count: int, file_size_bytes: int = 0):
+        """Update the file information display."""
+        # Show file icon and name
+        self.file_icon.show()
+        self.file_label.setText(filename)
+        self.file_label.show()
+        
+        # Format triangle count with comma separators
+        tri_text = f"{triangle_count:,} tri"
+        self.triangle_label.setText(tri_text)
+        self.triangle_label.show()
+        
+        # Format file size
+        if file_size_bytes > 0:
+            if file_size_bytes >= 1024 * 1024:
+                size_text = f"{file_size_bytes / (1024 * 1024):.2f} MB"
+            elif file_size_bytes >= 1024:
+                size_text = f"{file_size_bytes / 1024:.1f} KB"
+            else:
+                size_text = f"{file_size_bytes} B"
+            self.size_label.setText(size_text)
+            self.size_label.show()
+        else:
+            self.size_label.hide()
+    
+    def clear_file_info(self):
+        """Clear the file information display."""
+        self.file_icon.hide()
+        self.file_label.hide()
+        self.triangle_label.hide()
+        self.size_label.hide()
+    
+    def set_undo_enabled(self, enabled: bool):
+        """Enable/disable undo button."""
+        self.undo_btn.setEnabled(enabled)
+    
+    def set_redo_enabled(self, enabled: bool):
+        """Enable/disable redo button."""
+        self.redo_btn.setEnabled(enabled)
+
 
 class StepButton(QPushButton):
     """A step button for the sidebar."""
@@ -718,41 +1022,44 @@ class StepButton(QPushButton):
     def _update_style(self):
         bg_color = 'transparent'
         border_color = 'transparent'
+        text_color = Colors.DARK
         
         if self._is_active:
             bg_color = 'rgba(0, 123, 255, 0.1)'
             border_color = Colors.PRIMARY
         elif self._status == 'completed':
-            bg_color = 'rgba(23, 198, 113, 0.08)'
+            # Completed steps: subtle highlight, no checkmark
+            bg_color = 'rgba(23, 198, 113, 0.05)'
             border_color = Colors.SUCCESS
         elif self._status == 'needs-recalc':
-            bg_color = 'rgba(255, 180, 0, 0.08)'
+            bg_color = 'rgba(255, 180, 0, 0.05)'
             border_color = Colors.WARNING
+        elif self._status == 'locked':
+            # Locked steps: greyed out
+            text_color = Colors.GRAY_LIGHT
         
-        opacity = '0.4' if self._status == 'locked' else '1'
-        
-        # Build the display text
-        display_text = self.icon_text
-        if self._status == 'completed':
-            display_text += '\n✓'
-        elif self._status == 'needs-recalc':
-            display_text += '\n⟳'
-        
-        self.setText(display_text)
+        # Just show the icon, no status indicators
+        self.setText(self.icon_text)
         self.setStyleSheet(f"""
             QPushButton {{
                 background-color: {bg_color};
                 border: none;
                 border-left: 3px solid {border_color};
-                color: {Colors.DARK};
+                color: {text_color};
                 font-size: 20px;
                 padding: 10px;
             }}
             QPushButton:hover {{
                 background-color: rgba(0, 123, 255, 0.05);
             }}
+            QPushButton:disabled {{
+                color: {Colors.GRAY_LIGHT};
+            }}
         """)
         self.setToolTip(self.title)
+        
+        # Disable button if locked
+        self.setEnabled(self._status != 'locked')
 
 
 class StatsBox(QFrame):
@@ -760,6 +1067,10 @@ class StatsBox(QFrame):
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Minimum
+        )
         self.setStyleSheet(f"""
             StatsBox {{
                 background-color: {Colors.LIGHT};
@@ -779,24 +1090,25 @@ class StatsBox(QFrame):
     
     def add_row(self, text: str, color: str = None):
         label = QLabel(text)
+        label.setWordWrap(True)
         label.setStyleSheet(f"""
             color: {color or Colors.GRAY_DARK};
             font-size: 12px;
             background: transparent;
             border: none;
-            line-height: 1.7;
         """)
         self._layout.addWidget(label)
     
     def add_header(self, text: str, color: str = None):
         label = QLabel(text)
+        label.setWordWrap(True)
         label.setStyleSheet(f"""
             color: {color or Colors.DARK};
             font-size: 12px;
             font-weight: 500;
             background: transparent;
             border: none;
-            margin-bottom: 6px;
+            margin-bottom: 4px;
         """)
         self._layout.addWidget(label)
 
@@ -1165,6 +1477,7 @@ class DisplayOptionsPanel(QFrame):
     
     hide_mesh_changed = pyqtSignal(bool)
     hide_parting_changed = pyqtSignal(bool)  # Toggle visibility paint + arrows
+    hide_hull_changed = pyqtSignal(bool)  # Toggle bounding hull visibility
     
     # Must match MeshViewer.BACKGROUND_COLOR for rounded corners to blend
     VIEWER_BG = "#1a1a1a"  # Matches React frontend BACKGROUND_COLOR
@@ -1242,6 +1555,13 @@ class DisplayOptionsPanel(QFrame):
         self.hide_parting_cb.hide()  # Hidden until parting is computed
         layout.addWidget(self.hide_parting_cb)
         
+        # Hide bounding hull checkbox
+        self.hide_hull_cb = QCheckBox('Hide Bounding Hull')
+        self.hide_hull_cb.setChecked(False)  # Not hidden by default (hull is shown)
+        self.hide_hull_cb.stateChanged.connect(lambda s: self.hide_hull_changed.emit(s == Qt.CheckState.Checked.value))
+        self.hide_hull_cb.hide()  # Hidden until hull is computed
+        layout.addWidget(self.hide_hull_cb)
+        
         self.adjustSize()
         self.hide()
     
@@ -1252,6 +1572,15 @@ class DisplayOptionsPanel(QFrame):
             self.hide_parting_cb.setChecked(False)  # Reset to showing analysis
         else:
             self.hide_parting_cb.hide()
+        self.adjustSize()
+    
+    def show_hull_option(self, show: bool = True):
+        """Show or hide the hull visibility checkbox."""
+        if show:
+            self.hide_hull_cb.show()
+            self.hide_hull_cb.setChecked(False)  # Reset to showing hull
+        else:
+            self.hide_hull_cb.hide()
         self.adjustSize()
 
 
@@ -1277,6 +1606,10 @@ class MainWindow(QMainWindow):
         self._parting_result: Optional[PartingDirectionResult] = None
         self._visibility_paint_data: Optional[VisibilityPaintData] = None
         
+        # Inflated hull state
+        self._hull_worker: Optional[HullWorker] = None
+        self._hull_result: Optional[InflatedHullResult] = None
+        
         self._setup_window()
         self._setup_ui()
     
@@ -1297,8 +1630,22 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         
-        # Main horizontal layout
-        main_layout = QHBoxLayout(central)
+        # Main vertical layout (title bar on top, content below)
+        outer_layout = QVBoxLayout(central)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+        
+        # Title bar at the top
+        self.title_bar = TitleBar()
+        self.title_bar.reset_clicked.connect(self._on_reset_all)
+        self.title_bar.undo_clicked.connect(self._on_undo)
+        self.title_bar.redo_clicked.connect(self._on_redo)
+        self.title_bar.view_changed.connect(self._on_view_changed)
+        outer_layout.addWidget(self.title_bar)
+        
+        # Content area (sidebar + context + viewer)
+        content_widget = QWidget()
+        main_layout = QHBoxLayout(content_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
         
@@ -1313,6 +1660,8 @@ class MainWindow(QMainWindow):
         # Column 3: 3D Viewer (main area)
         self.viewer_container = self._create_viewer_container()
         main_layout.addWidget(self.viewer_container, 1)
+        
+        outer_layout.addWidget(content_widget, 1)
     
     def _create_steps_sidebar(self) -> QWidget:
         """Create the narrow steps sidebar (left column)."""
@@ -1354,8 +1703,12 @@ class MainWindow(QMainWindow):
             self.step_buttons[step_info['id']] = btn
             layout.addWidget(btn)
         
-        # Update initial state
+        # Update initial state - import is active, other steps locked
         self.step_buttons[Step.IMPORT].set_active(True)
+        if Step.PARTING in self.step_buttons:
+            self.step_buttons[Step.PARTING].set_status('locked')
+        if Step.HULL in self.step_buttons:
+            self.step_buttons[Step.HULL].set_status('locked')
         
         layout.addStretch()
         
@@ -1409,6 +1762,7 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setStyleSheet("""
             QScrollArea {
                 border: none;
@@ -1417,12 +1771,34 @@ class MainWindow(QMainWindow):
             QScrollArea > QWidget > QWidget {
                 background: transparent;
             }
+            QScrollBar:vertical {
+                border: none;
+                background: #f0f0f0;
+                width: 8px;
+                margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #c0c0c0;
+                border-radius: 4px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #a0a0a0;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+            }
         """)
         
         self.context_content = QWidget()
+        self.context_content.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Minimum
+        )
         self.context_layout = QVBoxLayout(self.context_content)
-        self.context_layout.setContentsMargins(20, 20, 20, 20)
-        self.context_layout.setSpacing(16)
+        self.context_layout.setContentsMargins(16, 16, 16, 16)
+        self.context_layout.setSpacing(12)
+        self.context_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll.setWidget(self.context_content)
         
         layout.addWidget(scroll, 1)
@@ -1487,6 +1863,7 @@ class MainWindow(QMainWindow):
         self.display_options.move(16, 16)
         self.display_options.hide_mesh_changed.connect(self._on_hide_mesh_changed)
         self.display_options.hide_parting_changed.connect(self._on_hide_parting_changed)
+        self.display_options.hide_hull_changed.connect(self._on_hide_hull_changed)
         
         return wrapper
     
@@ -1529,6 +1906,8 @@ class MainWindow(QMainWindow):
             self._setup_import_step()
         elif self._active_step == Step.PARTING:
             self._setup_parting_step()
+        elif self._active_step == Step.HULL:
+            self._setup_hull_step()
         
         self.context_layout.addStretch()
     
@@ -1677,20 +2056,23 @@ class MainWindow(QMainWindow):
         
         # Color legend for visibility paint (shown after calculation)
         self.color_legend = QLabel("""
-            <small>
             <b>Color Legend:</b><br>
-            <span style='color: #00ff00;'>■</span> D1 visible &nbsp;
-            <span style='color: #ff6600;'>■</span> D2 visible &nbsp;
-            <span style='color: #ffff00;'>■</span> Both visible &nbsp;
+            <span style='color: #00ff00;'>■</span> D1 visible<br>
+            <span style='color: #ff6600;'>■</span> D2 visible<br>
+            <span style='color: #ffff00;'>■</span> Both visible<br>
             <span style='color: #888888;'>■</span> Neither
-            </small>
         """)
+        self.color_legend.setWordWrap(True)
+        self.color_legend.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Minimum
+        )
         self.color_legend.setStyleSheet(f"""
             color: {Colors.GRAY_DARK};
-            padding: 8px 12px;
+            font-size: 11px;
+            padding: 10px 12px;
             background-color: {Colors.LIGHT};
-            border-radius: 4px;
-            margin-top: 8px;
+            border-radius: 6px;
         """)
         self.color_legend.hide()
         self.context_layout.addWidget(self.color_legend)
@@ -1787,6 +2169,10 @@ class MainWindow(QMainWindow):
         # Update step status
         self.step_buttons[Step.PARTING].set_status('completed')
         
+        # Unlock Hull step
+        if Step.HULL in self.step_buttons:
+            self.step_buttons[Step.HULL].set_status('available')
+        
         logger.info(f"Parting directions computed: coverage={result.total_coverage:.1f}%, angle={result.angle_degrees:.1f}°")
         
         # Automatically compute and show visibility paint
@@ -1852,6 +2238,307 @@ class MainWindow(QMainWindow):
             self.parting_progress_label.setText(f"Error: {message}")
             self.parting_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
     
+    # =========================================================================
+    # HULL STEP
+    # =========================================================================
+    
+    def _setup_hull_step(self):
+        """Setup the bounding hull step UI."""
+        # Check if mesh is loaded
+        if self._current_mesh is None:
+            no_mesh_label = QLabel("⚠️ No mesh loaded. Please import an STL file first.")
+            no_mesh_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_mesh_label.setWordWrap(True)
+            self.context_layout.addWidget(no_mesh_label)
+            return
+        
+        # Check if parting direction is computed
+        if self._parting_result is None:
+            no_parting_label = QLabel("⚠️ Please compute parting directions first.")
+            no_parting_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_parting_label.setWordWrap(True)
+            self.context_layout.addWidget(no_parting_label)
+            return
+        
+        # Compute default offset (20% of bounding box diagonal)
+        default_offset = compute_default_offset(self._current_mesh)
+        
+        # Offset input section
+        offset_group = QGroupBox("Inflation Offset")
+        offset_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        offset_layout = QVBoxLayout(offset_group)
+        
+        # Offset input row
+        input_row = QHBoxLayout()
+        
+        offset_label = QLabel("Offset:")
+        offset_label.setStyleSheet(f'color: {Colors.DARK}; font-size: 12px;')
+        input_row.addWidget(offset_label)
+        
+        self.hull_offset_spinbox = QDoubleSpinBox()
+        self.hull_offset_spinbox.setMinimum(0.01)
+        self.hull_offset_spinbox.setMaximum(1000.0)
+        self.hull_offset_spinbox.setDecimals(2)
+        self.hull_offset_spinbox.setSingleStep(0.1)
+        self.hull_offset_spinbox.setValue(default_offset)
+        self.hull_offset_spinbox.setSuffix(" units")
+        self.hull_offset_spinbox.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                background-color: {Colors.WHITE};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 4px;
+                padding: 6px 10px;
+                font-size: 12px;
+                color: {Colors.DARK};
+                min-width: 100px;
+            }}
+            QDoubleSpinBox:focus {{
+                border-color: {Colors.PRIMARY};
+            }}
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+                width: 20px;
+                border: none;
+                background: {Colors.LIGHT};
+            }}
+            QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {{
+                background: {Colors.GRAY_LIGHT};
+            }}
+        """)
+        input_row.addWidget(self.hull_offset_spinbox)
+        
+        input_row.addStretch()
+        
+        offset_layout.addLayout(input_row)
+        
+        # Info label showing default calculation
+        info_label = QLabel(f"Default: 20% of bounding box diagonal ({default_offset:.2f})")
+        info_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 11px; font-style: italic;')
+        offset_layout.addWidget(info_label)
+        
+        self.context_layout.addWidget(offset_group)
+        
+        # Calculate button
+        self.hull_calc_btn = QPushButton("📦 Generate Bounding Hull")
+        self.hull_calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.hull_calc_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {Colors.PRIMARY};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: #0056b3;
+            }}
+            QPushButton:disabled {{
+                background-color: {Colors.GRAY_LIGHT};
+                color: {Colors.GRAY};
+            }}
+        """)
+        self.hull_calc_btn.clicked.connect(self._on_calculate_hull)
+        self.context_layout.addWidget(self.hull_calc_btn)
+        
+        # Progress bar
+        self.hull_progress = QProgressBar()
+        self.hull_progress.setStyleSheet(f"""
+            QProgressBar {{
+                border: none;
+                border-radius: 4px;
+                background-color: {Colors.LIGHT};
+                height: 8px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {Colors.PRIMARY};
+                border-radius: 4px;
+            }}
+        """)
+        self.hull_progress.setTextVisible(False)
+        self.hull_progress.setRange(0, 0)  # Indeterminate
+        self.hull_progress.hide()
+        self.context_layout.addWidget(self.hull_progress)
+        
+        # Progress label
+        self.hull_progress_label = QLabel("")
+        self.hull_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.hull_progress_label.hide()
+        self.context_layout.addWidget(self.hull_progress_label)
+        
+        # Hull stats (show if computed)
+        self.hull_stats = StatsBox()
+        self.hull_stats.hide()
+        self.context_layout.addWidget(self.hull_stats)
+        
+        # Visibility toggles (show after calculation)
+        self.hull_visibility_group = QGroupBox("Display Options")
+        self.hull_visibility_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        vis_layout = QVBoxLayout(self.hull_visibility_group)
+        
+        self.hull_visible_check = QCheckBox("Show Inflated Hull")
+        self.hull_visible_check.setChecked(True)
+        self.hull_visible_check.setStyleSheet(f'color: {Colors.DARK}; font-size: 12px;')
+        self.hull_visible_check.stateChanged.connect(self._on_hull_visibility_changed)
+        vis_layout.addWidget(self.hull_visible_check)
+        
+        self.original_hull_visible_check = QCheckBox("Show Original Hull (wireframe)")
+        self.original_hull_visible_check.setChecked(False)
+        self.original_hull_visible_check.setStyleSheet(f'color: {Colors.DARK}; font-size: 12px;')
+        self.original_hull_visible_check.stateChanged.connect(self._on_original_hull_visibility_changed)
+        vis_layout.addWidget(self.original_hull_visible_check)
+        
+        self.hull_visibility_group.hide()
+        self.context_layout.addWidget(self.hull_visibility_group)
+        
+        # Update UI with current state
+        self._update_hull_step_ui()
+    
+
+    
+    def _update_hull_step_ui(self):
+        """Update hull step UI based on current state."""
+        if not hasattr(self, 'hull_stats'):
+            return
+        
+        if self._hull_result is not None:
+            # Show stats
+            self.hull_stats.clear()
+            self.hull_stats.show()
+            
+            result = self._hull_result
+            
+            self.hull_stats.add_header('✅ Hull Generated', Colors.SUCCESS)
+            self.hull_stats.add_row(f'Vertices: {result.vertex_count:,}')
+            self.hull_stats.add_row(f'Faces: {result.face_count:,}')
+            self.hull_stats.add_row(f'Offset: {result.offset:.2f} units')
+            
+            # Manifold validation
+            if result.manifold_validation.is_closed:
+                self.hull_stats.add_row('Manifold: ✅ Closed', Colors.SUCCESS)
+            else:
+                self.hull_stats.add_row('Manifold: ⚠️ Open', Colors.WARNING)
+            
+            # Show visibility toggles
+            self.hull_visibility_group.show()
+            
+            # Update button text
+            self.hull_calc_btn.setText("🔄 Regenerate Hull")
+        else:
+            self.hull_stats.hide()
+            self.hull_visibility_group.hide()
+    
+    def _on_calculate_hull(self):
+        """Start hull computation."""
+        if self._current_mesh is None:
+            return
+        
+        # Get offset from spinbox
+        offset = self.hull_offset_spinbox.value()
+        
+        # Disable button during computation
+        self.hull_calc_btn.setEnabled(False)
+        self.hull_progress.show()
+        self.hull_progress_label.setText("Computing inflated hull...")
+        self.hull_progress_label.show()
+        
+        # Clear previous hull
+        self.mesh_viewer.clear_hull()
+        self._hull_result = None
+        
+        # Start worker
+        self._hull_worker = HullWorker(self._current_mesh, offset=offset, subdivisions=2)
+        self._hull_worker.progress.connect(self._on_hull_progress)
+        self._hull_worker.complete.connect(self._on_hull_complete)
+        self._hull_worker.error.connect(self._on_hull_error)
+        self._hull_worker.finished.connect(self._on_hull_worker_finished)
+        self._hull_worker.start()
+    
+    def _on_hull_progress(self, message: str):
+        """Handle hull progress updates."""
+        self.hull_progress_label.setText(message)
+    
+    def _on_hull_complete(self, result: InflatedHullResult):
+        """Handle hull computation complete."""
+        self._hull_result = result
+        
+        # Add hull to viewer
+        self.mesh_viewer.set_hull_mesh(result.mesh, result.original_hull)
+        
+        # Update UI
+        self._update_hull_step_ui()
+        
+        # Update step status
+        self.step_buttons[Step.HULL].set_status('completed')
+        
+        logger.info(f"Hull generated: {result.vertex_count} vertices, {result.face_count} faces")
+    
+    def _on_hull_error(self, message: str):
+        """Handle hull computation error."""
+        self.hull_progress_label.setText(f"Error: {message}")
+        self.hull_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+        QMessageBox.critical(self, "Error", f"Hull generation failed:\n{message}")
+    
+    def _on_hull_worker_finished(self):
+        """Handle hull worker finished."""
+        self.hull_calc_btn.setEnabled(True)
+        self.hull_progress.hide()
+        self._hull_worker = None
+    
+    def _on_hull_visibility_changed(self, state: int):
+        """Handle hull visibility checkbox change."""
+        visible = state == Qt.CheckState.Checked.value
+        self.mesh_viewer.set_hull_visible(visible)
+    
+    def _on_original_hull_visibility_changed(self, state: int):
+        """Handle original hull visibility checkbox change."""
+        visible = state == Qt.CheckState.Checked.value
+        self.mesh_viewer.set_original_hull_visible(visible)
+
     def _on_step_clicked(self, step: Step):
         """Handle step button click."""
         for s, btn in self.step_buttons.items():
@@ -1859,6 +2546,62 @@ class MainWindow(QMainWindow):
         
         self._active_step = step
         self._update_context_panel()
+    
+    def _on_reset_all(self):
+        """Handle reset all button click - reset to initial state."""
+        # Clear mesh viewer
+        self.mesh_viewer.clear()
+        self.mesh_viewer.clear_hull()
+        
+        # Clear parting results
+        self._parting_result = None
+        self._visibility_paint_data = None
+        
+        # Clear hull results
+        self._hull_result = None
+        
+        # Reset current mesh
+        self._current_mesh = None
+        self._current_diagnostics = None
+        self._repair_result = None
+        self._loaded_filename = None
+        
+        # Reset step buttons - import available, others locked
+        self.step_buttons[Step.IMPORT].set_status('available')
+        self.step_buttons[Step.IMPORT].set_active(True)
+        if Step.PARTING in self.step_buttons:
+            self.step_buttons[Step.PARTING].set_status('locked')
+        if Step.HULL in self.step_buttons:
+            self.step_buttons[Step.HULL].set_status('locked')
+        self._active_step = Step.IMPORT
+        
+        # Reset title bar
+        self.title_bar.clear_file_info()
+        
+        # Reset display options
+        self.display_options.hide()
+        self.display_options.show_parting_option(False)
+        
+        # Update context panel
+        self._update_context_panel()
+        
+        logger.info("Application reset to initial state")
+    
+    def _on_undo(self):
+        """Handle undo button click."""
+        # TODO: Implement undo stack
+        logger.info("Undo clicked (not yet implemented)")
+    
+    def _on_redo(self):
+        """Handle redo button click."""
+        # TODO: Implement redo stack
+        logger.info("Redo clicked (not yet implemented)")
+    
+    def _on_view_changed(self, view: str):
+        """Handle view change from title bar."""
+        if self.mesh_viewer:
+            self.mesh_viewer.set_view(view)
+            logger.debug(f"View changed to: {view}")
     
     def _on_file_dropped(self, file_path: str, scale_factor: float = 1.0):
         """Handle file drop/selection."""
@@ -1919,6 +2662,19 @@ class MainWindow(QMainWindow):
         self._current_mesh = result.mesh
         self.mesh_viewer.set_mesh(result.mesh)
         
+        # Update title bar with file info
+        if self._loaded_filename:
+            filename = Path(self._loaded_filename).name
+            triangle_count = len(result.mesh.faces)
+            
+            # Get file size
+            try:
+                file_size = Path(self._loaded_filename).stat().st_size
+            except:
+                file_size = 0
+            
+            self.title_bar.set_file_info(filename, triangle_count, file_size)
+        
         # Reset display options and show panel
         self.display_options.hide_mesh_cb.setChecked(False)
         self.display_options.show_parting_option(False)  # Hide parting option until computed
@@ -1930,8 +2686,10 @@ class MainWindow(QMainWindow):
         self._current_diagnostics = diagnostics
         self._update_mesh_stats()
         
-        # Update step status
+        # Update step status - import complete, unlock parting
         self.step_buttons[Step.IMPORT].set_status('completed')
+        if Step.PARTING in self.step_buttons:
+            self.step_buttons[Step.PARTING].set_status('available')
     
     def _on_repair_complete(self, result: MeshRepairResult):
         self._repair_result = result

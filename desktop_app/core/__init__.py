@@ -10,6 +10,15 @@ from core.parting_direction import (
     VisibilityPaintData,
     PartingColors,
 )
+from core.inflated_hull import (
+    generate_inflated_hull,
+    compute_default_offset,
+    compute_smooth_vertex_normals,
+    validate_manifold,
+    InflatedHullResult,
+    ManifoldValidation,
+    DEFAULT_INFLATION_PERCENT,
+)
 
 __all__ = [
     'STLLoader',
@@ -26,4 +35,12 @@ __all__ = [
     'PartingDirectionResult',
     'VisibilityPaintData',
     'PartingColors',
+    # Inflated hull
+    'generate_inflated_hull',
+    'compute_default_offset',
+    'compute_smooth_vertex_normals',
+    'validate_manifold',
+    'InflatedHullResult',
+    'ManifoldValidation',
+    'DEFAULT_INFLATION_PERCENT',
 ]
