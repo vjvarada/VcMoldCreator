@@ -11,6 +11,8 @@ from pathlib import Path
 from enum import Enum
 from datetime import datetime
 
+import numpy as np
+
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QFrame, QLabel, QProgressBar, QPushButton, 
@@ -30,6 +32,14 @@ from core.mesh_decimation import (
     MeshDecimator, DecimationQuality, DecimationResult,
     get_decimation_recommendation, TRIANGLE_COUNT_THRESHOLDS
 )
+from core.parting_direction import (
+    find_parting_directions,
+    compute_visibility_paint,
+    get_face_colors,
+    PartingDirectionResult,
+    VisibilityPaintData,
+    PartingColors,
+)
 from viewer import MeshViewer
 
 logger = logging.getLogger(__name__)
@@ -41,8 +51,8 @@ logger = logging.getLogger(__name__)
 
 class Step(Enum):
     IMPORT = 'import'
+    PARTING = 'parting'
     # Future steps will be added here as we implement more features
-    # PARTING = 'parting'
     # HULL = 'hull'
     # CAVITY = 'cavity'
     # MOLD_HALVES = 'mold-halves'
@@ -52,6 +62,7 @@ class Step(Enum):
 
 STEPS = [
     {'id': Step.IMPORT, 'icon': '📁', 'title': 'Import STL', 'description': 'Load a 3D model file in STL format for mold analysis'},
+    {'id': Step.PARTING, 'icon': '🔀', 'title': 'Parting Direction', 'description': 'Compute optimal parting directions for mold separation'},
     # Future steps will be added here
 ]
 
@@ -79,6 +90,10 @@ class Colors:
     # Viewer colors
     VIEWER_BG = '#1a1d21'
     BORDER = '#e1e5eb'
+    
+    # Parting direction colors (matching React frontend)
+    PARTING_D1 = '#00ff00'  # Green - Primary direction
+    PARTING_D2 = '#ff6600'  # Orange - Secondary direction
 
 
 # ============================================================================
@@ -525,9 +540,10 @@ class MeshLoadWorker(QThread):
     repair_complete = pyqtSignal(object)
     error = pyqtSignal(str)
     
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str, scale_factor: float = 1.0):
         super().__init__()
         self.file_path = file_path
+        self.scale_factor = scale_factor
         self._should_repair = True
     
     def run(self):
@@ -541,6 +557,12 @@ class MeshLoadWorker(QThread):
                 logger.error(f"Failed to load STL: {result.error_message}")
                 self.error.emit(f"Failed to load STL: {result.error_message}")
                 return
+            
+            # Apply scale factor if not 1.0
+            if self.scale_factor != 1.0:
+                logger.info(f"Applying scale factor: {self.scale_factor}")
+                self.progress.emit(f"Scaling mesh by {self.scale_factor}x...")
+                result.mesh.vertices *= self.scale_factor
             
             logger.info(f"STL loaded: {result.mesh.vertices.shape[0]} vertices, {result.mesh.faces.shape[0]} faces")
             self.load_complete.emit(result)
@@ -557,7 +579,9 @@ class MeshLoadWorker(QThread):
                 logger.info("Repairing mesh...")
                 self.progress.emit("Repairing mesh...")
                 repairer = MeshRepairer(result.mesh)
-                repair_result = repairer.repair()
+                # IMPORTANT: Disable convex hull fallback to preserve original geometry
+                # Convex hull would destroy the original shape of non-watertight meshes
+                repair_result = repairer.repair(use_convex_hull_fallback=False)
                 logger.info(f"Repair complete: was_repaired={repair_result.was_repaired}")
                 self.repair_complete.emit(repair_result)
                 self.progress.emit("Mesh processing complete")
@@ -567,6 +591,102 @@ class MeshLoadWorker(QThread):
                 
         except Exception as e:
             logger.exception(f"Error in mesh processing: {e}")
+            self.error.emit(str(e))
+
+
+class PartingDirectionWorker(QThread):
+    """Background worker for computing parting directions."""
+    
+    progress = pyqtSignal(str)
+    progress_value = pyqtSignal(int, int)  # current, total
+    complete = pyqtSignal(object)  # PartingDirectionResult
+    error = pyqtSignal(str)
+    
+    def __init__(self, mesh, k: int = 128, num_workers: int = None):
+        """
+        Initialize parting direction worker.
+        
+        Args:
+            mesh: The trimesh mesh to analyze
+            k: Number of candidate directions to sample (default: 128)
+            num_workers: Number of parallel workers (default: auto)
+        """
+        super().__init__()
+        self.mesh = mesh
+        self.k = k
+        self.num_workers = num_workers
+    
+    def run(self):
+        try:
+            logger.info(f"Computing parting directions with k={self.k}...")
+            self.progress.emit(f"Sampling {self.k} candidate directions...")
+            
+            def progress_callback(current, total):
+                self.progress_value.emit(current, total)
+                if current % 10 == 0 or current == total:
+                    self.progress.emit(f"Testing direction {current}/{total}...")
+            
+            result = find_parting_directions(
+                self.mesh,
+                k=self.k,
+                num_workers=self.num_workers,
+                progress_callback=progress_callback
+            )
+            
+            self.progress.emit(f"Found optimal parting directions in {result.computation_time_ms:.0f}ms")
+            self.complete.emit(result)
+            
+        except Exception as e:
+            logger.exception(f"Error computing parting directions: {e}")
+            self.error.emit(str(e))
+
+
+class VisibilityPaintWorker(QThread):
+    """Background worker for computing visibility paint."""
+    
+    progress = pyqtSignal(str)
+    complete = pyqtSignal(object, object)  # VisibilityPaintData, face_colors
+    error = pyqtSignal(str)
+    
+    def __init__(self, mesh, d1: np.ndarray, d2: np.ndarray, show_d1: bool = True, show_d2: bool = True):
+        """
+        Initialize visibility paint worker.
+        
+        Args:
+            mesh: The trimesh mesh
+            d1: Primary parting direction
+            d2: Secondary parting direction
+            show_d1: Whether to show D1 visibility
+            show_d2: Whether to show D2 visibility
+        """
+        super().__init__()
+        self.mesh = mesh
+        self.d1 = d1
+        self.d2 = d2
+        self.show_d1 = show_d1
+        self.show_d2 = show_d2
+    
+    def run(self):
+        try:
+            logger.info("Computing visibility paint...")
+            self.progress.emit("Computing triangle visibility...")
+            
+            paint_data = compute_visibility_paint(
+                self.mesh,
+                self.d1,
+                self.d2,
+                show_d1=self.show_d1,
+                show_d2=self.show_d2
+            )
+            
+            # Convert to face colors
+            face_colors = get_face_colors(paint_data)
+            
+            self.progress.emit("Visibility paint computed")
+            self.complete.emit(paint_data, face_colors)
+            
+        except Exception as e:
+            logger.exception(f"Error computing visibility paint: {e}")
             self.error.emit(str(e))
 
 
@@ -681,10 +801,219 @@ class StatsBox(QFrame):
         self._layout.addWidget(label)
 
 
+# ============================================================================
+# UNIT SELECTION DIALOG
+# ============================================================================
+
+class UnitSelectionDialog(QDialog):
+    """Dialog to select units for STL file import with clean radio button UI."""
+    
+    # Map of unit keys to (display name, scale factor)
+    UNITS = {
+        "mm": ("Millimeters", 1.0),
+        "cm": ("Centimeters", 10.0),
+        "in": ("Inches", 25.4),
+    }
+    
+    def __init__(self, filename: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import STL")
+        self.setModal(True)
+        self.setFixedWidth(340)
+        self._selected_unit = "mm"  # Default
+        self._setup_ui(filename)
+    
+    def _setup_ui(self, filename: str):
+        # Set dialog background
+        self.setStyleSheet(f"""
+            QDialog {{
+                background-color: {Colors.WHITE};
+            }}
+        """)
+        
+        layout = QVBoxLayout(self)
+        layout.setSpacing(16)
+        layout.setContentsMargins(24, 24, 24, 24)
+        
+        # Title
+        title_label = QLabel("Select Units")
+        title_label.setStyleSheet(f"""
+            color: {Colors.DARK};
+            font-size: 18px;
+            font-weight: 600;
+        """)
+        layout.addWidget(title_label)
+        
+        # Filename
+        file_label = QLabel(f"📁 {filename}")
+        file_label.setStyleSheet(f"""
+            color: {Colors.GRAY_DARK};
+            font-size: 12px;
+            padding: 8px 12px;
+            background-color: {Colors.LIGHT};
+            border-radius: 4px;
+        """)
+        file_label.setWordWrap(True)
+        layout.addWidget(file_label)
+        
+        # Info text
+        info_label = QLabel("STL files don't contain unit information.\nSelect the units used when this file was created:")
+        info_label.setStyleSheet(f"""
+            color: {Colors.GRAY};
+            font-size: 12px;
+            line-height: 1.4;
+        """)
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # Unit selection buttons (radio-style)
+        self.unit_buttons = {}
+        self.button_group = QButtonGroup(self)
+        
+        units_layout = QHBoxLayout()
+        units_layout.setSpacing(12)
+        
+        for unit_key, (unit_name, scale) in self.UNITS.items():
+            btn = QPushButton(f"{unit_key}")
+            btn.setCheckable(True)
+            btn.setFixedSize(80, 50)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setProperty("unit_key", unit_key)
+            btn.setProperty("scale", scale)
+            
+            # Style for unselected state
+            btn.setStyleSheet(self._get_unit_button_style(False))
+            
+            btn.clicked.connect(lambda checked, k=unit_key: self._on_unit_selected(k))
+            
+            self.button_group.addButton(btn)
+            self.unit_buttons[unit_key] = btn
+            units_layout.addWidget(btn)
+        
+        units_layout.addStretch()
+        layout.addLayout(units_layout)
+        
+        # Select default (mm)
+        self.unit_buttons["mm"].setChecked(True)
+        self._update_button_styles()
+        
+        # Scale info label
+        self.scale_label = QLabel("Coordinates will be treated as millimeters")
+        self.scale_label.setStyleSheet(f"""
+            color: {Colors.GRAY};
+            font-size: 11px;
+            font-style: italic;
+        """)
+        layout.addWidget(self.scale_label)
+        
+        layout.addSpacing(8)
+        
+        # Action buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(12)
+        btn_layout.addStretch()
+        
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setFixedWidth(90)
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {Colors.WHITE};
+                color: {Colors.GRAY_DARK};
+                border: 1px solid {Colors.GRAY_LIGHT};
+                border-radius: 6px;
+                padding: 10px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: {Colors.LIGHT};
+                border-color: {Colors.GRAY};
+            }}
+        """)
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        
+        import_btn = QPushButton("Import")
+        import_btn.setFixedWidth(90)
+        import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        import_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {Colors.PRIMARY};
+                color: {Colors.WHITE};
+                border: none;
+                border-radius: 6px;
+                padding: 10px 16px;
+                font-size: 13px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background-color: #0056b3;
+            }}
+        """)
+        import_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(import_btn)
+        
+        layout.addLayout(btn_layout)
+    
+    def _get_unit_button_style(self, selected: bool) -> str:
+        """Get stylesheet for unit button based on selection state."""
+        if selected:
+            return f"""
+                QPushButton {{
+                    background-color: {Colors.PRIMARY};
+                    color: {Colors.WHITE};
+                    border: 2px solid {Colors.PRIMARY};
+                    border-radius: 8px;
+                    font-size: 16px;
+                    font-weight: 600;
+                }}
+            """
+        else:
+            return f"""
+                QPushButton {{
+                    background-color: {Colors.WHITE};
+                    color: {Colors.DARK};
+                    border: 2px solid {Colors.GRAY_LIGHT};
+                    border-radius: 8px;
+                    font-size: 16px;
+                    font-weight: 500;
+                }}
+                QPushButton:hover {{
+                    border-color: {Colors.PRIMARY};
+                    background-color: rgba(0, 123, 255, 0.05);
+                }}
+            """
+    
+    def _on_unit_selected(self, unit_key: str):
+        """Handle unit selection."""
+        self._selected_unit = unit_key
+        self._update_button_styles()
+        
+        # Update scale label
+        unit_name, scale = self.UNITS[unit_key]
+        if scale == 1.0:
+            self.scale_label.setText("Coordinates will be treated as millimeters")
+        else:
+            self.scale_label.setText(f"Coordinates will be scaled from {unit_name.lower()} to mm (×{scale})")
+    
+    def _update_button_styles(self):
+        """Update button styles based on selection."""
+        for key, btn in self.unit_buttons.items():
+            is_selected = (key == self._selected_unit)
+            btn.setStyleSheet(self._get_unit_button_style(is_selected))
+    
+    @property
+    def scale_factor(self) -> float:
+        """Get the selected scale factor."""
+        _, scale = self.UNITS[self._selected_unit]
+        return scale
+
+
 class DropZone(QFrame):
     """File drop zone widget matching the frontend's upload style."""
     
-    file_dropped = pyqtSignal(str)
+    file_dropped = pyqtSignal(str, float)  # file_path, scale_factor
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -796,7 +1125,7 @@ class DropZone(QFrame):
             self, "Open STL File", "", "STL Files (*.stl *.STL);;All Files (*)"
         )
         if file_path:
-            self.file_dropped.emit(file_path)
+            self._show_unit_dialog_and_emit(file_path)
     
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -818,7 +1147,16 @@ class DropZone(QFrame):
                 file_path = url.toLocalFile()
                 if file_path.lower().endswith('.stl'):
                     event.acceptProposedAction()
-                    self.file_dropped.emit(file_path)
+                    self._show_unit_dialog_and_emit(file_path)
+        self._update_style()
+    
+    def _show_unit_dialog_and_emit(self, file_path: str):
+        """Show unit selection dialog and emit file_dropped signal if accepted."""
+        from pathlib import Path
+        filename = Path(file_path).name
+        dialog = UnitSelectionDialog(filename, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.file_dropped.emit(file_path, dialog.scale_factor)
         self._update_style()
 
 
@@ -826,6 +1164,7 @@ class DisplayOptionsPanel(QFrame):
     """Floating display options panel for the viewer."""
     
     hide_mesh_changed = pyqtSignal(bool)
+    hide_parting_changed = pyqtSignal(bool)  # Toggle visibility paint + arrows
     
     # Must match MeshViewer.BACKGROUND_COLOR for rounded corners to blend
     VIEWER_BG = "#1a1a1a"  # Matches React frontend BACKGROUND_COLOR
@@ -891,13 +1230,29 @@ class DisplayOptionsPanel(QFrame):
         separator.setStyleSheet("background-color: #3a3f47;")
         layout.addWidget(separator)
         
-        # Add default checkbox
+        # Hide mesh checkbox
         self.hide_mesh_cb = QCheckBox('Hide Original Mesh')
         self.hide_mesh_cb.stateChanged.connect(lambda s: self.hide_mesh_changed.emit(s == Qt.CheckState.Checked.value))
         layout.addWidget(self.hide_mesh_cb)
         
+        # Hide parting analysis checkbox (visibility paint + arrows)
+        self.hide_parting_cb = QCheckBox('Hide Parting Analysis')
+        self.hide_parting_cb.setChecked(False)  # Not hidden by default (analysis is shown)
+        self.hide_parting_cb.stateChanged.connect(lambda s: self.hide_parting_changed.emit(s == Qt.CheckState.Checked.value))
+        self.hide_parting_cb.hide()  # Hidden until parting is computed
+        layout.addWidget(self.hide_parting_cb)
+        
         self.adjustSize()
         self.hide()
+    
+    def show_parting_option(self, show: bool = True):
+        """Show or hide the parting analysis checkbox."""
+        if show:
+            self.hide_parting_cb.show()
+            self.hide_parting_cb.setChecked(False)  # Reset to showing analysis
+        else:
+            self.hide_parting_cb.hide()
+        self.adjustSize()
 
 
 # ============================================================================
@@ -915,6 +1270,12 @@ class MainWindow(QMainWindow):
         self._worker: Optional[MeshLoadWorker] = None
         self._active_step = Step.IMPORT
         self._loaded_filename: Optional[str] = None
+        
+        # Parting direction state
+        self._parting_worker: Optional[PartingDirectionWorker] = None
+        self._visibility_worker: Optional[VisibilityPaintWorker] = None
+        self._parting_result: Optional[PartingDirectionResult] = None
+        self._visibility_paint_data: Optional[VisibilityPaintData] = None
         
         self._setup_window()
         self._setup_ui()
@@ -1125,6 +1486,7 @@ class MainWindow(QMainWindow):
         self.display_options = DisplayOptionsPanel(self.mesh_viewer)
         self.display_options.move(16, 16)
         self.display_options.hide_mesh_changed.connect(self._on_hide_mesh_changed)
+        self.display_options.hide_parting_changed.connect(self._on_hide_parting_changed)
         
         return wrapper
     
@@ -1165,6 +1527,8 @@ class MainWindow(QMainWindow):
         # Step-specific content
         if self._active_step == Step.IMPORT:
             self._setup_import_step()
+        elif self._active_step == Step.PARTING:
+            self._setup_parting_step()
         
         self.context_layout.addStretch()
     
@@ -1241,6 +1605,253 @@ class MainWindow(QMainWindow):
         if self._repair_result and self._repair_result.was_repaired:
             self.mesh_stats.add_row(f'Repaired: {self._repair_result.repair_method}', Colors.PRIMARY)
     
+    def _setup_parting_step(self):
+        """Setup the parting direction step UI."""
+        # Check if mesh is loaded
+        if self._current_mesh is None:
+            no_mesh_label = QLabel("⚠️ No mesh loaded. Please import an STL file first.")
+            no_mesh_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_mesh_label.setWordWrap(True)
+            self.context_layout.addWidget(no_mesh_label)
+            return
+        
+        # Calculate button (if not computed yet)
+        self.parting_calc_btn = QPushButton("🔀 Calculate Parting Directions")
+        self.parting_calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.parting_calc_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {Colors.PRIMARY};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: #0056b3;
+            }}
+            QPushButton:disabled {{
+                background-color: {Colors.GRAY_LIGHT};
+                color: {Colors.GRAY};
+            }}
+        """)
+        self.parting_calc_btn.clicked.connect(self._on_calculate_parting)
+        self.context_layout.addWidget(self.parting_calc_btn)
+        
+        # Progress bar for parting computation
+        self.parting_progress = QProgressBar()
+        self.parting_progress.setStyleSheet(f"""
+            QProgressBar {{
+                border: none;
+                border-radius: 4px;
+                background-color: {Colors.LIGHT};
+                height: 8px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {Colors.PRIMARY};
+                border-radius: 4px;
+            }}
+        """)
+        self.parting_progress.setTextVisible(False)
+        self.parting_progress.hide()
+        self.context_layout.addWidget(self.parting_progress)
+        
+        # Progress label
+        self.parting_progress_label = QLabel("")
+        self.parting_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.parting_progress_label.hide()
+        self.context_layout.addWidget(self.parting_progress_label)
+        
+        # Parting direction stats (show if computed)
+        self.parting_stats = StatsBox()
+        self.parting_stats.hide()
+        self.context_layout.addWidget(self.parting_stats)
+        
+        # Color legend for visibility paint (shown after calculation)
+        self.color_legend = QLabel("""
+            <small>
+            <b>Color Legend:</b><br>
+            <span style='color: #00ff00;'>■</span> D1 visible &nbsp;
+            <span style='color: #ff6600;'>■</span> D2 visible &nbsp;
+            <span style='color: #ffff00;'>■</span> Both visible &nbsp;
+            <span style='color: #888888;'>■</span> Neither
+            </small>
+        """)
+        self.color_legend.setStyleSheet(f"""
+            color: {Colors.GRAY_DARK};
+            padding: 8px 12px;
+            background-color: {Colors.LIGHT};
+            border-radius: 4px;
+            margin-top: 8px;
+        """)
+        self.color_legend.hide()
+        self.context_layout.addWidget(self.color_legend)
+        
+        # Update UI with current state
+        self._update_parting_step_ui()
+    
+    def _update_parting_step_ui(self):
+        """Update parting step UI based on current state."""
+        if not hasattr(self, 'parting_stats'):
+            return
+        
+        if self._parting_result is not None:
+            # Show stats
+            self.parting_stats.clear()
+            self.parting_stats.show()
+            
+            result = self._parting_result
+            
+            self.parting_stats.add_header('✅ Parting Directions Found', Colors.SUCCESS)
+            
+            # D1 direction
+            d1_str = f"[{result.d1[0]:.3f}, {result.d1[1]:.3f}, {result.d1[2]:.3f}]"
+            self.parting_stats.add_row(f'D1: {d1_str}', Colors.PARTING_D1)
+            
+            # D2 direction
+            d2_str = f"[{result.d2[0]:.3f}, {result.d2[1]:.3f}, {result.d2[2]:.3f}]"
+            self.parting_stats.add_row(f'D2: {d2_str}', Colors.PARTING_D2)
+            
+            # Coverage and angle
+            self.parting_stats.add_row(f'Coverage: {result.total_coverage:.1f}%')
+            self.parting_stats.add_row(f'Angle: {result.angle_degrees:.1f}°')
+            self.parting_stats.add_row(f'Time: {result.computation_time_ms:.0f}ms')
+            
+            # Show color legend
+            self.color_legend.show()
+            
+            # Update button text
+            self.parting_calc_btn.setText("🔄 Recalculate")
+        else:
+            self.parting_stats.hide()
+            self.color_legend.hide()
+    
+    def _on_calculate_parting(self):
+        """Start parting direction computation."""
+        if self._current_mesh is None:
+            return
+        
+        # Disable button during computation
+        self.parting_calc_btn.setEnabled(False)
+        self.parting_progress.setRange(0, 128)  # k=128 directions
+        self.parting_progress.setValue(0)
+        self.parting_progress.show()
+        self.parting_progress_label.setText("Starting computation...")
+        self.parting_progress_label.show()
+        
+        # Clear previous results
+        self._parting_result = None
+        self._visibility_paint_data = None
+        self.mesh_viewer.remove_parting_direction_arrows()
+        self.mesh_viewer.remove_visibility_paint()
+        
+        # Hide display options parting toggle
+        self.display_options.show_parting_option(False)
+        
+        # Start worker
+        self._parting_worker = PartingDirectionWorker(self._current_mesh, k=128)
+        self._parting_worker.progress.connect(self._on_parting_progress)
+        self._parting_worker.progress_value.connect(self._on_parting_progress_value)
+        self._parting_worker.complete.connect(self._on_parting_complete)
+        self._parting_worker.error.connect(self._on_parting_error)
+        self._parting_worker.finished.connect(self._on_parting_worker_finished)
+        self._parting_worker.start()
+    
+    def _on_parting_progress(self, message: str):
+        """Handle parting progress updates."""
+        self.parting_progress_label.setText(message)
+    
+    def _on_parting_progress_value(self, current: int, total: int):
+        """Handle parting progress value updates."""
+        self.parting_progress.setRange(0, total)
+        self.parting_progress.setValue(current)
+    
+    def _on_parting_complete(self, result: PartingDirectionResult):
+        """Handle parting direction computation complete."""
+        self._parting_result = result
+        
+        # Add arrows to viewer
+        self.mesh_viewer.add_parting_direction_arrows(result.d1, result.d2)
+        
+        # Update UI
+        self._update_parting_step_ui()
+        
+        # Update step status
+        self.step_buttons[Step.PARTING].set_status('completed')
+        
+        logger.info(f"Parting directions computed: coverage={result.total_coverage:.1f}%, angle={result.angle_degrees:.1f}°")
+        
+        # Automatically compute and show visibility paint
+        self._auto_compute_visibility_paint()
+    
+    def _on_parting_error(self, message: str):
+        """Handle parting computation error."""
+        self.parting_progress_label.setText(f"Error: {message}")
+        self.parting_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+        QMessageBox.critical(self, "Error", f"Parting direction computation failed:\n{message}")
+    
+    def _on_parting_worker_finished(self):
+        """Handle parting worker finished."""
+        self.parting_calc_btn.setEnabled(True)
+        self.parting_progress.hide()
+        self._parting_worker = None
+    
+    def _auto_compute_visibility_paint(self):
+        """Automatically compute and display visibility paint after parting directions found."""
+        if self._parting_result is None or self._current_mesh is None:
+            return
+        
+        # Show progress
+        if hasattr(self, 'parting_progress_label'):
+            self.parting_progress_label.setText("Computing visibility paint...")
+            self.parting_progress_label.show()
+        
+        # Start worker for visibility paint (show both D1 and D2)
+        self._visibility_worker = VisibilityPaintWorker(
+            self._current_mesh,
+            self._parting_result.d1,
+            self._parting_result.d2,
+            show_d1=True,
+            show_d2=True
+        )
+        self._visibility_worker.progress.connect(self._on_visibility_progress)
+        self._visibility_worker.complete.connect(self._on_visibility_complete)
+        self._visibility_worker.error.connect(self._on_visibility_error)
+        self._visibility_worker.start()
+    
+    def _on_visibility_progress(self, message: str):
+        """Handle visibility progress."""
+        if hasattr(self, 'parting_progress_label'):
+            self.parting_progress_label.setText(message)
+    
+    def _on_visibility_complete(self, paint_data: VisibilityPaintData, face_colors: np.ndarray):
+        """Handle visibility paint complete."""
+        self._visibility_paint_data = paint_data
+        
+        # Apply paint to viewer
+        self.mesh_viewer.apply_visibility_paint(face_colors)
+        
+        # Show the parting analysis toggle in display options (checkbox resets to unchecked = showing)
+        self.display_options.show_parting_option(True)
+        
+        if hasattr(self, 'parting_progress_label'):
+            self.parting_progress_label.setText("Visibility paint applied")
+            self.parting_progress_label.setStyleSheet(f'color: {Colors.SUCCESS}; font-size: 12px;')
+    
+    def _on_visibility_error(self, message: str):
+        """Handle visibility computation error."""
+        if hasattr(self, 'parting_progress_label'):
+            self.parting_progress_label.setText(f"Error: {message}")
+            self.parting_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+    
     def _on_step_clicked(self, step: Step):
         """Handle step button click."""
         for s, btn in self.step_buttons.items():
@@ -1249,9 +1860,9 @@ class MainWindow(QMainWindow):
         self._active_step = step
         self._update_context_panel()
     
-    def _on_file_dropped(self, file_path: str):
+    def _on_file_dropped(self, file_path: str, scale_factor: float = 1.0):
         """Handle file drop/selection."""
-        self._load_mesh(file_path)
+        self._load_mesh(file_path, scale_factor)
     
     def _on_hide_mesh_changed(self, hide: bool):
         """Handle hide mesh checkbox change."""
@@ -1259,9 +1870,26 @@ class MainWindow(QMainWindow):
             self.mesh_viewer.set_mesh_visible(not hide)
             logger.debug(f"Mesh visibility changed: hide={hide}")
     
-    def _load_mesh(self, file_path: str):
+    def _on_hide_parting_changed(self, hide: bool):
+        """Handle hide parting analysis checkbox change."""
+        if self.mesh_viewer:
+            # Toggle visibility paint (inverted - hide=True means don't show)
+            if hide:
+                self.mesh_viewer.remove_visibility_paint()
+            else:
+                # Re-apply visibility paint if we have the data
+                if self._visibility_paint_data is not None:
+                    face_colors = get_face_colors(self._visibility_paint_data)
+                    self.mesh_viewer.apply_visibility_paint(face_colors)
+            
+            # Toggle parting direction arrows (inverted)
+            self.mesh_viewer.set_parting_arrows_visible(not hide)
+            logger.debug(f"Parting analysis visibility changed: hide={hide}")
+    
+    def _load_mesh(self, file_path: str, scale_factor: float = 1.0):
         """Load and process a mesh file."""
         self._loaded_filename = file_path
+        self._current_scale_factor = scale_factor
         
         # Update UI
         self.drop_zone.set_loaded(Path(file_path).name)
@@ -1275,7 +1903,7 @@ class MainWindow(QMainWindow):
         self.display_options.hide()
         
         # Start worker thread
-        self._worker = MeshLoadWorker(file_path)
+        self._worker = MeshLoadWorker(file_path, scale_factor)
         self._worker.progress.connect(self._on_progress)
         self._worker.load_complete.connect(self._on_load_complete)
         self._worker.analysis_complete.connect(self._on_analysis_complete)
@@ -1293,6 +1921,8 @@ class MainWindow(QMainWindow):
         
         # Reset display options and show panel
         self.display_options.hide_mesh_cb.setChecked(False)
+        self.display_options.show_parting_option(False)  # Hide parting option until computed
+        self._visibility_paint_data = None  # Clear previous paint data
         self.display_options.show()
         self.display_options.raise_()  # Bring to front
     

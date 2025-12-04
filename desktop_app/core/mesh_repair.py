@@ -73,7 +73,7 @@ class MeshRepairer:
                remove_duplicates: bool = True,
                fix_normals: bool = True,
                fill_holes: bool = True,
-               use_convex_hull_fallback: bool = True) -> MeshRepairResult:
+               use_convex_hull_fallback: bool = False) -> MeshRepairResult:
         """
         Repair the mesh using various strategies.
         
@@ -83,7 +83,8 @@ class MeshRepairer:
             remove_duplicates: Remove duplicate faces
             fix_normals: Fix inconsistent face winding
             fill_holes: Attempt to fill holes
-            use_convex_hull_fallback: Use convex hull if repair fails
+            use_convex_hull_fallback: Use convex hull if repair fails (default False - 
+                                      this destroys original geometry!)
             
         Returns:
             MeshRepairResult with the repaired mesh and diagnostics

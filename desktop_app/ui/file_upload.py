@@ -10,10 +10,94 @@ from typing import Optional, Callable
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QPushButton, 
-    QFileDialog, QFrame
+    QFileDialog, QFrame, QDialog, QHBoxLayout,
+    QComboBox, QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
+
+
+class UnitSelectionDialog(QDialog):
+    """
+    Dialog for selecting the unit system of the imported STL file.
+    
+    STL files don't contain unit information, so we need to ask the user.
+    """
+    
+    # Unit options with their scale factors to convert to mm
+    UNITS = {
+        "Millimeters (mm)": 1.0,
+        "Centimeters (cm)": 10.0,
+        "Meters (m)": 1000.0,
+        "Inches (in)": 25.4,
+        "Feet (ft)": 304.8,
+    }
+    
+    def __init__(self, filename: str, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Units")
+        self.setModal(True)
+        self.setMinimumWidth(350)
+        
+        self._scale_factor = 1.0  # Default: mm (no scaling)
+        self._setup_ui(filename)
+    
+    def _setup_ui(self, filename: str):
+        """Set up the dialog UI."""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+        
+        # Info label
+        info_label = QLabel(
+            f"<b>File:</b> {filename}<br><br>"
+            "STL files don't contain unit information.<br>"
+            "Please select the units used when the model was created:"
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # Unit selection combo box
+        unit_layout = QHBoxLayout()
+        unit_label = QLabel("Units:")
+        self.unit_combo = QComboBox()
+        self.unit_combo.addItems(self.UNITS.keys())
+        self.unit_combo.setCurrentText("Millimeters (mm)")  # Default
+        self.unit_combo.currentTextChanged.connect(self._on_unit_changed)
+        
+        unit_layout.addWidget(unit_label)
+        unit_layout.addWidget(self.unit_combo, 1)
+        layout.addLayout(unit_layout)
+        
+        # Preview label showing conversion
+        self.preview_label = QLabel("Model will be imported as-is (1 unit = 1 mm)")
+        self.preview_label.setStyleSheet("color: #666; font-style: italic;")
+        layout.addWidget(self.preview_label)
+        
+        # Dialog buttons
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | 
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+    
+    def _on_unit_changed(self, unit_text: str):
+        """Handle unit selection change."""
+        self._scale_factor = self.UNITS.get(unit_text, 1.0)
+        
+        if self._scale_factor == 1.0:
+            self.preview_label.setText("Model will be imported as-is (1 unit = 1 mm)")
+        else:
+            self.preview_label.setText(
+                f"Model will be scaled by {self._scale_factor}x "
+                f"(1 {unit_text.split('(')[1].split(')')[0]} = {self._scale_factor} mm)"
+            )
+    
+    @property
+    def scale_factor(self) -> float:
+        """Get the scale factor to convert to mm."""
+        return self._scale_factor
 
 
 class FileUploadWidget(QWidget):
@@ -21,16 +105,17 @@ class FileUploadWidget(QWidget):
     File upload widget with drag-and-drop support.
     
     Signals:
-        file_selected: Emitted when a valid STL file is selected (path: str)
+        file_selected: Emitted when a valid STL file is selected (path: str, scale_factor: float)
     """
     
-    file_selected = pyqtSignal(str)  # Emits file path
+    file_selected = pyqtSignal(str, float)  # Emits file path and scale factor
     
     SUPPORTED_EXTENSIONS = {'.stl', '.STL'}
     
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._current_file: Optional[str] = None
+        self._current_scale: float = 1.0
         self._setup_ui()
         self._setup_drag_drop()
     
@@ -122,9 +207,15 @@ class FileUploadWidget(QWidget):
             self._show_error("File does not exist")
             return
         
+        # Show unit selection dialog
+        dialog = UnitSelectionDialog(path.name, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return  # User cancelled
+        
         self._current_file = str(path.absolute())
+        self._current_scale = dialog.scale_factor
         self._show_loaded(path.name)
-        self.file_selected.emit(self._current_file)
+        self.file_selected.emit(self._current_file, self._current_scale)
     
     def _show_loaded(self, filename: str):
         """Update UI to show loaded state."""

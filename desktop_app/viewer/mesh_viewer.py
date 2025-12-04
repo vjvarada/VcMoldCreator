@@ -6,10 +6,11 @@ Provides interactive 3D viewing of STL meshes with:
 - Orthographic projection (no perspective distortion)
 - Lighting and colors matching the React/Three.js frontend
 - Efficient rendering for large meshes
+- Parting direction visualization (arrows and visibility painting)
 """
 
 import logging
-from typing import Optional
+from typing import Optional, List, Tuple
 import numpy as np
 
 try:
@@ -37,15 +38,28 @@ class MeshViewer(QWidget):
     - Grid plane matching the frontend style
     - Scale rulers on X and Y axes showing dimensions
     - Orbit controls (rotate, pan, zoom)
+    - Parting direction arrows
+    - Visibility painting for mold analysis
+    - Cell/toon shading with feature edges (not triangle edges)
     """
     
-    # Colors matching React frontend (ThreeViewer.tsx + partingDirection.ts)
-    MESH_COLOR = "#00aaff"       # Light blue - COLORS.MESH_DEFAULT
-    BACKGROUND_COLOR = "#1a1a1a" # Dark background - BACKGROUND_COLOR
-    GRID_COLOR_CENTER = "#444444" # Grid center line
-    GRID_COLOR_LINES = "#333333"  # Grid other lines
-    EDGE_COLOR = "#404040"
-    SCALE_COLOR = "#ffcc00"      # Yellow/gold for scale rulers
+    # Colors for light theme
+    MESH_COLOR = "#00aaff"       # Light blue - mesh color
+    BACKGROUND_COLOR = "#f0f0f0" # Light gray background
+    GRID_COLOR_CENTER = "#aaaaaa" # Grid center line (darker for visibility)
+    GRID_COLOR_LINES = "#cccccc"  # Grid other lines
+    EDGE_COLOR = "#000000"        # Black for feature/silhouette edges (cel shading)
+    SCALE_COLOR = "#333333"      # Dark gray for scale rulers (visible on light bg)
+    
+    # Parting direction colors (matching React frontend)
+    PARTING_D1_COLOR = "#00ff00"  # Green - Primary direction
+    PARTING_D2_COLOR = "#ff6600"  # Orange - Secondary direction
+    
+    # Feature edge detection angle (degrees) - edges sharper than this are shown
+    # This is the dihedral angle threshold - faces meeting at angles > (180 - this) are detected
+    # 45° means edges where faces meet at 135°+ (i.e., 45° corners and sharper)
+    # This catches chamfers, bevels, and hard edges while ignoring smooth curves
+    FEATURE_EDGE_ANGLE = 45.0  # Detect 45° corners and sharper
     
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -54,8 +68,18 @@ class MeshViewer(QWidget):
         self._actor = None
         self._grid_actor = None
         self._scale_actors = []  # List of scale ruler actors
-        self._show_edges = False
+        self._show_edges = True  # Feature edges on by default for cel shading
         self._current_color = self.MESH_COLOR
+        self._feature_edges_actor = None  # Separate actor for feature edges
+        self._silhouette_actor = None     # Dynamic silhouette edges (view-dependent)
+        
+        # Parting direction visualization
+        self._arrow_actors: List = []  # List of arrow actors
+        self._parting_d1: Optional[np.ndarray] = None
+        self._parting_d2: Optional[np.ndarray] = None
+        self._visibility_paint_active = False
+        self._original_scalars = None  # Store original mesh colors
+        
         self._setup_ui()
     
     def _setup_ui(self):
@@ -119,7 +143,7 @@ class MeshViewer(QWidget):
         # Add coordinate axes
         self.plotter.add_axes(
             line_width=2,
-            color='white',
+            color='#333333',  # Dark gray for light theme
             xlabel='X',
             ylabel='Y',
             zlabel='Z',
@@ -150,12 +174,11 @@ class MeshViewer(QWidget):
     
     def _setup_lighting(self):
         """
-        Set up lighting matching the React/Three.js frontend.
+        Set up lighting for cell/toon shading style.
         
-        Three.js setup:
-        - AmbientLight: intensity 0.6
-        - DirectionalLight 1: intensity 0.8, position (200, 200, 200)
-        - DirectionalLight 2: intensity 0.4, position (-200, -200, -200)
+        Uses simplified lighting for a flatter, more stylized look:
+        - Single strong directional light for clear shadows
+        - High ambient to reduce harsh shadows
         """
         if not PYVISTA_AVAILABLE:
             return
@@ -163,34 +186,32 @@ class MeshViewer(QWidget):
         # Remove default lights
         self.plotter.remove_all_lights()
         
-        # Ambient light (simulated with a very soft omnidirectional light)
-        # PyVista doesn't have a true ambient light, so we use the renderer's ambient
-        
-        # Main directional light - matching Three.js light1
+        # Single main directional light for cell shading
+        # Positioned to create clear, readable shadows
         light1 = pv.Light(
-            position=(1, 1, 1),  # Normalized direction
+            position=(1, 1, 1.5),  # Slightly from above
             focal_point=(0, 0, 0),
             color='white',
-            intensity=0.8,
+            intensity=1.0,  # Strong main light
         )
         light1.positional = False  # Directional light
         self.plotter.add_light(light1)
         
-        # Fill directional light - matching Three.js light2
+        # Subtle fill light to soften shadows (optional for cell shading)
         light2 = pv.Light(
-            position=(-1, -1, -1),  # Normalized direction
+            position=(-0.5, -0.5, 0.5),
             focal_point=(0, 0, 0),
             color='white',
-            intensity=0.4,
+            intensity=0.3,  # Subtle fill
         )
-        light2.positional = False  # Directional light
+        light2.positional = False
         self.plotter.add_light(light2)
     
     def _add_grid_plane(self, mesh_bounds=None):
         """
         Add a grid plane matching the React/Three.js frontend.
         
-        Grid uses GRID_COLOR_CENTER for center lines and GRID_COLOR_LINES for others.
+        Grid is centered around the mesh and uses GRID_COLOR_LINES for lines.
         """
         if not PYVISTA_AVAILABLE:
             return
@@ -200,7 +221,7 @@ class MeshViewer(QWidget):
             self.plotter.remove_actor(self._grid_actor)
             self._grid_actor = None
         
-        # Calculate grid size based on mesh bounds or use default
+        # Calculate grid size and center based on mesh bounds
         if mesh_bounds is not None:
             max_extent = max(
                 mesh_bounds[1] - mesh_bounds[0],  # X extent
@@ -208,21 +229,23 @@ class MeshViewer(QWidget):
                 mesh_bounds[5] - mesh_bounds[4],  # Z extent
             )
             grid_size = max_extent * 2  # Grid is 2x the mesh size
+            
+            # Center the grid around the mesh center (X, Y)
+            center_x = (mesh_bounds[0] + mesh_bounds[1]) / 2
+            center_y = (mesh_bounds[2] + mesh_bounds[3]) / 2
+            z_pos = mesh_bounds[4]  # Bottom of mesh
         else:
             grid_size = 200  # Default size
+            center_x = 0
+            center_y = 0
+            z_pos = 0
         
-        # Create grid lines manually for better control over colors
-        # PyVista doesn't have a direct GridHelper like Three.js
-        n_cells = 20  # Number of grid divisions
-        cell_size = grid_size / n_cells
-        half_size = grid_size / 2
+        # Number of grid divisions
+        n_cells = 20
         
-        # Create grid as a plane at Z=0 (or at mesh bottom)
-        z_pos = mesh_bounds[4] if mesh_bounds else 0  # Bottom of mesh
-        
-        # Create the grid using pyvista's built-in method
+        # Create the grid centered around the mesh
         grid_mesh = pv.Plane(
-            center=(0, 0, z_pos),
+            center=(center_x, center_y, z_pos),
             direction=(0, 0, 1),
             i_size=grid_size,
             j_size=grid_size,
@@ -236,9 +259,12 @@ class MeshViewer(QWidget):
         self._grid_actor = self.plotter.add_mesh(
             edges,
             color=self.GRID_COLOR_LINES,
-            line_width=1,
-            opacity=0.5,
+            line_width=1.5,
+            opacity=0.6,
             render_lines_as_tubes=False,
+            ambient=1.0,  # Full ambient for unshaded lines
+            diffuse=0.0,
+            specular=0.0,
         )
     
     def _add_scale_rulers(self, mesh_bounds):
@@ -310,16 +336,32 @@ class MeshViewer(QWidget):
         # Scale for tick marks based on ruler length
         ruler_scale = max(1, length_mm / 50)
         
-        # Determine tick intervals based on length
-        if length_mm > 100:
-            tick_interval = 10
-            major_tick_interval = 50
-        elif length_mm > 20:
-            tick_interval = 5
-            major_tick_interval = 10
+        # Dynamically determine tick intervals to limit total tick count
+        # Target ~10-20 ticks maximum regardless of mesh size
+        MAX_TICKS = 20
+        
+        # Calculate appropriate tick interval based on length
+        if length_mm <= 0:
+            return
+        
+        # Find a "nice" tick interval that gives us roughly MAX_TICKS ticks
+        raw_interval = length_mm / MAX_TICKS
+        
+        # Round to a nice number (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, etc.)
+        magnitude = 10 ** np.floor(np.log10(raw_interval)) if raw_interval > 0 else 1
+        normalized = raw_interval / magnitude
+        
+        if normalized <= 1:
+            nice_interval = 1 * magnitude
+        elif normalized <= 2:
+            nice_interval = 2 * magnitude
+        elif normalized <= 5:
+            nice_interval = 5 * magnitude
         else:
-            tick_interval = 1
-            major_tick_interval = 5
+            nice_interval = 10 * magnitude
+        
+        tick_interval = max(1, nice_interval)
+        major_tick_interval = tick_interval * 5  # Every 5th tick is major
         
         # Main ruler line
         main_line = pv.Line(start_pos, end_pos)
@@ -331,25 +373,31 @@ class MeshViewer(QWidget):
         )
         self._scale_actors.append(actor)
         
-        # Create tick marks
-        tick_points = []
+        # Collect all tick mark points to create a single combined mesh
+        all_tick_points = []
+        all_tick_lines = []
+        
         for mm in np.arange(0, length_mm + tick_interval, tick_interval):
             if mm > length_mm:
                 mm = length_mm
             
             tick_pos = start_pos + dir_vec * mm
-            is_major = (mm % major_tick_interval == 0) or mm == 0 or abs(mm - length_mm) < 0.1
+            is_major = (mm % major_tick_interval < 0.1) or mm == 0 or abs(mm - length_mm) < 0.1
             tick_length = ruler_scale * 2 if is_major else ruler_scale * 1
             
             tick_start = tick_pos + perp_vec * (-tick_length / 2)
             tick_end = tick_pos + perp_vec * (tick_length / 2)
-            tick_points.append([tick_start, tick_end])
+            all_tick_points.extend([tick_start, tick_end])
+            all_tick_lines.append([len(all_tick_points) - 2, len(all_tick_points) - 1])
         
-        # Add tick marks as line segments
-        for tick_start, tick_end in tick_points:
-            tick_line = pv.Line(tick_start, tick_end)
+        # Create a single combined mesh for all tick marks
+        if all_tick_points:
+            points = np.array(all_tick_points)
+            lines = np.array([[2, line[0], line[1]] for line in all_tick_lines]).ravel()
+            tick_mesh = pv.PolyData(points, lines=lines)
+            
             actor = self.plotter.add_mesh(
-                tick_line,
+                tick_mesh,
                 color=self.SCALE_COLOR,
                 line_width=1,
                 opacity=0.7,
@@ -433,42 +481,46 @@ class MeshViewer(QWidget):
         logger.info("Mesh rendered successfully")
     
     def _render_mesh(self):
-        """Render the current mesh with settings matching Three.js MeshPhongMaterial."""
+        """Render the current mesh with cell/toon shading style."""
         if not PYVISTA_AVAILABLE or self._pv_mesh is None:
             return
         
         # Clear previous content
         self.plotter.clear()
+        self._feature_edges_actor = None
+        self._silhouette_actor = None
+        self._silhouette_filter = None
         
         # Re-setup lighting after clear
         self._setup_lighting()
         
-        # Add the mesh with material matching Three.js MeshPhongMaterial:
-        # color: COLORS.MESH_DEFAULT (0x00aaff)
-        # specular: 0x333333
-        # shininess: 60
+        # Add the mesh with cell/toon shading style:
+        # - Flat shading for sharp facets
+        # - High ambient, moderate diffuse, no specular
+        # - NO triangle edges (we add feature edges separately)
         self._actor = self.plotter.add_mesh(
             self._pv_mesh,
             color=self._current_color,
-            smooth_shading=True,       # Smooth shading like Phong
-            show_edges=self._show_edges,
-            edge_color=self.EDGE_COLOR,
-            line_width=1,
+            smooth_shading=False,      # Flat shading for cell/toon look
+            show_edges=False,          # Don't show triangle edges
             opacity=1.0,
-            # Material properties matching Three.js MeshPhongMaterial
-            ambient=0.6,               # Matching Three.js AmbientLight intensity
-            diffuse=0.8,               # Good diffuse response
-            specular=0.2,              # specular: 0x333333 ≈ 0.2 intensity
-            specular_power=60,         # shininess: 60
+            # Cell shading material properties
+            ambient=0.5,               # High ambient for flatter look
+            diffuse=0.5,               # Moderate diffuse
+            specular=0.0,              # No specular for toon style
+            specular_power=1,
             render_points_as_spheres=False,
             render_lines_as_tubes=False,
         )
         
-        # Set Phong interpolation for proper specular highlights
+        # Set flat interpolation for cell shading effect
         if self._actor is not None:
             prop = self._actor.GetProperty()
             if prop:
-                prop.SetInterpolationToPhong()
+                prop.SetInterpolationToFlat()
+        
+        # Add feature edges (silhouette + crease edges) for cel shading outline
+        self._add_feature_edges()
         
         # Add grid plane (like Three.js GridHelper)
         if self._pv_mesh is not None:
@@ -480,7 +532,7 @@ class MeshViewer(QWidget):
         # Add axes
         self.plotter.add_axes(
             line_width=2,
-            color='white',
+            color='#333333',  # Dark gray for light theme
             xlabel='X',
             ylabel='Y',
             zlabel='Z',
@@ -491,6 +543,111 @@ class MeshViewer(QWidget):
         
         # Update the view
         self.plotter.update()
+    
+    def _add_feature_edges(self):
+        """
+        Add feature edges for cel shading effect.
+        
+        For clean cel-shading without internal lines on curved surfaces:
+        - Only show VERY sharp feature edges (near 90° corners)
+        - Show boundary edges (open edges on non-watertight meshes)
+        - Skip dynamic silhouette (it creates unwanted lines on curves)
+        
+        This gives clean outlines on engineering models without
+        drawing internal contour lines on cylinders/spheres.
+        """
+        if not PYVISTA_AVAILABLE or self._pv_mesh is None:
+            return
+        
+        if not self._show_edges:
+            return
+        
+        try:
+            # Extract ONLY very sharp feature edges and boundary edges
+            # Use a very high angle (85°+) to only catch true corners
+            # This avoids detecting edges on curved surfaces
+            feature_edges = self._pv_mesh.extract_feature_edges(
+                feature_angle=self.FEATURE_EDGE_ANGLE,  # Very high - only sharp corners
+                boundary_edges=True,      # Include boundary/open edges
+                non_manifold_edges=True,  # Include non-manifold edges
+                feature_edges=True,       # Include sharp feature edges
+                manifold_edges=False,     # Don't include smooth manifold edges
+            )
+            
+            if feature_edges.n_points > 0:
+                # Render feature edges as black lines
+                self._feature_edges_actor = self.plotter.add_mesh(
+                    feature_edges,
+                    color=self.EDGE_COLOR,
+                    line_width=2.0,         # Good thickness for outline
+                    opacity=1.0,
+                    render_lines_as_tubes=False,
+                    ambient=1.0,            # Full ambient (unlit)
+                    diffuse=0.0,
+                    specular=0.0,
+                )
+                logger.debug(f"Added {feature_edges.n_lines} feature edges")
+        except Exception as e:
+            logger.warning(f"Could not extract feature edges: {e}")
+    
+    def _add_silhouette_edges(self):
+        """
+        Add dynamic silhouette edges that update with camera movement.
+        
+        Silhouette edges are the TRUE outline of the object from the current
+        viewpoint - essential for organic shapes that lack sharp features.
+        Uses VTK's vtkPolyDataSilhouette filter with contour edges only
+        (no border edges to avoid internal line artifacts).
+        """
+        if not PYVISTA_AVAILABLE or self._pv_mesh is None:
+            return
+        
+        try:
+            import vtkmodules.vtkFiltersHybrid as vtk_hybrid
+            
+            # Create silhouette filter
+            silhouette = vtk_hybrid.vtkPolyDataSilhouette()
+            silhouette.SetInputData(self._pv_mesh)
+            
+            # Connect to renderer's active camera for dynamic updates
+            renderer = self.plotter.renderer
+            silhouette.SetCamera(renderer.GetActiveCamera())
+            
+            # IMPORTANT: Only use contour edges (true silhouette outline)
+            # BorderEdgesOff prevents internal edge artifacts
+            silhouette.SetEnableFeatureAngle(False)  # We handle features separately
+            silhouette.BorderEdgesOff()  # Disable border edges - these cause internal lines
+            silhouette.PieceInvariantOn()
+            
+            # Update the filter
+            silhouette.Update()
+            
+            # Get the silhouette output
+            silhouette_output = silhouette.GetOutput()
+            
+            if silhouette_output and silhouette_output.GetNumberOfLines() > 0:
+                # Wrap in PyVista and add to plotter
+                silhouette_mesh = pv.wrap(silhouette_output)
+                
+                self._silhouette_actor = self.plotter.add_mesh(
+                    silhouette_mesh,
+                    color=self.EDGE_COLOR,
+                    line_width=2.5,         # Thicker for main outline
+                    opacity=1.0,
+                    render_lines_as_tubes=False,
+                    ambient=1.0,
+                    diffuse=0.0,
+                    specular=0.0,
+                )
+                
+                # Store the silhouette filter for dynamic updates
+                self._silhouette_filter = silhouette
+                
+                logger.debug(f"Added silhouette edges (contour only)")
+        except ImportError:
+            logger.debug("VTK silhouette filter not available, using feature edges only")
+        except Exception as e:
+            logger.warning(f"Could not add silhouette edges: {e}")
     
     def _fit_camera_to_mesh(self):
         """Fit the orthographic camera to show the entire mesh."""
@@ -576,7 +733,7 @@ class MeshViewer(QWidget):
         self._setup_lighting()
         self.plotter.add_axes(
             line_width=2,
-            color='white',
+            color='#333333',  # Dark gray for light theme
             xlabel='X',
             ylabel='Y',
             zlabel='Z',
@@ -624,15 +781,26 @@ class MeshViewer(QWidget):
         self.plotter.reset_camera()
     
     def show_edges(self, show: bool = True):
-        """Toggle edge visibility."""
+        """Toggle feature/silhouette edge visibility for cel shading outline."""
         if not PYVISTA_AVAILABLE:
             return
         
         self._show_edges = show
         
-        if self._pv_mesh is not None:
-            self._render_mesh()
-            self._fit_camera_to_mesh()
+        # Toggle feature edges visibility
+        if self._feature_edges_actor is not None:
+            self._feature_edges_actor.SetVisibility(show)
+        
+        # Toggle silhouette edges visibility
+        if self._silhouette_actor is not None:
+            self._silhouette_actor.SetVisibility(show)
+        
+        if show and self._pv_mesh is not None:
+            # Re-add edges if they don't exist
+            if self._feature_edges_actor is None and self._silhouette_actor is None:
+                self._add_feature_edges()
+        
+        self.plotter.update()
     
     def set_mesh_visible(self, visible: bool):
         """
@@ -672,6 +840,336 @@ class MeshViewer(QWidget):
         
         self.plotter.set_background(color)
         self.plotter.update()
+    
+    # ========================================================================
+    # PARTING DIRECTION VISUALIZATION
+    # ========================================================================
+    
+    def add_parting_direction_arrows(
+        self,
+        d1: np.ndarray,
+        d2: np.ndarray,
+        arrow_length: Optional[float] = None
+    ):
+        """
+        Add parting direction arrows to the viewer.
+        
+        Creates two arrows at the mesh center showing the optimal
+        parting directions for a two-piece mold. Uses cell/toon shading
+        for a cleaner, more stylized look.
+        
+        Args:
+            d1: Primary direction (3,) unit vector - shown in green
+            d2: Secondary direction (3,) unit vector - shown in orange
+            arrow_length: Optional arrow length (default: based on mesh size)
+        """
+        if not PYVISTA_AVAILABLE or self._pv_mesh is None:
+            return
+        
+        # Store directions for later use
+        self._parting_d1 = d1.copy()
+        self._parting_d2 = d2.copy()
+        
+        # Remove existing arrows
+        self.remove_parting_direction_arrows()
+        
+        # Calculate arrow dimensions based on mesh bounds
+        bounds = self._pv_mesh.bounds
+        center = np.array([
+            (bounds[0] + bounds[1]) / 2,
+            (bounds[2] + bounds[3]) / 2,
+            (bounds[4] + bounds[5]) / 2,
+        ])
+        
+        size = np.array([
+            bounds[1] - bounds[0],
+            bounds[3] - bounds[2],
+            bounds[5] - bounds[4],
+        ])
+        max_size = np.max(size)
+        min_size = np.min(size[size > 0]) if np.any(size > 0) else max_size
+        
+        # Scale arrow proportionally to mesh size
+        if arrow_length is None:
+            arrow_length = max_size * 0.8  # Slightly smaller than before
+        
+        # Scale arrow thickness based on bounding box - thinner arrows
+        # Use a factor that makes arrows visible but not overwhelming
+        thickness_factor = max_size / 100.0  # Base scale factor
+        shaft_radius = max(0.005, min(0.015, thickness_factor * 0.5))  # Thin shaft
+        tip_radius = shaft_radius * 2.5  # Tip is 2.5x shaft width
+        tip_length = 0.15  # 15% of arrow length for the tip
+        
+        # Create D1 arrow (green) - Primary direction
+        arrow1 = pv.Arrow(
+            start=center,
+            direction=d1,
+            scale=arrow_length,
+            tip_length=tip_length,
+            tip_radius=tip_radius,
+            shaft_radius=shaft_radius,
+            tip_resolution=16,
+            shaft_resolution=16,
+        )
+        
+        # Apply cell/toon shading style - flat shading with edge emphasis
+        actor1 = self.plotter.add_mesh(
+            arrow1,
+            color=self.PARTING_D1_COLOR,
+            opacity=1.0,
+            smooth_shading=False,  # Flat shading for cell/toon look
+            show_edges=False,
+            ambient=0.4,      # Higher ambient for flatter look
+            diffuse=0.6,      # Lower diffuse
+            specular=0.0,     # No specular for toon style
+        )
+        # Set flat interpolation for cell shading effect
+        if actor1 is not None:
+            prop = actor1.GetProperty()
+            if prop:
+                prop.SetInterpolationToFlat()
+                prop.SetEdgeVisibility(True)
+                prop.SetEdgeColor(0.0, 0.6, 0.0)  # Darker green edge
+                prop.SetLineWidth(1.5)
+        self._arrow_actors.append(actor1)
+        
+        # Create D2 arrow (orange) - Secondary direction
+        arrow2 = pv.Arrow(
+            start=center,
+            direction=d2,
+            scale=arrow_length,
+            tip_length=tip_length,
+            tip_radius=tip_radius,
+            shaft_radius=shaft_radius,
+            tip_resolution=16,
+            shaft_resolution=16,
+        )
+        
+        # Apply cell/toon shading style
+        actor2 = self.plotter.add_mesh(
+            arrow2,
+            color=self.PARTING_D2_COLOR,
+            opacity=1.0,
+            smooth_shading=False,  # Flat shading for cell/toon look
+            show_edges=False,
+            ambient=0.4,
+            diffuse=0.6,
+            specular=0.0,
+        )
+        if actor2 is not None:
+            prop = actor2.GetProperty()
+            if prop:
+                prop.SetInterpolationToFlat()
+                prop.SetEdgeVisibility(True)
+                prop.SetEdgeColor(0.8, 0.3, 0.0)  # Darker orange edge
+                prop.SetLineWidth(1.5)
+        self._arrow_actors.append(actor2)
+        
+        # Add labels at arrow tips
+        d1_tip = center + d1 * arrow_length * 1.05
+        d2_tip = center + d2 * arrow_length * 1.05
+        
+        self.plotter.add_point_labels(
+            [d1_tip],
+            ['D1'],
+            font_size=12,
+            text_color=self.PARTING_D1_COLOR,
+            font_family='arial',
+            bold=True,
+            show_points=False,
+            always_visible=True,
+            shape=None,
+            fill_shape=False,
+        )
+        
+        self.plotter.add_point_labels(
+            [d2_tip],
+            ['D2'],
+            font_size=12,
+            text_color=self.PARTING_D2_COLOR,
+            font_family='arial',
+            bold=True,
+            show_points=False,
+            always_visible=True,
+            shape=None,
+            fill_shape=False,
+        )
+        
+        self.plotter.update()
+        logger.info(f"Added parting direction arrows: D1={d1}, D2={d2}")
+    
+    def remove_parting_direction_arrows(self):
+        """Remove parting direction arrows from the viewer."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        for actor in self._arrow_actors:
+            try:
+                self.plotter.remove_actor(actor)
+            except Exception as e:
+                logger.debug(f"Could not remove arrow actor: {e}")
+        
+        self._arrow_actors = []
+        self.plotter.update()
+    
+    def set_parting_arrows_visible(self, visible: bool):
+        """
+        Set visibility of parting direction arrows.
+        
+        Args:
+            visible: True to show arrows, False to hide
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        for actor in self._arrow_actors:
+            try:
+                actor.SetVisibility(visible)
+            except Exception:
+                pass
+        
+        self.plotter.update()
+    
+    def apply_visibility_paint(
+        self,
+        face_colors: np.ndarray,
+    ):
+        """
+        Apply visibility-based face colors to the mesh.
+        
+        Colors the mesh triangles based on which parting direction
+        can see them (D1=green, D2=orange, overlap=yellow, neutral=gray).
+        
+        Args:
+            face_colors: Array of shape (n_faces, 4) with RGBA colors (0-255)
+        """
+        if not PYVISTA_AVAILABLE or self._pv_mesh is None:
+            return
+        
+        logger.info("Applying visibility paint to mesh")
+        
+        # Store original color state
+        if not self._visibility_paint_active:
+            self._original_scalars = self._pv_mesh.cell_data.get('colors', None)
+        
+        self._visibility_paint_active = True
+        
+        # Convert colors to 0-255 range if needed
+        if face_colors.max() <= 1.0:
+            face_colors = (face_colors * 255).astype(np.uint8)
+        
+        # Apply colors as cell data
+        # PyVista expects RGB or RGBA as uint8
+        self._pv_mesh.cell_data['colors'] = face_colors
+        
+        # Re-render with the new colors
+        self._render_mesh_with_colors()
+        
+        logger.debug(f"Applied visibility paint to {len(face_colors)} faces")
+    
+    def _render_mesh_with_colors(self):
+        """Render mesh with per-cell colors (for visibility painting) using cell shading."""
+        if not PYVISTA_AVAILABLE or self._pv_mesh is None:
+            return
+        
+        # Clear previous content
+        self.plotter.clear()
+        self._feature_edges_actor = None
+        self._silhouette_actor = None
+        self._silhouette_filter = None
+        
+        # Re-setup lighting after clear
+        self._setup_lighting()
+        
+        # Add mesh with cell colors and cell/toon shading
+        # NO triangle edges - we add feature edges separately
+        self._actor = self.plotter.add_mesh(
+            self._pv_mesh,
+            scalars='colors',
+            rgb=True,
+            smooth_shading=False,      # Flat shading for cell/toon look
+            show_edges=False,          # Don't show triangle edges
+            opacity=1.0,
+            ambient=0.5,               # High ambient for flatter look
+            diffuse=0.5,               # Moderate diffuse
+            specular=0.0,              # No specular for toon style
+            specular_power=1,
+        )
+        
+        # Set flat interpolation for cell shading
+        if self._actor is not None:
+            prop = self._actor.GetProperty()
+            if prop:
+                prop.SetInterpolationToFlat()
+        
+        # Add feature edges for cel shading outline
+        self._add_feature_edges()
+        
+        # Re-add grid and scale rulers
+        if self._pv_mesh is not None:
+            self._add_grid_plane(self._pv_mesh.bounds)
+            self._add_scale_rulers(self._pv_mesh.bounds)
+        
+        # Re-add parting direction arrows if they exist
+        if self._parting_d1 is not None and self._parting_d2 is not None:
+            # Store current arrows
+            old_actors = self._arrow_actors
+            self._arrow_actors = []
+            
+            # Re-add arrows
+            self.add_parting_direction_arrows(self._parting_d1, self._parting_d2)
+            
+            # Clean up old actors (they were already cleared)
+            old_actors.clear()
+        
+        # Add axes
+        self.plotter.add_axes(
+            line_width=2,
+            color='#333333',  # Dark gray for light theme
+            xlabel='X',
+            ylabel='Y',
+            zlabel='Z',
+        )
+        
+        # Ensure orthographic projection
+        self.plotter.enable_parallel_projection()
+        
+        self.plotter.update()
+    
+    def remove_visibility_paint(self):
+        """Remove visibility paint and restore original mesh appearance."""
+        if not PYVISTA_AVAILABLE or self._pv_mesh is None:
+            return
+        
+        if not self._visibility_paint_active:
+            return
+        
+        logger.info("Removing visibility paint from mesh")
+        
+        self._visibility_paint_active = False
+        
+        # Remove the colors cell data
+        if 'colors' in self._pv_mesh.cell_data:
+            del self._pv_mesh.cell_data['colors']
+        
+        # Re-render with original solid color
+        self._render_mesh()
+        self._fit_camera_to_mesh()
+    
+    @property
+    def parting_d1(self) -> Optional[np.ndarray]:
+        """Get the primary parting direction."""
+        return self._parting_d1
+    
+    @property
+    def parting_d2(self) -> Optional[np.ndarray]:
+        """Get the secondary parting direction."""
+        return self._parting_d2
+    
+    @property
+    def has_parting_directions(self) -> bool:
+        """Check if parting directions have been computed."""
+        return self._parting_d1 is not None and self._parting_d2 is not None
     
     @property
     def mesh(self) -> Optional[trimesh.Trimesh]:
