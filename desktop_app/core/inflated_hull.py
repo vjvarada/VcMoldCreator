@@ -20,6 +20,15 @@ from scipy.spatial import ConvexHull
 
 import trimesh
 
+# Check for GPU acceleration
+try:
+    import torch
+    TORCH_AVAILABLE = True
+    CUDA_AVAILABLE = torch.cuda.is_available()
+except ImportError:
+    TORCH_AVAILABLE = False
+    CUDA_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # Default inflation offset as percentage of bounding box diagonal
@@ -76,7 +85,8 @@ class InflatedHullResult:
 
 def compute_smooth_vertex_normals(
     vertices: np.ndarray,
-    faces: np.ndarray
+    faces: np.ndarray,
+    use_gpu: bool = True
 ) -> np.ndarray:
     """
     Compute area-weighted smooth vertex normals.
@@ -84,38 +94,133 @@ def compute_smooth_vertex_normals(
     Each vertex normal is the normalized sum of the normals of all faces
     that share that vertex, weighted by face area.
     
+    Uses GPU acceleration when available for large meshes.
+    
     Args:
         vertices: Nx3 array of vertex positions
         faces: Mx3 array of face vertex indices
+        use_gpu: Whether to use GPU acceleration if available
         
     Returns:
         Nx3 array of normalized vertex normals
     """
+    # Use GPU for large meshes
+    if use_gpu and CUDA_AVAILABLE and len(faces) > 10000:
+        return _compute_smooth_vertex_normals_gpu(vertices, faces)
+    else:
+        return _compute_smooth_vertex_normals_cpu(vertices, faces)
+
+
+def _compute_smooth_vertex_normals_gpu(
+    vertices: np.ndarray,
+    faces: np.ndarray
+) -> np.ndarray:
+    """
+    GPU-accelerated smooth vertex normal computation.
+    
+    Fully vectorized using PyTorch CUDA.
+    """
+    import torch
+    
+    device = torch.device('cuda')
     num_vertices = len(vertices)
+    num_faces = len(faces)
+    
+    logger.debug(f"Computing smooth normals on GPU for {num_vertices} vertices, {num_faces} faces")
+    
+    # Move data to GPU
+    verts_t = torch.tensor(vertices, dtype=torch.float64, device=device)
+    faces_t = torch.tensor(faces, dtype=torch.int64, device=device)
+    
+    # Get triangle vertices: (F, 3, 3)
+    v0 = verts_t[faces_t[:, 0]]  # (F, 3)
+    v1 = verts_t[faces_t[:, 1]]  # (F, 3)
+    v2 = verts_t[faces_t[:, 2]]  # (F, 3)
+    
+    # Compute face normals via cross product: edge1 x edge2
+    edge1 = v1 - v0  # (F, 3)
+    edge2 = v2 - v0  # (F, 3)
+    face_normals = torch.cross(edge1, edge2, dim=1)  # (F, 3)
+    
+    # Compute areas (half the magnitude of cross product)
+    face_normal_lengths = torch.norm(face_normals, dim=1, keepdim=True)  # (F, 1)
+    areas = face_normal_lengths / 2.0  # (F, 1)
+    
+    # Normalize face normals (avoid div by zero)
+    face_normals_normalized = face_normals / (face_normal_lengths + 1e-10)  # (F, 3)
+    
+    # Area-weighted normals for accumulation
+    weighted_normals = face_normals_normalized * areas  # (F, 3)
+    
+    # Accumulate normals at each vertex using scatter_add
+    # We need to scatter weighted_normals to vertices based on face indices
+    normal_accum = torch.zeros((num_vertices, 3), dtype=torch.float64, device=device)
+    
+    # For each corner of each face, accumulate the weighted normal
+    # Flatten: each face contributes to 3 vertices
+    # indices: (F*3,) - vertex indices to scatter to
+    # values: (F*3, 3) - weighted normals repeated 3 times per face
+    indices = faces_t.flatten()  # (F*3,)
+    values = weighted_normals.repeat_interleave(3, dim=0).reshape(-1, 3)  # This doesn't work right
+    
+    # Better approach: scatter each corner separately
+    for corner in range(3):
+        corner_indices = faces_t[:, corner].unsqueeze(1).expand(-1, 3)  # (F, 3)
+        normal_accum.scatter_add_(0, corner_indices, weighted_normals)
+    
+    # Normalize the accumulated normals
+    norms = torch.norm(normal_accum, dim=1, keepdim=True)  # (V, 1)
+    norms = torch.where(norms > 1e-10, norms, torch.ones_like(norms))
+    smooth_normals = normal_accum / norms
+    
+    result = smooth_normals.cpu().numpy().astype(np.float32)
+    torch.cuda.empty_cache()
+    
+    logger.debug(f"GPU smooth normals computed")
+    return result
+
+
+def _compute_smooth_vertex_normals_cpu(
+    vertices: np.ndarray,
+    faces: np.ndarray
+) -> np.ndarray:
+    """
+    CPU implementation of smooth vertex normal computation.
+    
+    Vectorized NumPy implementation.
+    """
+    num_vertices = len(vertices)
+    
+    # Get triangle vertices
+    v0 = vertices[faces[:, 0]]  # (F, 3)
+    v1 = vertices[faces[:, 1]]  # (F, 3)
+    v2 = vertices[faces[:, 2]]  # (F, 3)
+    
+    # Compute face normals via cross product
+    edge1 = v1 - v0  # (F, 3)
+    edge2 = v2 - v0  # (F, 3)
+    face_normals = np.cross(edge1, edge2)  # (F, 3)
+    
+    # Compute areas
+    face_normal_lengths = np.linalg.norm(face_normals, axis=1, keepdims=True)  # (F, 1)
+    areas = face_normal_lengths / 2.0  # (F, 1)
+    
+    # Normalize face normals
+    face_normals_normalized = face_normals / (face_normal_lengths + 1e-10)  # (F, 3)
+    
+    # Area-weighted normals
+    weighted_normals = face_normals_normalized * areas  # (F, 3)
+    
+    # Accumulate at each vertex using np.add.at
     normal_accum = np.zeros((num_vertices, 3), dtype=np.float64)
     
-    for face in faces:
-        v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
-        
-        # Compute face normal (not normalized yet - length is 2x area)
-        edge1 = v1 - v0
-        edge2 = v2 - v0
-        face_normal = np.cross(edge1, edge2)
-        
-        # Area is half the magnitude of the cross product
-        area = np.linalg.norm(face_normal) / 2.0
-        
-        if area > 1e-10:
-            # Normalize the face normal
-            face_normal = face_normal / (area * 2)
-            
-            # Add area-weighted normal to each vertex
-            for idx in face:
-                normal_accum[idx] += face_normal * area
+    # Add weighted normal to each corner vertex
+    np.add.at(normal_accum, faces[:, 0], weighted_normals)
+    np.add.at(normal_accum, faces[:, 1], weighted_normals)
+    np.add.at(normal_accum, faces[:, 2], weighted_normals)
     
-    # Normalize all vertex normals
+    # Normalize
     norms = np.linalg.norm(normal_accum, axis=1, keepdims=True)
-    # Avoid division by zero
     norms = np.where(norms > 1e-10, norms, 1.0)
     smooth_normals = normal_accum / norms
     

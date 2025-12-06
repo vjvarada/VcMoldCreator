@@ -28,6 +28,15 @@ from collections import defaultdict
 import numpy as np
 import trimesh
 
+# Check for GPU acceleration
+try:
+    import torch
+    TORCH_AVAILABLE = True
+    CUDA_AVAILABLE = torch.cuda.is_available()
+except ImportError:
+    TORCH_AVAILABLE = False
+    CUDA_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -145,13 +154,16 @@ def build_triangle_adjacency(mesh: trimesh.Trimesh) -> Dict[int, List[int]]:
 
 def identify_outer_boundary_from_hull(
     cavity_triangles: List[TriangleInfo],
-    hull_mesh: trimesh.Trimesh
+    hull_mesh: trimesh.Trimesh,
+    use_gpu: bool = True
 ) -> Set[int]:
     """
     Identify outer boundary triangles by checking if their centroids lie on the hull surface.
     
     Uses the same plane distance method as the React app:
     For each cavity triangle centroid, check if it lies on any hull face plane.
+    
+    Uses GPU acceleration when available for large meshes.
     
     The cavity mesh is created by CSG: Hull - Part
     Outer boundary = triangles on the Hull surface (distance to hull surface ≈ 0)
@@ -194,6 +206,11 @@ def identify_outer_boundary_from_hull(
     
     # Get all cavity centroids as a single array
     centroids = np.array([tri.centroid for tri in cavity_triangles])  # Shape: (n_tris, 3)
+    n_tris = len(centroids)
+    
+    # Use GPU for large meshes
+    if use_gpu and CUDA_AVAILABLE and n_tris > 50000:
+        return _identify_outer_boundary_from_hull_gpu(centroids, plane_normals, plane_d, tolerance)
     
     outer_triangles = set()
     
@@ -219,16 +236,72 @@ def identify_outer_boundary_from_hull(
     return outer_triangles
 
 
+def _identify_outer_boundary_from_hull_gpu(
+    centroids: np.ndarray,
+    plane_normals: np.ndarray,
+    plane_d: np.ndarray,
+    tolerance: float
+) -> Set[int]:
+    """
+    GPU-accelerated outer boundary identification using plane distances.
+    
+    Args:
+        centroids: (N, 3) triangle centroids
+        plane_normals: (P, 3) plane normal vectors
+        plane_d: (P,) plane distance constants
+        tolerance: Distance tolerance for on-hull detection
+    
+    Returns:
+        Set of triangle indices on the hull surface
+    """
+    import torch
+    
+    device = torch.device('cuda')
+    n_tris = len(centroids)
+    n_planes = len(plane_normals)
+    
+    logger.debug(f"GPU: Computing plane distances for {n_tris} triangles against {n_planes} planes")
+    
+    # Move data to GPU
+    centroids_t = torch.tensor(centroids, dtype=torch.float32, device=device)
+    normals_t = torch.tensor(plane_normals, dtype=torch.float32, device=device)
+    d_t = torch.tensor(plane_d, dtype=torch.float32, device=device)
+    
+    # Process in batches to manage GPU memory
+    batch_size = 100000
+    on_hull_mask = torch.zeros(n_tris, dtype=torch.bool, device=device)
+    
+    for start in range(0, n_tris, batch_size):
+        end = min(start + batch_size, n_tris)
+        batch = centroids_t[start:end]  # (B, 3)
+        
+        # Compute distances to all planes: |n·c - d|
+        dots = batch @ normals_t.T  # (B, P)
+        distances = torch.abs(dots - d_t)  # (B, P)
+        
+        # Check if any plane distance is within tolerance
+        on_hull_mask[start:end] = torch.any(distances < tolerance, dim=1)
+    
+    # Convert to set
+    outer_indices = torch.where(on_hull_mask)[0].cpu().numpy()
+    torch.cuda.empty_cache()
+    
+    return set(outer_indices.tolist())
+
+
 def identify_outer_boundary_by_proximity(
     boundary_mesh: trimesh.Trimesh,
     hull_mesh: trimesh.Trimesh,
-    part_mesh: trimesh.Trimesh = None
+    part_mesh: trimesh.Trimesh = None,
+    use_gpu: bool = True
 ) -> Set[int]:
     """
     Identify outer boundary triangles by proximity to hull surface vs part surface.
     
     This method works better for tetrahedral boundary meshes where triangles
     don't align exactly with hull planes.
+    
+    Uses GPU acceleration when available for faster distance computation.
     
     For each triangle centroid:
     - If closer to hull surface than to part surface -> outer boundary
@@ -240,6 +313,7 @@ def identify_outer_boundary_by_proximity(
         boundary_mesh: The boundary surface mesh (e.g., from tetrahedralization)
         hull_mesh: The original hull mesh
         part_mesh: The original part mesh (optional)
+        use_gpu: Whether to use GPU acceleration if available
     
     Returns:
         Set of triangle indices that are on the outer boundary (hull surface)
@@ -251,30 +325,165 @@ def identify_outer_boundary_by_proximity(
     # Compute centroids for all triangles
     centroids = boundary_mesh.triangles_center  # (n_faces, 3)
     
-    # Compute distance to hull surface
-    _, hull_distances, _ = hull_mesh.nearest.on_surface(centroids)
-    
     # Compute hull size for tolerance
     bounds = hull_mesh.bounds
     hull_size = np.linalg.norm(bounds[1] - bounds[0])
     tolerance = hull_size * 0.02  # 2% of hull size - more generous for tet meshes
     
-    if part_mesh is not None:
-        # Compare distances to hull vs part
-        _, part_distances, _ = part_mesh.nearest.on_surface(centroids)
+    # Use GPU for large meshes
+    if use_gpu and CUDA_AVAILABLE and n_faces > 5000:
+        hull_distances = _compute_distances_to_mesh_gpu(centroids, hull_mesh)
         
-        # Outer boundary = closer to hull than to part
-        outer_mask = hull_distances < part_distances
-        
-        logger.debug(f"Proximity classification: {np.sum(outer_mask)} outer, {np.sum(~outer_mask)} inner")
+        if part_mesh is not None:
+            part_distances = _compute_distances_to_mesh_gpu(centroids, part_mesh)
+            outer_mask = hull_distances < part_distances
+            logger.debug(f"GPU proximity classification: {np.sum(outer_mask)} outer, {np.sum(~outer_mask)} inner")
+        else:
+            outer_mask = hull_distances < tolerance
+            logger.debug(f"GPU threshold classification (tol={tolerance:.4f}): {np.sum(outer_mask)} outer, {np.sum(~outer_mask)} inner")
     else:
-        # Use threshold-based classification
-        outer_mask = hull_distances < tolerance
+        # CPU path using trimesh
+        _, hull_distances, _ = hull_mesh.nearest.on_surface(centroids)
         
-        logger.debug(f"Threshold classification (tol={tolerance:.4f}): {np.sum(outer_mask)} outer, {np.sum(~outer_mask)} inner")
+        if part_mesh is not None:
+            _, part_distances, _ = part_mesh.nearest.on_surface(centroids)
+            outer_mask = hull_distances < part_distances
+            logger.debug(f"Proximity classification: {np.sum(outer_mask)} outer, {np.sum(~outer_mask)} inner")
+        else:
+            outer_mask = hull_distances < tolerance
+            logger.debug(f"Threshold classification (tol={tolerance:.4f}): {np.sum(outer_mask)} outer, {np.sum(~outer_mask)} inner")
     
     outer_triangles = set(np.where(outer_mask)[0])
     return outer_triangles
+
+
+def _compute_distances_to_mesh_gpu(
+    query_points: np.ndarray,
+    target_mesh: trimesh.Trimesh,
+    batch_size: int = 50000
+) -> np.ndarray:
+    """
+    GPU-accelerated distance computation from points to mesh surface.
+    
+    Uses PyTorch CUDA to compute point-to-triangle distances in parallel.
+    
+    Args:
+        query_points: (N, 3) points to query
+        target_mesh: Target mesh to compute distance to
+        batch_size: Points per GPU batch
+    
+    Returns:
+        (N,) array of unsigned distances to mesh surface
+    """
+    import torch
+    
+    device = torch.device('cuda')
+    n_points = len(query_points)
+    n_faces = len(target_mesh.faces)
+    
+    logger.debug(f"GPU: Computing distances for {n_points} points to {n_faces} triangles")
+    
+    # Get mesh data on GPU
+    vertices = torch.tensor(target_mesh.vertices, dtype=torch.float32, device=device)
+    faces = torch.tensor(target_mesh.faces, dtype=torch.int64, device=device)
+    
+    # Pre-compute triangle vertices
+    v0 = vertices[faces[:, 0]]  # (F, 3)
+    v1 = vertices[faces[:, 1]]  # (F, 3)
+    v2 = vertices[faces[:, 2]]  # (F, 3)
+    
+    # Pre-compute triangle edge data
+    edge0 = v1 - v0  # (F, 3)
+    edge1 = v2 - v0  # (F, 3)
+    dot00 = (edge0 * edge0).sum(dim=-1)  # (F,)
+    dot01 = (edge0 * edge1).sum(dim=-1)  # (F,)
+    dot11 = (edge1 * edge1).sum(dim=-1)  # (F,)
+    inv_denom = 1.0 / (dot00 * dot11 - dot01 * dot01 + 1e-10)  # (F,)
+    
+    # Adjust batch size based on triangle count
+    max_pairs = 150_000_000
+    adaptive_batch = max(100, min(batch_size, max_pairs // n_faces))
+    
+    all_distances = torch.zeros(n_points, dtype=torch.float32, device=device)
+    
+    for start_idx in range(0, n_points, adaptive_batch):
+        end_idx = min(start_idx + adaptive_batch, n_points)
+        batch_points = torch.tensor(
+            query_points[start_idx:end_idx], 
+            dtype=torch.float32, 
+            device=device
+        )  # (B, 3)
+        
+        # Compute distances
+        batch_distances = _point_to_triangles_distance_gpu(
+            batch_points, v0, edge0, edge1, dot00, dot01, dot11, inv_denom
+        )
+        
+        all_distances[start_idx:end_idx] = batch_distances
+        
+        if (start_idx // adaptive_batch) % 10 == 0:
+            torch.cuda.empty_cache()
+    
+    result = all_distances.cpu().numpy().astype(np.float64)
+    torch.cuda.empty_cache()
+    return result
+
+
+def _point_to_triangles_distance_gpu(
+    points: 'torch.Tensor',
+    v0: 'torch.Tensor',
+    edge0: 'torch.Tensor',
+    edge1: 'torch.Tensor',
+    dot00: 'torch.Tensor',
+    dot01: 'torch.Tensor',
+    dot11: 'torch.Tensor',
+    inv_denom: 'torch.Tensor'
+) -> 'torch.Tensor':
+    """
+    Compute minimum distance from each point to any triangle (GPU).
+    
+    Args:
+        points: (B, 3) query points
+        v0: (F, 3) first vertex of each triangle
+        edge0, edge1: (F, 3) triangle edges
+        dot00, dot01, dot11, inv_denom: (F,) pre-computed values
+    
+    Returns:
+        (B,) minimum distance for each point
+    """
+    # Expand for broadcasting: points (B, 1, 3), triangles (1, F, 3)
+    p = points.unsqueeze(1)  # (B, 1, 3)
+    
+    # Vector from v0 to point
+    v0_to_p = p - v0.unsqueeze(0)  # (B, F, 3)
+    
+    # Compute dot products for barycentric coordinates
+    dot02 = (v0_to_p * edge0.unsqueeze(0)).sum(dim=-1)  # (B, F)
+    dot12 = (v0_to_p * edge1.unsqueeze(0)).sum(dim=-1)  # (B, F)
+    
+    # Barycentric coordinates
+    u = (dot11 * dot02 - dot01 * dot12) * inv_denom  # (B, F)
+    v = (dot00 * dot12 - dot01 * dot02) * inv_denom  # (B, F)
+    
+    # Clamp to triangle
+    import torch
+    u_clamped = torch.clamp(u, 0, 1)
+    v_clamped = torch.clamp(v, 0, 1)
+    
+    # Ensure u + v <= 1
+    uv_sum = u_clamped + v_clamped
+    scale = torch.where(uv_sum > 1, 1.0 / uv_sum, torch.ones_like(uv_sum))
+    u_final = u_clamped * scale
+    v_final = v_clamped * scale
+    
+    # Compute squared distance directly
+    diff = v0_to_p - u_final.unsqueeze(-1) * edge0.unsqueeze(0) - v_final.unsqueeze(-1) * edge1.unsqueeze(0)
+    dist_sq = (diff * diff).sum(dim=-1)  # (B, F)
+    
+    # Minimum distance across all triangles
+    min_dist = torch.sqrt(dist_sq.min(dim=1).values)  # (B,)
+    
+    return min_dist
 
 
 def classify_and_smooth(
