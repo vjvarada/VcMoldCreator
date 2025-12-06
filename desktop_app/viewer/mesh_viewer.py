@@ -1962,37 +1962,85 @@ class MeshViewer(QWidget):
         # Clear existing R visualization
         self.clear_r_distance_line()
         
-        # Create line between points
-        line = pv.Line(hull_point, part_point)
+        # Create a tube (cylinder) between points for better visibility
+        # Using a tube instead of line for cell/toon shading compatibility
+        direction = part_point - hull_point
+        length = np.linalg.norm(direction)
         
-        # Add the line - thick red line
-        self._r_line_actor = self.plotter.add_mesh(
-            line,
-            color='red',
-            line_width=4.0,
-            opacity=1.0,
-            render_lines_as_tubes=True,
+        # Tube radius proportional to R for consistent appearance
+        tube_radius = r_value * 0.015
+        
+        # Create tube mesh
+        tube = pv.Tube(
+            pointa=hull_point,
+            pointb=part_point,
+            resolution=16,
+            radius=tube_radius,
         )
         
-        # Create spheres at endpoints
-        # Hull point sphere (red)
-        hull_sphere = pv.Sphere(radius=r_value * 0.03, center=hull_point)
+        # Add the tube with cell/toon shading style
+        self._r_line_actor = self.plotter.add_mesh(
+            tube,
+            color='#ff3333',  # Bright red
+            opacity=1.0,
+            smooth_shading=False,  # Flat shading for cell/toon look
+            show_edges=False,
+            ambient=0.4,
+            diffuse=0.6,
+            specular=0.0,
+        )
+        # Set flat interpolation for cell shading effect
+        if self._r_line_actor is not None:
+            prop = self._r_line_actor.GetProperty()
+            if prop:
+                prop.SetInterpolationToFlat()
+                prop.SetEdgeVisibility(True)
+                prop.SetEdgeColor(0.6, 0.0, 0.0)  # Darker red edge
+                prop.SetLineWidth(1.5)
+        
+        # Create spheres at endpoints with cell/toon shading
+        sphere_radius = r_value * 0.025
+        
+        # Boundary point sphere (bright red)
+        hull_sphere = pv.Sphere(radius=sphere_radius, center=hull_point, theta_resolution=16, phi_resolution=16)
         hull_actor = self.plotter.add_mesh(
             hull_sphere,
-            color='red',
+            color='#ff3333',  # Bright red
             opacity=1.0,
-            smooth_shading=True,
+            smooth_shading=False,  # Flat shading for cell/toon look
+            show_edges=False,
+            ambient=0.4,
+            diffuse=0.6,
+            specular=0.0,
         )
+        if hull_actor is not None:
+            prop = hull_actor.GetProperty()
+            if prop:
+                prop.SetInterpolationToFlat()
+                prop.SetEdgeVisibility(True)
+                prop.SetEdgeColor(0.6, 0.0, 0.0)
+                prop.SetLineWidth(1.0)
         self._r_point_actors.append(hull_actor)
         
         # Part point sphere (darker red)
-        part_sphere = pv.Sphere(radius=r_value * 0.03, center=part_point)
+        part_sphere = pv.Sphere(radius=sphere_radius, center=part_point, theta_resolution=16, phi_resolution=16)
         part_actor = self.plotter.add_mesh(
             part_sphere,
-            color='darkred',
+            color='#cc0000',  # Darker red
             opacity=1.0,
-            smooth_shading=True,
+            smooth_shading=False,  # Flat shading for cell/toon look
+            show_edges=False,
+            ambient=0.4,
+            diffuse=0.6,
+            specular=0.0,
         )
+        if part_actor is not None:
+            prop = part_actor.GetProperty()
+            if prop:
+                prop.SetInterpolationToFlat()
+                prop.SetEdgeVisibility(True)
+                prop.SetEdgeColor(0.4, 0.0, 0.0)
+                prop.SetLineWidth(1.0)
         self._r_point_actors.append(part_actor)
         
         # Add label at midpoint

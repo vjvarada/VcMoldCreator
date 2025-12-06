@@ -866,8 +866,8 @@ class MoldHalvesWorker(QThread):
 class TetrahedralizeWorker(QThread):
     """Background worker for generating tetrahedral mesh of mold volume.
     
-    Runs pytetwild directly in a QThread. The QThread keeps the UI
-    responsive by running in a separate OS thread.
+    Runs pytetwild in a separate PROCESS to avoid GIL blocking.
+    This keeps the UI responsive during the long computation.
     """
     
     progress = pyqtSignal(str)
@@ -889,17 +889,23 @@ class TetrahedralizeWorker(QThread):
             optimize: Whether to optimize tet quality
         """
         super().__init__()
-        self.cavity_mesh = cavity_mesh
+        # Store mesh data (not the mesh object - can't pickle trimesh easily)
+        self.vertices = np.asarray(cavity_mesh.vertices, dtype=np.float64)
+        self.faces = np.asarray(cavity_mesh.faces, dtype=np.int32)
         self.edge_length_fac = edge_length_fac
         self.optimize = optimize
         self._cancelled = False
+        self._process = None
     
     def cancel(self):
         """Request cancellation of the operation."""
         self._cancelled = True
+        if self._process is not None and self._process.is_alive():
+            self._process.terminate()
     
     def run(self):
         import time
+        import multiprocessing as mp
         from core.tetrahedral_mesh import extract_edges, compute_edge_lengths, extract_boundary_surface, TetrahedralMeshResult
         
         try:
@@ -910,22 +916,42 @@ class TetrahedralizeWorker(QThread):
             logger.info("Generating tetrahedral mesh...")
             self.progress.emit("Starting tetrahedralization...")
             
-            # Get mesh data
-            vertices = np.asarray(self.cavity_mesh.vertices, dtype=np.float64)
-            faces = np.asarray(self.cavity_mesh.faces, dtype=np.int32)
-            
             start_time = time.time()
             
-            self.progress.emit(f"Tetrahedralizing {len(vertices)} vertices, {len(faces)} faces...")
+            self.progress.emit(f"Tetrahedralizing {len(self.vertices)} vertices, {len(self.faces)} faces...")
             
-            # Run tetrahedralization directly (QThread keeps UI responsive)
-            import pytetwild
-            tet_vertices, tetrahedra = pytetwild.tetrahedralize(
-                vertices, faces,
-                optimize=self.optimize,
-                edge_length_fac=self.edge_length_fac
+            # Run tetrahedralization in a separate process to avoid GIL blocking
+            # Use spawn context for Windows compatibility
+            ctx = mp.get_context('spawn')
+            result_queue = ctx.Queue()
+            
+            self._process = ctx.Process(
+                target=_run_tetrahedralize_subprocess,
+                args=(self.vertices, self.faces, self.edge_length_fac, self.optimize, result_queue)
             )
+            self._process.start()
             
+            # Poll for completion while keeping UI responsive
+            while self._process.is_alive():
+                self._process.join(timeout=0.1)  # Check every 100ms
+                if self._cancelled:
+                    self._process.terminate()
+                    self.error.emit("Cancelled by user")
+                    return
+            
+            # Get result from queue
+            if result_queue.empty():
+                self.error.emit("Tetrahedralization process failed - no result returned")
+                return
+            
+            proc_result = result_queue.get()
+            
+            if 'error' in proc_result:
+                self.error.emit(proc_result['error'])
+                return
+            
+            tet_vertices = proc_result['vertices']
+            tetrahedra = proc_result['tetrahedra']
             tet_time = (time.time() - start_time) * 1000
             
             if self._cancelled:
@@ -966,6 +992,30 @@ class TetrahedralizeWorker(QThread):
         except Exception as e:
             logger.exception(f"Error generating tetrahedral mesh: {e}")
             self.error.emit(str(e))
+
+
+def _run_tetrahedralize_subprocess(vertices, faces, edge_length_fac, optimize, result_queue):
+    """
+    Subprocess function to run pytetwild tetrahedralization.
+    
+    This runs in a separate process to avoid blocking the UI due to GIL.
+    """
+    try:
+        import pytetwild
+        import numpy as np
+        
+        tet_vertices, tetrahedra = pytetwild.tetrahedralize(
+            vertices, faces,
+            optimize=optimize,
+            edge_length_fac=edge_length_fac
+        )
+        
+        result_queue.put({
+            'vertices': np.asarray(tet_vertices),
+            'tetrahedra': np.asarray(tetrahedra)
+        })
+    except Exception as e:
+        result_queue.put({'error': str(e)})
 
 
 class EdgeWeightsWorker(QThread):
@@ -2185,7 +2235,8 @@ class MainWindow(QMainWindow):
     def _create_context_panel(self) -> QWidget:
         """Create the context/options panel (middle column)."""
         panel = QFrame()
-        panel.setFixedWidth(280)
+        panel.setMinimumWidth(300)
+        panel.setMaximumWidth(360)
         panel.setStyleSheet(f"""
             QFrame {{
                 background-color: {Colors.WHITE};
@@ -3826,13 +3877,47 @@ class MainWindow(QMainWindow):
         # Optimization checkbox
         self.tet_optimize_checkbox = QCheckBox("Optimize mesh quality (slower but better)")
         self.tet_optimize_checkbox.setChecked(self._tet_optimize)
-        self.tet_optimize_checkbox.stateChanged.connect(
-            lambda state: setattr(self, '_tet_optimize', state == Qt.CheckState.Checked.value)
-        )
+        self.tet_optimize_checkbox.stateChanged.connect(self._on_tet_optimize_changed)
         self.tet_optimize_checkbox.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
         settings_layout.addWidget(self.tet_optimize_checkbox)
         
         self.context_layout.addWidget(settings_group)
+        
+        # Complexity estimate group
+        estimate_group = QGroupBox("Estimated Complexity")
+        estimate_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        estimate_layout = QVBoxLayout(estimate_group)
+        
+        # Complexity info label
+        self.tet_complexity_label = QLabel()
+        self.tet_complexity_label.setWordWrap(True)
+        self.tet_complexity_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        estimate_layout.addWidget(self.tet_complexity_label)
+        
+        # Estimated time label
+        self.tet_time_estimate_label = QLabel()
+        self.tet_time_estimate_label.setStyleSheet(f'color: {Colors.INFO}; font-size: 12px; font-weight: 500;')
+        estimate_layout.addWidget(self.tet_time_estimate_label)
+        
+        self.context_layout.addWidget(estimate_group)
+        
+        # Update estimate based on current settings
+        self._update_tet_estimate()
         
         # Generate button
         self.tet_generate_btn = QPushButton("🔷 Generate Tetrahedral Mesh")
@@ -3899,6 +3984,99 @@ class MainWindow(QMainWindow):
                 self.tet_edge_label.setText(f"Edge length: {self._tet_edge_length_fac:.2f} × bbox diagonal")
             except RuntimeError:
                 pass
+        # Update estimate when edge length changes
+        self._update_tet_estimate()
+    
+    def _on_tet_optimize_changed(self, state: int):
+        """Handle tet optimize checkbox change."""
+        self._tet_optimize = state == Qt.CheckState.Checked.value
+        # Update estimate when optimize setting changes
+        self._update_tet_estimate()
+    
+    def _update_tet_estimate(self):
+        """Update the estimated time and complexity display for tetrahedralization."""
+        if not hasattr(self, 'tet_complexity_label') or self.tet_complexity_label is None:
+            return
+        if self._cavity_result is None:
+            return
+        
+        try:
+            cavity_mesh = self._cavity_result.mesh
+            n_verts = len(cavity_mesh.vertices)
+            n_faces = len(cavity_mesh.faces)
+            
+            # Calculate bounding box diagonal
+            bounds = cavity_mesh.bounds
+            bbox_diag = np.linalg.norm(bounds[1] - bounds[0])
+            
+            # Estimate target edge length
+            target_edge = bbox_diag * self._tet_edge_length_fac
+            
+            # Estimate mesh volume (approximate)
+            volume = cavity_mesh.volume if cavity_mesh.is_watertight else bbox_diag ** 3 * 0.1
+            
+            # Estimate number of tetrahedra based on volume and edge length
+            # Rough formula: n_tets ≈ volume / (edge^3 * 0.1)
+            # Each tet has volume ≈ edge^3 / 6
+            est_tet_volume = (target_edge ** 3) / 6.0
+            est_n_tets = max(100, int(abs(volume) / est_tet_volume))
+            
+            # Estimate vertices (roughly n_tets^(1/3) * factor)
+            est_n_verts = max(100, int(est_n_tets ** 0.4 * 10))
+            
+            # Cap estimates at reasonable bounds
+            est_n_tets = min(est_n_tets, 10_000_000)
+            est_n_verts = min(est_n_verts, 1_000_000)
+            
+            # Estimate time based on complexity
+            # Base time roughly proportional to input faces * output tets
+            complexity_factor = (n_faces * est_n_tets) / 1_000_000
+            
+            # Base time in seconds (empirically calibrated - increased 10x based on real measurements)
+            # fTetWild is CPU-intensive: small meshes ~10-50 sec, medium ~1-5 min, large: 5-30 min
+            base_time_sec = 5.0 + complexity_factor * 0.1
+            
+            # Add time based on input mesh complexity
+            input_complexity = n_faces / 10000.0
+            base_time_sec += input_complexity * 2.0
+            
+            # Optimization adds ~80% more time (mesh quality improvement is expensive)
+            if self._tet_optimize:
+                base_time_sec *= 1.8
+            
+            # Format time estimate
+            if base_time_sec < 60:
+                time_str = f"~{base_time_sec:.0f} seconds"
+            elif base_time_sec < 300:
+                time_str = f"~{base_time_sec/60:.1f} minutes"
+            else:
+                time_str = f"~{base_time_sec/60:.0f} minutes"
+            
+            # Determine complexity level for color coding (adjusted thresholds)
+            if base_time_sec < 30:
+                complexity_level = "Low"
+                time_color = Colors.SUCCESS
+            elif base_time_sec < 120:
+                complexity_level = "Medium"
+                time_color = Colors.WARNING
+            else:
+                complexity_level = "High"
+                time_color = Colors.DANGER
+            
+            # Update labels
+            self.tet_complexity_label.setText(
+                f"Input: {n_verts:,} vertices, {n_faces:,} faces\n"
+                f"Target edge: {target_edge:.3f} units\n"
+                f"Est. output: ~{est_n_tets:,} tetrahedra"
+            )
+            
+            self.tet_time_estimate_label.setText(f"⏱️ Estimated time: {time_str} ({complexity_level} complexity)")
+            self.tet_time_estimate_label.setStyleSheet(f'color: {time_color}; font-size: 12px; font-weight: 500;')
+            
+        except Exception as e:
+            logger.debug(f"Error updating tet estimate: {e}")
+            self.tet_complexity_label.setText("Unable to estimate complexity")
+            self.tet_time_estimate_label.setText("")
     
     def _update_tet_step_ui(self):
         """Update tetrahedralize step UI based on current state."""
@@ -3963,6 +4141,10 @@ class MainWindow(QMainWindow):
     
     def _on_tet_complete(self, result: TetrahedralMeshResult):
         """Handle tetrahedralize complete."""
+        logger.info(f"_on_tet_complete called with result: {type(result)}")
+        logger.info(f"  vertices shape: {result.vertices.shape if result.vertices is not None else 'None'}")
+        logger.info(f"  edges shape: {result.edges.shape if result.edges is not None else 'None'}")
+        
         self._tet_result = result
         
         # Update UI
@@ -3973,13 +4155,19 @@ class MainWindow(QMainWindow):
                 pass
         
         # Visualize tetrahedral mesh edges (no weights yet - just solid color)
-        self.mesh_viewer.set_tetrahedral_mesh(
-            result.vertices,
-            result.edges
-        )
+        logger.info("Calling mesh_viewer.set_tetrahedral_mesh...")
+        try:
+            self.mesh_viewer.set_tetrahedral_mesh(
+                result.vertices,
+                result.edges
+            )
+            logger.info("mesh_viewer.set_tetrahedral_mesh completed")
+        except Exception as e:
+            logger.exception(f"Error setting tetrahedral mesh: {e}")
         
         # Also set the boundary mesh as the cavity for visualization
         if result.boundary_mesh is not None:
+            logger.info(f"Setting boundary mesh with {len(result.boundary_mesh.faces)} faces")
             self.mesh_viewer.set_cavity_mesh(result.boundary_mesh)
         
         # Show tet mesh display option
