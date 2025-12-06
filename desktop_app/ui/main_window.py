@@ -863,11 +863,27 @@ class MoldHalvesWorker(QThread):
             self.error.emit(str(e))
 
 
+def _run_tetrahedralization_subprocess(vertices, faces, edge_length_fac, optimize):
+    """
+    Run tetrahedralization in a subprocess to avoid GIL blocking.
+    
+    This function is called in a separate process via multiprocessing.
+    Returns tuple of (tet_vertices, tetrahedra) or raises exception.
+    """
+    import pytetwild
+    tet_vertices, tetrahedra = pytetwild.tetrahedralize(
+        vertices, faces,
+        optimize=optimize,
+        edge_length_fac=edge_length_fac
+    )
+    return tet_vertices, tetrahedra
+
+
 class TetrahedralizeWorker(QThread):
     """Background worker for generating tetrahedral mesh of mold volume.
     
-    Runs pytetwild in a separate PROCESS to avoid GIL blocking.
-    This keeps the UI responsive during the long computation.
+    Runs pytetwild in a separate PROCESS (not just thread) to avoid GIL blocking.
+    This keeps the UI fully responsive during tetrahedralization.
     """
     
     progress = pyqtSignal(str)
@@ -889,9 +905,7 @@ class TetrahedralizeWorker(QThread):
             optimize: Whether to optimize tet quality
         """
         super().__init__()
-        # Store mesh data (not the mesh object - can't pickle trimesh easily)
-        self.vertices = np.asarray(cavity_mesh.vertices, dtype=np.float64)
-        self.faces = np.asarray(cavity_mesh.faces, dtype=np.int32)
+        self.cavity_mesh = cavity_mesh
         self.edge_length_fac = edge_length_fac
         self.optimize = optimize
         self._cancelled = False
@@ -906,6 +920,7 @@ class TetrahedralizeWorker(QThread):
     def run(self):
         import time
         import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError
         from core.tetrahedral_mesh import extract_edges, compute_edge_lengths, extract_boundary_surface, TetrahedralMeshResult
         
         try:
@@ -913,45 +928,45 @@ class TetrahedralizeWorker(QThread):
                 self.error.emit("pytetwild is not installed. Install with: pip install pytetwild")
                 return
             
-            logger.info("Generating tetrahedral mesh...")
-            self.progress.emit("Starting tetrahedralization...")
+            logger.info("Generating tetrahedral mesh in subprocess...")
+            self.progress.emit("Starting tetrahedralization (subprocess)...")
+            
+            # Get mesh data as numpy arrays
+            vertices = np.asarray(self.cavity_mesh.vertices, dtype=np.float64)
+            faces = np.asarray(self.cavity_mesh.faces, dtype=np.int32)
             
             start_time = time.time()
             
-            self.progress.emit(f"Tetrahedralizing {len(self.vertices)} vertices, {len(self.faces)} faces...")
+            self.progress.emit(f"Tetrahedralizing {len(vertices)} vertices, {len(faces)} faces...")
             
             # Run tetrahedralization in a separate process to avoid GIL blocking
-            # Use spawn context for Windows compatibility
+            # Use spawn context to ensure clean process on Windows
             ctx = mp.get_context('spawn')
-            result_queue = ctx.Queue()
             
-            self._process = ctx.Process(
-                target=_run_tetrahedralize_subprocess,
-                args=(self.vertices, self.faces, self.edge_length_fac, self.optimize, result_queue)
-            )
-            self._process.start()
+            with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
+                future = executor.submit(
+                    _run_tetrahedralization_subprocess,
+                    vertices, faces,
+                    self.edge_length_fac, self.optimize
+                )
+                
+                # Poll for completion while checking for cancellation
+                while not future.done():
+                    if self._cancelled:
+                        future.cancel()
+                        self.error.emit("Cancelled by user")
+                        return
+                    
+                    # Update progress with elapsed time
+                    elapsed = time.time() - start_time
+                    self.progress.emit(f"Tetrahedralizing... ({elapsed:.1f}s elapsed)")
+                    
+                    # Sleep briefly to allow UI updates
+                    time.sleep(0.5)
+                
+                # Get result
+                tet_vertices, tetrahedra = future.result()
             
-            # Poll for completion while keeping UI responsive
-            while self._process.is_alive():
-                self._process.join(timeout=0.1)  # Check every 100ms
-                if self._cancelled:
-                    self._process.terminate()
-                    self.error.emit("Cancelled by user")
-                    return
-            
-            # Get result from queue
-            if result_queue.empty():
-                self.error.emit("Tetrahedralization process failed - no result returned")
-                return
-            
-            proc_result = result_queue.get()
-            
-            if 'error' in proc_result:
-                self.error.emit(proc_result['error'])
-                return
-            
-            tet_vertices = proc_result['vertices']
-            tetrahedra = proc_result['tetrahedra']
             tet_time = (time.time() - start_time) * 1000
             
             if self._cancelled:
@@ -960,7 +975,7 @@ class TetrahedralizeWorker(QThread):
             
             self.progress.emit("Extracting edges...")
             
-            # Extract edges
+            # Extract edges (this is fast, can run in thread)
             edges = extract_edges(tetrahedra)
             edge_lengths = compute_edge_lengths(tet_vertices, edges)
             
@@ -992,30 +1007,6 @@ class TetrahedralizeWorker(QThread):
         except Exception as e:
             logger.exception(f"Error generating tetrahedral mesh: {e}")
             self.error.emit(str(e))
-
-
-def _run_tetrahedralize_subprocess(vertices, faces, edge_length_fac, optimize, result_queue):
-    """
-    Subprocess function to run pytetwild tetrahedralization.
-    
-    This runs in a separate process to avoid blocking the UI due to GIL.
-    """
-    try:
-        import pytetwild
-        import numpy as np
-        
-        tet_vertices, tetrahedra = pytetwild.tetrahedralize(
-            vertices, faces,
-            optimize=optimize,
-            edge_length_fac=edge_length_fac
-        )
-        
-        result_queue.put({
-            'vertices': np.asarray(tet_vertices),
-            'tetrahedra': np.asarray(tetrahedra)
-        })
-    except Exception as e:
-        result_queue.put({'error': str(e)})
 
 
 class EdgeWeightsWorker(QThread):
@@ -2235,8 +2226,7 @@ class MainWindow(QMainWindow):
     def _create_context_panel(self) -> QWidget:
         """Create the context/options panel (middle column)."""
         panel = QFrame()
-        panel.setMinimumWidth(300)
-        panel.setMaximumWidth(360)
+        panel.setFixedWidth(280)
         panel.setStyleSheet(f"""
             QFrame {{
                 background-color: {Colors.WHITE};
@@ -4032,17 +4022,13 @@ class MainWindow(QMainWindow):
             # Base time roughly proportional to input faces * output tets
             complexity_factor = (n_faces * est_n_tets) / 1_000_000
             
-            # Base time in seconds (empirically calibrated - increased 10x based on real measurements)
-            # fTetWild is CPU-intensive: small meshes ~10-50 sec, medium ~1-5 min, large: 5-30 min
-            base_time_sec = 5.0 + complexity_factor * 0.1
+            # Base time in seconds (empirically calibrated)
+            # Small meshes: ~5-30 sec, medium: ~2-8 min, large: 15-60+ min
+            base_time_sec = 7.5 + complexity_factor * 0.15
             
-            # Add time based on input mesh complexity
-            input_complexity = n_faces / 10000.0
-            base_time_sec += input_complexity * 2.0
-            
-            # Optimization adds ~80% more time (mesh quality improvement is expensive)
+            # Optimization adds ~50% more time
             if self._tet_optimize:
-                base_time_sec *= 1.8
+                base_time_sec *= 1.5
             
             # Format time estimate
             if base_time_sec < 60:
@@ -4052,11 +4038,11 @@ class MainWindow(QMainWindow):
             else:
                 time_str = f"~{base_time_sec/60:.0f} minutes"
             
-            # Determine complexity level for color coding (adjusted thresholds)
-            if base_time_sec < 30:
+            # Determine complexity level for color coding
+            if base_time_sec < 10:
                 complexity_level = "Low"
                 time_color = Colors.SUCCESS
-            elif base_time_sec < 120:
+            elif base_time_sec < 60:
                 complexity_level = "Medium"
                 time_color = Colors.WARNING
             else:
@@ -4141,10 +4127,6 @@ class MainWindow(QMainWindow):
     
     def _on_tet_complete(self, result: TetrahedralMeshResult):
         """Handle tetrahedralize complete."""
-        logger.info(f"_on_tet_complete called with result: {type(result)}")
-        logger.info(f"  vertices shape: {result.vertices.shape if result.vertices is not None else 'None'}")
-        logger.info(f"  edges shape: {result.edges.shape if result.edges is not None else 'None'}")
-        
         self._tet_result = result
         
         # Update UI
@@ -4155,19 +4137,13 @@ class MainWindow(QMainWindow):
                 pass
         
         # Visualize tetrahedral mesh edges (no weights yet - just solid color)
-        logger.info("Calling mesh_viewer.set_tetrahedral_mesh...")
-        try:
-            self.mesh_viewer.set_tetrahedral_mesh(
-                result.vertices,
-                result.edges
-            )
-            logger.info("mesh_viewer.set_tetrahedral_mesh completed")
-        except Exception as e:
-            logger.exception(f"Error setting tetrahedral mesh: {e}")
+        self.mesh_viewer.set_tetrahedral_mesh(
+            result.vertices,
+            result.edges
+        )
         
         # Also set the boundary mesh as the cavity for visualization
         if result.boundary_mesh is not None:
-            logger.info(f"Setting boundary mesh with {len(result.boundary_mesh.faces)} faces")
             self.mesh_viewer.set_cavity_mesh(result.boundary_mesh)
         
         # Show tet mesh display option

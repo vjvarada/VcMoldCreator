@@ -10,6 +10,7 @@ import sys
 import os
 import logging
 import traceback
+import multiprocessing
 
 # Configure logging
 logging.basicConfig(
@@ -92,6 +93,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # Required for Windows multiprocessing support
+    multiprocessing.freeze_support()
     try:
         sys.exit(main())
     except Exception as e:
