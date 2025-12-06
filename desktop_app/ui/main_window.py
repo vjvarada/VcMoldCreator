@@ -47,6 +47,22 @@ from core.inflated_hull import (
     InflatedHullResult,
     ManifoldValidation,
 )
+from core.mold_cavity import (
+    create_mold_cavity,
+    MoldCavityResult,
+)
+from core.mold_half_classification import (
+    classify_mold_halves,
+    get_mold_half_face_colors,
+    MoldHalfClassificationResult,
+    MoldHalfColors,
+)
+from core.tetrahedral_mesh import (
+    generate_tetrahedral_mesh,
+    compute_edge_costs,
+    TetrahedralMeshResult,
+    PYTETWILD_AVAILABLE,
+)
 from viewer import MeshViewer
 
 logger = logging.getLogger(__name__)
@@ -60,10 +76,11 @@ class Step(Enum):
     IMPORT = 'import'
     PARTING = 'parting'
     HULL = 'hull'
+    CAVITY = 'cavity'
+    TETRAHEDRALIZE = 'tetrahedralize'  # Now comes before mold halves
+    MOLD_HALVES = 'mold-halves'        # Now operates on tet boundary
+    EDGE_WEIGHTS = 'edge-weights'
     # Future steps will be added here as we implement more features
-    # CAVITY = 'cavity'
-    # MOLD_HALVES = 'mold-halves'
-    # VOXEL = 'voxel'
     # PARTING_SURFACE = 'parting-surface'
 
 
@@ -71,6 +88,10 @@ STEPS = [
     {'id': Step.IMPORT, 'icon': '📁', 'title': 'Import STL', 'description': 'Load a 3D model file in STL format for mold analysis'},
     {'id': Step.PARTING, 'icon': '🔀', 'title': 'Parting Direction', 'description': 'Compute optimal parting directions for mold separation'},
     {'id': Step.HULL, 'icon': '📦', 'title': 'Bounding Hull', 'description': 'Generate inflated convex hull for mold cavity creation'},
+    {'id': Step.CAVITY, 'icon': '🕳️', 'title': 'Mold Cavity', 'description': 'Create mold cavity by subtracting the original mesh from the hull'},
+    {'id': Step.TETRAHEDRALIZE, 'icon': '🔷', 'title': 'Tetrahedralize', 'description': 'Generate tetrahedral mesh of mold cavity volume'},
+    {'id': Step.MOLD_HALVES, 'icon': '🎨', 'title': 'Mold Halves', 'description': 'Classify tetrahedral boundary into H₁ and H₂ mold halves'},
+    {'id': Step.EDGE_WEIGHTS, 'icon': '⚖️', 'title': 'Edge Weights', 'description': 'Compute edge weights based on distance to part surface'},
     # Future steps will be added here
 ]
 
@@ -735,6 +756,367 @@ class HullWorker(QThread):
             
         except Exception as e:
             logger.exception(f"Error computing inflated hull: {e}")
+            self.error.emit(str(e))
+
+
+class CavityWorker(QThread):
+    """Background worker for computing mold cavity (CSG subtraction)."""
+    
+    progress = pyqtSignal(str)
+    complete = pyqtSignal(object)  # MoldCavityResult
+    error = pyqtSignal(str)
+    
+    def __init__(self, hull_mesh, original_mesh):
+        """
+        Initialize cavity worker.
+        
+        Args:
+            hull_mesh: The inflated hull mesh
+            original_mesh: The original mesh to subtract from hull
+        """
+        super().__init__()
+        self.hull_mesh = hull_mesh
+        self.original_mesh = original_mesh
+    
+    def run(self):
+        try:
+            logger.info("Computing mold cavity (CSG subtraction)...")
+            self.progress.emit("Performing CSG subtraction (hull - original)...")
+            
+            result = create_mold_cavity(
+                self.hull_mesh,
+                self.original_mesh
+            )
+            
+            if result.success:
+                self.progress.emit(f"Cavity created: {result.validation.vertex_count} vertices, {result.validation.face_count} faces")
+                self.complete.emit(result)
+            else:
+                self.error.emit(result.error_message or "CSG subtraction failed")
+            
+        except Exception as e:
+            logger.exception(f"Error computing mold cavity: {e}")
+            self.error.emit(str(e))
+
+
+class MoldHalvesWorker(QThread):
+    """Background worker for classifying mold halves (H₁ and H₂)."""
+    
+    progress = pyqtSignal(str)
+    complete = pyqtSignal(object)  # MoldHalfClassificationResult
+    error = pyqtSignal(str)
+    
+    def __init__(
+        self,
+        cavity_mesh,
+        hull_mesh,
+        d1: np.ndarray,
+        d2: np.ndarray,
+        boundary_zone_threshold: float = 0.15,
+        part_mesh=None,
+        use_proximity_method: bool = False
+    ):
+        """
+        Initialize mold halves classification worker.
+        
+        Args:
+            cavity_mesh: The mold cavity mesh (or tetrahedral boundary mesh)
+            hull_mesh: The hull mesh (used to identify outer boundary)
+            d1: Primary parting direction
+            d2: Secondary parting direction
+            boundary_zone_threshold: Threshold for boundary zone (0-1)
+            part_mesh: Original part mesh (for proximity-based classification)
+            use_proximity_method: Use proximity-based outer boundary detection
+        """
+        super().__init__()
+        self.cavity_mesh = cavity_mesh
+        self.hull_mesh = hull_mesh
+        self.d1 = d1
+        self.d2 = d2
+        self.boundary_zone_threshold = boundary_zone_threshold
+        self.part_mesh = part_mesh
+        self.use_proximity_method = use_proximity_method
+    
+    def run(self):
+        try:
+            logger.info("Classifying mold halves...")
+            self.progress.emit("Analyzing cavity geometry...")
+            
+            result = classify_mold_halves(
+                self.cavity_mesh,
+                self.hull_mesh,
+                self.d1,
+                self.d2,
+                self.boundary_zone_threshold,
+                part_mesh=self.part_mesh,
+                use_proximity_method=self.use_proximity_method
+            )
+            
+            self.progress.emit(
+                f"Classification complete: H₁={len(result.h1_triangles)}, "
+                f"H₂={len(result.h2_triangles)}"
+            )
+            self.complete.emit(result)
+            
+        except Exception as e:
+            logger.exception(f"Error classifying mold halves: {e}")
+            self.error.emit(str(e))
+
+
+class TetrahedralizeWorker(QThread):
+    """Background worker for generating tetrahedral mesh of mold volume.
+    
+    Runs pytetwild directly in a QThread. The QThread keeps the UI
+    responsive by running in a separate OS thread.
+    """
+    
+    progress = pyqtSignal(str)
+    complete = pyqtSignal(object)  # TetrahedralMeshResult
+    error = pyqtSignal(str)
+    
+    def __init__(
+        self, 
+        cavity_mesh, 
+        edge_length_fac: float = 0.05,
+        optimize: bool = True
+    ):
+        """
+        Initialize tetrahedralization worker.
+        
+        Args:
+            cavity_mesh: The mold cavity mesh
+            edge_length_fac: Target edge length as fraction of bbox diagonal
+            optimize: Whether to optimize tet quality
+        """
+        super().__init__()
+        self.cavity_mesh = cavity_mesh
+        self.edge_length_fac = edge_length_fac
+        self.optimize = optimize
+        self._cancelled = False
+    
+    def cancel(self):
+        """Request cancellation of the operation."""
+        self._cancelled = True
+    
+    def run(self):
+        import time
+        from core.tetrahedral_mesh import extract_edges, compute_edge_lengths, extract_boundary_surface, TetrahedralMeshResult
+        
+        try:
+            if not PYTETWILD_AVAILABLE:
+                self.error.emit("pytetwild is not installed. Install with: pip install pytetwild")
+                return
+            
+            logger.info("Generating tetrahedral mesh...")
+            self.progress.emit("Starting tetrahedralization...")
+            
+            # Get mesh data
+            vertices = np.asarray(self.cavity_mesh.vertices, dtype=np.float64)
+            faces = np.asarray(self.cavity_mesh.faces, dtype=np.int32)
+            
+            start_time = time.time()
+            
+            self.progress.emit(f"Tetrahedralizing {len(vertices)} vertices, {len(faces)} faces...")
+            
+            # Run tetrahedralization directly (QThread keeps UI responsive)
+            import pytetwild
+            tet_vertices, tetrahedra = pytetwild.tetrahedralize(
+                vertices, faces,
+                optimize=self.optimize,
+                edge_length_fac=self.edge_length_fac
+            )
+            
+            tet_time = (time.time() - start_time) * 1000
+            
+            if self._cancelled:
+                self.error.emit("Cancelled by user")
+                return
+            
+            self.progress.emit("Extracting edges...")
+            
+            # Extract edges
+            edges = extract_edges(tetrahedra)
+            edge_lengths = compute_edge_lengths(tet_vertices, edges)
+            
+            self.progress.emit("Extracting boundary surface...")
+            
+            # Extract boundary surface from tetrahedral mesh
+            boundary_mesh = extract_boundary_surface(tet_vertices, tetrahedra)
+            
+            # Build result
+            result = TetrahedralMeshResult(
+                vertices=tet_vertices,
+                tetrahedra=tetrahedra,
+                edges=edges,
+                edge_lengths=edge_lengths,
+                boundary_mesh=boundary_mesh,
+                num_vertices=len(tet_vertices),
+                num_tetrahedra=len(tetrahedra),
+                num_edges=len(edges),
+                num_boundary_faces=len(boundary_mesh.faces),
+                tetrahedralize_time_ms=tet_time
+            )
+            
+            self.progress.emit(
+                f"Complete: {result.num_vertices} vertices, "
+                f"{result.num_tetrahedra} tetrahedra, {result.num_edges} edges"
+            )
+            self.complete.emit(result)
+            
+        except Exception as e:
+            logger.exception(f"Error generating tetrahedral mesh: {e}")
+            self.error.emit(str(e))
+
+
+class EdgeWeightsWorker(QThread):
+    """Background worker for computing edge weights based on distance to part surface."""
+    
+    progress = pyqtSignal(str)
+    r_distance_computed = pyqtSignal(object)  # Dict with hull_point, part_point, r_value
+    complete = pyqtSignal(object)  # Updated TetrahedralMeshResult
+    error = pyqtSignal(str)
+    
+    def __init__(
+        self, 
+        tet_result,  # TetrahedralMeshResult from previous step
+        part_mesh,
+        cavity_mesh,
+        hull_mesh,
+        classification_result
+    ):
+        """
+        Initialize edge weights worker.
+        
+        Args:
+            tet_result: TetrahedralMeshResult from tetrahedralization step
+            part_mesh: Original part mesh (for distance computation)
+            cavity_mesh: Cavity mesh (for boundary labeling)
+            hull_mesh: Hull mesh (for boundary labeling)
+            classification_result: Mold half classification result
+        """
+        super().__init__()
+        self.tet_result = tet_result
+        self.part_mesh = part_mesh
+        self.cavity_mesh = cavity_mesh
+        self.hull_mesh = hull_mesh
+        self.classification_result = classification_result
+    
+    def run(self):
+        try:
+            from core.tetrahedral_mesh import (
+                compute_distances_to_mesh,
+                compute_distances_and_closest_points_gpu,
+                identify_boundary_vertices,
+                label_boundary_from_classification,
+                CUDA_AVAILABLE
+            )
+            import time
+            
+            logger.info("Computing edge weights...")
+            start_time = time.time()
+            
+            result = self.tet_result
+            vertices = result.vertices
+            edges = result.edges
+            edge_lengths = result.edge_lengths
+            
+            # Step 1: Compute R - maximum distance from tetrahedral boundary surface to part surface
+            self.progress.emit("Computing R (max boundary-to-part distance)...")
+            
+            # Get vertices from tetrahedral boundary surface
+            boundary_mesh = result.boundary_mesh
+            if boundary_mesh is None:
+                self.error.emit("Tetrahedral boundary mesh not available")
+                return
+            
+            boundary_vertices = np.asarray(boundary_mesh.vertices, dtype=np.float64)
+            logger.info(f"Computing R using {len(boundary_vertices)} boundary vertices")
+            
+            # Compute distances from all boundary vertices to part surface
+            # Use GPU if available for faster computation
+            if CUDA_AVAILABLE:
+                self.progress.emit(f"Computing R using GPU (CUDA) for {len(boundary_vertices)} vertices...")
+                boundary_to_part_distances, closest_points = compute_distances_and_closest_points_gpu(
+                    boundary_vertices, self.part_mesh
+                )
+            else:
+                self.progress.emit(f"Computing R using CPU for {len(boundary_vertices)} vertices...")
+                closest_points, boundary_to_part_distances, _ = self.part_mesh.nearest.on_surface(boundary_vertices)
+            
+            # Find the maximum distance
+            max_idx = np.argmax(boundary_to_part_distances)
+            r_value = float(boundary_to_part_distances[max_idx])
+            boundary_point = boundary_vertices[max_idx].copy()
+            part_point = closest_points[max_idx].copy()
+            
+            r_time = (time.time() - start_time) * 1000
+            logger.info(f"R computed in {r_time:.0f}ms: {r_value:.4f} (max boundary-to-part distance)")
+            logger.info(f"  Boundary point: {boundary_point}")
+            logger.info(f"  Part point: {part_point}")
+            
+            # Emit R distance data for visualization
+            r_data = {
+                'hull_point': boundary_point,  # Keep key name for compatibility
+                'part_point': part_point,
+                'r_value': r_value
+            }
+            self.r_distance_computed.emit(r_data)
+            
+            # Store R in result for later use
+            result.r_value = r_value
+            result.r_hull_point = boundary_point  # Keep attribute name for compatibility
+            result.r_part_point = part_point
+            
+            # For now, stop here as requested - don't process further calculations
+            self.progress.emit(f"R = {r_value:.4f} computed. Further processing paused.")
+            self.complete.emit(result)
+            
+            # NOTE: The following code is temporarily disabled as requested
+            # TODO: Re-enable when ready to continue edge weight calculations
+            '''
+            # Step 2: Identify boundary vertices
+            self.progress.emit("Identifying boundary vertices...")
+            boundary_mask = identify_boundary_vertices(vertices, self.cavity_mesh)
+            result.boundary_vertices = boundary_mask
+            logger.info(f"Found {np.sum(boundary_mask)} boundary vertices out of {len(vertices)}")
+            
+            # Step 3: Compute edge midpoint distances to part mesh
+            self.progress.emit("Computing edge distances to part surface...")
+            edge_midpoints = (vertices[edges[:, 0]] + vertices[edges[:, 1]]) / 2
+            
+            edge_dist_to_part = compute_distances_to_mesh(edge_midpoints, self.part_mesh)
+            result.edge_dist_to_part = edge_dist_to_part
+            
+            # Step 4: Compute edge weights: weight = 1 / (dist^2 + 0.25)
+            self.progress.emit("Computing edge weights...")
+            result.edge_weights = 1.0 / (edge_dist_to_part ** 2 + 0.25)
+            result.weighted_edge_lengths = edge_lengths * result.edge_weights
+            
+            logger.info(f"Edge weights: min={result.edge_weights.min():.4f}, max={result.edge_weights.max():.4f}")
+            
+            # Step 5: Label boundary vertices from classification
+            if self.classification_result is not None:
+                self.progress.emit("Labeling boundary vertices...")
+                result.boundary_labels = label_boundary_from_classification(
+                    vertices,
+                    boundary_mask,
+                    self.cavity_mesh,
+                    self.classification_result,
+                    self.hull_mesh
+                )
+                
+                n_h1 = np.sum(result.boundary_labels == 1)
+                n_h2 = np.sum(result.boundary_labels == 2)
+                n_inner = np.sum(result.boundary_labels == -1)
+                logger.info(f"Boundary labels: H1={n_h1}, H2={n_h2}, inner(seeds)={n_inner}")
+            
+            elapsed = (time.time() - start_time) * 1000
+            self.progress.emit(f"Edge weights computed in {elapsed:.0f}ms")
+            self.complete.emit(result)
+            '''
+            
+        except Exception as e:
+            logger.exception(f"Error computing edge weights: {e}")
             self.error.emit(str(e))
 
 
@@ -1478,6 +1860,9 @@ class DisplayOptionsPanel(QFrame):
     hide_mesh_changed = pyqtSignal(bool)
     hide_parting_changed = pyqtSignal(bool)  # Toggle visibility paint + arrows
     hide_hull_changed = pyqtSignal(bool)  # Toggle bounding hull visibility
+    hide_cavity_changed = pyqtSignal(bool)  # Toggle mold cavity visibility
+    hide_tet_mesh_changed = pyqtSignal(bool)  # Toggle tetrahedral mesh visibility
+    hide_mold_halves_changed = pyqtSignal(bool)  # Toggle mold halves visibility
     
     # Must match MeshViewer.BACKGROUND_COLOR for rounded corners to blend
     VIEWER_BG = "#1a1a1a"  # Matches React frontend BACKGROUND_COLOR
@@ -1562,6 +1947,27 @@ class DisplayOptionsPanel(QFrame):
         self.hide_hull_cb.hide()  # Hidden until hull is computed
         layout.addWidget(self.hide_hull_cb)
         
+        # Hide mold cavity checkbox
+        self.hide_cavity_cb = QCheckBox('Hide Mold Cavity')
+        self.hide_cavity_cb.setChecked(False)  # Not hidden by default (cavity is shown)
+        self.hide_cavity_cb.stateChanged.connect(lambda s: self.hide_cavity_changed.emit(s == Qt.CheckState.Checked.value))
+        self.hide_cavity_cb.hide()  # Hidden until cavity is computed
+        layout.addWidget(self.hide_cavity_cb)
+        
+        # Hide tetrahedral mesh checkbox
+        self.hide_tet_mesh_cb = QCheckBox('Hide Tet Mesh')
+        self.hide_tet_mesh_cb.setChecked(False)  # Not hidden by default (tet mesh is shown)
+        self.hide_tet_mesh_cb.stateChanged.connect(lambda s: self.hide_tet_mesh_changed.emit(s == Qt.CheckState.Checked.value))
+        self.hide_tet_mesh_cb.hide()  # Hidden until tet mesh is computed
+        layout.addWidget(self.hide_tet_mesh_cb)
+        
+        # Hide mold halves checkbox
+        self.hide_mold_halves_cb = QCheckBox('Hide Mold Halves')
+        self.hide_mold_halves_cb.setChecked(False)  # Not hidden by default (mold halves is shown)
+        self.hide_mold_halves_cb.stateChanged.connect(lambda s: self.hide_mold_halves_changed.emit(s == Qt.CheckState.Checked.value))
+        self.hide_mold_halves_cb.hide()  # Hidden until mold halves is computed
+        layout.addWidget(self.hide_mold_halves_cb)
+        
         self.adjustSize()
         self.hide()
     
@@ -1581,6 +1987,33 @@ class DisplayOptionsPanel(QFrame):
             self.hide_hull_cb.setChecked(False)  # Reset to showing hull
         else:
             self.hide_hull_cb.hide()
+        self.adjustSize()
+    
+    def show_cavity_option(self, show: bool = True):
+        """Show or hide the cavity visibility checkbox."""
+        if show:
+            self.hide_cavity_cb.show()
+            self.hide_cavity_cb.setChecked(False)  # Reset to showing cavity
+        else:
+            self.hide_cavity_cb.hide()
+        self.adjustSize()
+    
+    def show_tet_mesh_option(self, show: bool = True):
+        """Show or hide the tetrahedral mesh visibility checkbox."""
+        if show:
+            self.hide_tet_mesh_cb.show()
+            self.hide_tet_mesh_cb.setChecked(False)  # Reset to showing tet mesh
+        else:
+            self.hide_tet_mesh_cb.hide()
+        self.adjustSize()
+    
+    def show_mold_halves_option(self, show: bool = True):
+        """Show or hide the mold halves visibility checkbox."""
+        if show:
+            self.hide_mold_halves_cb.show()
+            self.hide_mold_halves_cb.setChecked(False)  # Reset to showing mold halves
+        else:
+            self.hide_mold_halves_cb.hide()
         self.adjustSize()
 
 
@@ -1609,6 +2042,24 @@ class MainWindow(QMainWindow):
         # Inflated hull state
         self._hull_worker: Optional[HullWorker] = None
         self._hull_result: Optional[InflatedHullResult] = None
+        
+        # Mold cavity state
+        self._cavity_worker: Optional[CavityWorker] = None
+        self._cavity_result: Optional[MoldCavityResult] = None
+        
+        # Mold halves classification state
+        self._mold_halves_worker = None
+        self._mold_halves_result: Optional[MoldHalfClassificationResult] = None
+        self._boundary_zone_threshold: float = 0.15  # Default 15%
+        
+        # Tetrahedral mesh state
+        self._tet_worker = None
+        self._tet_result: Optional[TetrahedralMeshResult] = None
+        self._tet_edge_length_fac: float = 0.05  # Default: bbox/20
+        self._tet_optimize: bool = True
+        
+        # Edge weights state
+        self._edge_weights_worker = None
         
         self._setup_window()
         self._setup_ui()
@@ -1864,6 +2315,9 @@ class MainWindow(QMainWindow):
         self.display_options.hide_mesh_changed.connect(self._on_hide_mesh_changed)
         self.display_options.hide_parting_changed.connect(self._on_hide_parting_changed)
         self.display_options.hide_hull_changed.connect(self._on_hide_hull_changed)
+        self.display_options.hide_cavity_changed.connect(self._on_hide_cavity_changed)
+        self.display_options.hide_tet_mesh_changed.connect(self._on_hide_tet_mesh_changed)
+        self.display_options.hide_mold_halves_changed.connect(self._on_hide_mold_halves_changed)
         
         return wrapper
     
@@ -1908,6 +2362,14 @@ class MainWindow(QMainWindow):
             self._setup_parting_step()
         elif self._active_step == Step.HULL:
             self._setup_hull_step()
+        elif self._active_step == Step.CAVITY:
+            self._setup_cavity_step()
+        elif self._active_step == Step.MOLD_HALVES:
+            self._setup_mold_halves_step()
+        elif self._active_step == Step.TETRAHEDRALIZE:
+            self._setup_tetrahedralize_step()
+        elif self._active_step == Step.EDGE_WEIGHTS:
+            self._setup_edge_weights_step()
         
         self.context_layout.addStretch()
     
@@ -2340,7 +2802,7 @@ class MainWindow(QMainWindow):
         offset_layout.addLayout(input_row)
         
         # Info label showing default calculation
-        info_label = QLabel(f"Default: 20% of bounding box diagonal ({default_offset:.2f})")
+        info_label = QLabel(f"Default: 10% of bounding box diagonal ({default_offset:.2f})")
         info_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 11px; font-style: italic;')
         offset_layout.addWidget(info_label)
         
@@ -2400,41 +2862,6 @@ class MainWindow(QMainWindow):
         self.hull_stats.hide()
         self.context_layout.addWidget(self.hull_stats)
         
-        # Visibility toggles (show after calculation)
-        self.hull_visibility_group = QGroupBox("Display Options")
-        self.hull_visibility_group.setStyleSheet(f"""
-            QGroupBox {{
-                font-size: 13px;
-                font-weight: 500;
-                color: {Colors.DARK};
-                border: 1px solid {Colors.BORDER};
-                border-radius: 6px;
-                margin-top: 10px;
-                padding-top: 10px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-            }}
-        """)
-        vis_layout = QVBoxLayout(self.hull_visibility_group)
-        
-        self.hull_visible_check = QCheckBox("Show Inflated Hull")
-        self.hull_visible_check.setChecked(True)
-        self.hull_visible_check.setStyleSheet(f'color: {Colors.DARK}; font-size: 12px;')
-        self.hull_visible_check.stateChanged.connect(self._on_hull_visibility_changed)
-        vis_layout.addWidget(self.hull_visible_check)
-        
-        self.original_hull_visible_check = QCheckBox("Show Original Hull (wireframe)")
-        self.original_hull_visible_check.setChecked(False)
-        self.original_hull_visible_check.setStyleSheet(f'color: {Colors.DARK}; font-size: 12px;')
-        self.original_hull_visible_check.stateChanged.connect(self._on_original_hull_visibility_changed)
-        vis_layout.addWidget(self.original_hull_visible_check)
-        
-        self.hull_visibility_group.hide()
-        self.context_layout.addWidget(self.hull_visibility_group)
-        
         # Update UI with current state
         self._update_hull_step_ui()
     
@@ -2463,14 +2890,10 @@ class MainWindow(QMainWindow):
             else:
                 self.hull_stats.add_row('Manifold: ⚠️ Open', Colors.WARNING)
             
-            # Show visibility toggles
-            self.hull_visibility_group.show()
-            
             # Update button text
             self.hull_calc_btn.setText("🔄 Regenerate Hull")
         else:
             self.hull_stats.hide()
-            self.hull_visibility_group.hide()
     
     def _on_calculate_hull(self):
         """Start hull computation."""
@@ -2500,45 +2923,65 @@ class MainWindow(QMainWindow):
     
     def _on_hull_progress(self, message: str):
         """Handle hull progress updates."""
-        self.hull_progress_label.setText(message)
+        # Check if widget still exists (user may have navigated away)
+        if hasattr(self, 'hull_progress_label') and self.hull_progress_label is not None:
+            try:
+                self.hull_progress_label.setText(message)
+            except RuntimeError:
+                pass  # Widget was deleted
     
     def _on_hull_complete(self, result: InflatedHullResult):
         """Handle hull computation complete."""
         self._hull_result = result
         
-        # Add hull to viewer
-        self.mesh_viewer.set_hull_mesh(result.mesh, result.original_hull)
+        # Add hull to viewer (no original hull wireframe)
+        self.mesh_viewer.set_hull_mesh(result.mesh, None)
         
-        # Update UI
-        self._update_hull_step_ui()
+        # Update UI only if widgets still exist
+        if hasattr(self, 'hull_stats') and self.hull_stats is not None:
+            try:
+                self._update_hull_step_ui()
+            except RuntimeError:
+                pass  # Widget was deleted
+        
+        # Show hull option in display options panel
+        self.display_options.show_hull_option(True)
         
         # Update step status
         self.step_buttons[Step.HULL].set_status('completed')
+        
+        # Unlock the CAVITY step now that hull is computed
+        if Step.CAVITY in self.step_buttons:
+            self.step_buttons[Step.CAVITY].set_status('available')
         
         logger.info(f"Hull generated: {result.vertex_count} vertices, {result.face_count} faces")
     
     def _on_hull_error(self, message: str):
         """Handle hull computation error."""
-        self.hull_progress_label.setText(f"Error: {message}")
-        self.hull_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+        # Check if widget still exists
+        if hasattr(self, 'hull_progress_label') and self.hull_progress_label is not None:
+            try:
+                self.hull_progress_label.setText(f"Error: {message}")
+                self.hull_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+            except RuntimeError:
+                pass  # Widget was deleted
         QMessageBox.critical(self, "Error", f"Hull generation failed:\n{message}")
     
     def _on_hull_worker_finished(self):
         """Handle hull worker finished."""
-        self.hull_calc_btn.setEnabled(True)
-        self.hull_progress.hide()
+        # Check if widgets still exist
+        if hasattr(self, 'hull_calc_btn') and self.hull_calc_btn is not None:
+            try:
+                self.hull_calc_btn.setEnabled(True)
+            except RuntimeError:
+                pass  # Widget was deleted
+        if hasattr(self, 'hull_progress') and self.hull_progress is not None:
+            try:
+                self.hull_progress.hide()
+            except RuntimeError:
+                pass  # Widget was deleted
         self._hull_worker = None
     
-    def _on_hull_visibility_changed(self, state: int):
-        """Handle hull visibility checkbox change."""
-        visible = state == Qt.CheckState.Checked.value
-        self.mesh_viewer.set_hull_visible(visible)
-    
-    def _on_original_hull_visibility_changed(self, state: int):
-        """Handle original hull visibility checkbox change."""
-        visible = state == Qt.CheckState.Checked.value
-        self.mesh_viewer.set_original_hull_visible(visible)
-
     def _on_step_clicked(self, step: Step):
         """Handle step button click."""
         for s, btn in self.step_buttons.items():
@@ -2552,6 +2995,7 @@ class MainWindow(QMainWindow):
         # Clear mesh viewer
         self.mesh_viewer.clear()
         self.mesh_viewer.clear_hull()
+        self.mesh_viewer.clear_cavity()
         
         # Clear parting results
         self._parting_result = None
@@ -2559,6 +3003,15 @@ class MainWindow(QMainWindow):
         
         # Clear hull results
         self._hull_result = None
+        
+        # Clear cavity results
+        self._cavity_result = None
+        
+        # Clear mold halves results
+        self._mold_halves_result = None
+        
+        # Clear tetrahedral mesh results
+        self._tet_mesh_result = None
         
         # Reset current mesh
         self._current_mesh = None
@@ -2573,6 +3026,14 @@ class MainWindow(QMainWindow):
             self.step_buttons[Step.PARTING].set_status('locked')
         if Step.HULL in self.step_buttons:
             self.step_buttons[Step.HULL].set_status('locked')
+        if Step.CAVITY in self.step_buttons:
+            self.step_buttons[Step.CAVITY].set_status('locked')
+        if Step.MOLD_HALVES in self.step_buttons:
+            self.step_buttons[Step.MOLD_HALVES].set_status('locked')
+        if Step.TETRAHEDRALIZE in self.step_buttons:
+            self.step_buttons[Step.TETRAHEDRALIZE].set_status('locked')
+        if Step.EDGE_WEIGHTS in self.step_buttons:
+            self.step_buttons[Step.EDGE_WEIGHTS].set_status('locked')
         self._active_step = Step.IMPORT
         
         # Reset title bar
@@ -2581,6 +3042,10 @@ class MainWindow(QMainWindow):
         # Reset display options
         self.display_options.hide()
         self.display_options.show_parting_option(False)
+        self.display_options.show_hull_option(False)
+        self.display_options.show_cavity_option(False)
+        self.display_options.show_tet_mesh_option(False)
+        self.display_options.show_mold_halves_option(False)
         
         # Update context panel
         self._update_context_panel()
@@ -2617,18 +3082,1201 @@ class MainWindow(QMainWindow):
         """Handle hide parting analysis checkbox change."""
         if self.mesh_viewer:
             # Toggle visibility paint (inverted - hide=True means don't show)
-            if hide:
-                self.mesh_viewer.remove_visibility_paint()
-            else:
-                # Re-apply visibility paint if we have the data
-                if self._visibility_paint_data is not None:
-                    face_colors = get_face_colors(self._visibility_paint_data)
-                    self.mesh_viewer.apply_visibility_paint(face_colors)
+            # Use the efficient toggle method that doesn't clear the scene
+            self.mesh_viewer.set_visibility_paint_visible(not hide)
             
             # Toggle parting direction arrows (inverted)
             self.mesh_viewer.set_parting_arrows_visible(not hide)
             logger.debug(f"Parting analysis visibility changed: hide={hide}")
     
+    def _on_hide_hull_changed(self, hide: bool):
+        """Handle hide bounding hull checkbox change."""
+        if self.mesh_viewer:
+            self.mesh_viewer.set_hull_visible(not hide)
+            logger.debug(f"Hull visibility changed: hide={hide}")
+    
+    def _on_hide_cavity_changed(self, hide: bool):
+        """Handle hide mold cavity checkbox change."""
+        if self.mesh_viewer:
+            self.mesh_viewer.set_cavity_visible(not hide)
+            logger.debug(f"Cavity visibility changed: hide={hide}")
+    
+    def _on_hide_tet_mesh_changed(self, hide: bool):
+        """Handle hide tetrahedral mesh checkbox change."""
+        if self.mesh_viewer:
+            self.mesh_viewer.set_tetrahedral_mesh_visible(not hide)
+            logger.debug(f"Tetrahedral mesh visibility changed: hide={hide}")
+    
+    def _on_hide_mold_halves_changed(self, hide: bool):
+        """Handle hide mold halves checkbox change."""
+        if self.mesh_viewer:
+            self.mesh_viewer.set_mold_halves_visible(not hide)
+            logger.debug(f"Mold halves visibility changed: hide={hide}")
+    
+    # =========================================================================
+    # CAVITY STEP
+    # =========================================================================
+    
+    def _setup_cavity_step(self):
+        """Setup the mold cavity step UI."""
+        # Check if mesh is loaded
+        if self._current_mesh is None:
+            no_mesh_label = QLabel("⚠️ No mesh loaded. Please import an STL file first.")
+            no_mesh_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_mesh_label.setWordWrap(True)
+            self.context_layout.addWidget(no_mesh_label)
+            return
+        
+        # Check if hull is computed
+        if self._hull_result is None:
+            no_hull_label = QLabel("⚠️ Please generate bounding hull first.")
+            no_hull_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_hull_label.setWordWrap(True)
+            self.context_layout.addWidget(no_hull_label)
+            return
+        
+        # Description section
+        info_group = QGroupBox("Mold Cavity Creation")
+        info_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        info_layout = QVBoxLayout(info_group)
+        
+        info_text = QLabel(
+            "Creates the mold cavity by performing CSG (Constructive Solid Geometry) "
+            "subtraction: Hull - Original Mesh = Cavity. The cavity represents the "
+            "hollow space between the hull and the original mesh."
+        )
+        info_text.setWordWrap(True)
+        info_text.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px; line-height: 1.4;')
+        info_layout.addWidget(info_text)
+        
+        self.context_layout.addWidget(info_group)
+        
+        # Calculate button
+        self.cavity_calc_btn = QPushButton("🕳️ Create Mold Cavity")
+        self.cavity_calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cavity_calc_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {Colors.PRIMARY};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: #0056b3;
+            }}
+            QPushButton:disabled {{
+                background-color: {Colors.GRAY_LIGHT};
+                color: {Colors.GRAY};
+            }}
+        """)
+        self.cavity_calc_btn.clicked.connect(self._on_calculate_cavity)
+        self.context_layout.addWidget(self.cavity_calc_btn)
+        
+        # Progress bar
+        self.cavity_progress = QProgressBar()
+        self.cavity_progress.setStyleSheet(f"""
+            QProgressBar {{
+                border: none;
+                border-radius: 4px;
+                background-color: {Colors.LIGHT};
+                height: 8px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {Colors.INFO};
+                border-radius: 4px;
+            }}
+        """)
+        self.cavity_progress.setTextVisible(False)
+        self.cavity_progress.setRange(0, 0)  # Indeterminate
+        self.cavity_progress.hide()
+        self.context_layout.addWidget(self.cavity_progress)
+        
+        # Progress label
+        self.cavity_progress_label = QLabel("")
+        self.cavity_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.cavity_progress_label.hide()
+        self.context_layout.addWidget(self.cavity_progress_label)
+        
+        # Cavity stats (show if computed)
+        self.cavity_stats = StatsBox()
+        self.cavity_stats.hide()
+        self.context_layout.addWidget(self.cavity_stats)
+        
+        # Update UI with current state
+        self._update_cavity_step_ui()
+    
+    def _update_cavity_step_ui(self):
+        """Update cavity step UI based on current state."""
+        if not hasattr(self, 'cavity_stats'):
+            return
+        
+        if self._cavity_result is not None:
+            # Show stats
+            self.cavity_stats.clear()
+            self.cavity_stats.show()
+            
+            result = self._cavity_result
+            
+            self.cavity_stats.add_header('✅ Cavity Created', Colors.SUCCESS)
+            self.cavity_stats.add_row(f'Vertices: {result.validation.vertex_count:,}')
+            self.cavity_stats.add_row(f'Faces: {result.validation.face_count:,}')
+            
+            # Validation info
+            if result.validation.is_closed:
+                self.cavity_stats.add_row('Manifold: ✅ Closed', Colors.SUCCESS)
+            else:
+                self.cavity_stats.add_row('Manifold: ⚠️ Open', Colors.WARNING)
+            
+            if result.validation.volume is not None:
+                self.cavity_stats.add_row(f'Volume: {result.validation.volume:.2f} cubic units')
+            
+            if result.used_fallback:
+                self.cavity_stats.add_row('⚠️ Used fallback engine', Colors.WARNING)
+            
+            # Update button text
+            self.cavity_calc_btn.setText("🔄 Regenerate Cavity")
+        else:
+            self.cavity_stats.hide()
+    
+    def _on_calculate_cavity(self):
+        """Start cavity computation."""
+        if self._current_mesh is None or self._hull_result is None:
+            return
+        
+        # Disable button during computation
+        self.cavity_calc_btn.setEnabled(False)
+        self.cavity_progress.show()
+        self.cavity_progress_label.setText("Computing mold cavity (CSG subtraction)...")
+        self.cavity_progress_label.show()
+        
+        # Clear previous cavity
+        self.mesh_viewer.clear_cavity()
+        self._cavity_result = None
+        
+        # Start worker
+        self._cavity_worker = CavityWorker(self._hull_result.mesh, self._current_mesh)
+        self._cavity_worker.progress.connect(self._on_cavity_progress)
+        self._cavity_worker.complete.connect(self._on_cavity_complete)
+        self._cavity_worker.error.connect(self._on_cavity_error)
+        self._cavity_worker.finished.connect(self._on_cavity_worker_finished)
+        self._cavity_worker.start()
+    
+    def _on_cavity_progress(self, message: str):
+        """Handle cavity progress updates."""
+        # Check if widget still exists (user may have navigated away)
+        if hasattr(self, 'cavity_progress_label') and self.cavity_progress_label is not None:
+            try:
+                self.cavity_progress_label.setText(message)
+            except RuntimeError:
+                pass  # Widget was deleted
+    
+    def _on_cavity_complete(self, result: MoldCavityResult):
+        """Handle cavity computation complete."""
+        self._cavity_result = result
+        
+        # Add cavity to viewer
+        self.mesh_viewer.set_cavity_mesh(result.mesh)
+        
+        # Update UI only if widgets still exist
+        if hasattr(self, 'cavity_stats') and self.cavity_stats is not None:
+            try:
+                self._update_cavity_step_ui()
+            except RuntimeError:
+                pass  # Widget was deleted
+        
+        # Show cavity option in display options panel
+        self.display_options.show_cavity_option(True)
+        
+        # Update step status
+        self.step_buttons[Step.CAVITY].set_status('completed')
+        
+        # Unlock tetrahedralize step (now comes before mold halves)
+        if Step.TETRAHEDRALIZE in self.step_buttons:
+            self.step_buttons[Step.TETRAHEDRALIZE].set_status('available')
+        
+        logger.info(f"Cavity created: {result.validation.vertex_count} vertices, {result.validation.face_count} faces")
+    
+    def _on_cavity_error(self, message: str):
+        """Handle cavity computation error."""
+        # Check if widget still exists
+        if hasattr(self, 'cavity_progress_label') and self.cavity_progress_label is not None:
+            try:
+                self.cavity_progress_label.setText(f"Error: {message}")
+                self.cavity_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+            except RuntimeError:
+                pass  # Widget was deleted
+        QMessageBox.critical(self, "Error", f"Cavity creation failed:\n{message}")
+    
+    def _on_cavity_worker_finished(self):
+        """Handle cavity worker finished."""
+        # Check if widgets still exist
+        if hasattr(self, 'cavity_calc_btn') and self.cavity_calc_btn is not None:
+            try:
+                self.cavity_calc_btn.setEnabled(True)
+            except RuntimeError:
+                pass  # Widget was deleted
+        if hasattr(self, 'cavity_progress') and self.cavity_progress is not None:
+            try:
+                self.cavity_progress.hide()
+            except RuntimeError:
+                pass  # Widget was deleted
+        self._cavity_worker = None
+
+    # =========================================================================
+    # MOLD HALVES STEP
+    # =========================================================================
+    
+    def _setup_mold_halves_step(self):
+        """Setup the mold halves classification step UI."""
+        # Check prerequisites
+        if self._current_mesh is None:
+            no_mesh_label = QLabel("⚠️ No mesh loaded. Please import an STL file first.")
+            no_mesh_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_mesh_label.setWordWrap(True)
+            self.context_layout.addWidget(no_mesh_label)
+            return
+        
+        if self._tet_result is None:
+            no_tet_label = QLabel("⚠️ Please generate tetrahedral mesh first.")
+            no_tet_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_tet_label.setWordWrap(True)
+            self.context_layout.addWidget(no_tet_label)
+            return
+        
+        if self._parting_result is None:
+            no_parting_label = QLabel("⚠️ Please compute parting directions first.")
+            no_parting_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_parting_label.setWordWrap(True)
+            self.context_layout.addWidget(no_parting_label)
+            return
+        
+        # Description section
+        info_group = QGroupBox("Mold Half Classification")
+        info_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        info_layout = QVBoxLayout(info_group)
+        
+        info_text = QLabel(
+            "Classifies the tetrahedral boundary surface into H₁ and H₂ mold halves based on "
+            "parting directions. H₁ (green) is pulled by D1, H₂ (orange) is pulled by D2. "
+            "The boundary zone (gray) is the interface between the two halves."
+        )
+        info_text.setWordWrap(True)
+        info_text.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px; line-height: 1.4;')
+        info_layout.addWidget(info_text)
+        
+        self.context_layout.addWidget(info_group)
+        
+        # Boundary zone slider
+        slider_group = QGroupBox("Boundary Zone Width")
+        slider_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        slider_layout = QVBoxLayout(slider_group)
+        
+        # Slider label
+        self.boundary_zone_label = QLabel(f"{int(self._boundary_zone_threshold * 100)}% of interface diagonal")
+        self.boundary_zone_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        slider_layout.addWidget(self.boundary_zone_label)
+        
+        # Slider
+        self.boundary_zone_slider = QSlider(Qt.Orientation.Horizontal)
+        self.boundary_zone_slider.setRange(0, 30)
+        self.boundary_zone_slider.setValue(int(self._boundary_zone_threshold * 100))
+        self.boundary_zone_slider.valueChanged.connect(self._on_boundary_zone_changed)
+        self.boundary_zone_slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{
+                border: none;
+                height: 6px;
+                background: {Colors.LIGHT};
+                border-radius: 3px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {Colors.PRIMARY};
+                border: none;
+                width: 16px;
+                height: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {Colors.PRIMARY};
+                border-radius: 3px;
+            }}
+        """)
+        slider_layout.addWidget(self.boundary_zone_slider)
+        
+        self.context_layout.addWidget(slider_group)
+        
+        # Calculate button
+        self.mold_halves_calc_btn = QPushButton("🎨 Classify Mold Halves")
+        self.mold_halves_calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mold_halves_calc_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {Colors.PRIMARY};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: #0056b3;
+            }}
+            QPushButton:disabled {{
+                background-color: {Colors.GRAY_LIGHT};
+                color: {Colors.GRAY};
+            }}
+        """)
+        self.mold_halves_calc_btn.clicked.connect(self._on_calculate_mold_halves)
+        self.context_layout.addWidget(self.mold_halves_calc_btn)
+        
+        # Progress bar
+        self.mold_halves_progress = QProgressBar()
+        self.mold_halves_progress.setStyleSheet(f"""
+            QProgressBar {{
+                border: none;
+                border-radius: 4px;
+                background-color: {Colors.LIGHT};
+                height: 8px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {Colors.INFO};
+                border-radius: 4px;
+            }}
+        """)
+        self.mold_halves_progress.setTextVisible(False)
+        self.mold_halves_progress.setRange(0, 0)  # Indeterminate
+        self.mold_halves_progress.hide()
+        self.context_layout.addWidget(self.mold_halves_progress)
+        
+        # Progress label
+        self.mold_halves_progress_label = QLabel("")
+        self.mold_halves_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.mold_halves_progress_label.hide()
+        self.context_layout.addWidget(self.mold_halves_progress_label)
+        
+        # Stats (show if computed)
+        self.mold_halves_stats = StatsBox()
+        self.mold_halves_stats.hide()
+        self.context_layout.addWidget(self.mold_halves_stats)
+        
+        # Update UI with current state
+        self._update_mold_halves_step_ui()
+    
+    def _on_boundary_zone_changed(self, value: int):
+        """Handle boundary zone slider change."""
+        self._boundary_zone_threshold = value / 100.0
+        if hasattr(self, 'boundary_zone_label') and self.boundary_zone_label is not None:
+            try:
+                self.boundary_zone_label.setText(f"{value}% of interface diagonal")
+            except RuntimeError:
+                pass
+    
+    def _update_mold_halves_step_ui(self):
+        """Update mold halves step UI based on current state."""
+        if not hasattr(self, 'mold_halves_stats'):
+            return
+        
+        if self._mold_halves_result is not None:
+            # Show stats
+            self.mold_halves_stats.clear()
+            self.mold_halves_stats.show()
+            
+            result = self._mold_halves_result
+            
+            self.mold_halves_stats.add_header('✅ Classification Complete', Colors.SUCCESS)
+            
+            # Calculate percentages
+            outer_total = len(result.h1_triangles) + len(result.h2_triangles) + len(result.boundary_zone_triangles)
+            h1_pct = (len(result.h1_triangles) / outer_total * 100) if outer_total > 0 else 0
+            h2_pct = (len(result.h2_triangles) / outer_total * 100) if outer_total > 0 else 0
+            
+            self.mold_halves_stats.add_row(f'H₁ (Green): {len(result.h1_triangles):,} ({h1_pct:.1f}%)', Colors.SUCCESS)
+            self.mold_halves_stats.add_row(f'H₂ (Orange): {len(result.h2_triangles):,} ({h2_pct:.1f}%)', Colors.WARNING)
+            self.mold_halves_stats.add_row(f'Boundary Zone: {len(result.boundary_zone_triangles):,}')
+            self.mold_halves_stats.add_row(f'Inner (part): {len(result.inner_boundary_triangles):,}')
+            self.mold_halves_stats.add_row(f'Total: {result.total_triangles:,}')
+            
+            # Update button text
+            self.mold_halves_calc_btn.setText("🔄 Reclassify")
+        else:
+            self.mold_halves_stats.hide()
+    
+    def _on_calculate_mold_halves(self):
+        """Start mold halves classification."""
+        if self._tet_result is None or self._parting_result is None or self._hull_result is None:
+            return
+        
+        # Check for boundary mesh
+        if self._tet_result.boundary_mesh is None:
+            QMessageBox.warning(self, "Error", "Tetrahedral boundary mesh not available")
+            return
+        
+        # Disable button during computation
+        self.mold_halves_calc_btn.setEnabled(False)
+        self.mold_halves_progress.show()
+        self.mold_halves_progress_label.setText("Classifying mold halves...")
+        self.mold_halves_progress_label.show()
+        
+        # Clear previous result
+        self._mold_halves_result = None
+        
+        # Get parting directions
+        d1 = self._parting_result.d1
+        d2 = self._parting_result.d2
+        
+        # Use tetrahedral boundary mesh instead of cavity mesh
+        boundary_mesh = self._tet_result.boundary_mesh
+        
+        # Start worker with part_mesh for proximity-based classification
+        self._mold_halves_worker = MoldHalvesWorker(
+            boundary_mesh,  # Use tet boundary mesh
+            self._hull_result.mesh,
+            d1, d2,
+            self._boundary_zone_threshold,
+            part_mesh=self._current_mesh,  # Pass part mesh for proximity detection
+            use_proximity_method=True  # Use proximity method for tet boundary
+        )
+        self._mold_halves_worker.progress.connect(self._on_mold_halves_progress)
+        self._mold_halves_worker.complete.connect(self._on_mold_halves_complete)
+        self._mold_halves_worker.error.connect(self._on_mold_halves_error)
+        self._mold_halves_worker.finished.connect(self._on_mold_halves_worker_finished)
+        self._mold_halves_worker.start()
+    
+    def _on_mold_halves_progress(self, message: str):
+        """Handle mold halves progress updates."""
+        if hasattr(self, 'mold_halves_progress_label') and self.mold_halves_progress_label is not None:
+            try:
+                self.mold_halves_progress_label.setText(message)
+            except RuntimeError:
+                pass
+    
+    def _on_mold_halves_complete(self, result: MoldHalfClassificationResult):
+        """Handle mold halves classification complete."""
+        self._mold_halves_result = result
+        
+        # Generate face colors for the tetrahedral boundary mesh
+        boundary_mesh = self._tet_result.boundary_mesh
+        n_faces = len(boundary_mesh.faces)
+        face_colors = get_mold_half_face_colors(n_faces, result)
+        
+        # Apply colors to tetrahedral boundary mesh in viewer
+        # First, set the boundary mesh as the cavity mesh for visualization
+        self.mesh_viewer.set_cavity_mesh(boundary_mesh)
+        self.mesh_viewer.apply_cavity_classification_paint(face_colors)
+        
+        # Show the mold halves display option
+        self.display_options.show_mold_halves_option(True)
+        
+        # Update UI
+        if hasattr(self, 'mold_halves_stats') and self.mold_halves_stats is not None:
+            try:
+                self._update_mold_halves_step_ui()
+            except RuntimeError:
+                pass
+        
+        # Update step status and unlock edge weights step
+        self.step_buttons[Step.MOLD_HALVES].set_status('completed')
+        if Step.EDGE_WEIGHTS in self.step_buttons:
+            self.step_buttons[Step.EDGE_WEIGHTS].set_status('available')
+        
+        logger.info(
+            f"Mold halves classified: H1={len(result.h1_triangles)}, "
+            f"H2={len(result.h2_triangles)}, boundary={len(result.boundary_zone_triangles)}"
+        )
+    
+    def _on_mold_halves_error(self, message: str):
+        """Handle mold halves classification error."""
+        if hasattr(self, 'mold_halves_progress_label') and self.mold_halves_progress_label is not None:
+            try:
+                self.mold_halves_progress_label.setText(f"Error: {message}")
+                self.mold_halves_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+            except RuntimeError:
+                pass
+        QMessageBox.critical(self, "Error", f"Mold halves classification failed:\n{message}")
+    
+    def _on_mold_halves_worker_finished(self):
+        """Handle mold halves worker finished."""
+        if hasattr(self, 'mold_halves_calc_btn') and self.mold_halves_calc_btn is not None:
+            try:
+                self.mold_halves_calc_btn.setEnabled(True)
+            except RuntimeError:
+                pass
+        if hasattr(self, 'mold_halves_progress') and self.mold_halves_progress is not None:
+            try:
+                self.mold_halves_progress.hide()
+            except RuntimeError:
+                pass
+        self._mold_halves_worker = None
+
+    # =========================================================================
+    # TETRAHEDRALIZE STEP
+    # =========================================================================
+    
+    def _setup_tetrahedralize_step(self):
+        """Setup the tetrahedralize step UI."""
+        # Check prerequisites
+        if self._current_mesh is None:
+            no_mesh_label = QLabel("⚠️ No mesh loaded. Please import an STL file first.")
+            no_mesh_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_mesh_label.setWordWrap(True)
+            self.context_layout.addWidget(no_mesh_label)
+            return
+        
+        if self._cavity_result is None:
+            no_cavity_label = QLabel("⚠️ Please create mold cavity first.")
+            no_cavity_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_cavity_label.setWordWrap(True)
+            self.context_layout.addWidget(no_cavity_label)
+            return
+        
+        if not PYTETWILD_AVAILABLE:
+            no_tetwild_label = QLabel("⚠️ pytetwild is not installed. Install with: pip install pytetwild")
+            no_tetwild_label.setStyleSheet(f"""
+                color: {Colors.DANGER};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 0, 0, 0.1);
+                border: 1px solid {Colors.DANGER};
+                border-radius: 6px;
+            """)
+            no_tetwild_label.setWordWrap(True)
+            self.context_layout.addWidget(no_tetwild_label)
+            return
+        
+        # Description section
+        info_group = QGroupBox("Tetrahedral Mesh Generation")
+        info_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        info_layout = QVBoxLayout(info_group)
+        
+        info_text = QLabel(
+            "Generates a tetrahedral mesh of the mold cavity volume using fTetWild. "
+            "This replaces the voxel grid with a more accurate mesh representation. "
+            "Edge weights are computed for the parting surface algorithm."
+        )
+        info_text.setWordWrap(True)
+        info_text.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px; line-height: 1.4;')
+        info_layout.addWidget(info_text)
+        
+        self.context_layout.addWidget(info_group)
+        
+        # Settings group
+        settings_group = QGroupBox("Mesh Resolution")
+        settings_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        settings_layout = QVBoxLayout(settings_group)
+        
+        # Edge length factor slider
+        edge_label = QLabel(f"Edge length: {self._tet_edge_length_fac:.2f} × bbox diagonal")
+        edge_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.tet_edge_label = edge_label
+        settings_layout.addWidget(edge_label)
+        
+        self.tet_edge_slider = QSlider(Qt.Orientation.Horizontal)
+        self.tet_edge_slider.setRange(1, 20)  # 0.01 to 0.20
+        self.tet_edge_slider.setValue(int(self._tet_edge_length_fac * 100))
+        self.tet_edge_slider.valueChanged.connect(self._on_tet_edge_changed)
+        self.tet_edge_slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{
+                border: none;
+                height: 6px;
+                background: {Colors.LIGHT};
+                border-radius: 3px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {Colors.PRIMARY};
+                border: none;
+                width: 16px;
+                height: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {Colors.PRIMARY};
+                border-radius: 3px;
+            }}
+        """)
+        settings_layout.addWidget(self.tet_edge_slider)
+        
+        # Optimization checkbox
+        self.tet_optimize_checkbox = QCheckBox("Optimize mesh quality (slower but better)")
+        self.tet_optimize_checkbox.setChecked(self._tet_optimize)
+        self.tet_optimize_checkbox.stateChanged.connect(
+            lambda state: setattr(self, '_tet_optimize', state == Qt.CheckState.Checked.value)
+        )
+        self.tet_optimize_checkbox.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        settings_layout.addWidget(self.tet_optimize_checkbox)
+        
+        self.context_layout.addWidget(settings_group)
+        
+        # Generate button
+        self.tet_generate_btn = QPushButton("🔷 Generate Tetrahedral Mesh")
+        self.tet_generate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.tet_generate_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {Colors.PRIMARY};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: #0056b3;
+            }}
+            QPushButton:disabled {{
+                background-color: {Colors.GRAY_LIGHT};
+                color: {Colors.GRAY};
+            }}
+        """)
+        self.tet_generate_btn.clicked.connect(self._on_generate_tet_mesh)
+        self.context_layout.addWidget(self.tet_generate_btn)
+        
+        # Progress bar
+        self.tet_progress = QProgressBar()
+        self.tet_progress.setStyleSheet(f"""
+            QProgressBar {{
+                border: none;
+                border-radius: 4px;
+                background-color: {Colors.LIGHT};
+                height: 8px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {Colors.INFO};
+                border-radius: 4px;
+            }}
+        """)
+        self.tet_progress.setTextVisible(False)
+        self.tet_progress.setRange(0, 0)  # Indeterminate
+        self.tet_progress.hide()
+        self.context_layout.addWidget(self.tet_progress)
+        
+        # Progress label
+        self.tet_progress_label = QLabel("")
+        self.tet_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.tet_progress_label.hide()
+        self.context_layout.addWidget(self.tet_progress_label)
+        
+        # Stats (show if computed)
+        self.tet_stats = StatsBox()
+        self.tet_stats.hide()
+        self.context_layout.addWidget(self.tet_stats)
+        
+        # Update UI with current state
+        self._update_tet_step_ui()
+    
+    def _on_tet_edge_changed(self, value: int):
+        """Handle tet edge length slider change."""
+        self._tet_edge_length_fac = value / 100.0
+        if hasattr(self, 'tet_edge_label') and self.tet_edge_label is not None:
+            try:
+                self.tet_edge_label.setText(f"Edge length: {self._tet_edge_length_fac:.2f} × bbox diagonal")
+            except RuntimeError:
+                pass
+    
+    def _update_tet_step_ui(self):
+        """Update tetrahedralize step UI based on current state."""
+        if not hasattr(self, 'tet_stats'):
+            return
+        
+        if self._tet_result is not None:
+            # Show stats
+            self.tet_stats.clear()
+            self.tet_stats.show()
+            
+            result = self._tet_result
+            
+            self.tet_stats.add_header('✅ Tetrahedral Mesh Generated', Colors.SUCCESS)
+            self.tet_stats.add_row(f'Vertices: {result.num_vertices:,}')
+            self.tet_stats.add_row(f'Tetrahedra: {result.num_tetrahedra:,}')
+            self.tet_stats.add_row(f'Edges: {result.num_edges:,}')
+            self.tet_stats.add_row(f'Boundary Faces: {result.num_boundary_faces:,}')
+            self.tet_stats.add_row(f'Tet Time: {result.tetrahedralize_time_ms:.0f}ms')
+        else:
+            self.tet_stats.hide()
+    
+    def _on_generate_tet_mesh(self):
+        """Handle generate tetrahedral mesh button click."""
+        if self._tet_worker is not None:
+            return
+        
+        # Show progress with indeterminate mode (pulsing bar)
+        self.tet_generate_btn.setEnabled(False)
+        self.tet_progress.setRange(0, 0)  # Indeterminate mode - pulsing bar
+        self.tet_progress.show()
+        self.tet_progress_label.show()
+        self.tet_progress_label.setText("Initializing tetrahedralization...")
+        self.tet_stats.hide()
+        
+        # Process events to update UI before blocking operation
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+        
+        # Clear previous result
+        self._tet_result = None
+        
+        # Start worker - only tetrahedralize, don't compute distances
+        self._tet_worker = TetrahedralizeWorker(
+            self._cavity_result.mesh,
+            edge_length_fac=self._tet_edge_length_fac,
+            optimize=self._tet_optimize
+        )
+        self._tet_worker.progress.connect(self._on_tet_progress)
+        self._tet_worker.complete.connect(self._on_tet_complete)
+        self._tet_worker.error.connect(self._on_tet_error)
+        self._tet_worker.finished.connect(self._on_tet_worker_finished)
+        self._tet_worker.start()
+    
+    def _on_tet_progress(self, message: str):
+        """Handle tetrahedralize progress update."""
+        if hasattr(self, 'tet_progress_label') and self.tet_progress_label is not None:
+            try:
+                self.tet_progress_label.setText(message)
+            except RuntimeError:
+                pass
+    
+    def _on_tet_complete(self, result: TetrahedralMeshResult):
+        """Handle tetrahedralize complete."""
+        self._tet_result = result
+        
+        # Update UI
+        if hasattr(self, 'tet_stats') and self.tet_stats is not None:
+            try:
+                self._update_tet_step_ui()
+            except RuntimeError:
+                pass
+        
+        # Visualize tetrahedral mesh edges (no weights yet - just solid color)
+        self.mesh_viewer.set_tetrahedral_mesh(
+            result.vertices,
+            result.edges
+        )
+        
+        # Also set the boundary mesh as the cavity for visualization
+        if result.boundary_mesh is not None:
+            self.mesh_viewer.set_cavity_mesh(result.boundary_mesh)
+        
+        # Show tet mesh display option
+        self.display_options.show_tet_mesh_option(True)
+        
+        # Update step status and unlock mold halves step (now comes after tetrahedralize)
+        self.step_buttons[Step.TETRAHEDRALIZE].set_status('completed')
+        if Step.MOLD_HALVES in self.step_buttons:
+            self.step_buttons[Step.MOLD_HALVES].set_status('available')
+        
+        logger.info(
+            f"Tetrahedral mesh complete: {result.num_vertices} verts, "
+            f"{result.num_tetrahedra} tets, {result.num_edges} edges, "
+            f"{result.num_boundary_faces} boundary faces"
+        )
+    
+    def _on_tet_error(self, message: str):
+        """Handle tetrahedralize error."""
+        if hasattr(self, 'tet_progress_label') and self.tet_progress_label is not None:
+            try:
+                self.tet_progress_label.setText(f"Error: {message}")
+                self.tet_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+            except RuntimeError:
+                pass
+        QMessageBox.critical(self, "Error", f"Tetrahedral mesh generation failed:\n{message}")
+    
+    def _on_tet_worker_finished(self):
+        """Handle tetrahedralize worker finished."""
+        if hasattr(self, 'tet_generate_btn') and self.tet_generate_btn is not None:
+            try:
+                self.tet_generate_btn.setEnabled(True)
+            except RuntimeError:
+                pass
+        if hasattr(self, 'tet_progress') and self.tet_progress is not None:
+            try:
+                self.tet_progress.setRange(0, 100)  # Reset to determinate mode
+                self.tet_progress.hide()
+            except RuntimeError:
+                pass
+        self._tet_worker = None
+
+    # =========================================================================
+    # EDGE WEIGHTS STEP
+    # =========================================================================
+    
+    def _setup_edge_weights_step(self):
+        """Setup the edge weights step UI."""
+        # Check prerequisites
+        if self._tet_result is None:
+            no_tet_label = QLabel("⚠️ Please generate tetrahedral mesh first.")
+            no_tet_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_tet_label.setWordWrap(True)
+            self.context_layout.addWidget(no_tet_label)
+            return
+        
+        # Description section
+        info_group = QGroupBox("Edge Weight Computation")
+        info_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        info_layout = QVBoxLayout(info_group)
+        
+        info_text = QLabel(
+            "Computes edge weights based on distance to the part surface. "
+            "Edges closer to the part get higher weights, guiding the parting "
+            "surface to stay near the part boundary.\n\n"
+            "Formula: weight = 1 / (distance² + 0.25)"
+        )
+        info_text.setWordWrap(True)
+        info_text.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px; line-height: 1.4;')
+        info_layout.addWidget(info_text)
+        
+        self.context_layout.addWidget(info_group)
+        
+        # Mesh info
+        tet_info = StatsBox()
+        tet_info.add_header('Tetrahedral Mesh', Colors.INFO)
+        tet_info.add_row(f'Vertices: {self._tet_result.num_vertices:,}')
+        tet_info.add_row(f'Edges: {self._tet_result.num_edges:,}')
+        tet_info.add_row(f'Tetrahedra: {self._tet_result.num_tetrahedra:,}')
+        self.context_layout.addWidget(tet_info)
+        
+        # Compute button
+        self.edge_weights_btn = QPushButton("⚖️ Compute Edge Weights")
+        self.edge_weights_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.edge_weights_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {Colors.PRIMARY};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: #0056b3;
+            }}
+            QPushButton:disabled {{
+                background-color: {Colors.GRAY_LIGHT};
+                color: {Colors.GRAY};
+            }}
+        """)
+        self.edge_weights_btn.clicked.connect(self._on_compute_edge_weights)
+        self.context_layout.addWidget(self.edge_weights_btn)
+        
+        # Progress bar
+        self.edge_weights_progress = QProgressBar()
+        self.edge_weights_progress.setStyleSheet(f"""
+            QProgressBar {{
+                border: none;
+                border-radius: 4px;
+                background-color: {Colors.LIGHT};
+                height: 8px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {Colors.INFO};
+                border-radius: 4px;
+            }}
+        """)
+        self.edge_weights_progress.setTextVisible(False)
+        self.edge_weights_progress.setRange(0, 0)  # Indeterminate
+        self.edge_weights_progress.hide()
+        self.context_layout.addWidget(self.edge_weights_progress)
+        
+        # Progress label
+        self.edge_weights_progress_label = QLabel("")
+        self.edge_weights_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.edge_weights_progress_label.hide()
+        self.context_layout.addWidget(self.edge_weights_progress_label)
+        
+        # Stats (show if computed)
+        self.edge_weights_stats = StatsBox()
+        self.edge_weights_stats.hide()
+        self.context_layout.addWidget(self.edge_weights_stats)
+        
+        # Update UI with current state
+        self._update_edge_weights_step_ui()
+    
+    def _update_edge_weights_step_ui(self):
+        """Update edge weights step UI based on current state."""
+        if not hasattr(self, 'edge_weights_stats'):
+            return
+        
+        if self._tet_result is not None and self._tet_result.edge_weights is not None:
+            # Show stats
+            self.edge_weights_stats.clear()
+            self.edge_weights_stats.show()
+            
+            result = self._tet_result
+            
+            self.edge_weights_stats.add_header('✅ Edge Weights Computed', Colors.SUCCESS)
+            self.edge_weights_stats.add_row(f'Weight Range: {result.edge_weights.min():.4f} - {result.edge_weights.max():.4f}')
+            self.edge_weights_stats.add_row(f'Mean Weight: {result.edge_weights.mean():.4f}')
+            
+            if result.boundary_labels is not None:
+                n_h1 = np.sum(result.boundary_labels == 1)
+                n_h2 = np.sum(result.boundary_labels == 2)
+                n_inner = np.sum(result.boundary_labels == -1)
+                self.edge_weights_stats.add_header('Boundary Labels', Colors.INFO)
+                self.edge_weights_stats.add_row(f'H₁ vertices: {n_h1:,}')
+                self.edge_weights_stats.add_row(f'H₂ vertices: {n_h2:,}')
+                self.edge_weights_stats.add_row(f'Seed vertices: {n_inner:,}')
+        else:
+            self.edge_weights_stats.hide()
+    
+    def _on_compute_edge_weights(self):
+        """Handle compute edge weights button click."""
+        if self._edge_weights_worker is not None:
+            return
+        
+        # Show progress
+        self.edge_weights_btn.setEnabled(False)
+        self.edge_weights_progress.show()
+        self.edge_weights_progress_label.show()
+        self.edge_weights_progress_label.setText("Initializing...")
+        self.edge_weights_stats.hide()
+        
+        # Start worker
+        self._edge_weights_worker = EdgeWeightsWorker(
+            self._tet_result,
+            self._current_mesh,
+            self._cavity_result.mesh,
+            self._hull_result.mesh,
+            self._mold_halves_result
+        )
+        self._edge_weights_worker.progress.connect(self._on_edge_weights_progress)
+        self._edge_weights_worker.r_distance_computed.connect(self._on_r_distance_computed)
+        self._edge_weights_worker.complete.connect(self._on_edge_weights_complete)
+        self._edge_weights_worker.error.connect(self._on_edge_weights_error)
+        self._edge_weights_worker.finished.connect(self._on_edge_weights_worker_finished)
+        self._edge_weights_worker.start()
+    
+    def _on_edge_weights_progress(self, message: str):
+        """Handle edge weights progress update."""
+        if hasattr(self, 'edge_weights_progress_label') and self.edge_weights_progress_label is not None:
+            try:
+                self.edge_weights_progress_label.setText(message)
+            except RuntimeError:
+                pass
+    
+    def _on_r_distance_computed(self, r_data: dict):
+        """Handle R distance computed - visualize the R line."""
+        hull_point = r_data['hull_point']
+        part_point = r_data['part_point']
+        r_value = r_data['r_value']
+        
+        # Visualize R as a red line in the 3D scene
+        self.mesh_viewer.set_r_distance_line(hull_point, part_point, r_value)
+        
+        # Update stats display
+        if hasattr(self, 'edge_weights_stats') and self.edge_weights_stats is not None:
+            try:
+                self.edge_weights_stats.clear()
+                self.edge_weights_stats.show()
+                self.edge_weights_stats.add_header('📏 R Distance Computed', Colors.INFO)
+                self.edge_weights_stats.add_row(f'R = {r_value:.4f}')
+                self.edge_weights_stats.add_row(f'Hull point: ({hull_point[0]:.2f}, {hull_point[1]:.2f}, {hull_point[2]:.2f})')
+                self.edge_weights_stats.add_row(f'Part point: ({part_point[0]:.2f}, {part_point[1]:.2f}, {part_point[2]:.2f})')
+            except RuntimeError:
+                pass
+        
+        logger.info(f"R distance visualized: R={r_value:.4f}")
+    
+    def _on_edge_weights_complete(self, result: TetrahedralMeshResult):
+        """Handle edge weights complete."""
+        self._tet_result = result
+        
+        # Update UI - only update edge weight stats if they exist
+        if result.edge_weights is not None:
+            if hasattr(self, 'edge_weights_stats') and self.edge_weights_stats is not None:
+                try:
+                    self._update_edge_weights_step_ui()
+                except RuntimeError:
+                    pass
+            
+            # Visualize tetrahedral mesh edges colored by weight
+            self.mesh_viewer.set_tetrahedral_mesh(
+                result.vertices,
+                result.edges,
+                edge_weights=result.edge_weights,
+                colormap='coolwarm'  # Blue (low weight) to Red (high weight)
+            )
+            
+            logger.info(f"Edge weights computed: range [{result.edge_weights.min():.4f}, {result.edge_weights.max():.4f}]")
+        else:
+            # Only R was computed - just log that
+            if result.r_value is not None:
+                logger.info(f"R computation complete: R={result.r_value:.4f}")
+        
+        # Update step status
+        self.step_buttons[Step.EDGE_WEIGHTS].set_status('completed')
+    
+    def _on_edge_weights_error(self, message: str):
+        """Handle edge weights error."""
+        if hasattr(self, 'edge_weights_progress_label') and self.edge_weights_progress_label is not None:
+            try:
+                self.edge_weights_progress_label.setText(f"Error: {message}")
+                self.edge_weights_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+            except RuntimeError:
+                pass
+        QMessageBox.critical(self, "Error", f"Edge weight computation failed:\n{message}")
+    
+    def _on_edge_weights_worker_finished(self):
+        """Handle edge weights worker finished."""
+        if hasattr(self, 'edge_weights_btn') and self.edge_weights_btn is not None:
+            try:
+                self.edge_weights_btn.setEnabled(True)
+            except RuntimeError:
+                pass
+        if hasattr(self, 'edge_weights_progress') and self.edge_weights_progress is not None:
+            try:
+                self.edge_weights_progress.hide()
+            except RuntimeError:
+                pass
+        self._edge_weights_worker = None
+
     def _load_mesh(self, file_path: str, scale_factor: float = 1.0):
         """Load and process a mesh file."""
         self._loaded_filename = file_path

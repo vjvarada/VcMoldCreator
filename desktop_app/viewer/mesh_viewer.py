@@ -60,6 +60,10 @@ class MeshViewer(QWidget):
     ORIGINAL_HULL_COLOR = "#666666"  # Gray - Original hull wireframe
     HULL_OPACITY = 0.3            # Transparency for hull
     
+    # Mold cavity colors (matching React frontend)
+    CAVITY_COLOR = "#00ffaa"      # Teal/Cyan - Mold cavity
+    CAVITY_OPACITY = 0.5          # Semi-transparent
+    
     # Feature edge detection angle (degrees) - edges sharper than this are shown
     # This is the dihedral angle threshold - faces meeting at angles > (180 - this) are detected
     # 45° means edges where faces meet at 135°+ (i.e., 45° corners and sharper)
@@ -83,6 +87,8 @@ class MeshViewer(QWidget):
         self._parting_d1: Optional[np.ndarray] = None
         self._parting_d2: Optional[np.ndarray] = None
         self._visibility_paint_active = False
+        self._visibility_paint_showing = False  # Whether paint is currently displayed
+        self._stored_face_colors: Optional[np.ndarray] = None  # Stored face colors for toggling
         self._original_scalars = None  # Store original mesh colors
         
         # Inflated hull visualization
@@ -91,6 +97,24 @@ class MeshViewer(QWidget):
         self._original_hull_actor = None
         self._hull_visible = True
         self._original_hull_visible = False  # Wireframe of original hull
+        
+        # Mold cavity visualization
+        self._cavity_mesh: Optional[trimesh.Trimesh] = None
+        self._cavity_actor = None
+        self._cavity_visible = True
+        
+        # Mold halves classification visualization (painted on cavity)
+        self._mold_halves_actor = None
+        self._mold_halves_visible = True
+        
+        # Tetrahedral mesh visualization
+        self._tet_edges_actor = None
+        self._tet_visible = True
+        
+        # R distance line visualization (max hull-to-part distance)
+        self._r_line_actor = None
+        self._r_point_actors = []  # Spheres at endpoints
+        self._r_label_actor = None
         
         self._setup_ui()
     
@@ -530,6 +554,10 @@ class MeshViewer(QWidget):
         self._feature_edges_actor = None
         self._silhouette_actor = None
         self._silhouette_filter = None
+        # Hull and cavity actors are invalidated by clear(), reset references
+        self._hull_actor = None
+        self._cavity_actor = None
+        self._original_hull_actor = None
         
         # Re-setup lighting after clear
         self._setup_lighting()
@@ -581,8 +609,70 @@ class MeshViewer(QWidget):
         # Ensure orthographic projection is maintained
         self.plotter.enable_parallel_projection()
         
+        # Re-add parting direction arrows if they exist (they get cleared by plotter.clear())
+        if self._parting_d1 is not None and self._parting_d2 is not None:
+            # Clear the stale actor references
+            self._arrow_actors = []
+            # Re-add arrows
+            self.add_parting_direction_arrows(self._parting_d1, self._parting_d2)
+        
+        # Re-add hull and cavity actors if they exist (they get cleared by plotter.clear())
+        self._re_add_hull_and_cavity_actors()
+        
         # Update the view
         self.plotter.update()
+    
+    def _re_add_hull_and_cavity_actors(self):
+        """
+        Re-add hull and cavity actors after plotter.clear().
+        
+        When _render_mesh() is called (e.g., loading new mesh, color change),
+        plotter.clear() removes all actors including hull and cavity. This method
+        re-adds them from the stored mesh data if available.
+        
+        NOTE: The new _update_mesh_display() method avoids clearing the scene,
+        so hull/cavity actors are preserved when toggling visibility paint.
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        # Re-add hull mesh if it exists
+        if self._hull_mesh is not None:
+            pv_hull = self._trimesh_to_pyvista(self._hull_mesh)
+            self._hull_actor = self.plotter.add_mesh(
+                pv_hull,
+                color=self.HULL_COLOR,
+                opacity=self.HULL_OPACITY,
+                smooth_shading=True,
+                show_edges=False,
+                style='surface',
+                render_points_as_spheres=False,
+            )
+            if self._hull_actor is not None:
+                prop = self._hull_actor.GetProperty()
+                if prop:
+                    prop.SetInterpolationToPhong()
+                # Restore visibility state
+                self._hull_actor.SetVisibility(self._hull_visible)
+        
+        # Re-add cavity mesh if it exists
+        if self._cavity_mesh is not None:
+            pv_cavity = self._trimesh_to_pyvista(self._cavity_mesh)
+            self._cavity_actor = self.plotter.add_mesh(
+                pv_cavity,
+                color=self.CAVITY_COLOR,
+                opacity=self.CAVITY_OPACITY,
+                smooth_shading=True,
+                show_edges=False,
+                style='surface',
+                render_points_as_spheres=False,
+            )
+            if self._cavity_actor is not None:
+                prop = self._cavity_actor.GetProperty()
+                if prop:
+                    prop.SetInterpolationToPhong()
+                # Restore visibility state
+                self._cavity_actor.SetVisibility(self._cavity_visible)
     
     def _add_feature_edges(self):
         """
@@ -760,15 +850,54 @@ class MeshViewer(QWidget):
         return pv_mesh
     
     def clear(self):
-        """Clear the viewer."""
+        """Clear the viewer and reset all state."""
         if not PYVISTA_AVAILABLE:
             return
         
+        # Reset main mesh state
         self._mesh = None
         self._pv_mesh = None
         self._actor = None
         self._grid_actor = None
         self._scale_actors = []
+        self._feature_edges_actor = None
+        self._silhouette_actor = None
+        self._silhouette_filter = None
+        
+        # Reset parting direction state
+        self._parting_d1 = None
+        self._parting_d2 = None
+        self._arrow_actors = []
+        self._visibility_paint_active = False
+        self._visibility_paint_showing = False
+        self._stored_face_colors = None
+        self._original_scalars = None
+        
+        # Reset hull state
+        self._hull_mesh = None
+        self._hull_actor = None
+        self._original_hull_actor = None
+        self._hull_visible = True
+        self._original_hull_visible = False
+        
+        # Reset cavity state
+        self._cavity_mesh = None
+        self._cavity_actor = None
+        self._cavity_visible = True
+        
+        # Reset mold halves state
+        self._mold_halves_actor = None
+        self._mold_halves_visible = True
+        
+        # Reset tetrahedral mesh state
+        self._tet_edges_actor = None
+        self._tet_visible = True
+        
+        # Reset R distance line state
+        self._r_line_actor = None
+        self._r_point_actors = []
+        self._r_label_actor = None
+        
         self.plotter.clear()
         self._setup_lighting()
         self.plotter.add_axes(
@@ -852,10 +981,19 @@ class MeshViewer(QWidget):
         if not PYVISTA_AVAILABLE:
             return
         
+        # Toggle main mesh actor
         if self._actor is not None:
             self._actor.SetVisibility(visible)
-            self.plotter.update()
-            logger.debug(f"Mesh visibility set to: {visible}")
+        
+        # Toggle feature edges (silhouette) - they should follow mesh visibility
+        if self._feature_edges_actor is not None:
+            self._feature_edges_actor.SetVisibility(visible and self._show_edges)
+        
+        if self._silhouette_actor is not None:
+            self._silhouette_actor.SetVisibility(visible and self._show_edges)
+        
+        self.plotter.update()
+        logger.debug(f"Mesh visibility set to: {visible}")
     
     def set_mesh_color(self, color: str):
         """
@@ -1088,27 +1226,136 @@ class MeshViewer(QWidget):
         
         logger.info("Applying visibility paint to mesh")
         
-        # Store original color state
-        if not self._visibility_paint_active:
-            self._original_scalars = self._pv_mesh.cell_data.get('colors', None)
-        
-        self._visibility_paint_active = True
-        
         # Convert colors to 0-255 range if needed
         if face_colors.max() <= 1.0:
             face_colors = (face_colors * 255).astype(np.uint8)
         
+        # Store the face colors for later toggling
+        self._stored_face_colors = face_colors.copy()
+        self._visibility_paint_active = True
+        self._visibility_paint_showing = True
+        
         # Apply colors as cell data
-        # PyVista expects RGB or RGBA as uint8
         self._pv_mesh.cell_data['colors'] = face_colors
         
-        # Re-render with the new colors
-        self._render_mesh_with_colors()
+        # Update the mesh actor to use the new colors
+        self._update_mesh_display(use_colors=True)
         
         logger.debug(f"Applied visibility paint to {len(face_colors)} faces")
     
+    def _update_mesh_display(self, use_colors: bool = False):
+        """
+        Update mesh display without clearing the entire scene.
+        
+        This method efficiently updates only the mesh actor, preserving
+        hull, cavity, and arrow actors.
+        
+        Args:
+            use_colors: If True, display with per-cell colors; if False, solid color
+        """
+        if not PYVISTA_AVAILABLE or self._pv_mesh is None:
+            return
+        
+        # Remove only the main mesh actor (not hull/cavity/arrows)
+        if self._actor is not None:
+            try:
+                self.plotter.remove_actor(self._actor)
+            except Exception:
+                pass
+            self._actor = None
+        
+        # Remove feature edges (they're tied to mesh appearance)
+        if self._feature_edges_actor is not None:
+            try:
+                self.plotter.remove_actor(self._feature_edges_actor)
+            except Exception:
+                pass
+            self._feature_edges_actor = None
+        
+        # Add mesh with appropriate coloring
+        if use_colors and 'colors' in self._pv_mesh.cell_data:
+            self._actor = self.plotter.add_mesh(
+                self._pv_mesh,
+                scalars='colors',
+                rgb=True,
+                smooth_shading=False,
+                show_edges=False,
+                opacity=1.0,
+                ambient=0.5,
+                diffuse=0.5,
+                specular=0.0,
+                specular_power=1,
+            )
+        else:
+            self._actor = self.plotter.add_mesh(
+                self._pv_mesh,
+                color=self._current_color,
+                smooth_shading=False,
+                show_edges=False,
+                opacity=1.0,
+                ambient=0.5,
+                diffuse=0.5,
+                specular=0.0,
+                specular_power=1,
+                render_points_as_spheres=False,
+                render_lines_as_tubes=False,
+            )
+        
+        # Set flat interpolation for cell shading effect
+        if self._actor is not None:
+            prop = self._actor.GetProperty()
+            if prop:
+                prop.SetInterpolationToFlat()
+        
+        # Re-add feature edges
+        self._add_feature_edges()
+        
+        self.plotter.update()
+    
+    def set_visibility_paint_visible(self, visible: bool):
+        """
+        Toggle visibility paint display without full re-render.
+        
+        This efficiently toggles between colored (parting analysis) and
+        solid color mesh display without affecting other scene elements.
+        
+        Args:
+            visible: True to show parting colors, False to show solid color
+        """
+        if not PYVISTA_AVAILABLE or self._pv_mesh is None:
+            return
+        
+        if not self._visibility_paint_active:
+            # No paint data available
+            return
+        
+        if visible == self._visibility_paint_showing:
+            # Already in the desired state
+            return
+        
+        self._visibility_paint_showing = visible
+        
+        if visible:
+            # Restore the stored colors
+            if self._stored_face_colors is not None:
+                self._pv_mesh.cell_data['colors'] = self._stored_face_colors
+                self._update_mesh_display(use_colors=True)
+        else:
+            # Show solid color (remove colors from cell data display)
+            self._update_mesh_display(use_colors=False)
+        
+        logger.debug(f"Visibility paint display set to: {visible}")
+    
     def _render_mesh_with_colors(self):
-        """Render mesh with per-cell colors (for visibility painting) using cell shading."""
+        """
+        Full re-render with per-cell colors (fallback method).
+        
+        NOTE: This method clears the entire scene and re-adds all actors.
+        Prefer using _update_mesh_display() for toggling visibility paint
+        as it's more efficient and doesn't affect hull/cavity actors.
+        
+        This method is kept for edge cases where a full re-render is needed.
+        """
         if not PYVISTA_AVAILABLE or self._pv_mesh is None:
             return
         
@@ -1117,6 +1364,10 @@ class MeshViewer(QWidget):
         self._feature_edges_actor = None
         self._silhouette_actor = None
         self._silhouette_filter = None
+        # Hull and cavity actors are invalidated by clear(), reset references
+        self._hull_actor = None
+        self._cavity_actor = None
+        self._original_hull_actor = None
         
         # Re-setup lighting after clear
         self._setup_lighting()
@@ -1174,6 +1425,9 @@ class MeshViewer(QWidget):
         # Ensure orthographic projection
         self.plotter.enable_parallel_projection()
         
+        # Re-add hull and cavity actors if they exist (they get cleared by plotter.clear())
+        self._re_add_hull_and_cavity_actors()
+        
         self.plotter.update()
     
     def remove_visibility_paint(self):
@@ -1187,14 +1441,15 @@ class MeshViewer(QWidget):
         logger.info("Removing visibility paint from mesh")
         
         self._visibility_paint_active = False
+        self._visibility_paint_showing = False
+        self._stored_face_colors = None
         
         # Remove the colors cell data
         if 'colors' in self._pv_mesh.cell_data:
             del self._pv_mesh.cell_data['colors']
         
-        # Re-render with original solid color
-        self._render_mesh()
-        self._fit_camera_to_mesh()
+        # Update mesh display to solid color (efficient - doesn't clear scene)
+        self._update_mesh_display(use_colors=False)
     
     @property
     def parting_d1(self) -> Optional[np.ndarray]:
@@ -1247,8 +1502,20 @@ class MeshViewer(QWidget):
         # Convert hull to PyVista
         pv_hull = self._trimesh_to_pyvista(hull_mesh)
         
-        # Remove existing hull actors
-        self.clear_hull()
+        # Remove existing hull actors (but don't clear mesh data)
+        if self._hull_actor is not None:
+            try:
+                self.plotter.remove_actor(self._hull_actor)
+            except Exception:
+                pass
+            self._hull_actor = None
+        
+        if self._original_hull_actor is not None:
+            try:
+                self.plotter.remove_actor(self._original_hull_actor)
+            except Exception:
+                pass
+            self._original_hull_actor = None
         
         # Add inflated hull mesh (semi-transparent)
         self._hull_actor = self.plotter.add_mesh(
@@ -1319,6 +1586,9 @@ class MeshViewer(QWidget):
         if self._hull_actor is not None:
             self._hull_actor.SetVisibility(visible)
             self.plotter.update()
+            logger.debug(f"Hull visibility set to {visible}")
+        else:
+            logger.debug(f"Hull visibility requested ({visible}) but no actor exists (mesh exists: {self._hull_mesh is not None})")
     
     def set_original_hull_visible(self, visible: bool):
         """
@@ -1355,3 +1625,428 @@ class MeshViewer(QWidget):
         """Check if a hull has been computed."""
         return self._hull_mesh is not None
 
+    # =========================================================================
+    # MOLD CAVITY VISUALIZATION
+    # =========================================================================
+    
+    def set_cavity_mesh(self, cavity_mesh: trimesh.Trimesh):
+        """
+        Set and display the mold cavity mesh.
+        
+        Args:
+            cavity_mesh: The mold cavity mesh (result of hull - original)
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        self._cavity_mesh = cavity_mesh
+        
+        # Convert cavity to PyVista
+        pv_cavity = self._trimesh_to_pyvista(cavity_mesh)
+        
+        # Remove existing cavity actor (but don't clear mesh data)
+        if self._cavity_actor is not None:
+            try:
+                self.plotter.remove_actor(self._cavity_actor)
+            except Exception:
+                pass
+            self._cavity_actor = None
+        
+        # Add cavity mesh (semi-transparent)
+        self._cavity_actor = self.plotter.add_mesh(
+            pv_cavity,
+            color=self.CAVITY_COLOR,
+            opacity=self.CAVITY_OPACITY,
+            smooth_shading=True,
+            show_edges=False,
+            style='surface',
+            render_points_as_spheres=False,
+        )
+        
+        # Set up rendering properties
+        if self._cavity_actor is not None:
+            prop = self._cavity_actor.GetProperty()
+            if prop:
+                prop.SetInterpolationToPhong()
+        
+        self.plotter.update()
+        logger.info(f"Cavity mesh displayed: {len(cavity_mesh.vertices)} vertices, {len(cavity_mesh.faces)} faces")
+    
+    def clear_cavity(self):
+        """Remove cavity visualization from the scene."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        if self._cavity_actor is not None:
+            try:
+                self.plotter.remove_actor(self._cavity_actor)
+            except Exception:
+                pass
+            self._cavity_actor = None
+        
+        self._cavity_mesh = None
+        self.plotter.update()
+        logger.info("Cavity mesh cleared")
+    
+    def set_cavity_visible(self, visible: bool):
+        """
+        Set visibility of the mold cavity.
+        
+        Args:
+            visible: True to show cavity, False to hide
+        """
+        self._cavity_visible = visible
+        if self._cavity_actor is not None:
+            self._cavity_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Cavity visibility set to {visible}")
+        else:
+            logger.debug(f"Cavity visibility requested ({visible}) but no actor exists (mesh exists: {self._cavity_mesh is not None})")
+    
+    def set_cavity_opacity(self, opacity: float):
+        """
+        Set the opacity of the mold cavity.
+        
+        Args:
+            opacity: Opacity value from 0.0 (transparent) to 1.0 (opaque)
+        """
+        if self._cavity_actor is not None:
+            prop = self._cavity_actor.GetProperty()
+            if prop:
+                prop.SetOpacity(opacity)
+            self.plotter.update()
+    
+    def apply_cavity_classification_paint(self, face_colors: np.ndarray):
+        """
+        Apply mold half classification colors to the cavity mesh.
+        
+        Colors the cavity triangles based on their mold half classification:
+        - H₁ (Green): Triangles pulled by D1
+        - H₂ (Orange): Triangles pulled by D2
+        - Boundary Zone (Gray): Interface between H₁ and H₂
+        - Inner (Dark Gray): Part surface triangles
+        
+        Args:
+            face_colors: Array of shape (n_faces, 4) with RGBA colors (0-255)
+        """
+        if not PYVISTA_AVAILABLE or self._cavity_mesh is None:
+            return
+        
+        logger.info("Applying mold half classification paint to cavity")
+        
+        # Remove existing plain cavity actor completely (to avoid Z-fighting)
+        if self._cavity_actor is not None:
+            try:
+                self.plotter.remove_actor(self._cavity_actor)
+            except Exception:
+                pass
+            self._cavity_actor = None
+        
+        # Convert cavity mesh to PyVista if needed
+        pv_cavity = self._trimesh_to_pyvista(self._cavity_mesh)
+        
+        # Apply colors as cell data
+        pv_cavity.cell_data['colors'] = face_colors
+        
+        # Remove existing mold halves actor
+        if self._mold_halves_actor is not None:
+            try:
+                self.plotter.remove_actor(self._mold_halves_actor)
+            except Exception:
+                pass
+            self._mold_halves_actor = None
+        
+        # Add mold halves mesh with cell colors
+        self._mold_halves_actor = self.plotter.add_mesh(
+            pv_cavity,
+            scalars='colors',
+            rgb=True,
+            smooth_shading=False,
+            show_edges=False,
+            opacity=1.0,  # Fully opaque - no other cavity actor to show through
+            ambient=0.4,
+            diffuse=0.6,
+            specular=0.1,
+        )
+        
+        # Set flat interpolation for better color visibility
+        if self._mold_halves_actor is not None:
+            prop = self._mold_halves_actor.GetProperty()
+            if prop:
+                prop.SetInterpolationToFlat()
+            # Set visibility state
+            self._mold_halves_actor.SetVisibility(self._mold_halves_visible)
+        
+        self.plotter.update()
+        logger.debug(f"Applied classification paint to {len(face_colors)} faces")
+    
+    def set_mold_halves_visible(self, visible: bool):
+        """Set visibility of mold halves classification."""
+        self._mold_halves_visible = visible
+        if self._mold_halves_actor is not None:
+            self._mold_halves_actor.SetVisibility(visible)
+            self.plotter.update()
+    
+    @property
+    def has_mold_halves(self) -> bool:
+        """Check if mold halves classification is displayed."""
+        return self._mold_halves_actor is not None
+    
+    @property
+    def cavity_mesh(self) -> Optional[trimesh.Trimesh]:
+        """Get the current cavity mesh."""
+        return self._cavity_mesh
+    
+    @property
+    def has_cavity(self) -> bool:
+        """Check if a cavity has been computed."""
+        return self._cavity_mesh is not None
+
+    # ========================================================================
+    # TETRAHEDRAL MESH VISUALIZATION
+    # ========================================================================
+    
+    def set_tetrahedral_mesh(
+        self,
+        vertices: np.ndarray,
+        edges: np.ndarray,
+        edge_weights: Optional[np.ndarray] = None,
+        colormap: str = 'coolwarm'
+    ):
+        """
+        Display tetrahedral mesh edges colored by weight.
+        
+        Args:
+            vertices: (N, 3) vertex positions
+            edges: (E, 2) edge vertex indices
+            edge_weights: (E,) weights for coloring edges (optional)
+            colormap: Matplotlib colormap name for weight visualization
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        logger.info(f"Setting tetrahedral mesh: {len(vertices)} verts, {len(edges)} edges")
+        
+        # Remove existing tet mesh actor
+        self.clear_tetrahedral_mesh()
+        
+        # Create line segments for edges using pv.lines_from_points approach
+        # We need to create separate line segments, each as a 2-point polyline
+        n_edges = len(edges)
+        
+        # Build the lines connectivity array
+        # Format: [n_pts_line1, idx1, idx2, n_pts_line2, idx3, idx4, ...]
+        # For edges, each line has 2 points
+        lines = np.empty((n_edges, 3), dtype=np.int64)
+        lines[:, 0] = 2  # Number of points in each line
+        lines[:, 1] = edges[:, 0]
+        lines[:, 2] = edges[:, 1]
+        
+        # Create PyVista PolyData with lines
+        mesh = pv.PolyData(vertices.astype(np.float32))
+        mesh.lines = lines.ravel()
+        
+        # Verify cell count matches edge count
+        logger.debug(f"Created mesh with {mesh.n_cells} cells for {n_edges} edges")
+        
+        # Add edge weights as scalars if provided
+        if edge_weights is not None and len(edge_weights) == mesh.n_cells:
+            mesh.cell_data['weight'] = edge_weights.astype(np.float32)
+            scalars = 'weight'
+            
+            # Log weight statistics
+            logger.debug(f"Edge weights: min={edge_weights.min():.4f}, max={edge_weights.max():.4f}, mean={edge_weights.mean():.4f}")
+        elif edge_weights is not None:
+            # Mismatch - use point data instead by averaging edge weights to vertices
+            logger.warning(f"Edge count mismatch: {len(edge_weights)} weights vs {mesh.n_cells} cells. Using point coloring.")
+            # Create vertex colors by averaging weights of incident edges
+            vertex_weights = np.zeros(len(vertices), dtype=np.float32)
+            vertex_counts = np.zeros(len(vertices), dtype=np.int32)
+            for i, (v0, v1) in enumerate(edges):
+                vertex_weights[v0] += edge_weights[i]
+                vertex_weights[v1] += edge_weights[i]
+                vertex_counts[v0] += 1
+                vertex_counts[v1] += 1
+            vertex_counts[vertex_counts == 0] = 1  # Avoid division by zero
+            vertex_weights /= vertex_counts
+            mesh.point_data['weight'] = vertex_weights
+            scalars = 'weight'
+        else:
+            scalars = None
+        
+        # Add to plotter
+        if scalars is not None:
+            self._tet_edges_actor = self.plotter.add_mesh(
+                mesh,
+                scalars=scalars,
+                cmap=colormap,
+                line_width=1.5,
+                render_lines_as_tubes=False,
+                show_scalar_bar=True,
+                scalar_bar_args={
+                    'title': 'Edge Weight',
+                    'title_font_size': 12,
+                    'label_font_size': 10,
+                    'n_labels': 5,
+                    'position_x': 0.85,
+                    'position_y': 0.1,
+                    'width': 0.1,
+                    'height': 0.3,
+                }
+            )
+        else:
+            self._tet_edges_actor = self.plotter.add_mesh(
+                mesh,
+                color='#ffaa00',  # Orange default
+                line_width=1.5,
+                render_lines_as_tubes=False,
+            )
+        
+        # Set visibility
+        if self._tet_edges_actor is not None:
+            self._tet_edges_actor.SetVisibility(self._tet_visible)
+        
+        self.plotter.update()
+        logger.info(f"Tetrahedral mesh edges displayed with {'weight coloring' if edge_weights is not None else 'solid color'}")
+    
+    def clear_tetrahedral_mesh(self):
+        """Remove tetrahedral mesh visualization."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        if self._tet_edges_actor is not None:
+            try:
+                self.plotter.remove_actor(self._tet_edges_actor)
+            except Exception:
+                pass
+            self._tet_edges_actor = None
+    
+    def set_tetrahedral_mesh_visible(self, visible: bool):
+        """Set visibility of tetrahedral mesh edges."""
+        self._tet_visible = visible
+        if self._tet_edges_actor is not None:
+            self._tet_edges_actor.SetVisibility(visible)
+            self.plotter.update()
+    
+    @property
+    def has_tetrahedral_mesh(self) -> bool:
+        """Check if tetrahedral mesh is displayed."""
+        return self._tet_edges_actor is not None
+
+    # ========================================================================
+    # R DISTANCE LINE VISUALIZATION
+    # ========================================================================
+    
+    def set_r_distance_line(
+        self,
+        hull_point: np.ndarray,
+        part_point: np.ndarray,
+        r_value: float
+    ):
+        """
+        Display the R distance line (max hull-to-part distance).
+        
+        Shows a red line between the hull point and the closest point on the part,
+        with small spheres at each endpoint.
+        
+        Args:
+            hull_point: (3,) position on hull surface (maximum distance point)
+            part_point: (3,) closest point on part surface
+            r_value: The R distance value
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        logger.info(f"Setting R distance line: R={r_value:.4f}")
+        
+        # Clear existing R visualization
+        self.clear_r_distance_line()
+        
+        # Create line between points
+        line = pv.Line(hull_point, part_point)
+        
+        # Add the line - thick red line
+        self._r_line_actor = self.plotter.add_mesh(
+            line,
+            color='red',
+            line_width=4.0,
+            opacity=1.0,
+            render_lines_as_tubes=True,
+        )
+        
+        # Create spheres at endpoints
+        # Hull point sphere (red)
+        hull_sphere = pv.Sphere(radius=r_value * 0.03, center=hull_point)
+        hull_actor = self.plotter.add_mesh(
+            hull_sphere,
+            color='red',
+            opacity=1.0,
+            smooth_shading=True,
+        )
+        self._r_point_actors.append(hull_actor)
+        
+        # Part point sphere (darker red)
+        part_sphere = pv.Sphere(radius=r_value * 0.03, center=part_point)
+        part_actor = self.plotter.add_mesh(
+            part_sphere,
+            color='darkred',
+            opacity=1.0,
+            smooth_shading=True,
+        )
+        self._r_point_actors.append(part_actor)
+        
+        # Add label at midpoint
+        midpoint = (hull_point + part_point) / 2
+        # Offset label slightly to avoid overlapping with line
+        offset = np.array([r_value * 0.1, r_value * 0.1, 0])
+        label_pos = midpoint + offset
+        
+        self._r_label_actor = self.plotter.add_point_labels(
+            [label_pos],
+            [f"R = {r_value:.3f}"],
+            font_size=14,
+            text_color='red',
+            point_color='red',
+            point_size=0,  # Don't show point
+            shape_opacity=0.7,
+            always_visible=True,
+        )
+        
+        self.plotter.update()
+        logger.info(f"R distance line displayed: hull={hull_point}, part={part_point}")
+    
+    def clear_r_distance_line(self):
+        """Remove R distance line visualization."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        # Remove line actor
+        if self._r_line_actor is not None:
+            try:
+                self.plotter.remove_actor(self._r_line_actor)
+            except Exception:
+                pass
+            self._r_line_actor = None
+        
+        # Remove point actors
+        for actor in self._r_point_actors:
+            try:
+                self.plotter.remove_actor(actor)
+            except Exception:
+                pass
+        self._r_point_actors = []
+        
+        # Remove label actor
+        if self._r_label_actor is not None:
+            try:
+                self.plotter.remove_actor(self._r_label_actor)
+            except Exception:
+                pass
+            self._r_label_actor = None
+        
+        self.plotter.update()
+    
+    @property
+    def has_r_distance_line(self) -> bool:
+        """Check if R distance line is displayed."""
+        return self._r_line_actor is not None
