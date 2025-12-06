@@ -1014,6 +1014,7 @@ class EdgeWeightsWorker(QThread):
     
     progress = pyqtSignal(str)
     r_distance_computed = pyqtSignal(object)  # Dict with hull_point, part_point, r_value
+    mesh_inflated = pyqtSignal(object)  # Updated TetrahedralMeshResult after inflation
     complete = pyqtSignal(object)  # Updated TetrahedralMeshResult
     error = pyqtSignal(str)
     
@@ -1108,8 +1109,28 @@ class EdgeWeightsWorker(QThread):
             result.r_hull_point = boundary_point  # Keep attribute name for compatibility
             result.r_part_point = part_point
             
-            # For now, stop here as requested - don't process further calculations
-            self.progress.emit(f"R = {r_value:.4f} computed. Further processing paused.")
+            # Step 2: Inflate boundary vertices outward by R - distance_to_part
+            self.progress.emit("Inflating boundary vertices...")
+            
+            from core.tetrahedral_mesh import inflate_boundary_vertices
+            
+            inflated_result = inflate_boundary_vertices(
+                result,
+                self.part_mesh,
+                r_value,
+                use_gpu=CUDA_AVAILABLE
+            )
+            
+            inflate_time = (time.time() - start_time) * 1000 - r_time
+            logger.info(f"Boundary inflation complete in {inflate_time:.0f}ms")
+            
+            # Emit inflated mesh for visualization
+            self.mesh_inflated.emit(inflated_result)
+            
+            # Update result reference
+            result = inflated_result
+            
+            self.progress.emit(f"R = {r_value:.4f}, mesh inflated. Processing complete.")
             self.complete.emit(result)
             
             # NOTE: The following code is temporarily disabled as requested
@@ -4352,6 +4373,7 @@ class MainWindow(QMainWindow):
         )
         self._edge_weights_worker.progress.connect(self._on_edge_weights_progress)
         self._edge_weights_worker.r_distance_computed.connect(self._on_r_distance_computed)
+        self._edge_weights_worker.mesh_inflated.connect(self._on_mesh_inflated)
         self._edge_weights_worker.complete.connect(self._on_edge_weights_complete)
         self._edge_weights_worker.error.connect(self._on_edge_weights_error)
         self._edge_weights_worker.finished.connect(self._on_edge_weights_worker_finished)
@@ -4387,6 +4409,29 @@ class MainWindow(QMainWindow):
                 pass
         
         logger.info(f"R distance visualized: R={r_value:.4f}")
+    
+    def _on_mesh_inflated(self, result: TetrahedralMeshResult):
+        """Handle mesh inflation complete - visualize the inflated boundary mesh."""
+        logger.info(f"Mesh inflated: {result.num_vertices} vertices, {result.num_boundary_faces} boundary faces")
+        
+        # Update stored result
+        self._tet_result = result
+        
+        # Display the inflated boundary mesh
+        if result.boundary_mesh is not None:
+            # Set the inflated boundary mesh as a surface visualization
+            self.mesh_viewer.set_inflated_boundary_mesh(result.boundary_mesh)
+            
+            # Update stats display
+            if hasattr(self, 'edge_weights_stats') and self.edge_weights_stats is not None:
+                try:
+                    self.edge_weights_stats.add_header('🔄 Mesh Inflated', Colors.SUCCESS)
+                    self.edge_weights_stats.add_row(f'Boundary vertices: {len(result.boundary_mesh.vertices):,}')
+                    self.edge_weights_stats.add_row(f'Boundary faces: {len(result.boundary_mesh.faces):,}')
+                except RuntimeError:
+                    pass
+        
+        logger.info("Inflated boundary mesh displayed")
     
     def _on_edge_weights_complete(self, result: TetrahedralMeshResult):
         """Handle edge weights complete."""

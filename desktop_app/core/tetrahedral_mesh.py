@@ -79,6 +79,9 @@ class TetrahedralMeshResult:
     r_hull_point: Optional[np.ndarray] = None  # Point on hull with max distance
     r_part_point: Optional[np.ndarray] = None  # Closest point on part surface
     
+    # Whether the mesh has been inflated
+    is_inflated: bool = False
+    
     # Statistics
     num_vertices: int = 0
     num_tetrahedra: int = 0
@@ -214,6 +217,143 @@ def extract_boundary_surface(
     logger.info(f"Boundary mesh cleaned: {len(boundary_mesh.vertices)} vertices, {len(boundary_mesh.faces)} faces")
     
     return boundary_mesh
+
+
+def inflate_boundary_vertices(
+    tet_result: 'TetrahedralMeshResult',
+    part_mesh: trimesh.Trimesh,
+    r_value: float,
+    use_gpu: bool = True
+) -> 'TetrahedralMeshResult':
+    """
+    Inflate boundary vertices of the tetrahedral mesh outward.
+    
+    For each boundary vertex, move it outward by:
+        displacement = R - distance_to_part
+    
+    This creates a more uniform thickness in the mold volume.
+    Vertices close to the part move more (up to R), vertices far from
+    the part move less.
+    
+    Args:
+        tet_result: TetrahedralMeshResult to modify
+        part_mesh: Original part mesh (for distance computation)
+        r_value: Maximum distance R (computed earlier)
+        use_gpu: Whether to use GPU acceleration
+    
+    Returns:
+        Modified TetrahedralMeshResult with inflated boundary vertices
+    """
+    import time
+    start_time = time.time()
+    
+    boundary_mesh = tet_result.boundary_mesh
+    if boundary_mesh is None:
+        logger.warning("No boundary mesh available for inflation")
+        return tet_result
+    
+    # Get boundary vertices
+    boundary_verts = np.asarray(boundary_mesh.vertices, dtype=np.float64)
+    n_boundary = len(boundary_verts)
+    
+    logger.info(f"Inflating {n_boundary} boundary vertices with R={r_value:.4f}")
+    
+    # Compute distance from each boundary vertex to part surface
+    if use_gpu and CUDA_AVAILABLE:
+        distances, closest_points = compute_distances_and_closest_points_gpu(
+            boundary_verts, part_mesh
+        )
+    else:
+        closest_points, distances, _ = part_mesh.nearest.on_surface(boundary_verts)
+    
+    # Compute displacement for each vertex: R - distance
+    displacements = r_value - distances
+    
+    # Clamp displacements to be non-negative (don't move inward)
+    displacements = np.maximum(displacements, 0.0)
+    
+    logger.info(f"Displacement range: [{displacements.min():.4f}, {displacements.max():.4f}]")
+    
+    # Compute outward direction for each vertex (vertex normal)
+    # Use the boundary mesh vertex normals
+    vertex_normals = boundary_mesh.vertex_normals
+    if vertex_normals is None or len(vertex_normals) != n_boundary:
+        # Fallback: compute direction from closest point on part to vertex
+        directions = boundary_verts - closest_points
+        norms = np.linalg.norm(directions, axis=1, keepdims=True)
+        norms = np.where(norms > 1e-10, norms, 1.0)
+        vertex_normals = directions / norms
+    
+    # Ensure normals are unit vectors
+    normal_lengths = np.linalg.norm(vertex_normals, axis=1, keepdims=True)
+    normal_lengths = np.where(normal_lengths > 1e-10, normal_lengths, 1.0)
+    vertex_normals = vertex_normals / normal_lengths
+    
+    # Move boundary vertices outward
+    inflated_boundary_verts = boundary_verts + vertex_normals * displacements[:, np.newaxis]
+    
+    # Update the boundary mesh with new vertex positions
+    inflated_boundary_mesh = trimesh.Trimesh(
+        vertices=inflated_boundary_verts,
+        faces=boundary_mesh.faces.copy(),
+        process=False
+    )
+    inflated_boundary_mesh.fix_normals()
+    
+    # Create mapping from boundary mesh vertices to tetrahedral mesh vertices
+    # The tetrahedral vertices include interior vertices, but we only modify boundary ones
+    # We need to identify which tet vertices correspond to boundary mesh vertices
+    
+    # Copy the original tet vertices
+    new_tet_verts = tet_result.vertices.copy()
+    
+    # For each boundary mesh vertex, find the corresponding tet vertex and update it
+    # Use nearest neighbor matching since boundary_mesh may have merged vertices
+    from scipy.spatial import cKDTree
+    tet_tree = cKDTree(tet_result.vertices)
+    
+    # For each original boundary vertex, find nearest tet vertex
+    orig_boundary_verts = np.asarray(boundary_mesh.vertices, dtype=np.float64)
+    _, tet_indices = tet_tree.query(orig_boundary_verts, k=1)
+    
+    # Update those tet vertices with inflated positions
+    new_tet_verts[tet_indices] = inflated_boundary_verts
+    
+    # Recompute edge lengths with new vertices
+    edges = tet_result.edges
+    v0 = new_tet_verts[edges[:, 0]]
+    v1 = new_tet_verts[edges[:, 1]]
+    new_edge_lengths = np.linalg.norm(v1 - v0, axis=1)
+    
+    elapsed = (time.time() - start_time) * 1000
+    logger.info(f"Boundary inflation complete in {elapsed:.0f}ms")
+    logger.info(f"  Updated {len(tet_indices)} tet vertices")
+    
+    # Create new result with updated data
+    inflated_result = TetrahedralMeshResult(
+        vertices=new_tet_verts,
+        tetrahedra=tet_result.tetrahedra,
+        edges=tet_result.edges,
+        edge_lengths=new_edge_lengths,
+        boundary_mesh=inflated_boundary_mesh,
+        edge_dist_to_part=None,  # Needs recomputation
+        edge_weights=None,  # Needs recomputation
+        weighted_edge_lengths=None,
+        boundary_vertices=tet_result.boundary_vertices,
+        boundary_labels=tet_result.boundary_labels,
+        r_value=r_value,
+        r_hull_point=tet_result.r_hull_point,
+        r_part_point=tet_result.r_part_point,
+        is_inflated=True,
+        num_vertices=len(new_tet_verts),
+        num_tetrahedra=tet_result.num_tetrahedra,
+        num_edges=tet_result.num_edges,
+        num_boundary_faces=len(inflated_boundary_mesh.faces),
+        tetrahedralize_time_ms=tet_result.tetrahedralize_time_ms,
+        total_time_ms=tet_result.total_time_ms + elapsed
+    )
+    
+    return inflated_result
 
 
 def extract_edges(tetrahedra: np.ndarray) -> np.ndarray:

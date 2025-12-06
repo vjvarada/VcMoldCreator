@@ -111,6 +111,10 @@ class MeshViewer(QWidget):
         self._tet_edges_actor = None
         self._tet_visible = True
         
+        # Inflated boundary mesh visualization
+        self._inflated_boundary_actor = None
+        self._inflated_boundary_visible = True
+        
         # R distance line visualization (max hull-to-part distance)
         self._r_line_actor = None
         self._r_point_actors = []  # Spheres at endpoints
@@ -892,6 +896,10 @@ class MeshViewer(QWidget):
         # Reset tetrahedral mesh state
         self._tet_edges_actor = None
         self._tet_visible = True
+        
+        # Reset inflated boundary mesh state
+        self._inflated_boundary_actor = None
+        self._inflated_boundary_visible = True
         
         # Reset R distance line state
         self._r_line_actor = None
@@ -1932,6 +1940,85 @@ class MeshViewer(QWidget):
     def has_tetrahedral_mesh(self) -> bool:
         """Check if tetrahedral mesh is displayed."""
         return self._tet_edges_actor is not None
+
+    # ========================================================================
+    # INFLATED BOUNDARY MESH VISUALIZATION
+    # ========================================================================
+    
+    def set_inflated_boundary_mesh(self, boundary_mesh: trimesh.Trimesh):
+        """
+        Display the inflated boundary mesh as a semi-transparent surface.
+        
+        Args:
+            boundary_mesh: The inflated boundary surface mesh
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        logger.info(f"Setting inflated boundary mesh: {len(boundary_mesh.vertices)} verts, {len(boundary_mesh.faces)} faces")
+        
+        # Remove existing inflated boundary actor
+        self.clear_inflated_boundary_mesh()
+        
+        # Convert to PyVista
+        vertices = np.asarray(boundary_mesh.vertices, dtype=np.float32)
+        faces = np.asarray(boundary_mesh.faces, dtype=np.int32)
+        
+        # PyVista face format: [n_points, idx0, idx1, idx2, ...]
+        pv_faces = np.column_stack([
+            np.full(len(faces), 3, dtype=np.int32),
+            faces
+        ]).ravel()
+        
+        pv_mesh = pv.PolyData(vertices, pv_faces)
+        
+        # Use a distinct color for inflated boundary - golden/amber
+        inflated_color = "#ffaa00"  # Golden amber
+        
+        # Add with cell shading style (flat interpolation, low specular)
+        self._inflated_boundary_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color=inflated_color,
+            opacity=0.6,
+            show_edges=False,
+            smooth_shading=False,  # Flat shading for cell/toon style
+            ambient=0.4,
+            diffuse=0.6,
+            specular=0.0,
+        )
+        
+        # Configure actor properties for cell shading
+        if self._inflated_boundary_actor is not None:
+            prop = self._inflated_boundary_actor.GetProperty()
+            prop.SetInterpolationToFlat()
+            self._inflated_boundary_actor.SetVisibility(self._inflated_boundary_visible)
+        
+        self.plotter.update()
+        logger.info("Inflated boundary mesh displayed")
+    
+    def clear_inflated_boundary_mesh(self):
+        """Remove inflated boundary mesh visualization."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        if self._inflated_boundary_actor is not None:
+            try:
+                self.plotter.remove_actor(self._inflated_boundary_actor)
+            except Exception:
+                pass
+            self._inflated_boundary_actor = None
+    
+    def set_inflated_boundary_visible(self, visible: bool):
+        """Set visibility of inflated boundary mesh."""
+        self._inflated_boundary_visible = visible
+        if self._inflated_boundary_actor is not None:
+            self._inflated_boundary_actor.SetVisibility(visible)
+            self.plotter.update()
+    
+    @property
+    def has_inflated_boundary(self) -> bool:
+        """Check if inflated boundary mesh is displayed."""
+        return self._inflated_boundary_actor is not None
 
     # ========================================================================
     # R DISTANCE LINE VISUALIZATION
