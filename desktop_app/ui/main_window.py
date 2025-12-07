@@ -58,7 +58,6 @@ from core.mold_half_classification import (
     MoldHalfColors,
 )
 from core.tetrahedral_mesh import (
-    generate_tetrahedral_mesh,
     compute_edge_costs,
     TetrahedralMeshResult,
     PYTETWILD_AVAILABLE,
@@ -816,7 +815,9 @@ class MoldHalvesWorker(QThread):
         d2: np.ndarray,
         boundary_zone_threshold: float = 0.15,
         part_mesh=None,
-        use_proximity_method: bool = False
+        use_proximity_method: bool = False,
+        tet_vertices: np.ndarray = None,
+        tet_boundary_labels: np.ndarray = None
     ):
         """
         Initialize mold halves classification worker.
@@ -829,6 +830,8 @@ class MoldHalvesWorker(QThread):
             boundary_zone_threshold: Threshold for boundary zone (0-1)
             part_mesh: Original part mesh (for proximity-based classification)
             use_proximity_method: Use proximity-based outer boundary detection
+            tet_vertices: (N, 3) tet mesh vertices (enables fast label-based detection)
+            tet_boundary_labels: (N,) boundary labels from tet mesh
         """
         super().__init__()
         self.cavity_mesh = cavity_mesh
@@ -838,11 +841,13 @@ class MoldHalvesWorker(QThread):
         self.boundary_zone_threshold = boundary_zone_threshold
         self.part_mesh = part_mesh
         self.use_proximity_method = use_proximity_method
+        self.tet_vertices = tet_vertices
+        self.tet_boundary_labels = tet_boundary_labels
     
     def run(self):
         try:
             logger.info("Classifying mold halves...")
-            self.progress.emit("Analyzing cavity geometry...")
+            self.progress.emit("Classifying mold halves...")
             
             result = classify_mold_halves(
                 self.cavity_mesh,
@@ -851,7 +856,9 @@ class MoldHalvesWorker(QThread):
                 self.d2,
                 self.boundary_zone_threshold,
                 part_mesh=self.part_mesh,
-                use_proximity_method=self.use_proximity_method
+                use_proximity_method=self.use_proximity_method,
+                tet_vertices=self.tet_vertices,
+                tet_boundary_labels=self.tet_boundary_labels
             )
             
             self.progress.emit(
@@ -1509,10 +1516,6 @@ class TitleBar(QFrame):
             }}
         """)
         return btn
-    
-    def _create_tool_button(self, icon: str, tooltip: str) -> QPushButton:
-        """Create a tool button (legacy, for compatibility)."""
-        return self._create_icon_button(icon, tooltip)
     
     def _create_view_button(self, label: str, tooltip: str) -> QPushButton:
         """Create a view control button (cube face icons)."""
@@ -3972,14 +3975,16 @@ class MainWindow(QMainWindow):
         # Log mesh stats (quick)
         logger.info(f"Mold halves using tet boundary mesh: {len(boundary_mesh.vertices)} verts, {len(boundary_mesh.faces)} faces")
         
-        # Start worker with part_mesh for proximity-based classification
+        # Start worker with tet mesh data for fast label-based detection
         self._mold_halves_worker = MoldHalvesWorker(
             boundary_mesh,  # Use tet boundary mesh
             self._hull_result.mesh,
             d1, d2,
             self._boundary_zone_threshold,
-            part_mesh=self._current_mesh,  # Pass part mesh for proximity detection
-            use_proximity_method=True  # Use proximity method for tet boundary
+            part_mesh=self._current_mesh,  # Keep for fallback
+            use_proximity_method=False,  # Don't use slow proximity method
+            tet_vertices=self._tet_result.vertices,  # Pass tet vertices
+            tet_boundary_labels=self._tet_result.boundary_labels  # Pass pre-computed labels
         )
         self._mold_halves_worker.progress.connect(self._on_mold_halves_progress)
         self._mold_halves_worker.complete.connect(self._on_mold_halves_complete)

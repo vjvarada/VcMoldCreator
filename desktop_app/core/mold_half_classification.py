@@ -152,6 +152,220 @@ def build_triangle_adjacency(mesh: trimesh.Trimesh) -> Dict[int, List[int]]:
     return adjacency
 
 
+def classify_mold_halves_fast(
+    boundary_mesh: trimesh.Trimesh,
+    outer_triangles: Set[int],
+    d1: np.ndarray,
+    d2: np.ndarray,
+    adjacency: Dict[int, List[int]] = None
+) -> Dict[int, int]:
+    """
+    Fast mold half classification using greedy region growing (per research paper).
+    
+    Algorithm from paper:
+    "Given the two parting directions, we partition the boundary ∂H into two parts, 
+    ∂H1 and ∂H2: we select the two faces F1 and F2 of ∂H whose normals best align 
+    with d1 and d2 and then use a greedy region-growing approach from F1 and F2 
+    to assign faces to ∂H1 and ∂H2, according to the alignment of their normal to d1 and d2"
+    
+    This is O(n) where n = number of triangles, much faster than the proximity-based approach.
+    
+    Args:
+        boundary_mesh: The boundary mesh
+        outer_triangles: Set of outer boundary triangle indices to classify
+        d1: First parting direction (normalized)
+        d2: Second parting direction (normalized)
+        adjacency: Pre-computed adjacency map (optional, will compute if not provided)
+    
+    Returns:
+        Dict mapping triangle index to mold half (1 or 2)
+    """
+    if len(outer_triangles) == 0:
+        return {}
+    
+    # Get face normals
+    face_normals = boundary_mesh.face_normals
+    outer_array = np.array(list(outer_triangles), dtype=np.int32)
+    n_outer = len(outer_array)
+    
+    # Compute dot products with parting directions (vectorized)
+    normals = face_normals[outer_array]  # (n_outer, 3)
+    dot1 = normals @ d1  # (n_outer,)
+    dot2 = normals @ d2  # (n_outer,)
+    
+    # Find seed faces: F1 = best alignment with d1, F2 = best alignment with d2
+    f1_local_idx = np.argmax(dot1)
+    f2_local_idx = np.argmax(dot2)
+    f1 = outer_array[f1_local_idx]
+    f2 = outer_array[f2_local_idx]
+    
+    # Build adjacency if not provided
+    if adjacency is None:
+        adjacency = build_triangle_adjacency(boundary_mesh)
+    
+    # Create mapping from triangle idx to local index for fast lookup
+    outer_set = set(outer_triangles)
+    
+    # Greedy region growing using priority queues
+    # Priority = negative dot product (so highest alignment is processed first)
+    import heapq
+    
+    side = {}  # Result: triangle_idx -> 1 or 2
+    
+    # Initialize with seed faces
+    side[f1] = 1
+    side[f2] = 2
+    
+    # Priority queues: (-alignment_score, triangle_idx)
+    # Use negative so highest alignment is popped first
+    pq1 = []  # For H1 expansion
+    pq2 = []  # For H2 expansion
+    
+    # Add neighbors of seeds to queues
+    for neighbor in adjacency.get(f1, []):
+        if neighbor in outer_set and neighbor not in side:
+            # Alignment with d1 for H1 candidates
+            n_vec = face_normals[neighbor]
+            score = np.dot(n_vec, d1)
+            heapq.heappush(pq1, (-score, neighbor))
+    
+    for neighbor in adjacency.get(f2, []):
+        if neighbor in outer_set and neighbor not in side:
+            # Alignment with d2 for H2 candidates
+            n_vec = face_normals[neighbor]
+            score = np.dot(n_vec, d2)
+            heapq.heappush(pq2, (-score, neighbor))
+    
+    # Greedy expansion - alternate between H1 and H2, always taking best-aligned
+    in_queue = set()  # Track which triangles are already queued
+    for _, tri in pq1:
+        in_queue.add(tri)
+    for _, tri in pq2:
+        in_queue.add(tri)
+    
+    while pq1 or pq2:
+        # Try H1 expansion
+        assigned_h1 = False
+        while pq1:
+            neg_score, tri = heapq.heappop(pq1)
+            if tri in side:
+                continue
+            
+            # Assign to H1 if this face aligns better with d1 than d2
+            n_vec = face_normals[tri]
+            align1 = np.dot(n_vec, d1)
+            align2 = np.dot(n_vec, d2)
+            
+            if align1 >= align2:
+                side[tri] = 1
+                assigned_h1 = True
+                # Add unassigned neighbors to H1 queue
+                for neighbor in adjacency.get(tri, []):
+                    if neighbor in outer_set and neighbor not in side and neighbor not in in_queue:
+                        n_vec2 = face_normals[neighbor]
+                        score = np.dot(n_vec2, d1)
+                        heapq.heappush(pq1, (-score, neighbor))
+                        in_queue.add(neighbor)
+                break
+            else:
+                # This face prefers H2, put it in H2 queue
+                heapq.heappush(pq2, (-align2, tri))
+        
+        # Try H2 expansion
+        assigned_h2 = False
+        while pq2:
+            neg_score, tri = heapq.heappop(pq2)
+            if tri in side:
+                continue
+            
+            # Assign to H2 if this face aligns better with d2 than d1
+            n_vec = face_normals[tri]
+            align1 = np.dot(n_vec, d1)
+            align2 = np.dot(n_vec, d2)
+            
+            if align2 >= align1:
+                side[tri] = 2
+                assigned_h2 = True
+                # Add unassigned neighbors to H2 queue
+                for neighbor in adjacency.get(tri, []):
+                    if neighbor in outer_set and neighbor not in side and neighbor not in in_queue:
+                        n_vec2 = face_normals[neighbor]
+                        score = np.dot(n_vec2, d2)
+                        heapq.heappush(pq2, (-score, neighbor))
+                        in_queue.add(neighbor)
+                break
+            else:
+                # This face prefers H1, put it in H1 queue
+                heapq.heappush(pq1, (-align1, tri))
+        
+        # Safety: if neither queue made progress, break
+        if not assigned_h1 and not assigned_h2 and not pq1 and not pq2:
+            break
+    
+    # Handle any remaining unassigned triangles (disconnected components)
+    for tri in outer_triangles:
+        if tri not in side:
+            n_vec = face_normals[tri]
+            align1 = np.dot(n_vec, d1)
+            align2 = np.dot(n_vec, d2)
+            side[tri] = 1 if align1 >= align2 else 2
+    
+    return side
+
+
+def identify_outer_boundary_from_tet_labels(
+    boundary_mesh: trimesh.Trimesh,
+    tet_vertices: np.ndarray,
+    boundary_labels: np.ndarray
+) -> Tuple[Set[int], Set[int]]:
+    """
+    Identify outer vs inner boundary triangles using pre-computed tet boundary labels.
+    
+    This is O(n) - much faster than proximity-based detection which is O(n*m).
+    
+    The boundary_labels array marks each tet vertex as:
+    - 0: interior (not on boundary)
+    - 1: H1 (outer boundary aligned with d1)
+    - 2: H2 (outer boundary aligned with d2)
+    - -1: inner boundary (part surface)
+    
+    A triangle is on the inner boundary if ALL its vertices are on the inner boundary.
+    Otherwise it's on the outer boundary (or mixed, treated as outer).
+    
+    Args:
+        boundary_mesh: The boundary mesh extracted from tet mesh
+        tet_vertices: (N, 3) tetrahedral mesh vertices
+        boundary_labels: (N,) boundary labels from tet mesh (-1=inner, 1=H1, 2=H2)
+    
+    Returns:
+        Tuple of (outer_triangles, inner_triangles) sets
+    """
+    from scipy.spatial import cKDTree
+    
+    # Map boundary mesh vertices to tet mesh vertices
+    boundary_verts = np.asarray(boundary_mesh.vertices)
+    tet_tree = cKDTree(tet_vertices)
+    _, boundary_to_tet = tet_tree.query(boundary_verts, k=1)
+    
+    # Get labels for boundary mesh vertices
+    vertex_labels = boundary_labels[boundary_to_tet]  # (n_boundary_verts,)
+    
+    # Classify each triangle
+    faces = boundary_mesh.faces  # (n_faces, 3)
+    face_vertex_labels = vertex_labels[faces]  # (n_faces, 3)
+    
+    # A face is "inner" if ALL its vertices are inner boundary (-1)
+    # This is conservative - mixed faces go to outer
+    all_inner = np.all(face_vertex_labels == -1, axis=1)  # (n_faces,)
+    
+    inner_triangles = set(np.where(all_inner)[0])
+    outer_triangles = set(np.where(~all_inner)[0])
+    
+    logger.debug(f"From tet labels: {len(outer_triangles)} outer, {len(inner_triangles)} inner triangles")
+    
+    return outer_triangles, inner_triangles
+
+
 def identify_outer_boundary_from_hull(
     cavity_triangles: List[TriangleInfo],
     hull_mesh: trimesh.Trimesh,
@@ -337,11 +551,7 @@ def identify_outer_boundary_by_proximity(
         if part_mesh is not None:
             part_distances = _compute_distances_to_mesh_gpu(centroids, part_mesh)
             outer_mask = hull_distances < part_distances
-            n_outer = np.sum(outer_mask)
-            n_inner = np.sum(~outer_mask)
-            logger.info(f"GPU proximity classification: {n_outer} outer, {n_inner} inner")
-            logger.info(f"  Hull distances: min={hull_distances.min():.4f}, max={hull_distances.max():.4f}, mean={hull_distances.mean():.4f}")
-            logger.info(f"  Part distances: min={part_distances.min():.4f}, max={part_distances.max():.4f}, mean={part_distances.mean():.4f}")
+            logger.debug(f"GPU proximity classification: {np.sum(outer_mask)} outer, {np.sum(~outer_mask)} inner")
         else:
             outer_mask = hull_distances < tolerance
             logger.debug(f"GPU threshold classification (tol={tolerance:.4f}): {np.sum(outer_mask)} outer, {np.sum(~outer_mask)} inner")
@@ -352,14 +562,10 @@ def identify_outer_boundary_by_proximity(
         if part_mesh is not None:
             _, part_distances, _ = part_mesh.nearest.on_surface(centroids)
             outer_mask = hull_distances < part_distances
-            n_outer = np.sum(outer_mask)
-            n_inner = np.sum(~outer_mask)
-            logger.info(f"Proximity classification: {n_outer} outer, {n_inner} inner")
-            logger.info(f"  Hull distances: min={hull_distances.min():.4f}, max={hull_distances.max():.4f}, mean={hull_distances.mean():.4f}")
-            logger.info(f"  Part distances: min={part_distances.min():.4f}, max={part_distances.max():.4f}, mean={part_distances.mean():.4f}")
+            logger.debug(f"CPU proximity classification: {np.sum(outer_mask)} outer, {np.sum(~outer_mask)} inner")
         else:
             outer_mask = hull_distances < tolerance
-            logger.debug(f"Threshold classification (tol={tolerance:.4f}): {np.sum(outer_mask)} outer, {np.sum(~outer_mask)} inner")
+            logger.debug(f"CPU threshold classification (tol={tolerance:.4f}): {np.sum(outer_mask)} outer, {np.sum(~outer_mask)} inner")
     
     outer_triangles = set(np.where(outer_mask)[0])
     return outer_triangles
@@ -800,7 +1006,10 @@ def classify_mold_halves(
     d2: np.ndarray,
     boundary_zone_threshold: float = 0.15,
     part_mesh: trimesh.Trimesh = None,
-    use_proximity_method: bool = False
+    use_proximity_method: bool = False,
+    use_fast_method: bool = True,
+    tet_vertices: np.ndarray = None,
+    tet_boundary_labels: np.ndarray = None
 ) -> MoldHalfClassificationResult:
     """
     Classify boundary triangles of mold cavity into two mold halves.
@@ -816,6 +1025,10 @@ def classify_mold_halves(
         part_mesh: Original part mesh (optional, used for proximity-based classification)
         use_proximity_method: If True, use proximity-based outer boundary detection
                              (better for tetrahedral boundary meshes)
+        use_fast_method: If True, use fast greedy region-growing (O(n) per paper)
+                        If False, use original morphological smoothing approach
+        tet_vertices: (N, 3) tet mesh vertices (if available, enables fast label-based detection)
+        tet_boundary_labels: (N,) boundary labels from tet mesh (-1=inner, 1=H1, 2=H2)
     
     Returns:
         MoldHalfClassificationResult with classification data
@@ -827,29 +1040,36 @@ def classify_mold_halves(
     d1 = d1 / np.linalg.norm(d1)
     d2 = d2 / np.linalg.norm(d2)
     
-    # Step 1: Extract triangle information from cavity
-    triangles = extract_triangle_info(cavity_mesh)
+    n_triangles = len(cavity_mesh.faces)
     
-    # Step 2: Identify outer boundary triangles
-    if use_proximity_method or part_mesh is not None:
-        # Use proximity-based method (better for tetrahedral boundary meshes)
+    # Step 1: Identify outer boundary triangles (fast path if tet labels available)
+    if tet_vertices is not None and tet_boundary_labels is not None:
+        # Fast O(n) path using pre-computed tet boundary labels
+        outer_triangles, inner_boundary_triangles = identify_outer_boundary_from_tet_labels(
+            cavity_mesh, tet_vertices, tet_boundary_labels
+        )
+        logger.debug(f"Using tet labels: {len(outer_triangles)} outer, {len(inner_boundary_triangles)} inner")
+    elif use_proximity_method or part_mesh is not None:
+        # Slower proximity-based method (for legacy compatibility)
+        triangles_info = extract_triangle_info(cavity_mesh)
         outer_triangles = identify_outer_boundary_by_proximity(cavity_mesh, hull_mesh, part_mesh)
+        inner_boundary_triangles = set(range(n_triangles)) - outer_triangles
     else:
-        # Use plane-based method (original CSG cavity mesh)
-        outer_triangles = identify_outer_boundary_from_hull(triangles, hull_mesh)
-    
-    inner_boundary_triangles = set(range(len(triangles))) - outer_triangles
+        # Plane-based method (original CSG cavity mesh)
+        triangles_info = extract_triangle_info(cavity_mesh)
+        outer_triangles = identify_outer_boundary_from_hull(triangles_info, hull_mesh)
+        inner_boundary_triangles = set(range(n_triangles)) - outer_triangles
     
     logger.debug(f"Outer boundary: {len(outer_triangles)} triangles")
     logger.debug(f"Inner boundary (part surface): {len(inner_boundary_triangles)} triangles")
     
     # If hull matching found very few outer triangles, treat ALL as outer
     effective_outer_triangles = outer_triangles
-    if len(outer_triangles) < len(triangles) * 0.1:
+    if len(outer_triangles) < n_triangles * 0.1:
         logger.warning("Hull matching found too few triangles, using all triangles")
-        effective_outer_triangles = set(range(len(triangles)))
+        effective_outer_triangles = set(range(n_triangles))
     
-    # Step 3: Build triangle adjacency on the FULL cavity mesh
+    # Step 2: Build triangle adjacency on the FULL cavity mesh
     adjacency = build_triangle_adjacency(cavity_mesh)
     
     # Early exit if no outer triangles
@@ -861,12 +1081,18 @@ def classify_mold_halves(
             h2_triangles=set(),
             boundary_zone_triangles=set(),
             inner_boundary_triangles=inner_boundary_triangles,
-            total_triangles=len(triangles),
+            total_triangles=n_triangles,
             outer_boundary_count=0,
         )
     
-    # Step 4: Classify and smooth
-    side = classify_and_smooth(triangles, adjacency, effective_outer_triangles, d1, d2)
+    # Step 3: Classify using chosen method
+    if use_fast_method:
+        # Fast O(n) greedy region-growing (per research paper)
+        side = classify_mold_halves_fast(cavity_mesh, effective_outer_triangles, d1, d2, adjacency)
+    else:
+        # Original morphological smoothing approach (requires triangle info)
+        triangles_info = extract_triangle_info(cavity_mesh)
+        side = classify_and_smooth(triangles_info, adjacency, effective_outer_triangles, d1, d2)
     
     # Step 5: Compute boundary zone parameters
     # Pre-compute neighbors filtered to outer triangles
@@ -953,7 +1179,7 @@ def classify_mold_halves(
         h2_triangles=h2_triangles,
         boundary_zone_triangles=boundary_zone_triangles,
         inner_boundary_triangles=inner_boundary_triangles,
-        total_triangles=len(triangles),
+        total_triangles=n_triangles,
         outer_boundary_count=len(effective_outer_triangles),
     )
 

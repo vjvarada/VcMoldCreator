@@ -110,10 +110,6 @@ class TetrahedralMeshResult:
     # Seed distances to boundary (S,) - shortest path distance to H1/H2
     seed_distances: Optional[np.ndarray] = None
     
-    # Legacy fields (kept for compatibility, may be removed later)
-    vertex_escape_labels: Optional[np.ndarray] = None
-    tetrahedra_labels: Optional[np.ndarray] = None
-    
     # Timing
     tetrahedralize_time_ms: float = 0.0
     total_time_ms: float = 0.0
@@ -1023,38 +1019,6 @@ def _point_to_triangles_distance_gpu_efficient(
     return min_dist
 
 
-def _point_to_triangles_distance_gpu(
-    points: 'torch.Tensor',
-    v0: 'torch.Tensor',
-    v1: 'torch.Tensor', 
-    v2: 'torch.Tensor'
-) -> 'torch.Tensor':
-    """
-    Compute minimum distance from each point to any triangle (GPU).
-    Legacy version - use _point_to_triangles_distance_gpu_efficient instead.
-    
-    Args:
-        points: (B, 3) query points
-        v0, v1, v2: (F, 3) triangle vertices
-    
-    Returns:
-        (B,) minimum distance for each point
-    """
-    import torch
-    
-    # Triangle edges
-    edge0 = v1 - v0  # (F, 3)
-    edge1 = v2 - v0  # (F, 3)
-    dot00 = (edge0 * edge0).sum(dim=-1)  # (F,)
-    dot01 = (edge0 * edge1).sum(dim=-1)  # (F,)
-    dot11 = (edge1 * edge1).sum(dim=-1)  # (F,)
-    inv_denom = 1.0 / (dot00 * dot11 - dot01 * dot01 + 1e-10)
-    
-    return _point_to_triangles_distance_gpu_efficient(
-        points, v0, edge0, edge1, dot00, dot01, dot11, inv_denom
-    )
-
-
 def compute_distances_to_mesh_cpu(
     query_points: np.ndarray,
     target_mesh: trimesh.Trimesh,
@@ -1371,17 +1335,11 @@ def generate_tetrahedral_mesh(
         
         logger.info(f"Edge weights: min={result.edge_weights.min():.4f}, max={result.edge_weights.max():.4f}, mean={result.edge_weights.mean():.4f}")
     
-    # Step 5: Label boundary vertices from classification
-    # NOTE: This path is deprecated. The EdgeWeightsWorker now classifies the
-    # tetrahedral boundary mesh directly and labels vertices accordingly.
-    # This code path may produce incorrect results since classification_result
-    # was computed on cavity_mesh but we now expect it on boundary_mesh.
+    # Step 5: Label boundary vertices from classification (optional)
+    # Note: The preferred path is to use EdgeWeightsWorker which classifies
+    # the tetrahedral boundary mesh directly for better accuracy.
     if classification_result is not None:
         logger.debug("Labeling boundary vertices from classification...")
-        logger.warning(
-            "Using deprecated classification path. "
-            "For accurate results, use EdgeWeightsWorker which classifies the tet boundary mesh directly."
-        )
         result.boundary_labels = label_boundary_from_classification(
             tet_vertices,
             boundary_mask,
@@ -1581,8 +1539,8 @@ def run_dijkstra_escape_labeling(
     
     vertices = tet_result.vertices  # INFLATED vertices
     edges = tet_result.edges
-    edge_lengths = tet_result.edge_lengths  # Computed on inflated mesh
-    edge_weights = tet_result.edge_weights  # Computed on inflated mesh
+    edge_lengths = tet_result.edge_lengths
+    edge_weights = tet_result.edge_weights
     boundary_labels = tet_result.boundary_labels
     
     n_vertices = len(vertices)
@@ -1592,26 +1550,15 @@ def run_dijkstra_escape_labeling(
     
     # Compute edge costs
     # edge_weights = 1/(dist² + ε), so higher weight = closer to part
-    # 
-    # We want: cost HIGH near part, cost HIGH far from part, cost LOW in middle
-    # This creates a "valley" that guides walks along the gradient before turning
-    #
-    # cost = length × weight means:
-    #   - Near part (high weight): HIGH cost
-    #   - Far from part (low weight): LOW cost (but edges are also longer)
-    #
-    # The path will prefer edges in the middle zone where the gradient exists
+    # cost = length × weight: HIGH cost near part, guides paths along gradient
     if use_weighted_edges and edge_weights is not None:
         edge_costs = edge_lengths * edge_weights
     else:
         edge_costs = edge_lengths.copy()
     
-    logger.info(f"Edge costs: min={edge_costs.min():.6f}, max={edge_costs.max():.6f}, mean={edge_costs.mean():.6f}")
-    logger.info(f"Edge lengths: min={edge_lengths.min():.6f}, max={edge_lengths.max():.6f}")
-    logger.info(f"Edge weights: min={edge_weights.min():.6f}, max={edge_weights.max():.6f}")
+    logger.debug(f"Edge costs: min={edge_costs.min():.4f}, max={edge_costs.max():.4f}, mean={edge_costs.mean():.4f}")
     
     # Build adjacency list with edge costs
-    # adjacency[v] = [(neighbor, cost), ...]
     adjacency: Dict[int, List[Tuple[int, float]]] = {i: [] for i in range(n_vertices)}
     
     for edge_idx, (v0, v1) in enumerate(edges):
@@ -1619,82 +1566,34 @@ def run_dijkstra_escape_labeling(
         adjacency[v0].append((v1, cost))
         adjacency[v1].append((v0, cost))
     
-    # Identify seed vertices (inner boundary = part surface) and target vertices (H1, H2)
+    # Identify seed vertices (inner boundary) and target vertices (H1, H2)
     seed_vertex_indices = np.where(boundary_labels == -1)[0]
     h1_vertices = set(np.where(boundary_labels == 1)[0])
     h2_vertices = set(np.where(boundary_labels == 2)[0])
-    target_vertices = h1_vertices | h2_vertices
     
     n_seeds = len(seed_vertex_indices)
     logger.info(f"Dijkstra: {n_seeds} seeds, {len(h1_vertices)} H1 targets, {len(h2_vertices)} H2 targets")
     
-    # Debug: Check boundary_labels distribution
-    unique, counts = np.unique(boundary_labels, return_counts=True)
-    logger.info(f"Boundary labels distribution: {dict(zip(unique, counts))}")
-    
     if n_seeds == 0:
-        logger.warning("No seed vertices (inner boundary) found - cannot run Dijkstra")
+        logger.warning("No seed vertices (inner boundary) found")
         return np.array([], dtype=np.int8), np.array([], dtype=np.int64), np.array([], dtype=np.float64)
     
-    if len(target_vertices) == 0:
-        logger.warning("No H1 or H2 boundary vertices found - cannot run Dijkstra")
+    if len(h1_vertices) == 0 and len(h2_vertices) == 0:
+        logger.warning("No H1 or H2 boundary vertices found")
         return np.zeros(n_seeds, dtype=np.int8), seed_vertex_indices, np.full(n_seeds, np.inf)
     
-    # Debug: Check geometric distances (Euclidean) from seeds to H1/H2
-    seed_positions = vertices[seed_vertex_indices]
-    if len(h1_vertices) > 0:
-        h1_positions = vertices[list(h1_vertices)]
-        min_h1_dist = np.min([np.min(np.linalg.norm(h1_positions - sp, axis=1)) for sp in seed_positions[:10]])
-        logger.info(f"Sample Euclidean distance from seeds to nearest H1: {min_h1_dist:.2f}")
-    if len(h2_vertices) > 0:
-        h2_positions = vertices[list(h2_vertices)]
-        min_h2_dist = np.min([np.min(np.linalg.norm(h2_positions - sp, axis=1)) for sp in seed_positions[:10]])
-        logger.info(f"Sample Euclidean distance from seeds to nearest H2: {min_h2_dist:.2f}")
-    
-    # Run Dijkstra FROM each seed independently
-    # For efficiency, we batch process but each seed has its own independent walk
-    
+    # Run Dijkstra FROM each seed to find shortest path to H1 or H2
     seed_escape_labels = np.zeros(n_seeds, dtype=np.int8)
     seed_distances = np.full(n_seeds, np.inf, dtype=np.float64)
     
-    # For the FIRST seed, run complete Dijkstra to see distances to both H1 and H2
-    first_seed_v = seed_vertex_indices[0]
-    debug_dist = np.full(n_vertices, np.inf, dtype=np.float64)
-    debug_dist[first_seed_v] = 0.0
-    debug_pq = [(0.0, first_seed_v)]
-    debug_visited = np.zeros(n_vertices, dtype=bool)
-    
-    while debug_pq:
-        d, u = heapq.heappop(debug_pq)
-        if debug_visited[u]:
-            continue
-        debug_visited[u] = True
-        for v, cost in adjacency[u]:
-            if debug_visited[v]:
-                continue
-            new_dist = d + cost
-            if new_dist < debug_dist[v]:
-                debug_dist[v] = new_dist
-                heapq.heappush(debug_pq, (new_dist, v))
-    
-    # Check distances from first seed to all H1 and H2 vertices
-    h1_dists = debug_dist[list(h1_vertices)]
-    h2_dists = debug_dist[list(h2_vertices)]
-    logger.info(f"First seed to H1: min={h1_dists.min():.2f}, max={h1_dists.max():.2f}, mean={h1_dists.mean():.2f}")
-    logger.info(f"First seed to H2: min={h2_dists.min():.2f}, max={h2_dists.max():.2f}, mean={h2_dists.mean():.2f}")
-    
-    # For each seed, run Dijkstra until we hit a target
     for seed_idx, seed_v in enumerate(seed_vertex_indices):
-        # Dijkstra from this seed
         dist = np.full(n_vertices, np.inf, dtype=np.float64)
         dist[seed_v] = 0.0
         
         pq = [(0.0, seed_v)]
         visited = np.zeros(n_vertices, dtype=bool)
         
-        found_target = False
-        
-        while pq and not found_target:
+        while pq:
             d, u = heapq.heappop(pq)
             
             if visited[u]:
@@ -1705,12 +1604,10 @@ def run_dijkstra_escape_labeling(
             if u in h1_vertices:
                 seed_escape_labels[seed_idx] = 1
                 seed_distances[seed_idx] = d
-                found_target = True
                 break
             elif u in h2_vertices:
                 seed_escape_labels[seed_idx] = 2
                 seed_distances[seed_idx] = d
-                found_target = True
                 break
             
             # Propagate to neighbors
@@ -1721,25 +1618,13 @@ def run_dijkstra_escape_labeling(
                 if new_dist < dist[v]:
                     dist[v] = new_dist
                     heapq.heappush(pq, (new_dist, v))
-        
-        # Log progress every 1000 seeds
-        if (seed_idx + 1) % 1000 == 0:
-            logger.info(f"Processed {seed_idx + 1}/{n_seeds} seeds...")
     
     # Count results
     n_h1_seeds = np.sum(seed_escape_labels == 1)
     n_h2_seeds = np.sum(seed_escape_labels == 2)
     n_unreached = np.sum(seed_escape_labels == 0)
     
-    # Debug: Check distances
-    h1_seed_mask = seed_escape_labels == 1
-    h2_seed_mask = seed_escape_labels == 2
-    if np.any(h1_seed_mask):
-        logger.info(f"H1 seed distances: min={seed_distances[h1_seed_mask].min():.4f}, max={seed_distances[h1_seed_mask].max():.4f}")
-    if np.any(h2_seed_mask):
-        logger.info(f"H2 seed distances: min={seed_distances[h2_seed_mask].min():.4f}, max={seed_distances[h2_seed_mask].max():.4f}")
-    
     elapsed = (time.time() - start_time) * 1000
-    logger.info(f"Dijkstra complete in {elapsed:.0f}ms: {n_h1_seeds} seeds->H1, {n_h2_seeds} seeds->H2, {n_unreached} unreached")
+    logger.info(f"Dijkstra complete in {elapsed:.0f}ms: {n_h1_seeds} seeds→H1, {n_h2_seeds} seeds→H2, {n_unreached} unreached")
     
     return seed_escape_labels, seed_vertex_indices, seed_distances

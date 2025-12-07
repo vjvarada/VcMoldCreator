@@ -120,7 +120,7 @@ class MeshViewer(QWidget):
         self._part_surface_visible = True
         
         # Tetrahedral mesh visualization
-        self._tet_edges_actor = None  # Legacy single actor
+        self._tet_edges_actor = None  # Combined edges (when not using split view)
         self._tet_interior_actor = None  # Interior edges (weight colored)
         self._tet_boundary_actor = None  # Boundary edges (mold-half colored)
         self._tet_visible = True
