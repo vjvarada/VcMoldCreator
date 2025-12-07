@@ -337,7 +337,11 @@ def identify_outer_boundary_by_proximity(
         if part_mesh is not None:
             part_distances = _compute_distances_to_mesh_gpu(centroids, part_mesh)
             outer_mask = hull_distances < part_distances
-            logger.debug(f"GPU proximity classification: {np.sum(outer_mask)} outer, {np.sum(~outer_mask)} inner")
+            n_outer = np.sum(outer_mask)
+            n_inner = np.sum(~outer_mask)
+            logger.info(f"GPU proximity classification: {n_outer} outer, {n_inner} inner")
+            logger.info(f"  Hull distances: min={hull_distances.min():.4f}, max={hull_distances.max():.4f}, mean={hull_distances.mean():.4f}")
+            logger.info(f"  Part distances: min={part_distances.min():.4f}, max={part_distances.max():.4f}, mean={part_distances.mean():.4f}")
         else:
             outer_mask = hull_distances < tolerance
             logger.debug(f"GPU threshold classification (tol={tolerance:.4f}): {np.sum(outer_mask)} outer, {np.sum(~outer_mask)} inner")
@@ -348,7 +352,11 @@ def identify_outer_boundary_by_proximity(
         if part_mesh is not None:
             _, part_distances, _ = part_mesh.nearest.on_surface(centroids)
             outer_mask = hull_distances < part_distances
-            logger.debug(f"Proximity classification: {np.sum(outer_mask)} outer, {np.sum(~outer_mask)} inner")
+            n_outer = np.sum(outer_mask)
+            n_inner = np.sum(~outer_mask)
+            logger.info(f"Proximity classification: {n_outer} outer, {n_inner} inner")
+            logger.info(f"  Hull distances: min={hull_distances.min():.4f}, max={hull_distances.max():.4f}, mean={hull_distances.mean():.4f}")
+            logger.info(f"  Part distances: min={part_distances.min():.4f}, max={part_distances.max():.4f}, mean={part_distances.mean():.4f}")
         else:
             outer_mask = hull_distances < tolerance
             logger.debug(f"Threshold classification (tol={tolerance:.4f}): {np.sum(outer_mask)} outer, {np.sum(~outer_mask)} inner")

@@ -104,8 +104,20 @@ class MeshViewer(QWidget):
         self._cavity_visible = True
         
         # Mold halves classification visualization (painted on cavity)
-        self._mold_halves_actor = None
+        self._mold_halves_actor = None  # Inner boundary (seed) edges
         self._mold_halves_visible = True
+        self._mold_halves_edges_actor = None  # Outer boundary edges (H1/H2/boundary)
+        self._outer_boundary_visible = True  # Visibility for outer boundary
+        self._inner_boundary_visible = True  # Visibility for inner boundary (seeds)
+        
+        # Inner boundary (seed) vertices/edges visualization  
+        self._inner_boundary_vertices_actor = None
+        self._inner_boundary_edges_actor = None
+        self._inner_boundary_visible = True
+        
+        # Part surface reference visualization (for debugging)
+        self._part_surface_actor = None
+        self._part_surface_visible = True
         
         # Tetrahedral mesh visualization
         self._tet_edges_actor = None  # Legacy single actor
@@ -905,6 +917,16 @@ class MeshViewer(QWidget):
         # Reset mold halves state
         self._mold_halves_actor = None
         self._mold_halves_visible = True
+        self._mold_halves_edges_actor = None
+        
+        # Reset inner boundary visualization state
+        self._inner_boundary_vertices_actor = None
+        self._inner_boundary_edges_actor = None
+        self._inner_boundary_visible = True
+        
+        # Reset part surface reference state
+        self._part_surface_actor = None
+        self._part_surface_visible = True
         
         # Reset tetrahedral mesh state
         self._tet_edges_actor = None
@@ -1750,6 +1772,267 @@ class MeshViewer(QWidget):
                 prop.SetOpacity(opacity)
             self.plotter.update()
     
+    def apply_tet_mesh_classification(
+        self,
+        tet_vertices: np.ndarray,
+        tet_edges: np.ndarray,
+        boundary_mesh: 'trimesh.Trimesh',
+        classification_result,
+        part_mesh: 'trimesh.Trimesh',
+        seed_distance_threshold: float = None
+    ):
+        """
+        Apply mold half classification to tetrahedral mesh with seed vertices.
+        
+        This method:
+        1. Colors boundary mesh edges by H1/H2/boundary classification
+        2. Identifies and highlights seed vertices (close to part surface) in blue
+        
+        Colors:
+        - H₁ (Green): Edges on H1 triangles
+        - H₂ (Orange): Edges on H2 triangles  
+        - Boundary Zone (Gray): Interface between H₁ and H₂
+        - Seed (Blue): Tetrahedral vertices close to part surface
+        
+        Args:
+            tet_vertices: Full tetrahedral mesh vertices (N x 3)
+            tet_edges: Tetrahedral mesh edges (E x 2)
+            boundary_mesh: The tetrahedral boundary mesh
+            classification_result: MoldHalfClassificationResult
+            part_mesh: Original part mesh (for identifying seed vertices)
+            seed_distance_threshold: Distance threshold for seed vertices (auto if None)
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        logger.info("Applying tet mesh classification with seed vertices")
+        
+        # Remove existing actors
+        if self._cavity_actor is not None:
+            try:
+                self.plotter.remove_actor(self._cavity_actor)
+            except Exception:
+                pass
+            self._cavity_actor = None
+        
+        if self._mold_halves_actor is not None:
+            try:
+                self.plotter.remove_actor(self._mold_halves_actor)
+            except Exception:
+                pass
+            self._mold_halves_actor = None
+        
+        if self._mold_halves_edges_actor is not None:
+            try:
+                self.plotter.remove_actor(self._mold_halves_edges_actor)
+            except Exception:
+                pass
+            self._mold_halves_edges_actor = None
+        
+        # Remove part surface reference if exists
+        if self._part_surface_actor is not None:
+            try:
+                self.plotter.remove_actor(self._part_surface_actor)
+            except Exception:
+                pass
+            self._part_surface_actor = None
+        
+        # =====================================================================
+        # STEP 1: Identify seed vertices (tetrahedral vertices close to part)
+        # =====================================================================
+        
+        # Compute distance from all tetrahedral vertices to part surface
+        _, tet_to_part_distances, _ = part_mesh.nearest.on_surface(tet_vertices)
+        
+        # Auto-compute threshold if not provided
+        if seed_distance_threshold is None:
+            # Use a small fraction of the mesh size
+            bounds = part_mesh.bounds
+            mesh_size = np.linalg.norm(bounds[1] - bounds[0])
+            seed_distance_threshold = mesh_size * 0.02  # 2% of mesh size
+        
+        # Find seed vertices (those very close to part surface)
+        seed_mask = tet_to_part_distances < seed_distance_threshold
+        n_seeds = np.sum(seed_mask)
+        seed_indices = np.where(seed_mask)[0]
+        
+        logger.info(f"Found {n_seeds} seed vertices (distance < {seed_distance_threshold:.4f})")
+        logger.info(f"  Distance to part: min={tet_to_part_distances.min():.4f}, max={tet_to_part_distances.max():.4f}")
+        
+        # =====================================================================
+        # STEP 2: Classify boundary mesh for H1/H2/boundary visualization
+        # =====================================================================
+        
+        boundary_vertices = np.asarray(boundary_mesh.vertices)
+        boundary_faces = np.asarray(boundary_mesh.faces)
+        n_boundary_verts = len(boundary_vertices)
+        
+        # Get classification sets
+        h1_set = classification_result.h1_triangles
+        h2_set = classification_result.h2_triangles
+        boundary_set = classification_result.boundary_zone_triangles
+        
+        # Assign vertex labels based on adjacent triangles
+        vertex_h1_count = np.zeros(n_boundary_verts, dtype=np.int32)
+        vertex_h2_count = np.zeros(n_boundary_verts, dtype=np.int32)
+        vertex_boundary_count = np.zeros(n_boundary_verts, dtype=np.int32)
+        
+        for face_idx, face in enumerate(boundary_faces):
+            v0, v1, v2 = face
+            if face_idx in h1_set:
+                vertex_h1_count[v0] += 1
+                vertex_h1_count[v1] += 1
+                vertex_h1_count[v2] += 1
+            elif face_idx in h2_set:
+                vertex_h2_count[v0] += 1
+                vertex_h2_count[v1] += 1
+                vertex_h2_count[v2] += 1
+            elif face_idx in boundary_set:
+                vertex_boundary_count[v0] += 1
+                vertex_boundary_count[v1] += 1
+                vertex_boundary_count[v2] += 1
+        
+        # Assign boundary vertex labels
+        boundary_vertex_labels = np.zeros(n_boundary_verts, dtype=np.int8)
+        for i in range(n_boundary_verts):
+            if vertex_h1_count[i] > vertex_h2_count[i] and vertex_h1_count[i] > vertex_boundary_count[i]:
+                boundary_vertex_labels[i] = 1  # H1
+            elif vertex_h2_count[i] > vertex_h1_count[i] and vertex_h2_count[i] > vertex_boundary_count[i]:
+                boundary_vertex_labels[i] = 2  # H2
+            elif vertex_boundary_count[i] > 0:
+                boundary_vertex_labels[i] = 3  # Boundary
+            elif vertex_h1_count[i] > 0:
+                boundary_vertex_labels[i] = 1
+            elif vertex_h2_count[i] > 0:
+                boundary_vertex_labels[i] = 2
+        
+        # Build boundary edges
+        boundary_edge_set = set()
+        for face in boundary_faces:
+            v0, v1, v2 = face
+            boundary_edge_set.add((min(v0, v1), max(v0, v1)))
+            boundary_edge_set.add((min(v1, v2), max(v1, v2)))
+            boundary_edge_set.add((min(v2, v0), max(v2, v0)))
+        
+        boundary_edges = np.array(list(boundary_edge_set))
+        n_boundary_edges = len(boundary_edges)
+        
+        # =====================================================================
+        # STEP 2b: Identify inner boundary (seed) edges FIRST
+        # =====================================================================
+        # We need to identify seed edges before assigning colors so we can
+        # exclude them from the outer boundary visualization
+        
+        _, boundary_to_part_distances, _ = part_mesh.nearest.on_surface(boundary_vertices)
+        boundary_seed_mask = boundary_to_part_distances < seed_distance_threshold
+        n_boundary_seeds = np.sum(boundary_seed_mask)
+        logger.info(f"Found {n_boundary_seeds} seed vertices on boundary mesh surface")
+        
+        # Find which edges are seed edges (both endpoints are seeds)
+        is_seed_edge = np.zeros(n_boundary_edges, dtype=bool)
+        for i, (v0, v1) in enumerate(boundary_edges):
+            if boundary_seed_mask[v0] and boundary_seed_mask[v1]:
+                is_seed_edge[i] = True
+        
+        n_seed_edges = np.sum(is_seed_edge)
+        logger.info(f"Found {n_seed_edges} seed edges on boundary surface")
+        
+        # =====================================================================
+        # STEP 2c: Assign colors to NON-SEED edges only (outer boundary)
+        # =====================================================================
+        
+        # Get non-seed edges for outer boundary visualization
+        outer_edge_mask = ~is_seed_edge
+        outer_edges = boundary_edges[outer_edge_mask]
+        n_outer_edges = len(outer_edges)
+        
+        # Assign edge colors based on endpoint labels (only for outer edges)
+        outer_edge_colors = np.zeros((n_outer_edges, 3), dtype=np.uint8)
+        for i, (v0, v1) in enumerate(outer_edges):
+            l0, l1 = boundary_vertex_labels[v0], boundary_vertex_labels[v1]
+            
+            if l0 == 1 and l1 == 1:
+                outer_edge_colors[i] = [76, 175, 80]  # Green for H1
+            elif l0 == 2 and l1 == 2:
+                outer_edge_colors[i] = [255, 152, 0]  # Orange for H2
+            elif l0 == 3 and l1 == 3:
+                outer_edge_colors[i] = [158, 158, 158]  # Gray for boundary
+            elif l0 in [1, 2] and l1 in [1, 2]:
+                outer_edge_colors[i] = [158, 158, 158]  # Gray for H1-H2 interface
+            elif l0 == 1 or l1 == 1:
+                outer_edge_colors[i] = [76, 175, 80]  # Green
+            elif l0 == 2 or l1 == 2:
+                outer_edge_colors[i] = [255, 152, 0]  # Orange
+            else:
+                outer_edge_colors[i] = [158, 158, 158]  # Gray for unclassified
+        
+        n_h1_verts = np.sum(boundary_vertex_labels == 1)
+        n_h2_verts = np.sum(boundary_vertex_labels == 2)
+        n_boundary_zone_verts = np.sum(boundary_vertex_labels == 3)
+        logger.info(f"Boundary vertex labels: H1={n_h1_verts}, H2={n_h2_verts}, boundary={n_boundary_zone_verts}")
+        
+        # =====================================================================
+        # STEP 3: Create visualizations
+        # =====================================================================
+        
+        # Create OUTER boundary edge mesh (excludes inner boundary/seed edges)
+        if n_outer_edges > 0:
+            cells = np.empty((n_outer_edges, 3), dtype=np.int64)
+            cells[:, 0] = 2
+            cells[:, 1] = outer_edges[:, 0]
+            cells[:, 2] = outer_edges[:, 1]
+            cell_types = np.full(n_outer_edges, 3, dtype=np.uint8)  # VTK_LINE
+            
+            edge_grid = pv.UnstructuredGrid(cells.ravel(), cell_types, boundary_vertices)
+            edge_grid.cell_data['colors'] = outer_edge_colors
+            
+            # Add boundary edges
+            self._mold_halves_edges_actor = self.plotter.add_mesh(
+                edge_grid,
+                scalars='colors',
+                rgb=True,
+                line_width=3,
+                show_edges=False,
+            )
+        else:
+            logger.info("No outer boundary edges to display")
+        
+        # Create INNER boundary (seed) edges visualization (blue)
+        # We already identified seed edges above
+        if n_seed_edges > 0:
+            seed_edges = boundary_edges[is_seed_edge]
+            
+            # Create UnstructuredGrid with VTK_LINE cells for seed edges
+            seed_cells = np.empty((n_seed_edges, 3), dtype=np.int64)
+            seed_cells[:, 0] = 2  # Each line has 2 points
+            seed_cells[:, 1] = seed_edges[:, 0]
+            seed_cells[:, 2] = seed_edges[:, 1]
+            seed_cell_types = np.full(n_seed_edges, 3, dtype=np.uint8)  # VTK_LINE = 3
+            
+            # Use boundary_vertices since edges reference boundary mesh
+            seed_edge_grid = pv.UnstructuredGrid(seed_cells.ravel(), seed_cell_types, boundary_vertices)
+            
+            self._mold_halves_actor = self.plotter.add_mesh(
+                seed_edge_grid,
+                color='blue',
+                line_width=4,
+                show_edges=False,
+            )
+            logger.info(f"Visualizing {n_seed_edges} seed edges as blue lines on boundary surface")
+        else:
+            logger.warning("No seed edges found on boundary surface!")
+        
+        # Set visibility based on individual flags
+        if self._mold_halves_edges_actor is not None:
+            self._mold_halves_edges_actor.SetVisibility(self._outer_boundary_visible)
+        if self._mold_halves_actor is not None:
+            self._mold_halves_actor.SetVisibility(self._inner_boundary_visible)
+        
+        self.plotter.update()
+        logger.info(f"Applied tet classification: {n_outer_edges} outer edges, {n_seed_edges} seed edges")
+
     def apply_cavity_classification_paint(self, face_colors: np.ndarray):
         """
         Apply mold half classification colors to the cavity mesh.
@@ -1763,12 +2046,38 @@ class MeshViewer(QWidget):
         Args:
             face_colors: Array of shape (n_faces, 4) with RGBA colors (0-255)
         """
-        if not PYVISTA_AVAILABLE or self._cavity_mesh is None:
+        # This method is kept for backwards compatibility but we now use
+        # apply_cavity_classification_vertices_edges for better visualization
+        pass
+    
+    def apply_cavity_classification_vertices_edges(
+        self,
+        boundary_mesh: 'trimesh.Trimesh',
+        classification_result
+    ):
+        """
+        Apply mold half classification colors to vertices and edges (not faces).
+        
+        Colors vertices and edges based on their mold half classification:
+        - H₁ (Green): Vertices/edges on H1 triangles
+        - H₂ (Orange): Vertices/edges on H2 triangles  
+        - Boundary Zone (Gray): Interface between H₁ and H₂
+        - Inner/Seed (Blue): Part surface vertices (Dijkstra seeds)
+        
+        Args:
+            boundary_mesh: The tetrahedral boundary mesh
+            classification_result: MoldHalfClassificationResult
+            part_mesh: Original part mesh (optional, for identifying seed vertices)
+            seed_distance_threshold: Distance threshold for seed vertices (optional)
+        """
+        if not PYVISTA_AVAILABLE:
             return
         
-        logger.info("Applying mold half classification paint to cavity")
+        import pyvista as pv
         
-        # Remove existing plain cavity actor completely (to avoid Z-fighting)
+        logger.info("Applying mold half classification to vertices and edges")
+        
+        # Remove existing actors
         if self._cavity_actor is not None:
             try:
                 self.plotter.remove_actor(self._cavity_actor)
@@ -1776,13 +2085,6 @@ class MeshViewer(QWidget):
                 pass
             self._cavity_actor = None
         
-        # Convert cavity mesh to PyVista if needed
-        pv_cavity = self._trimesh_to_pyvista(self._cavity_mesh)
-        
-        # Apply colors as cell data
-        pv_cavity.cell_data['colors'] = face_colors
-        
-        # Remove existing mold halves actor
         if self._mold_halves_actor is not None:
             try:
                 self.plotter.remove_actor(self._mold_halves_actor)
@@ -1790,36 +2092,350 @@ class MeshViewer(QWidget):
                 pass
             self._mold_halves_actor = None
         
-        # Add mold halves mesh with cell colors
-        self._mold_halves_actor = self.plotter.add_mesh(
-            pv_cavity,
+        # Get mesh data
+        vertices = np.asarray(boundary_mesh.vertices)
+        faces = np.asarray(boundary_mesh.faces)
+        n_verts = len(vertices)
+        
+        # Get classification sets
+        h1_set = classification_result.h1_triangles
+        h2_set = classification_result.h2_triangles
+        boundary_set = classification_result.boundary_zone_triangles
+        inner_set = classification_result.inner_boundary_triangles
+        
+        # Assign vertex labels based on adjacent triangles (majority vote)
+        # Priority: inner > h1/h2 > boundary
+        vertex_h1_count = np.zeros(n_verts, dtype=np.int32)
+        vertex_h2_count = np.zeros(n_verts, dtype=np.int32)
+        vertex_boundary_count = np.zeros(n_verts, dtype=np.int32)
+        vertex_inner_count = np.zeros(n_verts, dtype=np.int32)
+        
+        for face_idx, face in enumerate(faces):
+            v0, v1, v2 = face
+            if face_idx in inner_set:
+                vertex_inner_count[v0] += 1
+                vertex_inner_count[v1] += 1
+                vertex_inner_count[v2] += 1
+            elif face_idx in h1_set:
+                vertex_h1_count[v0] += 1
+                vertex_h1_count[v1] += 1
+                vertex_h1_count[v2] += 1
+            elif face_idx in h2_set:
+                vertex_h2_count[v0] += 1
+                vertex_h2_count[v1] += 1
+                vertex_h2_count[v2] += 1
+            elif face_idx in boundary_set:
+                vertex_boundary_count[v0] += 1
+                vertex_boundary_count[v1] += 1
+                vertex_boundary_count[v2] += 1
+        
+        # Assign vertex colors based on majority
+        # Colors: H1=green, H2=orange, boundary=gray, inner=blue
+        vertex_colors = np.zeros((n_verts, 3), dtype=np.uint8)
+        vertex_labels = np.zeros(n_verts, dtype=np.int8)  # 0=unclassified, 1=H1, 2=H2, 3=boundary, -1=inner
+        
+        for i in range(n_verts):
+            if vertex_inner_count[i] > 0:
+                vertex_colors[i] = [0, 100, 255]  # Blue for inner/seed
+                vertex_labels[i] = -1
+            elif vertex_h1_count[i] > vertex_h2_count[i] and vertex_h1_count[i] > vertex_boundary_count[i]:
+                vertex_colors[i] = [76, 175, 80]  # Green for H1
+                vertex_labels[i] = 1
+            elif vertex_h2_count[i] > vertex_h1_count[i] and vertex_h2_count[i] > vertex_boundary_count[i]:
+                vertex_colors[i] = [255, 152, 0]  # Orange for H2
+                vertex_labels[i] = 2
+            elif vertex_boundary_count[i] > 0:
+                vertex_colors[i] = [158, 158, 158]  # Gray for boundary
+                vertex_labels[i] = 3
+            elif vertex_h1_count[i] > 0:
+                vertex_colors[i] = [76, 175, 80]  # Green for H1
+                vertex_labels[i] = 1
+            elif vertex_h2_count[i] > 0:
+                vertex_colors[i] = [255, 152, 0]  # Orange for H2
+                vertex_labels[i] = 2
+            else:
+                vertex_colors[i] = [100, 100, 100]  # Dark gray for unclassified
+        
+        # Count vertex labels
+        n_inner = np.sum(vertex_labels == -1)
+        n_h1 = np.sum(vertex_labels == 1)
+        n_h2 = np.sum(vertex_labels == 2)
+        n_boundary = np.sum(vertex_labels == 3)
+        logger.info(f"Vertex labels: H1={n_h1}, H2={n_h2}, boundary={n_boundary}, inner/seed={n_inner}")
+        
+        # Build edges from all triangles
+        edge_set = set()
+        for face in faces:
+            v0, v1, v2 = face
+            edge_set.add((min(v0, v1), max(v0, v1)))
+            edge_set.add((min(v1, v2), max(v1, v2)))
+            edge_set.add((min(v2, v0), max(v2, v0)))
+        
+        edges = np.array(list(edge_set))
+        n_edges = len(edges)
+        logger.info(f"Total edges: {n_edges}")
+        
+        # Assign edge colors based on endpoint vertex labels
+        # If both endpoints are same label, use that color
+        # If mixed, use the "higher priority" color (inner > h1/h2 > boundary)
+        edge_colors = np.zeros((n_edges, 3), dtype=np.uint8)
+        
+        for i, (v0, v1) in enumerate(edges):
+            l0, l1 = vertex_labels[v0], vertex_labels[v1]
+            
+            # Priority: inner (-1) > H1 (1) = H2 (2) > boundary (3)
+            if l0 == -1 or l1 == -1:
+                edge_colors[i] = [0, 100, 255]  # Blue
+            elif l0 == 1 and l1 == 1:
+                edge_colors[i] = [76, 175, 80]  # Green
+            elif l0 == 2 and l1 == 2:
+                edge_colors[i] = [255, 152, 0]  # Orange
+            elif l0 == 3 and l1 == 3:
+                edge_colors[i] = [158, 158, 158]  # Gray
+            elif l0 in [1, 2] and l1 in [1, 2]:
+                # H1-H2 interface edge - use boundary color
+                edge_colors[i] = [158, 158, 158]  # Gray
+            elif l0 == 1 or l1 == 1:
+                edge_colors[i] = [76, 175, 80]  # Green (one endpoint is H1)
+            elif l0 == 2 or l1 == 2:
+                edge_colors[i] = [255, 152, 0]  # Orange (one endpoint is H2)
+            else:
+                edge_colors[i] = [100, 100, 100]  # Dark gray
+        
+        # Create edge mesh using PyVista's from_irregular_faces for lines
+        # Build cells array: [2, p0, p1, 2, p0, p1, ...]
+        n_edges = len(edges)
+        cells = np.empty((n_edges, 3), dtype=np.int64)
+        cells[:, 0] = 2  # Each line has 2 points
+        cells[:, 1] = edges[:, 0]
+        cells[:, 2] = edges[:, 1]
+        cells = cells.ravel()
+        
+        # Cell types: VTK_LINE = 3
+        cell_types = np.full(n_edges, 3, dtype=np.uint8)
+        
+        # Create unstructured grid for lines with cell colors
+        edge_grid = pv.UnstructuredGrid(cells, cell_types, vertices)
+        edge_grid.cell_data['colors'] = edge_colors
+        
+        # Remove existing edges actor
+        if self._mold_halves_edges_actor is not None:
+            try:
+                self.plotter.remove_actor(self._mold_halves_edges_actor)
+            except Exception:
+                pass
+            self._mold_halves_edges_actor = None
+        
+        # Add edges as colored lines using UnstructuredGrid
+        self._mold_halves_edges_actor = self.plotter.add_mesh(
+            edge_grid,
             scalars='colors',
             rgb=True,
-            smooth_shading=False,
+            line_width=4,
             show_edges=False,
-            opacity=1.0,  # Fully opaque - no other cavity actor to show through
-            ambient=0.4,
-            diffuse=0.6,
-            specular=0.1,
         )
         
-        # Set flat interpolation for better color visibility
-        if self._mold_halves_actor is not None:
-            prop = self._mold_halves_actor.GetProperty()
-            if prop:
-                prop.SetInterpolationToFlat()
-            # Set visibility state
-            self._mold_halves_actor.SetVisibility(self._mold_halves_visible)
+        # Set visibility
+        if self._mold_halves_edges_actor is not None:
+            self._mold_halves_edges_actor.SetVisibility(self._mold_halves_visible)
         
         self.plotter.update()
-        logger.debug(f"Applied classification paint to {len(face_colors)} faces")
+        logger.info(f"Applied classification to {n_verts} vertices, {n_edges} edges")
+    
+    def show_part_surface_reference(self, part_mesh: 'trimesh.Trimesh'):
+        """
+        Show the part mesh surface as a semi-transparent reference.
+        
+        This helps debug why inner boundary detection might be failing by
+        showing where the part surface actually is.
+        
+        Args:
+            part_mesh: The original part mesh
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        logger.info(f"Showing part surface reference: {len(part_mesh.vertices)} vertices")
+        
+        # Remove existing part surface actor
+        if self._part_surface_actor is not None:
+            try:
+                self.plotter.remove_actor(self._part_surface_actor)
+            except Exception:
+                pass
+            self._part_surface_actor = None
+        
+        # Convert to PyVista
+        pv_mesh = self._trimesh_to_pyvista(part_mesh)
+        
+        # Add as semi-transparent cyan surface
+        self._part_surface_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='cyan',
+            opacity=0.3,
+            show_edges=True,
+            edge_color='darkblue',
+            line_width=1,
+        )
+        
+        if self._part_surface_actor is not None:
+            self._part_surface_actor.SetVisibility(self._part_surface_visible)
+        
+        self.plotter.update()
+    
+    def set_part_surface_visible(self, visible: bool):
+        """Set visibility of part surface reference."""
+        self._part_surface_visible = visible
+        if self._part_surface_actor is not None:
+            self._part_surface_actor.SetVisibility(visible)
+            self.plotter.update()
     
     def set_mold_halves_visible(self, visible: bool):
-        """Set visibility of mold halves classification."""
+        """Set visibility of mold halves classification (both outer and inner boundary)."""
         self._mold_halves_visible = visible
+        if self._mold_halves_edges_actor is not None:
+            self._mold_halves_edges_actor.SetVisibility(visible)
         if self._mold_halves_actor is not None:
             self._mold_halves_actor.SetVisibility(visible)
-            self.plotter.update()
+        self.plotter.update()
+    
+    def set_outer_boundary_visible(self, visible: bool):
+        """Set visibility of outer boundary edges (H1/H2/boundary zone)."""
+        self._outer_boundary_visible = visible
+        if self._mold_halves_edges_actor is not None:
+            self._mold_halves_edges_actor.SetVisibility(visible)
+        self.plotter.update()
+    
+    def set_inner_boundary_visible(self, visible: bool):
+        """Set visibility of inner boundary edges (seed edges close to part)."""
+        self._inner_boundary_visible = visible
+        logger.debug(f"set_inner_boundary_visible({visible})")
+        
+        # Control all inner boundary actors
+        if self._mold_halves_actor is not None:
+            self._mold_halves_actor.SetVisibility(visible)
+            logger.debug(f"_mold_halves_actor visibility set to {visible}")
+        
+        if self._inner_boundary_vertices_actor is not None:
+            self._inner_boundary_vertices_actor.SetVisibility(visible)
+            logger.debug(f"_inner_boundary_vertices_actor visibility set to {visible}")
+        
+        if self._inner_boundary_edges_actor is not None:
+            self._inner_boundary_edges_actor.SetVisibility(visible)
+            logger.debug(f"_inner_boundary_edges_actor visibility set to {visible}")
+        
+        self.plotter.update()
+    
+    def set_inner_boundary_visualization(
+        self,
+        boundary_mesh: 'trimesh.Trimesh',
+        classification_result
+    ):
+        """
+        Visualize inner boundary (seed) vertices and edges in blue.
+        
+        This shows vertices that are on the inner boundary (close to part surface)
+        and the edges connecting them. These are the seed vertices for Dijkstra.
+        
+        Args:
+            boundary_mesh: The tetrahedral boundary mesh
+            classification_result: MoldHalfClassificationResult with inner_boundary_triangles
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        # Get inner boundary triangle indices
+        inner_triangles = classification_result.inner_boundary_triangles
+        
+        if len(inner_triangles) == 0:
+            logger.warning("No inner boundary triangles to visualize")
+            return
+        
+        logger.info(f"Visualizing {len(inner_triangles)} inner boundary triangles as seed vertices/edges")
+        
+        # Get all vertices that belong to inner boundary triangles
+        faces = np.asarray(boundary_mesh.faces)
+        inner_tri_array = np.array(list(inner_triangles))
+        inner_faces = faces[inner_tri_array]  # Shape: (n_inner, 3)
+        
+        # Get unique vertex indices
+        inner_vertex_indices = np.unique(inner_faces.flatten())
+        inner_vertices = np.asarray(boundary_mesh.vertices)[inner_vertex_indices]
+        
+        logger.info(f"  Inner boundary: {len(inner_vertex_indices)} vertices")
+        
+        # Build edges from inner triangles
+        # Each triangle has 3 edges: (v0,v1), (v1,v2), (v2,v0)
+        edge_set = set()
+        for face in inner_faces:
+            v0, v1, v2 = face
+            edge_set.add((min(v0, v1), max(v0, v1)))
+            edge_set.add((min(v1, v2), max(v1, v2)))
+            edge_set.add((min(v2, v0), max(v2, v0)))
+        
+        edges = np.array(list(edge_set))
+        logger.info(f"  Inner boundary: {len(edges)} edges")
+        
+        # Remove existing inner boundary actors
+        if self._inner_boundary_vertices_actor is not None:
+            try:
+                self.plotter.remove_actor(self._inner_boundary_vertices_actor)
+            except Exception:
+                pass
+            self._inner_boundary_vertices_actor = None
+        
+        if self._inner_boundary_edges_actor is not None:
+            try:
+                self.plotter.remove_actor(self._inner_boundary_edges_actor)
+            except Exception:
+                pass
+            self._inner_boundary_edges_actor = None
+        
+        # Create point cloud for inner boundary vertices
+        inner_points = pv.PolyData(inner_vertices)
+        
+        # Add vertices as blue points
+        self._inner_boundary_vertices_actor = self.plotter.add_mesh(
+            inner_points,
+            color='blue',
+            point_size=8,
+            render_points_as_spheres=True,
+            style='points',
+        )
+        
+        # Create line mesh for inner boundary edges
+        if len(edges) > 0:
+            all_vertices = np.asarray(boundary_mesh.vertices)
+            
+            # Build lines array for PyVista
+            # Format: [n_pts, idx0, idx1, n_pts, idx0, idx1, ...]
+            lines = np.zeros((len(edges), 3), dtype=np.int64)
+            lines[:, 0] = 2  # Each line has 2 points
+            lines[:, 1] = edges[:, 0]
+            lines[:, 2] = edges[:, 1]
+            
+            edge_mesh = pv.PolyData(all_vertices, lines=lines.flatten())
+            
+            # Add edges as blue lines
+            self._inner_boundary_edges_actor = self.plotter.add_mesh(
+                edge_mesh,
+                color='blue',
+                line_width=3,
+                style='wireframe',
+            )
+        
+        # Set visibility
+        if self._inner_boundary_vertices_actor is not None:
+            self._inner_boundary_vertices_actor.SetVisibility(self._inner_boundary_visible)
+        if self._inner_boundary_edges_actor is not None:
+            self._inner_boundary_edges_actor.SetVisibility(self._inner_boundary_visible)
+        
+        self.plotter.update()
+        logger.info(f"Inner boundary visualization complete: {len(inner_vertex_indices)} vertices, {len(edges)} edges")
     
     @property
     def has_mold_halves(self) -> bool:
@@ -2236,8 +2852,8 @@ class MeshViewer(QWidget):
         """
         Display the R distance line (max hull-to-part distance).
         
-        Shows a red line between the hull point and the closest point on the part,
-        with small spheres at each endpoint.
+        Shows a simple red line between the hull point and the closest point on the part,
+        using the same edge-based visualization style as mold halves.
         
         Args:
             hull_point: (3,) position on hull surface (maximum distance point)
@@ -2247,91 +2863,29 @@ class MeshViewer(QWidget):
         if not PYVISTA_AVAILABLE:
             return
         
+        import pyvista as pv
+        
         logger.info(f"Setting R distance line: R={r_value:.4f}")
         
         # Clear existing R visualization
         self.clear_r_distance_line()
         
-        # Create a tube (cylinder) between points for better visibility
-        # Using a tube instead of line for cell/toon shading compatibility
-        direction = part_point - hull_point
-        length = np.linalg.norm(direction)
+        # Create a simple line using UnstructuredGrid with VTK_LINE (same as mold halves)
+        vertices = np.array([hull_point, part_point])
         
-        # Tube radius proportional to R for consistent appearance
-        tube_radius = r_value * 0.015
+        # Create cells array: [2, 0, 1] for a single line
+        cells = np.array([[2, 0, 1]], dtype=np.int64)
+        cell_types = np.array([3], dtype=np.uint8)  # VTK_LINE = 3
         
-        # Create tube mesh
-        tube = pv.Tube(
-            pointa=hull_point,
-            pointb=part_point,
-            resolution=16,
-            radius=tube_radius,
-        )
+        line_grid = pv.UnstructuredGrid(cells.ravel(), cell_types, vertices)
         
-        # Add the tube with cell/toon shading style
+        # Add the line with red color
         self._r_line_actor = self.plotter.add_mesh(
-            tube,
+            line_grid,
             color='#ff3333',  # Bright red
-            opacity=1.0,
-            smooth_shading=False,  # Flat shading for cell/toon look
+            line_width=4,
             show_edges=False,
-            ambient=0.4,
-            diffuse=0.6,
-            specular=0.0,
         )
-        # Set flat interpolation for cell shading effect
-        if self._r_line_actor is not None:
-            prop = self._r_line_actor.GetProperty()
-            if prop:
-                prop.SetInterpolationToFlat()
-                prop.SetEdgeVisibility(True)
-                prop.SetEdgeColor(0.6, 0.0, 0.0)  # Darker red edge
-                prop.SetLineWidth(1.5)
-        
-        # Create spheres at endpoints with cell/toon shading
-        sphere_radius = r_value * 0.025
-        
-        # Boundary point sphere (bright red)
-        hull_sphere = pv.Sphere(radius=sphere_radius, center=hull_point, theta_resolution=16, phi_resolution=16)
-        hull_actor = self.plotter.add_mesh(
-            hull_sphere,
-            color='#ff3333',  # Bright red
-            opacity=1.0,
-            smooth_shading=False,  # Flat shading for cell/toon look
-            show_edges=False,
-            ambient=0.4,
-            diffuse=0.6,
-            specular=0.0,
-        )
-        if hull_actor is not None:
-            prop = hull_actor.GetProperty()
-            if prop:
-                prop.SetInterpolationToFlat()
-                prop.SetEdgeVisibility(True)
-                prop.SetEdgeColor(0.6, 0.0, 0.0)
-                prop.SetLineWidth(1.0)
-        self._r_point_actors.append(hull_actor)
-        
-        # Part point sphere (darker red)
-        part_sphere = pv.Sphere(radius=sphere_radius, center=part_point, theta_resolution=16, phi_resolution=16)
-        part_actor = self.plotter.add_mesh(
-            part_sphere,
-            color='#cc0000',  # Darker red
-            opacity=1.0,
-            smooth_shading=False,  # Flat shading for cell/toon look
-            show_edges=False,
-            ambient=0.4,
-            diffuse=0.6,
-            specular=0.0,
-        )
-        if part_actor is not None:
-            prop = part_actor.GetProperty()
-            if prop:
-                prop.SetInterpolationToFlat()
-                prop.SetEdgeVisibility(True)
-                prop.SetEdgeColor(0.4, 0.0, 0.0)
-                prop.SetLineWidth(1.0)
-        self._r_point_actors.append(part_actor)
         
         # Add label at midpoint
         midpoint = (hull_point + part_point) / 2
@@ -2502,16 +3056,23 @@ class MeshViewer(QWidget):
     def set_dijkstra_result(
         self,
         vertices: np.ndarray,
-        tetrahedra: np.ndarray,
-        tetrahedra_labels: np.ndarray
+        seed_vertex_indices: np.ndarray,
+        seed_escape_labels: np.ndarray,
+        boundary_mesh: 'trimesh.Trimesh' = None,
+        seed_distances: np.ndarray = None
     ):
         """
-        Display tetrahedra colored by Dijkstra escape labels.
+        Display Dijkstra results as colored edges on the inner boundary mesh.
+        
+        Shows the inner boundary (part surface) with edges colored by which 
+        boundary (H1 or H2) each seed vertex walks to via the shortest weighted path.
         
         Args:
-            vertices: (N, 3) vertex positions (use original for parting surface)
-            tetrahedra: (M, 4) tetrahedron vertex indices
-            tetrahedra_labels: (M,) labels: 1=H1, 2=H2, 0=undecided
+            vertices: (N, 3) vertex positions (use original for proper geometry)
+            seed_vertex_indices: (S,) indices of seed vertices in the tet mesh
+            seed_escape_labels: (S,) labels: 1=walks to H1, 2=walks to H2, 0=unreachable
+            boundary_mesh: The tetrahedral boundary mesh (to extract inner boundary edges)
+            seed_distances: (S,) optional distances to boundary
         """
         if not PYVISTA_AVAILABLE:
             return
@@ -2519,57 +3080,127 @@ class MeshViewer(QWidget):
         # Remove existing actor
         self.clear_dijkstra_result()
         
-        n_tets = len(tetrahedra)
-        logger.info(f"Setting Dijkstra result: {n_tets} tetrahedra")
+        n_seeds = len(seed_vertex_indices)
+        if n_seeds == 0:
+            logger.warning("No seed vertices to visualize")
+            return
+            
+        logger.info(f"Setting Dijkstra result: {n_seeds} seed vertices")
         
-        # Create UnstructuredGrid for tetrahedra
-        # PyVista expects cells in format: [n_points, p0, p1, p2, p3, ...]
-        cells = np.hstack([
-            np.full((n_tets, 1), 4, dtype=np.int64),  # 4 vertices per tet
-            tetrahedra
-        ]).ravel()
+        # Create a mapping from tet vertex index to escape label
+        # Initialize all vertices as 0 (not a seed)
+        vertex_escape_labels = np.zeros(len(vertices), dtype=np.int8)
+        for i, seed_idx in enumerate(seed_vertex_indices):
+            vertex_escape_labels[seed_idx] = seed_escape_labels[i]
         
-        # Cell types: VTK_TETRA = 10
-        cell_types = np.full(n_tets, 10, dtype=np.uint8)
+        # Get seed vertex positions for building edges
+        seed_set = set(seed_vertex_indices)
         
-        grid = pv.UnstructuredGrid(cells, cell_types, vertices.astype(np.float64))
+        # Build edges connecting seed vertices
+        # Use boundary mesh faces to find edges between seeds
+        if boundary_mesh is not None:
+            from scipy.spatial import cKDTree
+            
+            # Map boundary mesh vertices to tet vertices
+            boundary_verts = np.asarray(boundary_mesh.vertices)
+            tet_tree = cKDTree(vertices)
+            _, boundary_to_tet = tet_tree.query(boundary_verts, k=1)
+            
+            # Find edges from boundary mesh faces where BOTH vertices are seeds
+            edge_set = set()
+            for face in boundary_mesh.faces:
+                tet_v0 = boundary_to_tet[face[0]]
+                tet_v1 = boundary_to_tet[face[1]]
+                tet_v2 = boundary_to_tet[face[2]]
+                
+                # Check each edge of this face
+                for va, vb in [(tet_v0, tet_v1), (tet_v1, tet_v2), (tet_v2, tet_v0)]:
+                    if va in seed_set and vb in seed_set:
+                        edge_set.add((min(va, vb), max(va, vb)))
+            
+            edges = np.array(list(edge_set)) if edge_set else np.empty((0, 2), dtype=np.int64)
+        else:
+            # Fallback: just show points if no boundary mesh
+            edges = np.empty((0, 2), dtype=np.int64)
         
-        # Create colors for tetrahedra
-        colors = np.zeros((n_tets, 4), dtype=np.uint8)
+        n_edges = len(edges)
+        logger.info(f"Found {n_edges} edges between seed vertices")
         
-        # H1 = green (semi-transparent)
-        h1_mask = tetrahedra_labels == 1
-        colors[h1_mask] = [76, 175, 80, 180]  # #4CAF50 with alpha
+        if n_edges > 0:
+            # Assign edge colors based on endpoint escape labels
+            edge_colors = np.zeros((n_edges, 3), dtype=np.uint8)
+            
+            for i, (v0, v1) in enumerate(edges):
+                l0 = vertex_escape_labels[v0]
+                l1 = vertex_escape_labels[v1]
+                
+                # Color based on labels
+                if l0 == 1 and l1 == 1:
+                    edge_colors[i] = [76, 175, 80]  # Green - both walk to H1
+                elif l0 == 2 and l1 == 2:
+                    edge_colors[i] = [255, 152, 0]  # Orange - both walk to H2
+                elif (l0 == 1 and l1 == 2) or (l0 == 2 and l1 == 1):
+                    edge_colors[i] = [255, 255, 0]  # Yellow - interface between H1 and H2
+                elif l0 == 1 or l1 == 1:
+                    edge_colors[i] = [76, 175, 80]  # Green - at least one walks to H1
+                elif l0 == 2 or l1 == 2:
+                    edge_colors[i] = [255, 152, 0]  # Orange - at least one walks to H2
+                else:
+                    edge_colors[i] = [150, 150, 150]  # Gray - unreachable
+            
+            # Build cells array for lines: [2, p0, p1, 2, p0, p1, ...]
+            cells = np.empty((n_edges, 3), dtype=np.int64)
+            cells[:, 0] = 2  # Each line has 2 points
+            cells[:, 1] = edges[:, 0]
+            cells[:, 2] = edges[:, 1]
+            cells = cells.ravel()
+            
+            # Cell types: VTK_LINE = 3
+            cell_types = np.full(n_edges, 3, dtype=np.uint8)
+            
+            # Create unstructured grid for lines
+            edge_grid = pv.UnstructuredGrid(cells, cell_types, vertices.astype(np.float64))
+            edge_grid.cell_data['colors'] = edge_colors
+            
+            # Add edges as colored lines
+            self._dijkstra_actor = self.plotter.add_mesh(
+                edge_grid,
+                scalars='colors',
+                rgb=True,
+                line_width=4,
+                show_edges=False,
+                show_scalar_bar=False
+            )
+        else:
+            # Fallback: show seed points if no edges
+            seed_positions = vertices[seed_vertex_indices]
+            point_cloud = pv.PolyData(seed_positions.astype(np.float64))
+            
+            colors = np.zeros((n_seeds, 3), dtype=np.uint8)
+            colors[seed_escape_labels == 1] = [76, 175, 80]  # Green
+            colors[seed_escape_labels == 2] = [255, 152, 0]  # Orange
+            colors[seed_escape_labels == 0] = [150, 150, 150]  # Gray
+            
+            point_cloud.point_data['colors'] = colors
+            
+            self._dijkstra_actor = self.plotter.add_mesh(
+                point_cloud,
+                scalars='colors',
+                rgb=True,
+                point_size=8.0,
+                render_points_as_spheres=True,
+                show_scalar_bar=False
+            )
         
-        # H2 = orange (semi-transparent)
-        h2_mask = tetrahedra_labels == 2
-        colors[h2_mask] = [255, 152, 0, 180]  # #FF9800 with alpha
-        
-        # Undecided = light gray (more transparent)
-        undecided_mask = tetrahedra_labels == 0
-        colors[undecided_mask] = [150, 150, 150, 100]
-        
-        grid.cell_data['colors'] = colors
-        
-        self._dijkstra_actor = self.plotter.add_mesh(
-            grid,
-            scalars='colors',
-            rgb=True,
-            show_edges=True,
-            edge_color='#333333',
-            line_width=0.5,
-            opacity=1.0,  # Overall opacity (colors have their own alpha)
-            show_scalar_bar=False
-        )
-        
-        self._dijkstra_actor.SetVisibility(self._dijkstra_visible)
+        if self._dijkstra_actor is not None:
+            self._dijkstra_actor.SetVisibility(self._dijkstra_visible)
         
         self.plotter.update()
         
-        n_h1 = np.sum(h1_mask)
-        n_h2 = np.sum(h2_mask)
-        n_undecided = np.sum(undecided_mask)
-        logger.info(f"Dijkstra visualization: H1={n_h1}, H2={n_h2}, undecided={n_undecided}")
+        n_h1 = np.sum(seed_escape_labels == 1)
+        n_h2 = np.sum(seed_escape_labels == 2)
+        n_unreached = np.sum(seed_escape_labels == 0)
+        logger.info(f"Dijkstra visualization: {n_h1} seeds→H1 (green), {n_h2} seeds→H2 (orange), {n_unreached} unreached")
     
     def clear_dijkstra_result(self):
         """Remove Dijkstra result visualization."""

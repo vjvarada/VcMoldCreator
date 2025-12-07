@@ -895,6 +895,7 @@ class TetrahedralizeWorker(QThread):
     def __init__(
         self, 
         cavity_mesh, 
+        part_mesh=None,
         edge_length_fac: float = 0.05,
         optimize: bool = True
     ):
@@ -903,11 +904,13 @@ class TetrahedralizeWorker(QThread):
         
         Args:
             cavity_mesh: The mold cavity mesh
+            part_mesh: The original part mesh (for filtering tetrahedra inside part)
             edge_length_fac: Target edge length as fraction of bbox diagonal
             optimize: Whether to optimize tet quality
         """
         super().__init__()
         self.cavity_mesh = cavity_mesh
+        self.part_mesh = part_mesh
         self.edge_length_fac = edge_length_fac
         self.optimize = optimize
         self._cancelled = False
@@ -922,6 +925,7 @@ class TetrahedralizeWorker(QThread):
     def run(self):
         import time
         import multiprocessing as mp
+        import concurrent.futures
         from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError
         from core.tetrahedral_mesh import extract_edges, compute_edge_lengths, extract_boundary_surface, TetrahedralMeshResult
         
@@ -966,14 +970,35 @@ class TetrahedralizeWorker(QThread):
                     # Sleep briefly to allow UI updates
                     time.sleep(0.5)
                 
-                # Get result
-                tet_vertices, tetrahedra = future.result()
+                # Get result - handle BrokenProcessPool specifically
+                try:
+                    tet_vertices, tetrahedra = future.result()
+                except concurrent.futures.process.BrokenProcessPool as e:
+                    logger.error(f"TetGen process crashed: {e}")
+                    self.error.emit(
+                        "Tetrahedralization failed: TetGen process crashed.\n"
+                        "This may be caused by problematic mesh geometry.\n"
+                        "Try: 1) Repair mesh, 2) Simplify mesh, 3) Adjust edge length factor."
+                    )
+                    return
             
             tet_time = (time.time() - start_time) * 1000
             
             if self._cancelled:
                 self.error.emit("Cancelled by user")
                 return
+            
+            # Filter out tetrahedra that are inside the part mesh
+            if self.part_mesh is not None:
+                self.progress.emit("Filtering tetrahedra inside part mesh...")
+                from core.tetrahedral_mesh import filter_tetrahedra_outside_part
+                tet_vertices, tetrahedra = filter_tetrahedra_outside_part(
+                    tet_vertices, tetrahedra, self.part_mesh
+                )
+                
+                if len(tetrahedra) == 0:
+                    self.error.emit("All tetrahedra were inside the part mesh. Check mesh quality.")
+                    return
             
             self.progress.emit("Extracting edges...")
             
@@ -1118,29 +1143,10 @@ class EdgeWeightsWorker(QThread):
             result.r_hull_point = boundary_point  # Keep attribute name for compatibility
             result.r_part_point = part_point
             
-            # Step 2: Inflate boundary vertices outward by R - distance_to_part
-            self.progress.emit("Inflating boundary vertices...")
-            
-            from core.tetrahedral_mesh import inflate_boundary_vertices
-            
-            inflated_result = inflate_boundary_vertices(
-                result,
-                self.part_mesh,
-                r_value,
-                use_gpu=CUDA_AVAILABLE
-            )
-            
-            inflate_time = (time.time() - start_time) * 1000 - r_time
-            logger.info(f"Boundary inflation complete in {inflate_time:.0f}ms")
-            
-            # Emit inflated mesh for visualization
-            self.mesh_inflated.emit(inflated_result)
-            
-            # Update result reference
-            result = inflated_result
-            
-            # Step 3: Classify the inflated tetrahedral boundary mesh directly
-            self.progress.emit("Classifying inflated boundary mesh...")
+            # Step 2: Classify the ORIGINAL boundary mesh BEFORE inflation
+            # This is critical - after inflation, outer boundary triangles may be 
+            # misclassified because their centroids move away from hull.
+            self.progress.emit("Classifying boundary mesh (before inflation)...")
             
             from core.mold_half_classification import classify_mold_halves
             
@@ -1154,10 +1160,12 @@ class EdgeWeightsWorker(QThread):
                 d2 = np.array([0.0, 0.0, -1.0])
                 logger.warning("Using default parting directions (Z-axis)")
             
-            # Classify the inflated boundary mesh using proximity method
-            boundary_mesh = result.boundary_mesh
+            # Classify the ORIGINAL boundary mesh using proximity method
+            # Triangle indices stay the same after inflation, so this classification
+            # can be applied to the inflated mesh
+            original_boundary_mesh = result.boundary_mesh
             tet_boundary_classification = classify_mold_halves(
-                boundary_mesh,  # The inflated tetrahedral boundary mesh
+                original_boundary_mesh,  # The ORIGINAL tetrahedral boundary mesh
                 self.hull_mesh,
                 d1, d2,
                 boundary_zone_threshold=0.15,
@@ -1165,7 +1173,7 @@ class EdgeWeightsWorker(QThread):
                 use_proximity_method=True  # Important: use proximity for tet boundary mesh
             )
             
-            classify_time = (time.time() - start_time) * 1000 - r_time - inflate_time
+            classify_time = (time.time() - start_time) * 1000 - r_time
             logger.info(f"Boundary mesh classified in {classify_time:.0f}ms")
             logger.info(
                 f"  H1={len(tet_boundary_classification.h1_triangles)}, "
@@ -1173,24 +1181,51 @@ class EdgeWeightsWorker(QThread):
                 f"inner={len(tet_boundary_classification.inner_boundary_triangles)}"
             )
             
+            # Step 3: Inflate boundary vertices outward by R - distance_to_part
+            self.progress.emit("Inflating boundary vertices...")
+            
+            from core.tetrahedral_mesh import inflate_boundary_vertices
+            
+            # inner_boundary_threshold=None means auto-compute (2% of mesh size)
+            # This ensures consistency with seed vertex identification in visualization
+            inflated_result = inflate_boundary_vertices(
+                result,
+                self.part_mesh,
+                r_value,
+                use_gpu=CUDA_AVAILABLE,
+                inner_boundary_threshold=None  # Auto-compute same as visualization
+            )
+            
+            inflate_time = (time.time() - start_time) * 1000 - r_time - classify_time
+            logger.info(f"Boundary inflation complete in {inflate_time:.0f}ms")
+            
+            # Emit inflated mesh for visualization
+            self.mesh_inflated.emit(inflated_result)
+            
+            # Update result reference
+            result = inflated_result
+            
             # Emit classification for visualization
             self.boundary_classified.emit(tet_boundary_classification)
             
             # Step 4: Label boundary vertices from the tetrahedral boundary mesh classification
+            # Use the INFLATED boundary mesh for vertex labeling (same face indices as original)
             self.progress.emit("Labeling boundary vertices...")
+            
+            inflated_boundary_mesh = result.boundary_mesh
             
             boundary_mask = result.boundary_vertices
             if boundary_mask is None:
                 # Recompute boundary mask if not available
                 from core.tetrahedral_mesh import identify_boundary_vertices
-                boundary_mask = identify_boundary_vertices(result.vertices, boundary_mesh)
+                boundary_mask = identify_boundary_vertices(result.vertices, inflated_boundary_mesh)
                 result.boundary_vertices = boundary_mask
             
             result.boundary_labels = label_boundary_from_classification(
                 result.vertices,
                 boundary_mask,
-                boundary_mesh,  # Use the tetrahedral boundary mesh
-                tet_boundary_classification,  # Classification done on tet boundary mesh
+                inflated_boundary_mesh,  # Use the inflated boundary mesh (same face indices)
+                tet_boundary_classification,  # Classification done on original boundary mesh
                 self.hull_mesh  # Not used, kept for compatibility
             )
             
@@ -1234,7 +1269,7 @@ class EdgeWeightsWorker(QThread):
 
 
 class DijkstraWorker(QThread):
-    """Background worker for running Dijkstra escape labeling."""
+    """Background worker for running Dijkstra escape labeling on seed vertices."""
     
     progress = pyqtSignal(str)
     complete = pyqtSignal(object)  # Updated TetrahedralMeshResult
@@ -1258,24 +1293,25 @@ class DijkstraWorker(QThread):
             logger.info("Running Dijkstra escape labeling...")
             start_time = time.time()
             
-            self.progress.emit("Running Dijkstra from inner boundary to H1/H2...")
+            self.progress.emit("Running Dijkstra from seed vertices to H1/H2...")
             
-            vertex_escape_labels, tetrahedra_labels = run_dijkstra_escape_labeling(
+            seed_escape_labels, seed_vertex_indices, seed_distances = run_dijkstra_escape_labeling(
                 self.tet_result,
                 use_weighted_edges=True
             )
             
             # Store results in tet_result
-            self.tet_result.vertex_escape_labels = vertex_escape_labels
-            self.tet_result.tetrahedra_labels = tetrahedra_labels
+            self.tet_result.seed_escape_labels = seed_escape_labels
+            self.tet_result.seed_vertex_indices = seed_vertex_indices
+            self.tet_result.seed_distances = seed_distances
             
             elapsed = (time.time() - start_time) * 1000
             
-            n_h1 = np.sum(tetrahedra_labels == 1)
-            n_h2 = np.sum(tetrahedra_labels == 2)
-            n_tie = np.sum(tetrahedra_labels == 0)
+            n_h1 = np.sum(seed_escape_labels == 1)
+            n_h2 = np.sum(seed_escape_labels == 2)
+            n_unreached = np.sum(seed_escape_labels == 0)
             
-            self.progress.emit(f"Complete in {elapsed:.0f}ms: H1={n_h1}, H2={n_h2}, tie={n_tie}")
+            self.progress.emit(f"Complete in {elapsed:.0f}ms: {n_h1} seeds→H1, {n_h2} seeds→H2")
             self.complete.emit(self.tet_result)
             
         except Exception as e:
@@ -2025,7 +2061,19 @@ class DisplayOptionsPanel(QFrame):
     hide_hull_changed = pyqtSignal(bool)  # Toggle bounding hull visibility
     hide_cavity_changed = pyqtSignal(bool)  # Toggle mold cavity visibility
     hide_tet_mesh_changed = pyqtSignal(bool)  # Toggle tetrahedral mesh visibility
-    hide_mold_halves_changed = pyqtSignal(bool)  # Toggle mold halves visibility
+    hide_mold_halves_changed = pyqtSignal(bool)  # Toggle mold halves visibility (both)
+    hide_outer_boundary_changed = pyqtSignal(bool)  # Toggle outer boundary (H1/H2/boundary zone)
+    hide_inner_boundary_changed = pyqtSignal(bool)  # Toggle inner boundary (seed edges)
+    
+    # Edge weight visualization signals
+    show_edge_weights_changed = pyqtSignal(bool)  # Toggle edge weight visualization
+    show_interior_edges_changed = pyqtSignal(bool)  # Toggle interior edges
+    show_boundary_edges_changed = pyqtSignal(bool)  # Toggle boundary edges
+    show_original_tet_changed = pyqtSignal(bool)  # Toggle original tet mesh
+    show_inflated_boundary_changed = pyqtSignal(bool)  # Toggle inflated boundary
+    
+    # Dijkstra result signal
+    show_dijkstra_result_changed = pyqtSignal(bool)  # Toggle Dijkstra result visualization
     
     # Must match MeshViewer.BACKGROUND_COLOR for rounded corners to blend
     VIEWER_BG = "#1a1a1a"  # Matches React frontend BACKGROUND_COLOR
@@ -2124,12 +2172,80 @@ class DisplayOptionsPanel(QFrame):
         self.hide_tet_mesh_cb.hide()  # Hidden until tet mesh is computed
         layout.addWidget(self.hide_tet_mesh_cb)
         
-        # Hide mold halves checkbox
-        self.hide_mold_halves_cb = QCheckBox('Hide Mold Halves')
-        self.hide_mold_halves_cb.setChecked(False)  # Not hidden by default (mold halves is shown)
-        self.hide_mold_halves_cb.stateChanged.connect(lambda s: self.hide_mold_halves_changed.emit(s == Qt.CheckState.Checked.value))
-        self.hide_mold_halves_cb.hide()  # Hidden until mold halves is computed
-        layout.addWidget(self.hide_mold_halves_cb)
+        # Hide mold boundary label (section header)
+        self.mold_boundary_label = QLabel('Hide Mold Boundary')
+        self.mold_boundary_label.setStyleSheet("font-size: 10px; font-weight: bold; padding-top: 4px; color: rgba(255, 255, 255, 0.7);")
+        self.mold_boundary_label.hide()
+        layout.addWidget(self.mold_boundary_label)
+        
+        # Hide outer boundary checkbox (H1/H2/boundary zone edges)
+        self.hide_outer_boundary_cb = QCheckBox('  Outer Boundary')
+        self.hide_outer_boundary_cb.setChecked(False)  # Not hidden by default
+        self.hide_outer_boundary_cb.stateChanged.connect(lambda s: self.hide_outer_boundary_changed.emit(s == Qt.CheckState.Checked.value))
+        self.hide_outer_boundary_cb.hide()
+        layout.addWidget(self.hide_outer_boundary_cb)
+        
+        # Hide inner boundary checkbox (seed edges close to part)
+        self.hide_inner_boundary_cb = QCheckBox('  Inner Boundary')
+        self.hide_inner_boundary_cb.setChecked(False)  # Not hidden by default
+        self.hide_inner_boundary_cb.stateChanged.connect(lambda s: self.hide_inner_boundary_changed.emit(s == Qt.CheckState.Checked.value))
+        self.hide_inner_boundary_cb.hide()
+        layout.addWidget(self.hide_inner_boundary_cb)
+        
+        # Separator for edge weight options
+        self.edge_weight_separator = QFrame()
+        self.edge_weight_separator.setFixedHeight(1)
+        self.edge_weight_separator.setStyleSheet("background-color: #3a3f47;")
+        self.edge_weight_separator.hide()
+        layout.addWidget(self.edge_weight_separator)
+        
+        # Edge weight section label
+        self.edge_weight_label = QLabel('Edge Weights')
+        self.edge_weight_label.setStyleSheet("font-size: 10px; font-weight: bold; padding-top: 4px; color: rgba(255, 255, 255, 0.7);")
+        self.edge_weight_label.hide()
+        layout.addWidget(self.edge_weight_label)
+        
+        # Show edge weight visualization checkbox
+        self.show_edge_weights_cb = QCheckBox('Edge Weight Vis.')
+        self.show_edge_weights_cb.setChecked(True)
+        self.show_edge_weights_cb.stateChanged.connect(lambda s: self.show_edge_weights_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_edge_weights_cb.hide()
+        layout.addWidget(self.show_edge_weights_cb)
+        
+        # Show interior edges checkbox
+        self.show_interior_edges_cb = QCheckBox('  Interior Edges')
+        self.show_interior_edges_cb.setChecked(True)
+        self.show_interior_edges_cb.stateChanged.connect(lambda s: self.show_interior_edges_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_interior_edges_cb.hide()
+        layout.addWidget(self.show_interior_edges_cb)
+        
+        # Show boundary edges checkbox
+        self.show_boundary_edges_cb = QCheckBox('  Boundary Edges')
+        self.show_boundary_edges_cb.setChecked(True)
+        self.show_boundary_edges_cb.stateChanged.connect(lambda s: self.show_boundary_edges_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_boundary_edges_cb.hide()
+        layout.addWidget(self.show_boundary_edges_cb)
+        
+        # Show original tet mesh checkbox
+        self.show_original_tet_cb = QCheckBox('Original Tet Mesh')
+        self.show_original_tet_cb.setChecked(False)
+        self.show_original_tet_cb.stateChanged.connect(lambda s: self.show_original_tet_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_original_tet_cb.hide()
+        layout.addWidget(self.show_original_tet_cb)
+        
+        # Show inflated boundary checkbox
+        self.show_inflated_boundary_cb = QCheckBox('Inflated Boundary')
+        self.show_inflated_boundary_cb.setChecked(True)
+        self.show_inflated_boundary_cb.stateChanged.connect(lambda s: self.show_inflated_boundary_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_inflated_boundary_cb.hide()
+        layout.addWidget(self.show_inflated_boundary_cb)
+        
+        # Dijkstra result checkbox
+        self.show_dijkstra_result_cb = QCheckBox('Dijkstra Result')
+        self.show_dijkstra_result_cb.setChecked(True)
+        self.show_dijkstra_result_cb.stateChanged.connect(lambda s: self.show_dijkstra_result_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_dijkstra_result_cb.hide()
+        layout.addWidget(self.show_dijkstra_result_cb)
         
         self.adjustSize()
         self.hide()
@@ -2171,12 +2287,53 @@ class DisplayOptionsPanel(QFrame):
         self.adjustSize()
     
     def show_mold_halves_option(self, show: bool = True):
-        """Show or hide the mold halves visibility checkbox."""
+        """Show or hide the mold boundary visibility options."""
         if show:
-            self.hide_mold_halves_cb.show()
-            self.hide_mold_halves_cb.setChecked(False)  # Reset to showing mold halves
+            self.mold_boundary_label.show()
+            self.hide_outer_boundary_cb.show()
+            self.hide_inner_boundary_cb.show()
+            # Reset to showing both boundaries
+            self.hide_outer_boundary_cb.setChecked(False)
+            self.hide_inner_boundary_cb.setChecked(False)
         else:
-            self.hide_mold_halves_cb.hide()
+            self.mold_boundary_label.hide()
+            self.hide_outer_boundary_cb.hide()
+            self.hide_inner_boundary_cb.hide()
+        self.adjustSize()
+    
+    def show_edge_weight_options(self, show: bool = True):
+        """Show or hide the edge weight visibility options."""
+        if show:
+            self.edge_weight_separator.show()
+            self.edge_weight_label.show()
+            self.show_edge_weights_cb.show()
+            self.show_interior_edges_cb.show()
+            self.show_boundary_edges_cb.show()
+            self.show_original_tet_cb.show()
+            self.show_inflated_boundary_cb.show()
+            # Reset to defaults
+            self.show_edge_weights_cb.setChecked(True)
+            self.show_interior_edges_cb.setChecked(True)
+            self.show_boundary_edges_cb.setChecked(True)
+            self.show_original_tet_cb.setChecked(False)
+            self.show_inflated_boundary_cb.setChecked(True)
+        else:
+            self.edge_weight_separator.hide()
+            self.edge_weight_label.hide()
+            self.show_edge_weights_cb.hide()
+            self.show_interior_edges_cb.hide()
+            self.show_boundary_edges_cb.hide()
+            self.show_original_tet_cb.hide()
+            self.show_inflated_boundary_cb.hide()
+        self.adjustSize()
+    
+    def show_dijkstra_result_option(self, show: bool = True):
+        """Show or hide the Dijkstra result visibility checkbox."""
+        if show:
+            self.show_dijkstra_result_cb.show()
+            self.show_dijkstra_result_cb.setChecked(True)  # Reset to showing result
+        else:
+            self.show_dijkstra_result_cb.hide()
         self.adjustSize()
 
 
@@ -2484,6 +2641,28 @@ class MainWindow(QMainWindow):
         self.display_options.hide_cavity_changed.connect(self._on_hide_cavity_changed)
         self.display_options.hide_tet_mesh_changed.connect(self._on_hide_tet_mesh_changed)
         self.display_options.hide_mold_halves_changed.connect(self._on_hide_mold_halves_changed)
+        self.display_options.hide_outer_boundary_changed.connect(self._on_hide_outer_boundary_changed)
+        self.display_options.hide_inner_boundary_changed.connect(self._on_hide_inner_boundary_changed)
+        
+        # Edge weight visibility signals
+        self.display_options.show_edge_weights_changed.connect(
+            lambda show: self.mesh_viewer.set_edge_weights_visible(show)
+        )
+        self.display_options.show_interior_edges_changed.connect(
+            lambda show: self.mesh_viewer.set_tet_interior_visible(show)
+        )
+        self.display_options.show_boundary_edges_changed.connect(
+            lambda show: self.mesh_viewer.set_tet_boundary_visible(show)
+        )
+        self.display_options.show_original_tet_changed.connect(
+            lambda show: self.mesh_viewer.set_original_tet_visible(show)
+        )
+        self.display_options.show_inflated_boundary_changed.connect(
+            lambda show: self.mesh_viewer.set_inflated_boundary_visible(show)
+        )
+        self.display_options.show_dijkstra_result_changed.connect(
+            lambda show: self.mesh_viewer.set_dijkstra_visible(show)
+        )
         
         return wrapper
     
@@ -3276,10 +3455,22 @@ class MainWindow(QMainWindow):
             logger.debug(f"Tetrahedral mesh visibility changed: hide={hide}")
     
     def _on_hide_mold_halves_changed(self, hide: bool):
-        """Handle hide mold halves checkbox change."""
+        """Handle hide mold halves checkbox change (both boundaries)."""
         if self.mesh_viewer:
             self.mesh_viewer.set_mold_halves_visible(not hide)
             logger.debug(f"Mold halves visibility changed: hide={hide}")
+    
+    def _on_hide_outer_boundary_changed(self, hide: bool):
+        """Handle hide outer boundary checkbox change (H1/H2/boundary zone)."""
+        if self.mesh_viewer:
+            self.mesh_viewer.set_outer_boundary_visible(not hide)
+            logger.debug(f"Outer boundary visibility changed: hide={hide}")
+    
+    def _on_hide_inner_boundary_changed(self, hide: bool):
+        """Handle hide inner boundary checkbox change (seed edges)."""
+        if self.mesh_viewer:
+            self.mesh_viewer.set_inner_boundary_visible(not hide)
+            logger.debug(f"Inner boundary visibility changed: hide={hide}")
     
     # =========================================================================
     # CAVITY STEP
@@ -3778,6 +3969,9 @@ class MainWindow(QMainWindow):
         # Use tetrahedral boundary mesh instead of cavity mesh
         boundary_mesh = self._tet_result.boundary_mesh
         
+        # Log mesh stats (quick)
+        logger.info(f"Mold halves using tet boundary mesh: {len(boundary_mesh.vertices)} verts, {len(boundary_mesh.faces)} faces")
+        
         # Start worker with part_mesh for proximity-based classification
         self._mold_halves_worker = MoldHalvesWorker(
             boundary_mesh,  # Use tet boundary mesh
@@ -3805,15 +3999,23 @@ class MainWindow(QMainWindow):
         """Handle mold halves classification complete."""
         self._mold_halves_result = result
         
-        # Generate face colors for the tetrahedral boundary mesh
+        # Get the tetrahedral boundary mesh
         boundary_mesh = self._tet_result.boundary_mesh
-        n_faces = len(boundary_mesh.faces)
-        face_colors = get_mold_half_face_colors(n_faces, result)
         
-        # Apply colors to tetrahedral boundary mesh in viewer
-        # First, set the boundary mesh as the cavity mesh for visualization
+        # Set up cavity mesh for visualization
         self.mesh_viewer.set_cavity_mesh(boundary_mesh)
-        self.mesh_viewer.apply_cavity_classification_paint(face_colors)
+        
+        # Apply classification colors AND seed vertex identification
+        # Seeds are identified by distance to part mesh (not boundary mesh classification)
+        # This shows H1=green, H2=orange, boundary=gray, seed=blue
+        self.mesh_viewer.apply_tet_mesh_classification(
+            tet_vertices=self._tet_result.vertices,
+            tet_edges=self._tet_result.edges,
+            boundary_mesh=boundary_mesh,
+            classification_result=result,
+            part_mesh=self._current_mesh,
+            seed_distance_threshold=None  # Auto-compute (2% of mesh size) - same as inflation
+        )
         
         # Show the mold halves display option
         self.display_options.show_mold_halves_option(True)
@@ -4225,6 +4427,10 @@ class MainWindow(QMainWindow):
         self.tet_progress_label.setText("Initializing tetrahedralization...")
         self.tet_stats.hide()
         
+        # Log cavity mesh stats (quick - no distance computation)
+        cavity_mesh = self._cavity_result.mesh
+        logger.info(f"Cavity mesh for tetrahedralization: {len(cavity_mesh.vertices)} verts, {len(cavity_mesh.faces)} faces")
+        
         # Process events to update UI before blocking operation
         from PyQt6.QtWidgets import QApplication
         QApplication.processEvents()
@@ -4232,9 +4438,10 @@ class MainWindow(QMainWindow):
         # Clear previous result
         self._tet_result = None
         
-        # Start worker - only tetrahedralize, don't compute distances
+        # Start worker - tetrahedralize and filter out tetrahedra inside part
         self._tet_worker = TetrahedralizeWorker(
             self._cavity_result.mesh,
+            part_mesh=self._current_mesh,  # Pass part mesh for filtering
             edge_length_fac=self._tet_edge_length_fac,
             optimize=self._tet_optimize
         )
@@ -4426,70 +4633,6 @@ class MainWindow(QMainWindow):
         self.edge_weights_stats = StatsBox()
         self.edge_weights_stats.hide()
         self.context_layout.addWidget(self.edge_weights_stats)
-        
-        # Visibility toggles section
-        visibility_section = QFrame()
-        visibility_section.setStyleSheet(f"""
-            QFrame {{
-                background-color: {Colors.LIGHT};
-                border-radius: 8px;
-                padding: 4px;
-            }}
-        """)
-        visibility_layout = QVBoxLayout(visibility_section)
-        visibility_layout.setContentsMargins(12, 8, 12, 8)
-        visibility_layout.setSpacing(8)
-        
-        visibility_label = QLabel("Visibility")
-        visibility_label.setStyleSheet(f"color: {Colors.GRAY}; font-size: 11px; font-weight: 600;")
-        visibility_layout.addWidget(visibility_label)
-        
-        # All edge weights toggle
-        self.show_all_edge_weights_cb = QCheckBox("Edge Weight Visualization")
-        self.show_all_edge_weights_cb.setChecked(True)
-        self.show_all_edge_weights_cb.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px; font-weight: 500;")
-        self.show_all_edge_weights_cb.stateChanged.connect(
-            lambda state: self.mesh_viewer.set_edge_weights_visible(state == Qt.CheckState.Checked.value)
-        )
-        visibility_layout.addWidget(self.show_all_edge_weights_cb)
-        
-        # Interior edges toggle (sub-option)
-        self.show_interior_edges_cb = QCheckBox("  Interior Edges (weight colored)")
-        self.show_interior_edges_cb.setChecked(True)
-        self.show_interior_edges_cb.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px; margin-left: 12px;")
-        self.show_interior_edges_cb.stateChanged.connect(
-            lambda state: self.mesh_viewer.set_tet_interior_visible(state == Qt.CheckState.Checked.value)
-        )
-        visibility_layout.addWidget(self.show_interior_edges_cb)
-        
-        # Boundary edges toggle (sub-option)
-        self.show_boundary_edges_cb = QCheckBox("  Boundary Edges (mold-half colored)")
-        self.show_boundary_edges_cb.setChecked(True)
-        self.show_boundary_edges_cb.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px; margin-left: 12px;")
-        self.show_boundary_edges_cb.stateChanged.connect(
-            lambda state: self.mesh_viewer.set_tet_boundary_visible(state == Qt.CheckState.Checked.value)
-        )
-        visibility_layout.addWidget(self.show_boundary_edges_cb)
-        
-        # Original tet mesh toggle
-        self.show_original_tet_cb = QCheckBox("Original Tetrahedral Mesh")
-        self.show_original_tet_cb.setChecked(False)
-        self.show_original_tet_cb.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
-        self.show_original_tet_cb.stateChanged.connect(
-            lambda state: self.mesh_viewer.set_original_tet_visible(state == Qt.CheckState.Checked.value)
-        )
-        visibility_layout.addWidget(self.show_original_tet_cb)
-        
-        # Inflated boundary mesh toggle
-        self.show_inflated_boundary_cb = QCheckBox("Inflated Boundary Surface")
-        self.show_inflated_boundary_cb.setChecked(True)
-        self.show_inflated_boundary_cb.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
-        self.show_inflated_boundary_cb.stateChanged.connect(
-            lambda state: self.mesh_viewer.set_inflated_boundary_visible(state == Qt.CheckState.Checked.value)
-        )
-        visibility_layout.addWidget(self.show_inflated_boundary_cb)
-        
-        self.context_layout.addWidget(visibility_section)
         
         # Update UI with current state
         self._update_edge_weights_step_ui()
@@ -4687,10 +4830,16 @@ class MainWindow(QMainWindow):
             )
             
             # Also store original (non-inflated) tetrahedral mesh for visualization
-            if result.original_vertices is not None:
-                self.mesh_viewer.set_original_tetrahedral_mesh(result.original_vertices, result.edges)
+            if result.vertices_original is not None:
+                logger.info(f"Setting original tet mesh with {len(result.vertices_original)} vertices")
+                self.mesh_viewer.set_original_tetrahedral_mesh(result.vertices_original, result.edges)
+            else:
+                logger.warning("No original vertices available for original tet mesh visualization")
             
             logger.info(f"Edge weights computed: range [{result.edge_weights.min():.4f}, {result.edge_weights.max():.4f}]")
+            
+            # Show edge weight options in display panel
+            self.display_options.show_edge_weight_options(True)
         else:
             # Only R was computed - just log that
             if result.r_value is not None:
@@ -4765,10 +4914,11 @@ class MainWindow(QMainWindow):
         info_layout = QVBoxLayout(info_group)
         
         info_text = QLabel(
-            "Runs Dijkstra's algorithm from inner boundary (part surface) vertices "
-            "to find the shortest weighted path to either H₁ or H₂ boundary.\n\n"
-            "Each vertex is labeled by which mold half it 'escapes' to. "
-            "Tetrahedra are labeled by majority vote of their vertices."
+            "Each seed vertex (blue vertices on part surface) walks through the "
+            "tetrahedral mesh to find the shortest weighted path to either H₁ or H₂ boundary.\n\n"
+            "Seeds are colored by destination:\n"
+            "• Green = walks to H₁\n"
+            "• Orange = walks to H₂"
         )
         info_text.setWordWrap(True)
         info_text.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px; line-height: 1.4;')
@@ -4847,52 +4997,6 @@ class MainWindow(QMainWindow):
         self.dijkstra_stats.hide()
         self.context_layout.addWidget(self.dijkstra_stats)
         
-        # Visibility toggles section
-        visibility_section = QFrame()
-        visibility_section.setStyleSheet(f"""
-            QFrame {{
-                background-color: {Colors.LIGHT};
-                border-radius: 8px;
-                padding: 4px;
-            }}
-        """)
-        visibility_layout = QVBoxLayout(visibility_section)
-        visibility_layout.setContentsMargins(12, 8, 12, 8)
-        visibility_layout.setSpacing(8)
-        
-        visibility_label = QLabel("Visibility")
-        visibility_label.setStyleSheet(f"color: {Colors.GRAY}; font-size: 11px; font-weight: 600;")
-        visibility_layout.addWidget(visibility_label)
-        
-        # Edge weights toggle
-        self.dijkstra_show_edge_weights_cb = QCheckBox("Edge Weight Coloring")
-        self.dijkstra_show_edge_weights_cb.setChecked(True)
-        self.dijkstra_show_edge_weights_cb.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
-        self.dijkstra_show_edge_weights_cb.stateChanged.connect(
-            lambda state: self.mesh_viewer.set_edge_weights_visible(state == Qt.CheckState.Checked.value)
-        )
-        visibility_layout.addWidget(self.dijkstra_show_edge_weights_cb)
-        
-        # Original tet mesh toggle
-        self.dijkstra_show_original_tet_cb = QCheckBox("Original Tetrahedral Mesh")
-        self.dijkstra_show_original_tet_cb.setChecked(False)
-        self.dijkstra_show_original_tet_cb.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
-        self.dijkstra_show_original_tet_cb.stateChanged.connect(
-            lambda state: self.mesh_viewer.set_original_tet_visible(state == Qt.CheckState.Checked.value)
-        )
-        visibility_layout.addWidget(self.dijkstra_show_original_tet_cb)
-        
-        # Dijkstra result toggle
-        self.dijkstra_show_result_cb = QCheckBox("Dijkstra Result (Tetrahedra)")
-        self.dijkstra_show_result_cb.setChecked(True)
-        self.dijkstra_show_result_cb.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
-        self.dijkstra_show_result_cb.stateChanged.connect(
-            lambda state: self.mesh_viewer.set_dijkstra_visible(state == Qt.CheckState.Checked.value)
-        )
-        visibility_layout.addWidget(self.dijkstra_show_result_cb)
-        
-        self.context_layout.addWidget(visibility_section)
-        
         # Update UI with current state
         self._update_dijkstra_step_ui()
     
@@ -4901,30 +5005,36 @@ class MainWindow(QMainWindow):
         if not hasattr(self, 'dijkstra_stats'):
             return
         
-        if self._tet_result is not None and self._tet_result.tetrahedra_labels is not None:
+        if self._tet_result is not None and self._tet_result.seed_escape_labels is not None:
             # Show stats
             self.dijkstra_stats.clear()
             self.dijkstra_stats.show()
             
             result = self._tet_result
-            tet_labels = result.tetrahedra_labels
+            seed_labels = result.seed_escape_labels
+            seed_distances = result.seed_distances
             
-            n_h1_tets = np.sum(tet_labels == 1)
-            n_h2_tets = np.sum(tet_labels == 2)
-            n_tie_tets = np.sum(tet_labels == 0)
+            n_seeds = len(seed_labels)
+            n_h1_seeds = np.sum(seed_labels == 1)
+            n_h2_seeds = np.sum(seed_labels == 2)
+            n_unreached = np.sum(seed_labels == 0)
             
             self.dijkstra_stats.add_header('✅ Dijkstra Complete', Colors.SUCCESS)
-            self.dijkstra_stats.add_row(f'H₁ tetrahedra: {n_h1_tets:,}')
-            self.dijkstra_stats.add_row(f'H₂ tetrahedra: {n_h2_tets:,}')
-            self.dijkstra_stats.add_row(f'Undecided: {n_tie_tets:,}')
+            self.dijkstra_stats.add_row(f'Total seeds: {n_seeds:,}')
+            self.dijkstra_stats.add_row(f'Seeds → H₁ (green): {n_h1_seeds:,}')
+            self.dijkstra_stats.add_row(f'Seeds → H₂ (orange): {n_h2_seeds:,}')
+            if n_unreached > 0:
+                self.dijkstra_stats.add_row(f'Unreachable: {n_unreached:,}')
             
-            if result.vertex_escape_labels is not None:
-                vert_labels = result.vertex_escape_labels
-                n_h1_verts = np.sum(vert_labels == 1)
-                n_h2_verts = np.sum(vert_labels == 2)
-                self.dijkstra_stats.add_header('Vertex Labels', Colors.INFO)
-                self.dijkstra_stats.add_row(f'H₁ vertices: {n_h1_verts:,}')
-                self.dijkstra_stats.add_row(f'H₂ vertices: {n_h2_verts:,}')
+            if seed_distances is not None:
+                # Show distance stats for reached seeds
+                reached_mask = seed_labels != 0
+                if np.any(reached_mask):
+                    reached_dists = seed_distances[reached_mask]
+                    self.dijkstra_stats.add_header('Path Distances', Colors.INFO)
+                    self.dijkstra_stats.add_row(f'Min: {reached_dists.min():.4f}')
+                    self.dijkstra_stats.add_row(f'Max: {reached_dists.max():.4f}')
+                    self.dijkstra_stats.add_row(f'Mean: {reached_dists.mean():.4f}')
         else:
             self.dijkstra_stats.hide()
     
@@ -4970,21 +5080,28 @@ class MainWindow(QMainWindow):
         # Update stats
         self._update_dijkstra_step_ui()
         
-        # Visualize result - use ORIGINAL vertices for parting surface geometry
+        # Visualize result - use ORIGINAL vertices and boundary mesh for proper geometry
         vertices_for_viz = result.vertices_original if result.vertices_original is not None else result.vertices
+        boundary_mesh_for_viz = result.boundary_mesh_original if result.boundary_mesh_original is not None else result.boundary_mesh
         
+        # Show seed vertices colored by their escape labels as edges
         self.mesh_viewer.set_dijkstra_result(
             vertices_for_viz,
-            result.tetrahedra,
-            result.tetrahedra_labels
+            result.seed_vertex_indices,
+            result.seed_escape_labels,
+            boundary_mesh_for_viz,
+            result.seed_distances
         )
+        
+        # Show Dijkstra result option in display panel
+        self.display_options.show_dijkstra_result_option(True)
         
         # Update step status
         self.step_buttons[Step.DIJKSTRA].set_status('completed')
         
-        n_h1 = np.sum(result.tetrahedra_labels == 1)
-        n_h2 = np.sum(result.tetrahedra_labels == 2)
-        logger.info(f"Dijkstra complete: H1={n_h1}, H2={n_h2} tetrahedra")
+        n_h1 = np.sum(result.seed_escape_labels == 1)
+        n_h2 = np.sum(result.seed_escape_labels == 2)
+        logger.info(f"Dijkstra complete: {n_h1} seeds→H1, {n_h2} seeds→H2")
     
     def _on_dijkstra_error(self, message: str):
         """Handle Dijkstra error."""
