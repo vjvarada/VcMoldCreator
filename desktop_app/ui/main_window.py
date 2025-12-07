@@ -80,6 +80,7 @@ class Step(Enum):
     TETRAHEDRALIZE = 'tetrahedralize'  # Now comes before mold halves
     MOLD_HALVES = 'mold-halves'        # Now operates on tet boundary
     EDGE_WEIGHTS = 'edge-weights'
+    DIJKSTRA = 'dijkstra'              # Dijkstra walk to find parting surface
     # Future steps will be added here as we implement more features
     # PARTING_SURFACE = 'parting-surface'
 
@@ -92,6 +93,7 @@ STEPS = [
     {'id': Step.TETRAHEDRALIZE, 'icon': '🔷', 'title': 'Tetrahedralize', 'description': 'Generate tetrahedral mesh of mold cavity volume'},
     {'id': Step.MOLD_HALVES, 'icon': '🎨', 'title': 'Mold Halves', 'description': 'Classify tetrahedral boundary into H₁ and H₂ mold halves'},
     {'id': Step.EDGE_WEIGHTS, 'icon': '⚖️', 'title': 'Edge Weights', 'description': 'Compute edge weights based on distance to part surface'},
+    {'id': Step.DIJKSTRA, 'icon': '🛤️', 'title': 'Dijkstra Walk', 'description': 'Find shortest paths from part surface to mold halves'},
     # Future steps will be added here
 ]
 
@@ -1015,6 +1017,7 @@ class EdgeWeightsWorker(QThread):
     progress = pyqtSignal(str)
     r_distance_computed = pyqtSignal(object)  # Dict with hull_point, part_point, r_value
     mesh_inflated = pyqtSignal(object)  # Updated TetrahedralMeshResult after inflation
+    boundary_classified = pyqtSignal(object)  # MoldHalfClassificationResult for the tet boundary mesh
     complete = pyqtSignal(object)  # Updated TetrahedralMeshResult
     error = pyqtSignal(str)
     
@@ -1024,7 +1027,9 @@ class EdgeWeightsWorker(QThread):
         part_mesh,
         cavity_mesh,
         hull_mesh,
-        classification_result
+        classification_result,
+        d1=None,  # Parting direction 1 (for classifying tet boundary mesh)
+        d2=None   # Parting direction 2 (for classifying tet boundary mesh)
     ):
         """
         Initialize edge weights worker.
@@ -1032,9 +1037,11 @@ class EdgeWeightsWorker(QThread):
         Args:
             tet_result: TetrahedralMeshResult from tetrahedralization step
             part_mesh: Original part mesh (for distance computation)
-            cavity_mesh: Cavity mesh (for boundary labeling)
-            hull_mesh: Hull mesh (for boundary labeling)
-            classification_result: Mold half classification result
+            cavity_mesh: Cavity mesh (for proximity-based boundary detection)
+            hull_mesh: Hull mesh (for outer boundary identification)
+            classification_result: Mold half classification result (used for d1/d2 if not provided)
+            d1: Parting direction 1 (optional, will use default if not provided)
+            d2: Parting direction 2 (optional, will use default if not provided)
         """
         super().__init__()
         self.tet_result = tet_result
@@ -1042,6 +1049,8 @@ class EdgeWeightsWorker(QThread):
         self.cavity_mesh = cavity_mesh
         self.hull_mesh = hull_mesh
         self.classification_result = classification_result
+        self.d1 = d1
+        self.d2 = d2
     
     def run(self):
         try:
@@ -1130,55 +1139,147 @@ class EdgeWeightsWorker(QThread):
             # Update result reference
             result = inflated_result
             
-            self.progress.emit(f"R = {r_value:.4f}, mesh inflated. Processing complete.")
-            self.complete.emit(result)
+            # Step 3: Classify the inflated tetrahedral boundary mesh directly
+            self.progress.emit("Classifying inflated boundary mesh...")
             
-            # NOTE: The following code is temporarily disabled as requested
-            # TODO: Re-enable when ready to continue edge weight calculations
-            '''
-            # Step 2: Identify boundary vertices
-            self.progress.emit("Identifying boundary vertices...")
-            boundary_mask = identify_boundary_vertices(vertices, self.cavity_mesh)
-            result.boundary_vertices = boundary_mask
-            logger.info(f"Found {np.sum(boundary_mask)} boundary vertices out of {len(vertices)}")
+            from core.mold_half_classification import classify_mold_halves
             
-            # Step 3: Compute edge midpoint distances to part mesh
-            self.progress.emit("Computing edge distances to part surface...")
-            edge_midpoints = (vertices[edges[:, 0]] + vertices[edges[:, 1]]) / 2
+            # Get parting directions (d1, d2) - either from constructor or use defaults
+            if self.d1 is not None and self.d2 is not None:
+                d1 = self.d1
+                d2 = self.d2
+            else:
+                # Default parting directions (along Z-axis)
+                d1 = np.array([0.0, 0.0, 1.0])
+                d2 = np.array([0.0, 0.0, -1.0])
+                logger.warning("Using default parting directions (Z-axis)")
             
-            edge_dist_to_part = compute_distances_to_mesh(edge_midpoints, self.part_mesh)
+            # Classify the inflated boundary mesh using proximity method
+            boundary_mesh = result.boundary_mesh
+            tet_boundary_classification = classify_mold_halves(
+                boundary_mesh,  # The inflated tetrahedral boundary mesh
+                self.hull_mesh,
+                d1, d2,
+                boundary_zone_threshold=0.15,
+                part_mesh=self.part_mesh,
+                use_proximity_method=True  # Important: use proximity for tet boundary mesh
+            )
+            
+            classify_time = (time.time() - start_time) * 1000 - r_time - inflate_time
+            logger.info(f"Boundary mesh classified in {classify_time:.0f}ms")
+            logger.info(
+                f"  H1={len(tet_boundary_classification.h1_triangles)}, "
+                f"H2={len(tet_boundary_classification.h2_triangles)}, "
+                f"inner={len(tet_boundary_classification.inner_boundary_triangles)}"
+            )
+            
+            # Emit classification for visualization
+            self.boundary_classified.emit(tet_boundary_classification)
+            
+            # Step 4: Label boundary vertices from the tetrahedral boundary mesh classification
+            self.progress.emit("Labeling boundary vertices...")
+            
+            boundary_mask = result.boundary_vertices
+            if boundary_mask is None:
+                # Recompute boundary mask if not available
+                from core.tetrahedral_mesh import identify_boundary_vertices
+                boundary_mask = identify_boundary_vertices(result.vertices, boundary_mesh)
+                result.boundary_vertices = boundary_mask
+            
+            result.boundary_labels = label_boundary_from_classification(
+                result.vertices,
+                boundary_mask,
+                boundary_mesh,  # Use the tetrahedral boundary mesh
+                tet_boundary_classification,  # Classification done on tet boundary mesh
+                self.hull_mesh  # Not used, kept for compatibility
+            )
+            
+            n_h1 = np.sum(result.boundary_labels == 1)
+            n_h2 = np.sum(result.boundary_labels == 2)
+            n_inner = np.sum(result.boundary_labels == -1)
+            label_time = (time.time() - start_time) * 1000 - r_time - inflate_time - classify_time
+            logger.info(f"Boundary labels computed in {label_time:.0f}ms: H1={n_h1}, H2={n_h2}, inner(seeds)={n_inner}")
+            
+            # Step 5: Compute edge weights on the inflated mesh
+            self.progress.emit("Computing edge weights on inflated mesh...")
+            
+            from core.tetrahedral_mesh import compute_edge_weights_simple, compute_edge_boundary_labels
+            
+            edge_weights, edge_dist_to_part = compute_edge_weights_simple(
+                result,
+                self.part_mesh,
+                epsilon=0.25,
+                use_gpu=CUDA_AVAILABLE
+            )
+            
+            result.edge_weights = edge_weights
             result.edge_dist_to_part = edge_dist_to_part
+            result.weighted_edge_lengths = result.edge_lengths * edge_weights
             
-            # Step 4: Compute edge weights: weight = 1 / (dist^2 + 0.25)
-            self.progress.emit("Computing edge weights...")
-            result.edge_weights = 1.0 / (edge_dist_to_part ** 2 + 0.25)
-            result.weighted_edge_lengths = edge_lengths * result.edge_weights
+            edge_weight_time = (time.time() - start_time) * 1000 - r_time - inflate_time - classify_time - label_time
+            logger.info(f"Edge weights computed in {edge_weight_time:.0f}ms")
             
-            logger.info(f"Edge weights: min={result.edge_weights.min():.4f}, max={result.edge_weights.max():.4f}")
+            # Step 6: Compute edge boundary labels for visualization
+            self.progress.emit("Computing edge boundary labels...")
             
-            # Step 5: Label boundary vertices from classification
-            if self.classification_result is not None:
-                self.progress.emit("Labeling boundary vertices...")
-                result.boundary_labels = label_boundary_from_classification(
-                    vertices,
-                    boundary_mask,
-                    self.cavity_mesh,
-                    self.classification_result,
-                    self.hull_mesh
-                )
-                
-                n_h1 = np.sum(result.boundary_labels == 1)
-                n_h2 = np.sum(result.boundary_labels == 2)
-                n_inner = np.sum(result.boundary_labels == -1)
-                logger.info(f"Boundary labels: H1={n_h1}, H2={n_h2}, inner(seeds)={n_inner}")
+            result.edge_boundary_labels = compute_edge_boundary_labels(result)
             
-            elapsed = (time.time() - start_time) * 1000
-            self.progress.emit(f"Edge weights computed in {elapsed:.0f}ms")
+            total_time = (time.time() - start_time) * 1000
+            self.progress.emit(f"Complete in {total_time:.0f}ms. R={r_value:.4f}")
             self.complete.emit(result)
-            '''
             
         except Exception as e:
             logger.exception(f"Error computing edge weights: {e}")
+            self.error.emit(str(e))
+
+
+class DijkstraWorker(QThread):
+    """Background worker for running Dijkstra escape labeling."""
+    
+    progress = pyqtSignal(str)
+    complete = pyqtSignal(object)  # Updated TetrahedralMeshResult
+    error = pyqtSignal(str)
+    
+    def __init__(self, tet_result):
+        """
+        Initialize Dijkstra worker.
+        
+        Args:
+            tet_result: TetrahedralMeshResult with edge_weights and boundary_labels computed
+        """
+        super().__init__()
+        self.tet_result = tet_result
+    
+    def run(self):
+        try:
+            from core.tetrahedral_mesh import run_dijkstra_escape_labeling
+            import time
+            
+            logger.info("Running Dijkstra escape labeling...")
+            start_time = time.time()
+            
+            self.progress.emit("Running Dijkstra from inner boundary to H1/H2...")
+            
+            vertex_escape_labels, tetrahedra_labels = run_dijkstra_escape_labeling(
+                self.tet_result,
+                use_weighted_edges=True
+            )
+            
+            # Store results in tet_result
+            self.tet_result.vertex_escape_labels = vertex_escape_labels
+            self.tet_result.tetrahedra_labels = tetrahedra_labels
+            
+            elapsed = (time.time() - start_time) * 1000
+            
+            n_h1 = np.sum(tetrahedra_labels == 1)
+            n_h2 = np.sum(tetrahedra_labels == 2)
+            n_tie = np.sum(tetrahedra_labels == 0)
+            
+            self.progress.emit(f"Complete in {elapsed:.0f}ms: H1={n_h1}, H2={n_h2}, tie={n_tie}")
+            self.complete.emit(self.tet_result)
+            
+        except Exception as e:
+            logger.exception(f"Error in Dijkstra: {e}")
             self.error.emit(str(e))
 
 
@@ -2123,6 +2224,9 @@ class MainWindow(QMainWindow):
         # Edge weights state
         self._edge_weights_worker = None
         
+        # Dijkstra state
+        self._dijkstra_worker = None
+        
         self._setup_window()
         self._setup_ui()
     
@@ -2432,6 +2536,8 @@ class MainWindow(QMainWindow):
             self._setup_tetrahedralize_step()
         elif self._active_step == Step.EDGE_WEIGHTS:
             self._setup_edge_weights_step()
+        elif self._active_step == Step.DIJKSTRA:
+            self._setup_dijkstra_step()
         
         self.context_layout.addStretch()
     
@@ -4321,6 +4427,70 @@ class MainWindow(QMainWindow):
         self.edge_weights_stats.hide()
         self.context_layout.addWidget(self.edge_weights_stats)
         
+        # Visibility toggles section
+        visibility_section = QFrame()
+        visibility_section.setStyleSheet(f"""
+            QFrame {{
+                background-color: {Colors.LIGHT};
+                border-radius: 8px;
+                padding: 4px;
+            }}
+        """)
+        visibility_layout = QVBoxLayout(visibility_section)
+        visibility_layout.setContentsMargins(12, 8, 12, 8)
+        visibility_layout.setSpacing(8)
+        
+        visibility_label = QLabel("Visibility")
+        visibility_label.setStyleSheet(f"color: {Colors.GRAY}; font-size: 11px; font-weight: 600;")
+        visibility_layout.addWidget(visibility_label)
+        
+        # All edge weights toggle
+        self.show_all_edge_weights_cb = QCheckBox("Edge Weight Visualization")
+        self.show_all_edge_weights_cb.setChecked(True)
+        self.show_all_edge_weights_cb.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px; font-weight: 500;")
+        self.show_all_edge_weights_cb.stateChanged.connect(
+            lambda state: self.mesh_viewer.set_edge_weights_visible(state == Qt.CheckState.Checked.value)
+        )
+        visibility_layout.addWidget(self.show_all_edge_weights_cb)
+        
+        # Interior edges toggle (sub-option)
+        self.show_interior_edges_cb = QCheckBox("  Interior Edges (weight colored)")
+        self.show_interior_edges_cb.setChecked(True)
+        self.show_interior_edges_cb.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px; margin-left: 12px;")
+        self.show_interior_edges_cb.stateChanged.connect(
+            lambda state: self.mesh_viewer.set_tet_interior_visible(state == Qt.CheckState.Checked.value)
+        )
+        visibility_layout.addWidget(self.show_interior_edges_cb)
+        
+        # Boundary edges toggle (sub-option)
+        self.show_boundary_edges_cb = QCheckBox("  Boundary Edges (mold-half colored)")
+        self.show_boundary_edges_cb.setChecked(True)
+        self.show_boundary_edges_cb.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px; margin-left: 12px;")
+        self.show_boundary_edges_cb.stateChanged.connect(
+            lambda state: self.mesh_viewer.set_tet_boundary_visible(state == Qt.CheckState.Checked.value)
+        )
+        visibility_layout.addWidget(self.show_boundary_edges_cb)
+        
+        # Original tet mesh toggle
+        self.show_original_tet_cb = QCheckBox("Original Tetrahedral Mesh")
+        self.show_original_tet_cb.setChecked(False)
+        self.show_original_tet_cb.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
+        self.show_original_tet_cb.stateChanged.connect(
+            lambda state: self.mesh_viewer.set_original_tet_visible(state == Qt.CheckState.Checked.value)
+        )
+        visibility_layout.addWidget(self.show_original_tet_cb)
+        
+        # Inflated boundary mesh toggle
+        self.show_inflated_boundary_cb = QCheckBox("Inflated Boundary Surface")
+        self.show_inflated_boundary_cb.setChecked(True)
+        self.show_inflated_boundary_cb.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
+        self.show_inflated_boundary_cb.stateChanged.connect(
+            lambda state: self.mesh_viewer.set_inflated_boundary_visible(state == Qt.CheckState.Checked.value)
+        )
+        visibility_layout.addWidget(self.show_inflated_boundary_cb)
+        
+        self.context_layout.addWidget(visibility_section)
+        
         # Update UI with current state
         self._update_edge_weights_step_ui()
     
@@ -4364,16 +4534,25 @@ class MainWindow(QMainWindow):
         self.edge_weights_stats.hide()
         
         # Start worker
+        # Get parting directions from parting result (if available)
+        d1, d2 = None, None
+        if self._parting_result is not None:
+            d1 = self._parting_result.d1
+            d2 = self._parting_result.d2
+        
         self._edge_weights_worker = EdgeWeightsWorker(
             self._tet_result,
             self._current_mesh,
             self._cavity_result.mesh,
             self._hull_result.mesh,
-            self._mold_halves_result
+            self._mold_halves_result,
+            d1=d1,
+            d2=d2
         )
         self._edge_weights_worker.progress.connect(self._on_edge_weights_progress)
         self._edge_weights_worker.r_distance_computed.connect(self._on_r_distance_computed)
         self._edge_weights_worker.mesh_inflated.connect(self._on_mesh_inflated)
+        self._edge_weights_worker.boundary_classified.connect(self._on_boundary_classified)
         self._edge_weights_worker.complete.connect(self._on_edge_weights_complete)
         self._edge_weights_worker.error.connect(self._on_edge_weights_error)
         self._edge_weights_worker.finished.connect(self._on_edge_weights_worker_finished)
@@ -4433,25 +4612,83 @@ class MainWindow(QMainWindow):
         
         logger.info("Inflated boundary mesh displayed")
     
+    def _on_boundary_classified(self, classification_result):
+        """Handle boundary mesh classification result."""
+        # Update stats display with classification info
+        if hasattr(self, 'edge_weights_stats') and self.edge_weights_stats is not None:
+            try:
+                self.edge_weights_stats.add_header('🏷️ Boundary Classified', Colors.INFO)
+                self.edge_weights_stats.add_row(f'H₁ faces: {len(classification_result.h1_triangles):,}')
+                self.edge_weights_stats.add_row(f'H₂ faces: {len(classification_result.h2_triangles):,}')
+                self.edge_weights_stats.add_row(f'Inner boundary: {len(classification_result.inner_boundary_triangles):,}')
+                self.edge_weights_stats.add_row(f'Boundary zone: {len(classification_result.boundary_zone_triangles):,}')
+            except RuntimeError:
+                pass
+        
+        logger.info(
+            f"Tetrahedral boundary classified: H1={len(classification_result.h1_triangles)}, "
+            f"H2={len(classification_result.h2_triangles)}, inner={len(classification_result.inner_boundary_triangles)}"
+        )
+    
     def _on_edge_weights_complete(self, result: TetrahedralMeshResult):
         """Handle edge weights complete."""
         self._tet_result = result
         
-        # Update UI - only update edge weight stats if they exist
-        if result.edge_weights is not None:
+        # Update UI with boundary labels
+        if result.boundary_labels is not None:
+            n_h1 = np.sum(result.boundary_labels == 1)
+            n_h2 = np.sum(result.boundary_labels == 2)
+            n_inner = np.sum(result.boundary_labels == -1)
+            
             if hasattr(self, 'edge_weights_stats') and self.edge_weights_stats is not None:
                 try:
-                    self._update_edge_weights_step_ui()
+                    self.edge_weights_stats.add_header('🏷️ Vertex Labels', Colors.SUCCESS)
+                    self.edge_weights_stats.add_row(f'H₁ vertices: {n_h1:,}')
+                    self.edge_weights_stats.add_row(f'H₂ vertices: {n_h2:,}')
+                    self.edge_weights_stats.add_row(f'Seed (inner) vertices: {n_inner:,}')
                 except RuntimeError:
                     pass
             
-            # Visualize tetrahedral mesh edges colored by weight
+            logger.info(f"Boundary vertex labels: H1={n_h1}, H2={n_h2}, inner(seeds)={n_inner}")
+        
+        # Update UI with edge stats
+        if result.edge_weights is not None:
+            if hasattr(self, 'edge_weights_stats') and self.edge_weights_stats is not None:
+                try:
+                    self.edge_weights_stats.add_header('⚖️ Edge Weights', Colors.INFO)
+                    self.edge_weights_stats.add_row(f'Range: [{result.edge_weights.min():.4f}, {result.edge_weights.max():.4f}]')
+                    self.edge_weights_stats.add_row(f'Mean: {result.edge_weights.mean():.4f}')
+                    
+                    if result.edge_boundary_labels is not None:
+                        n_interior = np.sum(result.edge_boundary_labels == 0)
+                        n_h1_edges = np.sum(result.edge_boundary_labels == 1)
+                        n_h2_edges = np.sum(result.edge_boundary_labels == 2)
+                        n_inner_edges = np.sum(result.edge_boundary_labels == -1)
+                        n_mixed_edges = np.sum(result.edge_boundary_labels == -2)
+                        
+                        self.edge_weights_stats.add_header('🔗 Edge Labels', Colors.INFO)
+                        self.edge_weights_stats.add_row(f'Interior edges: {n_interior:,}')
+                        self.edge_weights_stats.add_row(f'H₁ edges: {n_h1_edges:,}')
+                        self.edge_weights_stats.add_row(f'H₂ edges: {n_h2_edges:,}')
+                        self.edge_weights_stats.add_row(f'Inner edges: {n_inner_edges:,}')
+                        self.edge_weights_stats.add_row(f'Mixed edges: {n_mixed_edges:,}')
+                except RuntimeError:
+                    pass
+            
+            # Visualize tetrahedral mesh edges:
+            # - Interior edges colored by weight (coolwarm)
+            # - Boundary edges colored by mold half (green/orange/gray)
             self.mesh_viewer.set_tetrahedral_mesh(
                 result.vertices,
                 result.edges,
                 edge_weights=result.edge_weights,
+                edge_boundary_labels=result.edge_boundary_labels,
                 colormap='coolwarm'  # Blue (low weight) to Red (high weight)
             )
+            
+            # Also store original (non-inflated) tetrahedral mesh for visualization
+            if result.original_vertices is not None:
+                self.mesh_viewer.set_original_tetrahedral_mesh(result.original_vertices, result.edges)
             
             logger.info(f"Edge weights computed: range [{result.edge_weights.min():.4f}, {result.edge_weights.max():.4f}]")
         else:
@@ -4485,6 +4722,293 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 pass
         self._edge_weights_worker = None
+
+    # ========================================================================
+    # DIJKSTRA STEP
+    # ========================================================================
+    
+    def _setup_dijkstra_step(self):
+        """Setup the Dijkstra step UI."""
+        # Check prerequisites
+        if self._tet_result is None or self._tet_result.edge_weights is None:
+            no_weights_label = QLabel("⚠️ Please compute edge weights first.")
+            no_weights_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_weights_label.setWordWrap(True)
+            self.context_layout.addWidget(no_weights_label)
+            return
+        
+        # Description section
+        info_group = QGroupBox("Dijkstra Escape Labeling")
+        info_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        info_layout = QVBoxLayout(info_group)
+        
+        info_text = QLabel(
+            "Runs Dijkstra's algorithm from inner boundary (part surface) vertices "
+            "to find the shortest weighted path to either H₁ or H₂ boundary.\n\n"
+            "Each vertex is labeled by which mold half it 'escapes' to. "
+            "Tetrahedra are labeled by majority vote of their vertices."
+        )
+        info_text.setWordWrap(True)
+        info_text.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px; line-height: 1.4;')
+        info_layout.addWidget(info_text)
+        
+        self.context_layout.addWidget(info_group)
+        
+        # Info about current state
+        result = self._tet_result
+        state_info = StatsBox()
+        state_info.add_header('Current State', Colors.INFO)
+        
+        if result.boundary_labels is not None:
+            n_seeds = np.sum(result.boundary_labels == -1)
+            n_h1 = np.sum(result.boundary_labels == 1)
+            n_h2 = np.sum(result.boundary_labels == 2)
+            state_info.add_row(f'Seed vertices (inner): {n_seeds:,}')
+            state_info.add_row(f'H₁ target vertices: {n_h1:,}')
+            state_info.add_row(f'H₂ target vertices: {n_h2:,}')
+        
+        state_info.add_row(f'Total edges: {result.num_edges:,}')
+        state_info.add_row(f'Total tetrahedra: {result.num_tetrahedra:,}')
+        self.context_layout.addWidget(state_info)
+        
+        # Compute button
+        self.dijkstra_btn = QPushButton("🛤️ Run Dijkstra Walk")
+        self.dijkstra_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.dijkstra_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {Colors.PRIMARY};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: #0056b3;
+            }}
+            QPushButton:disabled {{
+                background-color: {Colors.GRAY_LIGHT};
+                color: {Colors.GRAY};
+            }}
+        """)
+        self.dijkstra_btn.clicked.connect(self._on_run_dijkstra)
+        self.context_layout.addWidget(self.dijkstra_btn)
+        
+        # Progress bar
+        self.dijkstra_progress = QProgressBar()
+        self.dijkstra_progress.setStyleSheet(f"""
+            QProgressBar {{
+                border: none;
+                border-radius: 4px;
+                background-color: {Colors.LIGHT};
+                height: 8px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {Colors.INFO};
+                border-radius: 4px;
+            }}
+        """)
+        self.dijkstra_progress.setTextVisible(False)
+        self.dijkstra_progress.setRange(0, 0)  # Indeterminate
+        self.dijkstra_progress.hide()
+        self.context_layout.addWidget(self.dijkstra_progress)
+        
+        # Progress label
+        self.dijkstra_progress_label = QLabel("")
+        self.dijkstra_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.dijkstra_progress_label.hide()
+        self.context_layout.addWidget(self.dijkstra_progress_label)
+        
+        # Stats (show if computed)
+        self.dijkstra_stats = StatsBox()
+        self.dijkstra_stats.hide()
+        self.context_layout.addWidget(self.dijkstra_stats)
+        
+        # Visibility toggles section
+        visibility_section = QFrame()
+        visibility_section.setStyleSheet(f"""
+            QFrame {{
+                background-color: {Colors.LIGHT};
+                border-radius: 8px;
+                padding: 4px;
+            }}
+        """)
+        visibility_layout = QVBoxLayout(visibility_section)
+        visibility_layout.setContentsMargins(12, 8, 12, 8)
+        visibility_layout.setSpacing(8)
+        
+        visibility_label = QLabel("Visibility")
+        visibility_label.setStyleSheet(f"color: {Colors.GRAY}; font-size: 11px; font-weight: 600;")
+        visibility_layout.addWidget(visibility_label)
+        
+        # Edge weights toggle
+        self.dijkstra_show_edge_weights_cb = QCheckBox("Edge Weight Coloring")
+        self.dijkstra_show_edge_weights_cb.setChecked(True)
+        self.dijkstra_show_edge_weights_cb.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
+        self.dijkstra_show_edge_weights_cb.stateChanged.connect(
+            lambda state: self.mesh_viewer.set_edge_weights_visible(state == Qt.CheckState.Checked.value)
+        )
+        visibility_layout.addWidget(self.dijkstra_show_edge_weights_cb)
+        
+        # Original tet mesh toggle
+        self.dijkstra_show_original_tet_cb = QCheckBox("Original Tetrahedral Mesh")
+        self.dijkstra_show_original_tet_cb.setChecked(False)
+        self.dijkstra_show_original_tet_cb.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
+        self.dijkstra_show_original_tet_cb.stateChanged.connect(
+            lambda state: self.mesh_viewer.set_original_tet_visible(state == Qt.CheckState.Checked.value)
+        )
+        visibility_layout.addWidget(self.dijkstra_show_original_tet_cb)
+        
+        # Dijkstra result toggle
+        self.dijkstra_show_result_cb = QCheckBox("Dijkstra Result (Tetrahedra)")
+        self.dijkstra_show_result_cb.setChecked(True)
+        self.dijkstra_show_result_cb.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
+        self.dijkstra_show_result_cb.stateChanged.connect(
+            lambda state: self.mesh_viewer.set_dijkstra_visible(state == Qt.CheckState.Checked.value)
+        )
+        visibility_layout.addWidget(self.dijkstra_show_result_cb)
+        
+        self.context_layout.addWidget(visibility_section)
+        
+        # Update UI with current state
+        self._update_dijkstra_step_ui()
+    
+    def _update_dijkstra_step_ui(self):
+        """Update Dijkstra step UI based on current state."""
+        if not hasattr(self, 'dijkstra_stats'):
+            return
+        
+        if self._tet_result is not None and self._tet_result.tetrahedra_labels is not None:
+            # Show stats
+            self.dijkstra_stats.clear()
+            self.dijkstra_stats.show()
+            
+            result = self._tet_result
+            tet_labels = result.tetrahedra_labels
+            
+            n_h1_tets = np.sum(tet_labels == 1)
+            n_h2_tets = np.sum(tet_labels == 2)
+            n_tie_tets = np.sum(tet_labels == 0)
+            
+            self.dijkstra_stats.add_header('✅ Dijkstra Complete', Colors.SUCCESS)
+            self.dijkstra_stats.add_row(f'H₁ tetrahedra: {n_h1_tets:,}')
+            self.dijkstra_stats.add_row(f'H₂ tetrahedra: {n_h2_tets:,}')
+            self.dijkstra_stats.add_row(f'Undecided: {n_tie_tets:,}')
+            
+            if result.vertex_escape_labels is not None:
+                vert_labels = result.vertex_escape_labels
+                n_h1_verts = np.sum(vert_labels == 1)
+                n_h2_verts = np.sum(vert_labels == 2)
+                self.dijkstra_stats.add_header('Vertex Labels', Colors.INFO)
+                self.dijkstra_stats.add_row(f'H₁ vertices: {n_h1_verts:,}')
+                self.dijkstra_stats.add_row(f'H₂ vertices: {n_h2_verts:,}')
+        else:
+            self.dijkstra_stats.hide()
+    
+    def _on_run_dijkstra(self):
+        """Handle run Dijkstra button click."""
+        if self._dijkstra_worker is not None:
+            return
+        
+        # Show progress
+        self.dijkstra_btn.setEnabled(False)
+        self.dijkstra_progress.show()
+        self.dijkstra_progress_label.show()
+        self.dijkstra_progress_label.setText("Initializing...")
+        self.dijkstra_stats.hide()
+        
+        # Also set original tet mesh for visualization
+        if self._tet_result.vertices_original is not None:
+            self.mesh_viewer.set_original_tetrahedral_mesh(
+                self._tet_result.vertices_original,
+                self._tet_result.edges
+            )
+        
+        # Start worker
+        self._dijkstra_worker = DijkstraWorker(self._tet_result)
+        self._dijkstra_worker.progress.connect(self._on_dijkstra_progress)
+        self._dijkstra_worker.complete.connect(self._on_dijkstra_complete)
+        self._dijkstra_worker.error.connect(self._on_dijkstra_error)
+        self._dijkstra_worker.finished.connect(self._on_dijkstra_worker_finished)
+        self._dijkstra_worker.start()
+    
+    def _on_dijkstra_progress(self, message: str):
+        """Handle Dijkstra progress update."""
+        if hasattr(self, 'dijkstra_progress_label') and self.dijkstra_progress_label is not None:
+            try:
+                self.dijkstra_progress_label.setText(message)
+            except RuntimeError:
+                pass
+    
+    def _on_dijkstra_complete(self, result: TetrahedralMeshResult):
+        """Handle Dijkstra complete."""
+        self._tet_result = result
+        
+        # Update stats
+        self._update_dijkstra_step_ui()
+        
+        # Visualize result - use ORIGINAL vertices for parting surface geometry
+        vertices_for_viz = result.vertices_original if result.vertices_original is not None else result.vertices
+        
+        self.mesh_viewer.set_dijkstra_result(
+            vertices_for_viz,
+            result.tetrahedra,
+            result.tetrahedra_labels
+        )
+        
+        # Update step status
+        self.step_buttons[Step.DIJKSTRA].set_status('completed')
+        
+        n_h1 = np.sum(result.tetrahedra_labels == 1)
+        n_h2 = np.sum(result.tetrahedra_labels == 2)
+        logger.info(f"Dijkstra complete: H1={n_h1}, H2={n_h2} tetrahedra")
+    
+    def _on_dijkstra_error(self, message: str):
+        """Handle Dijkstra error."""
+        if hasattr(self, 'dijkstra_progress_label') and self.dijkstra_progress_label is not None:
+            try:
+                self.dijkstra_progress_label.setText(f"Error: {message}")
+                self.dijkstra_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+            except RuntimeError:
+                pass
+        QMessageBox.critical(self, "Error", f"Dijkstra failed:\n{message}")
+    
+    def _on_dijkstra_worker_finished(self):
+        """Handle Dijkstra worker finished."""
+        if hasattr(self, 'dijkstra_btn') and self.dijkstra_btn is not None:
+            try:
+                self.dijkstra_btn.setEnabled(True)
+            except RuntimeError:
+                pass
+        if hasattr(self, 'dijkstra_progress') and self.dijkstra_progress is not None:
+            try:
+                self.dijkstra_progress.hide()
+            except RuntimeError:
+                pass
+        self._dijkstra_worker = None
 
     def _load_mesh(self, file_path: str, scale_factor: float = 1.0):
         """Load and process a mesh file."""

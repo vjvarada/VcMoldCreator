@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 class TetrahedralMeshResult:
     """Result of tetrahedral mesh generation."""
     
-    # Vertex positions (N x 3)
+    # Vertex positions (N x 3) - these are the CURRENT (possibly inflated) positions
     vertices: np.ndarray
     
     # Tetrahedra indices (M x 4) - each row is 4 vertex indices
@@ -53,16 +53,25 @@ class TetrahedralMeshResult:
     # Edge list (E x 2) - unique edges extracted from tetrahedra
     edges: np.ndarray
     
-    # Edge lengths (E,)
+    # Edge lengths (E,) - computed on CURRENT vertex positions
     edge_lengths: np.ndarray
     
     # Boundary surface mesh (extracted from tetrahedral mesh outer faces)
+    # Uses CURRENT (possibly inflated) vertex positions
     boundary_mesh: Optional[trimesh.Trimesh] = None
+    
+    # ORIGINAL (non-inflated) vertex positions (N x 3)
+    # Used for parting surface construction
+    vertices_original: Optional[np.ndarray] = None
+    
+    # ORIGINAL boundary surface mesh (non-inflated)
+    # Used for parting surface construction
+    boundary_mesh_original: Optional[trimesh.Trimesh] = None
     
     # Edge midpoint distances to part mesh (E,) - for weight computation
     edge_dist_to_part: Optional[np.ndarray] = None
     
-    # Edge weights (E,) - weight = 1 / (dist^2 + 0.25)
+    # Edge weights (E,) - weight = 1 / (dist^2 + epsilon)
     edge_weights: Optional[np.ndarray] = None
     
     # Weighted edge lengths (E,) = edge_length * edge_weight
@@ -73,6 +82,9 @@ class TetrahedralMeshResult:
     
     # Shell boundary vertex labels: 0=interior, 1=H1, 2=H2, -1=inner boundary (N,)
     boundary_labels: Optional[np.ndarray] = None
+    
+    # Edge boundary labels: 0=interior, 1=H1, 2=H2, -1=inner boundary, -2=boundary zone (E,)
+    edge_boundary_labels: Optional[np.ndarray] = None
     
     # R value - maximum distance from hull vertices to part surface
     r_value: Optional[float] = None
@@ -87,6 +99,12 @@ class TetrahedralMeshResult:
     num_tetrahedra: int = 0
     num_edges: int = 0
     num_boundary_faces: int = 0
+    
+    # Dijkstra results - vertex escape labels: 1=escapes to H1, 2=escapes to H2
+    vertex_escape_labels: Optional[np.ndarray] = None
+    
+    # Tetrahedra labels based on majority vote of vertex escape labels
+    tetrahedra_labels: Optional[np.ndarray] = None
     
     # Timing
     tetrahedralize_time_ms: float = 0.0
@@ -223,12 +241,17 @@ def inflate_boundary_vertices(
     tet_result: 'TetrahedralMeshResult',
     part_mesh: trimesh.Trimesh,
     r_value: float,
-    use_gpu: bool = True
+    use_gpu: bool = True,
+    inner_boundary_threshold: float = 0.01
 ) -> 'TetrahedralMeshResult':
     """
-    Inflate boundary vertices of the tetrahedral mesh outward.
+    Inflate OUTER boundary vertices of the tetrahedral mesh outward.
     
-    For each boundary vertex, move it outward by:
+    Only outer boundary vertices (hull surface) are inflated.
+    Inner boundary vertices (part surface) are kept fixed to preserve
+    the part cavity shape.
+    
+    For each OUTER boundary vertex, move it outward by:
         displacement = R - distance_to_part
     
     This creates a more uniform thickness in the mold volume.
@@ -240,9 +263,11 @@ def inflate_boundary_vertices(
         part_mesh: Original part mesh (for distance computation)
         r_value: Maximum distance R (computed earlier)
         use_gpu: Whether to use GPU acceleration
+        inner_boundary_threshold: Distance threshold to identify inner boundary
+                                  vertices (those touching the part surface)
     
     Returns:
-        Modified TetrahedralMeshResult with inflated boundary vertices
+        Modified TetrahedralMeshResult with inflated outer boundary vertices
     """
     import time
     start_time = time.time()
@@ -256,7 +281,7 @@ def inflate_boundary_vertices(
     boundary_verts = np.asarray(boundary_mesh.vertices, dtype=np.float64)
     n_boundary = len(boundary_verts)
     
-    logger.info(f"Inflating {n_boundary} boundary vertices with R={r_value:.4f}")
+    logger.info(f"Processing {n_boundary} boundary vertices with R={r_value:.4f}")
     
     # Compute distance from each boundary vertex to part surface
     if use_gpu and CUDA_AVAILABLE:
@@ -266,13 +291,23 @@ def inflate_boundary_vertices(
     else:
         closest_points, distances, _ = part_mesh.nearest.on_surface(boundary_verts)
     
-    # Compute displacement for each vertex: R - distance
-    displacements = r_value - distances
+    # Identify inner boundary vertices (those very close to part surface)
+    # These should NOT be moved - they define the part cavity
+    inner_boundary_mask = distances < inner_boundary_threshold
+    outer_boundary_mask = ~inner_boundary_mask
+    
+    n_inner = np.sum(inner_boundary_mask)
+    n_outer = np.sum(outer_boundary_mask)
+    logger.info(f"Inner boundary (fixed): {n_inner} vertices, Outer boundary (to inflate): {n_outer} vertices")
+    
+    # Compute displacement for outer boundary vertices only: R - distance
+    displacements = np.zeros(n_boundary, dtype=np.float64)
+    displacements[outer_boundary_mask] = r_value - distances[outer_boundary_mask]
     
     # Clamp displacements to be non-negative (don't move inward)
     displacements = np.maximum(displacements, 0.0)
     
-    logger.info(f"Displacement range: [{displacements.min():.4f}, {displacements.max():.4f}]")
+    logger.info(f"Outer boundary displacement range: [{displacements[outer_boundary_mask].min():.4f}, {displacements[outer_boundary_mask].max():.4f}]")
     
     # Compute outward direction for each vertex (vertex normal)
     # Use the boundary mesh vertex normals
@@ -289,7 +324,7 @@ def inflate_boundary_vertices(
     normal_lengths = np.where(normal_lengths > 1e-10, normal_lengths, 1.0)
     vertex_normals = vertex_normals / normal_lengths
     
-    # Move boundary vertices outward
+    # Move boundary vertices outward (only outer boundary will move due to displacement=0 for inner)
     inflated_boundary_verts = boundary_verts + vertex_normals * displacements[:, np.newaxis]
     
     # Update the boundary mesh with new vertex positions
@@ -329,6 +364,11 @@ def inflate_boundary_vertices(
     logger.info(f"Boundary inflation complete in {elapsed:.0f}ms")
     logger.info(f"  Updated {len(tet_indices)} tet vertices")
     
+    # Store original vertices and boundary mesh (for parting surface construction later)
+    # If already inflated, keep the original from previous result
+    original_verts = tet_result.vertices_original if tet_result.vertices_original is not None else tet_result.vertices.copy()
+    original_boundary = tet_result.boundary_mesh_original if tet_result.boundary_mesh_original is not None else boundary_mesh
+    
     # Create new result with updated data
     inflated_result = TetrahedralMeshResult(
         vertices=new_tet_verts,
@@ -336,11 +376,14 @@ def inflate_boundary_vertices(
         edges=tet_result.edges,
         edge_lengths=new_edge_lengths,
         boundary_mesh=inflated_boundary_mesh,
+        vertices_original=original_verts,
+        boundary_mesh_original=original_boundary,
         edge_dist_to_part=None,  # Needs recomputation
         edge_weights=None,  # Needs recomputation
         weighted_edge_lengths=None,
         boundary_vertices=tet_result.boundary_vertices,
         boundary_labels=tet_result.boundary_labels,
+        edge_boundary_labels=None,  # Will be computed with edge weights
         r_value=r_value,
         r_hull_point=tet_result.r_hull_point,
         r_part_point=tet_result.r_part_point,
@@ -406,6 +449,154 @@ def compute_edge_lengths(vertices: np.ndarray, edges: np.ndarray) -> np.ndarray:
     v1 = vertices[edges[:, 1]]
     lengths = np.linalg.norm(v1 - v0, axis=1)
     return lengths
+
+
+def compute_edge_weights_simple(
+    tet_result: 'TetrahedralMeshResult',
+    part_mesh: trimesh.Trimesh,
+    epsilon: float = 0.25,
+    use_gpu: bool = True
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute edge weights based on distance to part surface.
+    
+    Simple formula (no boundary bias since inflation already handles that):
+        weight = 1 / (distance^2 + epsilon)
+    
+    Higher weights mean lower traversal cost (edges near the part are "cheaper").
+    
+    Args:
+        tet_result: Tetrahedral mesh result (uses inflated vertex positions)
+        part_mesh: Original part mesh for distance computation
+        epsilon: Small constant to avoid division by zero (default 0.25)
+        use_gpu: Whether to use GPU acceleration
+    
+    Returns:
+        Tuple of:
+            - edge_weights: (E,) array of edge weights
+            - edge_dist_to_part: (E,) array of edge midpoint distances to part
+    """
+    import time
+    start_time = time.time()
+    
+    vertices = tet_result.vertices
+    edges = tet_result.edges
+    n_edges = len(edges)
+    
+    # Compute edge midpoints
+    edge_midpoints = (vertices[edges[:, 0]] + vertices[edges[:, 1]]) / 2
+    
+    logger.info(f"Computing edge weights for {n_edges} edges...")
+    
+    # Compute distances from edge midpoints to part surface
+    if use_gpu and CUDA_AVAILABLE:
+        logger.debug("Using GPU for edge midpoint distance computation")
+        edge_dist_to_part, _ = compute_distances_and_closest_points_gpu(
+            edge_midpoints, part_mesh
+        )
+    else:
+        logger.debug("Using CPU for edge midpoint distance computation")
+        _, edge_dist_to_part, _ = part_mesh.nearest.on_surface(edge_midpoints)
+    
+    # Compute weights: weight = 1 / (distance^2 + epsilon)
+    # Higher weight = lower cost for edges near the part surface
+    edge_weights = 1.0 / (edge_dist_to_part ** 2 + epsilon)
+    
+    elapsed = (time.time() - start_time) * 1000
+    logger.info(f"Edge weights computed in {elapsed:.0f}ms")
+    logger.info(f"  Distance range: [{edge_dist_to_part.min():.4f}, {edge_dist_to_part.max():.4f}]")
+    logger.info(f"  Weight range: [{edge_weights.min():.4f}, {edge_weights.max():.4f}]")
+    
+    return edge_weights, edge_dist_to_part
+
+
+def compute_edge_boundary_labels(
+    tet_result: 'TetrahedralMeshResult'
+) -> np.ndarray:
+    """
+    Compute labels for each edge based on vertex boundary labels.
+    
+    Edge labels:
+        0  = Interior edge (at least one vertex is interior, OR connects interior to boundary)
+        1  = H1 boundary edge (both vertices on H1)
+        2  = H2 boundary edge (both vertices on H2)
+        -1 = Inner boundary edge (both vertices on inner/part boundary)
+        -2 = Mixed boundary edge (both on boundary but different types)
+    
+    Note: Edges connecting interior vertices to boundary vertices are labeled as
+    interior (0) so they get colored by weight, not by mold half.
+    
+    Args:
+        tet_result: Tetrahedral mesh result with boundary_labels computed
+    
+    Returns:
+        (E,) int8 array of edge boundary labels
+    """
+    edges = tet_result.edges
+    n_edges = len(edges)
+    
+    edge_labels = np.zeros(n_edges, dtype=np.int8)
+    
+    boundary_labels = tet_result.boundary_labels
+    if boundary_labels is None:
+        logger.warning("No boundary labels available for edge labeling")
+        return edge_labels
+    
+    boundary_verts = tet_result.boundary_vertices
+    if boundary_verts is None:
+        logger.warning("No boundary_vertices mask available for edge labeling")
+        return edge_labels
+    
+    # Get labels for both endpoints of each edge
+    v0_labels = boundary_labels[edges[:, 0]]
+    v1_labels = boundary_labels[edges[:, 1]]
+    
+    # Get boundary status for both endpoints
+    v0_boundary = boundary_verts[edges[:, 0]]
+    v1_boundary = boundary_verts[edges[:, 1]]
+    
+    # An edge is a "boundary edge" only if BOTH vertices are on the boundary surface
+    both_on_boundary = v0_boundary & v1_boundary
+    
+    # Edge label rules (only for edges where both vertices are on boundary):
+    # - Both H1: edge is H1 (1)
+    # - Both H2: edge is H2 (2)
+    # - Both inner: edge is inner (-1)
+    # - Both on boundary but different types: mixed (-2)
+    # - Otherwise (at least one interior): interior edge (0) - colored by weight
+    
+    # H1 edges (both on H1 boundary)
+    h1_mask = both_on_boundary & (v0_labels == 1) & (v1_labels == 1)
+    edge_labels[h1_mask] = 1
+    
+    # H2 edges (both on H2 boundary)
+    h2_mask = both_on_boundary & (v0_labels == 2) & (v1_labels == 2)
+    edge_labels[h2_mask] = 2
+    
+    # Inner boundary edges (both on inner boundary / part surface)
+    inner_mask = both_on_boundary & (v0_labels == -1) & (v1_labels == -1)
+    edge_labels[inner_mask] = -1
+    
+    # Mixed boundary edges (both on boundary but not same type)
+    mixed_mask = both_on_boundary & ~h1_mask & ~h2_mask & ~inner_mask
+    edge_labels[mixed_mask] = -2
+    
+    # All other edges (including interior-to-boundary connections) stay at 0
+    # These will be colored by weight
+    
+    # Count stats
+    n_interior = np.sum(edge_labels == 0)
+    n_h1 = np.sum(edge_labels == 1)
+    n_h2 = np.sum(edge_labels == 2)
+    n_inner = np.sum(edge_labels == -1)
+    n_mixed = np.sum(edge_labels == -2)
+    
+    logger.info(
+        f"Edge boundary labels: interior={n_interior}, H1={n_h1}, H2={n_h2}, "
+        f"inner={n_inner}, mixed={n_mixed}"
+    )
+    
+    return edge_labels
 
 
 def compute_distances_to_mesh_gpu(
@@ -868,22 +1059,25 @@ def identify_boundary_vertices(
 def label_boundary_from_classification(
     tet_vertices: np.ndarray,
     boundary_mask: np.ndarray,
-    cavity_mesh: trimesh.Trimesh,
+    boundary_mesh: trimesh.Trimesh,
     classification_result,  # MoldHalfClassificationResult
-    hull_mesh: trimesh.Trimesh
+    hull_mesh: trimesh.Trimesh = None  # Not used but kept for backwards compatibility
 ) -> np.ndarray:
     """
     Label boundary vertices as H1, H2, or inner boundary based on mold half classification.
     
+    This function now works directly with the tetrahedral boundary mesh classification.
+    Face labels are propagated to vertices by majority voting from adjacent faces.
+    
     Args:
         tet_vertices: (N, 3) tetrahedral mesh vertices
         boundary_mask: (N,) boolean mask of boundary vertices
-        cavity_mesh: Cavity surface mesh
-        classification_result: Result from mold half classification
-        hull_mesh: Original hull mesh
+        boundary_mesh: The tetrahedral boundary mesh (classification was done on this mesh)
+        classification_result: Result from mold half classification on boundary_mesh
+        hull_mesh: Not used - kept for backwards compatibility
     
     Returns:
-        (N,) int8 array: 0=interior, 1=H1 boundary, 2=H2 boundary, -1=inner boundary (part surface)
+        (N,) int8 array: 0=interior/boundary zone, 1=H1 boundary, 2=H2 boundary, -1=inner boundary (part surface)
     """
     labels = np.zeros(len(tet_vertices), dtype=np.int8)
     
@@ -893,24 +1087,69 @@ def label_boundary_from_classification(
     if len(boundary_indices) == 0:
         return labels
     
-    # Get boundary vertex positions
-    boundary_verts = tet_vertices[boundary_indices]
-    
-    # Find closest face on cavity mesh for each boundary vertex
-    closest_points, distances, face_ids = cavity_mesh.nearest.on_surface(boundary_verts)
-    
-    # Label based on face classification
+    # Get classification sets
     h1_set = classification_result.h1_triangles
     h2_set = classification_result.h2_triangles
     inner_set = classification_result.inner_boundary_triangles
     
-    for i, (vert_idx, face_id) in enumerate(zip(boundary_indices, face_ids)):
-        if face_id in h1_set:
+    # Build vertex-to-face adjacency from the boundary mesh
+    # Each vertex gets labels from all faces it belongs to
+    vertex_h1_count = np.zeros(len(tet_vertices), dtype=np.int32)
+    vertex_h2_count = np.zeros(len(tet_vertices), dtype=np.int32)
+    vertex_inner_count = np.zeros(len(tet_vertices), dtype=np.int32)
+    
+    # The boundary mesh vertices are indexed from 0, but they correspond to 
+    # tetrahedral vertices. We need to map boundary mesh faces to tet vertices.
+    # boundary_mesh.faces contains indices into boundary_mesh.vertices
+    
+    # Find the mapping from boundary mesh vertices to tet vertices
+    # boundary_mesh.vertices should be a subset of tet_vertices (boundary vertices)
+    # Use KDTree for efficient lookup
+    from scipy.spatial import cKDTree
+    
+    tet_tree = cKDTree(tet_vertices)
+    
+    # Find which tet vertex each boundary mesh vertex corresponds to
+    boundary_to_tet = tet_tree.query(boundary_mesh.vertices, k=1)[1]
+    
+    # Now iterate over faces and accumulate labels for each vertex
+    for face_idx, face in enumerate(boundary_mesh.faces):
+        # Map face vertex indices to tet vertex indices
+        tet_v0 = boundary_to_tet[face[0]]
+        tet_v1 = boundary_to_tet[face[1]]
+        tet_v2 = boundary_to_tet[face[2]]
+        
+        if face_idx in h1_set:
+            vertex_h1_count[tet_v0] += 1
+            vertex_h1_count[tet_v1] += 1
+            vertex_h1_count[tet_v2] += 1
+        elif face_idx in h2_set:
+            vertex_h2_count[tet_v0] += 1
+            vertex_h2_count[tet_v1] += 1
+            vertex_h2_count[tet_v2] += 1
+        elif face_idx in inner_set:
+            vertex_inner_count[tet_v0] += 1
+            vertex_inner_count[tet_v1] += 1
+            vertex_inner_count[tet_v2] += 1
+        # Boundary zone faces contribute to no count (vertex stays 0)
+    
+    # For each boundary vertex, assign label based on majority vote
+    # Priority: inner boundary > H1/H2 (inner boundary is the seed for Dijkstra)
+    for vert_idx in boundary_indices:
+        h1_count = vertex_h1_count[vert_idx]
+        h2_count = vertex_h2_count[vert_idx]
+        inner_count = vertex_inner_count[vert_idx]
+        
+        # Inner boundary takes priority (these are Dijkstra seeds)
+        if inner_count > 0:
+            labels[vert_idx] = -1
+        elif h1_count > h2_count:
             labels[vert_idx] = 1
-        elif face_id in h2_set:
+        elif h2_count > h1_count:
             labels[vert_idx] = 2
-        elif face_id in inner_set:
-            labels[vert_idx] = -1  # Inner boundary (part surface) - seed for Dijkstra
+        elif h1_count > 0:
+            # Tie - assign to H1 arbitrarily
+            labels[vert_idx] = 1
         # else: stays 0 (boundary zone or unclassified)
     
     return labels
@@ -1006,12 +1245,20 @@ def generate_tetrahedral_mesh(
         logger.info(f"Edge weights: min={result.edge_weights.min():.4f}, max={result.edge_weights.max():.4f}, mean={result.edge_weights.mean():.4f}")
     
     # Step 5: Label boundary vertices from classification
+    # NOTE: This path is deprecated. The EdgeWeightsWorker now classifies the
+    # tetrahedral boundary mesh directly and labels vertices accordingly.
+    # This code path may produce incorrect results since classification_result
+    # was computed on cavity_mesh but we now expect it on boundary_mesh.
     if classification_result is not None:
         logger.debug("Labeling boundary vertices from classification...")
+        logger.warning(
+            "Using deprecated classification path. "
+            "For accurate results, use EdgeWeightsWorker which classifies the tet boundary mesh directly."
+        )
         result.boundary_labels = label_boundary_from_classification(
             tet_vertices,
             boundary_mask,
-            cavity_mesh,
+            boundary_mesh,  # Use tet boundary mesh for vertex mapping
             classification_result,
             hull_mesh
         )
@@ -1171,3 +1418,167 @@ def compute_edge_costs(
     logger.debug(f"Computed edge costs: min={costs.min():.6f}, max={costs.max():.6f}, mean={costs.mean():.6f}")
     
     return costs
+
+
+def run_dijkstra_escape_labeling(
+    tet_result: 'TetrahedralMeshResult',
+    use_weighted_edges: bool = True
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Run Dijkstra's algorithm from inner boundary (part surface) vertices to find
+    which outer boundary (H1 or H2) each vertex escapes to.
+    
+    This performs a multi-source Dijkstra from all inner boundary vertices,
+    finding the shortest path to either H1 or H2 boundary vertices.
+    
+    Args:
+        tet_result: Tetrahedral mesh result with boundary_labels and edge_weights computed
+        use_weighted_edges: If True, use edge_length / edge_weight as cost
+                           If False, use just edge_length as cost
+    
+    Returns:
+        Tuple of:
+            - vertex_escape_labels: (N,) int8 array where:
+                1 = vertex escapes to H1
+                2 = vertex escapes to H2
+                0 = vertex is on inner boundary (seed) or unreachable
+            - tetrahedra_labels: (M,) int8 array where:
+                1 = tetrahedron belongs to H1 (majority of vertices escape to H1)
+                2 = tetrahedron belongs to H2 (majority of vertices escape to H2)
+                0 = tie or contains inner boundary vertices
+    """
+    import heapq
+    import time
+    
+    start_time = time.time()
+    
+    vertices = tet_result.vertices
+    edges = tet_result.edges
+    tetrahedra = tet_result.tetrahedra
+    edge_lengths = tet_result.edge_lengths
+    edge_weights = tet_result.edge_weights
+    boundary_labels = tet_result.boundary_labels
+    
+    n_vertices = len(vertices)
+    n_tetrahedra = len(tetrahedra)
+    
+    if boundary_labels is None:
+        raise ValueError("boundary_labels must be computed before running Dijkstra")
+    
+    # Compute edge costs
+    # Lower cost = preferred path
+    # Since edge_weights = 1/(dist² + ε), higher weight means closer to part
+    # We want paths to prefer staying close to part, so cost = length / weight
+    if use_weighted_edges and edge_weights is not None:
+        # cost = length / weight = length * (dist² + ε)
+        # This makes edges near the part cheaper to traverse
+        edge_costs = edge_lengths / (edge_weights + 1e-10)
+    else:
+        edge_costs = edge_lengths.copy()
+    
+    logger.info(f"Edge costs: min={edge_costs.min():.6f}, max={edge_costs.max():.6f}, mean={edge_costs.mean():.6f}")
+    
+    # Build adjacency list with edge costs
+    # adjacency[v] = [(neighbor, cost), ...]
+    adjacency: Dict[int, List[Tuple[int, float]]] = {i: [] for i in range(n_vertices)}
+    
+    for edge_idx, (v0, v1) in enumerate(edges):
+        cost = edge_costs[edge_idx]
+        adjacency[v0].append((v1, cost))
+        adjacency[v1].append((v0, cost))
+    
+    # Identify seed vertices (inner boundary = part surface) and target vertices (H1, H2)
+    inner_boundary_vertices = np.where(boundary_labels == -1)[0]
+    h1_vertices = set(np.where(boundary_labels == 1)[0])
+    h2_vertices = set(np.where(boundary_labels == 2)[0])
+    
+    logger.info(f"Dijkstra: {len(inner_boundary_vertices)} seeds, {len(h1_vertices)} H1 targets, {len(h2_vertices)} H2 targets")
+    
+    if len(inner_boundary_vertices) == 0:
+        logger.warning("No inner boundary vertices found - cannot run Dijkstra")
+        return np.zeros(n_vertices, dtype=np.int8), np.zeros(n_tetrahedra, dtype=np.int8)
+    
+    if len(h1_vertices) == 0 and len(h2_vertices) == 0:
+        logger.warning("No H1 or H2 boundary vertices found - cannot run Dijkstra")
+        return np.zeros(n_vertices, dtype=np.int8), np.zeros(n_tetrahedra, dtype=np.int8)
+    
+    # Initialize distances and escape labels
+    dist = np.full(n_vertices, np.inf, dtype=np.float64)
+    escape_label = np.zeros(n_vertices, dtype=np.int8)
+    visited = np.zeros(n_vertices, dtype=bool)
+    
+    # Priority queue: (distance, vertex_id)
+    # We run Dijkstra BACKWARDS from H1 and H2 targets to all vertices
+    # This is more efficient than running from each inner boundary vertex
+    pq = []
+    
+    # Initialize H1 targets with label 1
+    for v in h1_vertices:
+        dist[v] = 0.0
+        escape_label[v] = 1
+        heapq.heappush(pq, (0.0, v))
+    
+    # Initialize H2 targets with label 2
+    for v in h2_vertices:
+        dist[v] = 0.0
+        escape_label[v] = 2
+        heapq.heappush(pq, (0.0, v))
+    
+    # Run Dijkstra
+    while pq:
+        d, u = heapq.heappop(pq)
+        
+        if visited[u]:
+            continue
+        visited[u] = True
+        
+        # Propagate to neighbors
+        for v, cost in adjacency[u]:
+            if visited[v]:
+                continue
+            
+            new_dist = d + cost
+            if new_dist < dist[v]:
+                dist[v] = new_dist
+                escape_label[v] = escape_label[u]  # Inherit the escape label
+                heapq.heappush(pq, (new_dist, v))
+    
+    # Mark inner boundary vertices as seeds (label 0)
+    escape_label[inner_boundary_vertices] = 0
+    
+    # Count results
+    n_h1 = np.sum(escape_label == 1)
+    n_h2 = np.sum(escape_label == 2)
+    n_seed = np.sum(escape_label == 0)
+    n_unreached = np.sum((escape_label == 0) & (boundary_labels != -1))
+    
+    logger.info(f"Vertex escape labels: H1={n_h1}, H2={n_h2}, seeds={n_seed}, unreached={n_unreached}")
+    
+    # Label tetrahedra based on majority vote of vertex escape labels
+    tetrahedra_labels = np.zeros(n_tetrahedra, dtype=np.int8)
+    
+    for tet_idx, tet in enumerate(tetrahedra):
+        tet_vertex_labels = escape_label[tet]
+        
+        # Count H1 and H2 vertices in this tetrahedron
+        n_h1_verts = np.sum(tet_vertex_labels == 1)
+        n_h2_verts = np.sum(tet_vertex_labels == 2)
+        
+        if n_h1_verts > n_h2_verts:
+            tetrahedra_labels[tet_idx] = 1
+        elif n_h2_verts > n_h1_verts:
+            tetrahedra_labels[tet_idx] = 2
+        else:
+            # Tie - assign based on which has more boundary vertices
+            # or leave as 0 (undecided)
+            tetrahedra_labels[tet_idx] = 0
+    
+    # Count tet results
+    n_tet_h1 = np.sum(tetrahedra_labels == 1)
+    n_tet_h2 = np.sum(tetrahedra_labels == 2)
+    n_tet_tie = np.sum(tetrahedra_labels == 0)
+    
+    elapsed = (time.time() - start_time) * 1000
+    logger.info(f"Dijkstra complete in {elapsed:.0f}ms: H1 tets={n_tet_h1}, H2 tets={n_tet_h2}, ties={n_tet_tie}")
+    
+    return escape_label, tetrahedra_labels

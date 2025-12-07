@@ -108,8 +108,21 @@ class MeshViewer(QWidget):
         self._mold_halves_visible = True
         
         # Tetrahedral mesh visualization
-        self._tet_edges_actor = None
+        self._tet_edges_actor = None  # Legacy single actor
+        self._tet_interior_actor = None  # Interior edges (weight colored)
+        self._tet_boundary_actor = None  # Boundary edges (mold-half colored)
         self._tet_visible = True
+        self._tet_interior_visible = True
+        self._tet_boundary_visible = True
+        self._edge_weights_visible = True  # Show/hide edge weight coloring
+        
+        # Original (non-inflated) tetrahedral mesh visualization
+        self._tet_original_actor = None
+        self._tet_original_visible = False
+        
+        # Dijkstra result visualization (tetrahedra colored by escape label)
+        self._dijkstra_actor = None
+        self._dijkstra_visible = True
         
         # Inflated boundary mesh visualization
         self._inflated_boundary_actor = None
@@ -895,7 +908,20 @@ class MeshViewer(QWidget):
         
         # Reset tetrahedral mesh state
         self._tet_edges_actor = None
+        self._tet_interior_actor = None
+        self._tet_boundary_actor = None
         self._tet_visible = True
+        self._tet_interior_visible = True
+        self._tet_boundary_visible = True
+        self._edge_weights_visible = True
+        
+        # Reset original tet mesh state
+        self._tet_original_actor = None
+        self._tet_original_visible = False
+        
+        # Reset Dijkstra visualization state
+        self._dijkstra_actor = None
+        self._dijkstra_visible = True
         
         # Reset inflated boundary mesh state
         self._inflated_boundary_actor = None
@@ -1819,15 +1845,23 @@ class MeshViewer(QWidget):
         vertices: np.ndarray,
         edges: np.ndarray,
         edge_weights: Optional[np.ndarray] = None,
+        edge_boundary_labels: Optional[np.ndarray] = None,
         colormap: str = 'coolwarm'
     ):
         """
-        Display tetrahedral mesh edges colored by weight.
+        Display tetrahedral mesh edges with coloring based on weights and boundary labels.
+        
+        - Interior edges: colored by weight (coolwarm colormap)
+        - H1 boundary edges: green
+        - H2 boundary edges: orange  
+        - Inner boundary edges: dark gray
+        - Mixed boundary edges: light gray
         
         Args:
             vertices: (N, 3) vertex positions
             edges: (E, 2) edge vertex indices
-            edge_weights: (E,) weights for coloring edges (optional)
+            edge_weights: (E,) weights for coloring interior edges (optional)
+            edge_boundary_labels: (E,) boundary labels: 0=interior, 1=H1, 2=H2, -1=inner, -2=mixed
             colormap: Matplotlib colormap name for weight visualization
         """
         if not PYVISTA_AVAILABLE:
@@ -1835,93 +1869,243 @@ class MeshViewer(QWidget):
         
         logger.info(f"Setting tetrahedral mesh: {len(vertices)} verts, {len(edges)} edges")
         
-        # Remove existing tet mesh actor
+        # Remove existing tet mesh actors
         self.clear_tetrahedral_mesh()
         
-        # Create line segments for edges using pv.lines_from_points approach
-        # We need to create separate line segments, each as a 2-point polyline
         n_edges = len(edges)
         
-        # Build the lines connectivity array
-        # Format: [n_pts_line1, idx1, idx2, n_pts_line2, idx3, idx4, ...]
-        # For edges, each line has 2 points
-        lines = np.empty((n_edges, 3), dtype=np.int64)
-        lines[:, 0] = 2  # Number of points in each line
-        lines[:, 1] = edges[:, 0]
-        lines[:, 2] = edges[:, 1]
-        
-        # Create PyVista PolyData with lines
-        mesh = pv.PolyData(vertices.astype(np.float32))
-        mesh.lines = lines.ravel()
-        
-        # Verify cell count matches edge count
-        logger.debug(f"Created mesh with {mesh.n_cells} cells for {n_edges} edges")
-        
-        # Add edge weights as scalars if provided
-        if edge_weights is not None and len(edge_weights) == mesh.n_cells:
-            mesh.cell_data['weight'] = edge_weights.astype(np.float32)
-            scalars = 'weight'
+        # If we have boundary labels, separate boundary and interior edges
+        if edge_boundary_labels is not None:
+            # Boundary edges: labels != 0
+            boundary_mask = edge_boundary_labels != 0
+            interior_mask = ~boundary_mask
             
-            # Log weight statistics
-            logger.debug(f"Edge weights: min={edge_weights.min():.4f}, max={edge_weights.max():.4f}, mean={edge_weights.mean():.4f}")
-        elif edge_weights is not None:
-            # Mismatch - use point data instead by averaging edge weights to vertices
-            logger.warning(f"Edge count mismatch: {len(edge_weights)} weights vs {mesh.n_cells} cells. Using point coloring.")
-            # Create vertex colors by averaging weights of incident edges
-            vertex_weights = np.zeros(len(vertices), dtype=np.float32)
-            vertex_counts = np.zeros(len(vertices), dtype=np.int32)
-            for i, (v0, v1) in enumerate(edges):
-                vertex_weights[v0] += edge_weights[i]
-                vertex_weights[v1] += edge_weights[i]
-                vertex_counts[v0] += 1
-                vertex_counts[v1] += 1
-            vertex_counts[vertex_counts == 0] = 1  # Avoid division by zero
-            vertex_weights /= vertex_counts
-            mesh.point_data['weight'] = vertex_weights
-            scalars = 'weight'
+            n_boundary = np.sum(boundary_mask)
+            n_interior = np.sum(interior_mask)
+            logger.info(f"  Interior edges: {n_interior}, Boundary edges: {n_boundary}")
+            
+            # === INTERIOR EDGES: Colored by weight ===
+            if n_interior > 0:
+                interior_edges = edges[interior_mask]
+                interior_weights = edge_weights[interior_mask] if edge_weights is not None else None
+                
+                # Build PyVista PolyData for interior edges
+                interior_mesh = pv.PolyData()
+                interior_mesh.points = vertices.astype(np.float32)
+                
+                # Create cells array: for lines, each cell is [2, v0, v1]
+                cells = np.column_stack([
+                    np.full(n_interior, 2, dtype=np.int64),
+                    interior_edges[:, 0],
+                    interior_edges[:, 1]
+                ]).ravel()
+                
+                interior_mesh.lines = cells
+                
+                logger.debug(f"Interior mesh: {interior_mesh.n_cells} cells, interior_edges: {len(interior_edges)}")
+                
+                if interior_weights is not None:
+                    logger.debug(f"Interior weights: {len(interior_weights)} weights")
+                    if len(interior_weights) == n_interior:
+                        # Apply log scale to weights for better visualization
+                        # Since weights = 1/(dist² + ε), high weight = close to part
+                        # Log scale spreads out the values for better color differentiation
+                        log_weights = np.log10(interior_weights + 1e-10)
+                        
+                        # Normalize to 0-1 range for better colormap usage
+                        w_min, w_max = log_weights.min(), log_weights.max()
+                        if w_max > w_min:
+                            normalized_weights = (log_weights - w_min) / (w_max - w_min)
+                        else:
+                            normalized_weights = np.zeros_like(log_weights)
+                        
+                        logger.debug(f"Weight range: [{interior_weights.min():.4f}, {interior_weights.max():.4f}]")
+                        logger.debug(f"Log weight range: [{w_min:.4f}, {w_max:.4f}]")
+                        
+                        # Weights match number of interior edges - assign to cells
+                        interior_mesh.cell_data['weight'] = normalized_weights.astype(np.float32)
+                        self._tet_interior_actor = self.plotter.add_mesh(
+                            interior_mesh,
+                            scalars='weight',
+                            cmap='plasma',  # plasma has better perceptual uniformity than coolwarm
+                            clim=[0, 1],  # Fixed range since we normalized
+                            line_width=1.5,
+                            render_lines_as_tubes=False,
+                            show_scalar_bar=True,
+                            scalar_bar_args={
+                                'title': 'Edge Weight (log)',
+                                'title_font_size': 12,
+                                'label_font_size': 10,
+                                'n_labels': 5,
+                                'position_x': 0.85,
+                                'position_y': 0.1,
+                                'width': 0.1,
+                                'height': 0.3,
+                            }
+                        )
+                    else:
+                        logger.warning(f"Interior weights length mismatch: {len(interior_weights)} vs {n_interior} edges")
+                        self._tet_interior_actor = self.plotter.add_mesh(
+                            interior_mesh,
+                            color='#888888',  # Gray default
+                            line_width=1.5,
+                            render_lines_as_tubes=False,
+                        )
+                else:
+                    logger.warning("No interior weights provided")
+                    self._tet_interior_actor = self.plotter.add_mesh(
+                        interior_mesh,
+                        color='#888888',  # Gray default
+                        line_width=1.5,
+                        render_lines_as_tubes=False,
+                    )
+            
+            # === BOUNDARY EDGES: Colored by mold half ===
+            if n_boundary > 0:
+                boundary_edges = edges[boundary_mask]
+                boundary_labels = edge_boundary_labels[boundary_mask]
+                
+                # Create RGBA colors for each boundary edge
+                # H1 = green, H2 = orange, inner = dark gray, mixed = light gray
+                boundary_colors = np.zeros((n_boundary, 4), dtype=np.uint8)
+                
+                # H1 edges (label=1): Green
+                h1_mask = boundary_labels == 1
+                boundary_colors[h1_mask] = [76, 175, 80, 255]  # #4CAF50
+                
+                # H2 edges (label=2): Orange
+                h2_mask = boundary_labels == 2
+                boundary_colors[h2_mask] = [255, 152, 0, 255]  # #FF9800
+                
+                # Inner boundary edges (label=-1): Dark gray
+                inner_mask = boundary_labels == -1
+                boundary_colors[inner_mask] = [80, 80, 80, 255]  # #505050
+                
+                # Mixed boundary edges (label=-2): Light gray
+                mixed_mask = boundary_labels == -2
+                boundary_colors[mixed_mask] = [180, 180, 180, 255]  # #B4B4B4
+                
+                # Unclassified (label=0 but still in boundary mask somehow): Gray
+                unclass_mask = boundary_labels == 0
+                boundary_colors[unclass_mask] = [150, 150, 150, 255]
+                
+                # Build PyVista PolyData for boundary edges
+                # Use the new cells format for PyVista
+                boundary_mesh = pv.PolyData()
+                boundary_mesh.points = vertices.astype(np.float32)
+                
+                # Create cells array: for lines, each cell is [2, v0, v1]
+                cells = np.column_stack([
+                    np.full(n_boundary, 2, dtype=np.int64),
+                    boundary_edges[:, 0],
+                    boundary_edges[:, 1]
+                ]).ravel()
+                
+                # Set lines using the lines property with proper format
+                boundary_mesh.lines = cells
+                
+                logger.debug(f"Boundary mesh: {boundary_mesh.n_cells} cells, {len(boundary_colors)} colors")
+                
+                # Verify cell count matches colors
+                if boundary_mesh.n_cells == len(boundary_colors):
+                    boundary_mesh.cell_data['colors'] = boundary_colors
+                    
+                    self._tet_boundary_actor = self.plotter.add_mesh(
+                        boundary_mesh,
+                        scalars='colors',
+                        rgb=True,
+                        line_width=2.5,  # Slightly thicker for boundary
+                        render_lines_as_tubes=False,
+                        show_scalar_bar=False,
+                    )
+                else:
+                    logger.warning(
+                        f"Cell count mismatch: {boundary_mesh.n_cells} cells vs {len(boundary_colors)} colors. "
+                        "Showing boundary edges without mold half coloring."
+                    )
+                    self._tet_boundary_actor = self.plotter.add_mesh(
+                        boundary_mesh,
+                        color='#888888',
+                        line_width=2.5,
+                        render_lines_as_tubes=False,
+                    )
         else:
-            scalars = None
-        
-        # Add to plotter
-        if scalars is not None:
-            self._tet_edges_actor = self.plotter.add_mesh(
-                mesh,
-                scalars=scalars,
-                cmap=colormap,
-                line_width=1.5,
-                render_lines_as_tubes=False,
-                show_scalar_bar=True,
-                scalar_bar_args={
-                    'title': 'Edge Weight',
-                    'title_font_size': 12,
-                    'label_font_size': 10,
-                    'n_labels': 5,
-                    'position_x': 0.85,
-                    'position_y': 0.1,
-                    'width': 0.1,
-                    'height': 0.3,
-                }
-            )
-        else:
-            self._tet_edges_actor = self.plotter.add_mesh(
-                mesh,
-                color='#ffaa00',  # Orange default
-                line_width=1.5,
-                render_lines_as_tubes=False,
-            )
+            # No boundary labels - show all edges colored by weight (original behavior)
+            mesh = pv.PolyData()
+            mesh.points = vertices.astype(np.float32)
+            
+            # Create cells array for all edges
+            cells = np.column_stack([
+                np.full(n_edges, 2, dtype=np.int64),
+                edges[:, 0],
+                edges[:, 1]
+            ]).ravel()
+            
+            mesh.lines = cells
+            
+            logger.debug(f"All edges mesh: {mesh.n_cells} cells")
+            
+            if edge_weights is not None and len(edge_weights) == mesh.n_cells:
+                mesh.cell_data['weight'] = edge_weights.astype(np.float32)
+                self._tet_interior_actor = self.plotter.add_mesh(
+                    mesh,
+                    scalars='weight',
+                    cmap=colormap,
+                    line_width=1.5,
+                    render_lines_as_tubes=False,
+                    show_scalar_bar=True,
+                    scalar_bar_args={
+                        'title': 'Edge Weight',
+                        'title_font_size': 12,
+                        'label_font_size': 10,
+                        'n_labels': 5,
+                        'position_x': 0.85,
+                        'position_y': 0.1,
+                        'width': 0.1,
+                        'height': 0.3,
+                    }
+                )
+            else:
+                self._tet_interior_actor = self.plotter.add_mesh(
+                    mesh,
+                    color='#ffaa00',  # Orange default
+                    line_width=1.5,
+                    render_lines_as_tubes=False,
+                )
         
         # Set visibility
-        if self._tet_edges_actor is not None:
-            self._tet_edges_actor.SetVisibility(self._tet_visible)
+        self._apply_tet_visibility()
         
         self.plotter.update()
-        logger.info(f"Tetrahedral mesh edges displayed with {'weight coloring' if edge_weights is not None else 'solid color'}")
+        logger.info(f"Tetrahedral mesh edges displayed")
+    
+    def _apply_tet_visibility(self):
+        """Apply current visibility settings to tetrahedral mesh actors."""
+        if self._tet_interior_actor is not None:
+            self._tet_interior_actor.SetVisibility(self._tet_interior_visible)
+        if self._tet_boundary_actor is not None:
+            self._tet_boundary_actor.SetVisibility(self._tet_boundary_visible)
     
     def clear_tetrahedral_mesh(self):
         """Remove tetrahedral mesh visualization."""
         if not PYVISTA_AVAILABLE:
             return
         
+        if self._tet_interior_actor is not None:
+            try:
+                self.plotter.remove_actor(self._tet_interior_actor)
+            except Exception:
+                pass
+            self._tet_interior_actor = None
+        
+        if self._tet_boundary_actor is not None:
+            try:
+                self.plotter.remove_actor(self._tet_boundary_actor)
+            except Exception:
+                pass
+            self._tet_boundary_actor = None
+        
+        # Also clear old single actor if exists
         if self._tet_edges_actor is not None:
             try:
                 self.plotter.remove_actor(self._tet_edges_actor)
@@ -1930,16 +2114,35 @@ class MeshViewer(QWidget):
             self._tet_edges_actor = None
     
     def set_tetrahedral_mesh_visible(self, visible: bool):
-        """Set visibility of tetrahedral mesh edges."""
+        """Set visibility of all tetrahedral mesh edges."""
+        self._tet_interior_visible = visible
+        self._tet_boundary_visible = visible
         self._tet_visible = visible
+        self._apply_tet_visibility()
         if self._tet_edges_actor is not None:
             self._tet_edges_actor.SetVisibility(visible)
+        self.plotter.update()
+    
+    def set_tet_interior_visible(self, visible: bool):
+        """Set visibility of interior tetrahedral edges (weight-colored)."""
+        self._tet_interior_visible = visible
+        if self._tet_interior_actor is not None:
+            self._tet_interior_actor.SetVisibility(visible)
+            self.plotter.update()
+    
+    def set_tet_boundary_visible(self, visible: bool):
+        """Set visibility of boundary tetrahedral edges (mold-half colored)."""
+        self._tet_boundary_visible = visible
+        if self._tet_boundary_actor is not None:
+            self._tet_boundary_actor.SetVisibility(visible)
             self.plotter.update()
     
     @property
     def has_tetrahedral_mesh(self) -> bool:
         """Check if tetrahedral mesh is displayed."""
-        return self._tet_edges_actor is not None
+        return (self._tet_edges_actor is not None or 
+                self._tet_interior_actor is not None or 
+                self._tet_boundary_actor is not None)
 
     # ========================================================================
     # INFLATED BOUNDARY MESH VISUALIZATION
@@ -2185,3 +2388,215 @@ class MeshViewer(QWidget):
     def has_r_distance_line(self) -> bool:
         """Check if R distance line is displayed."""
         return self._r_line_actor is not None
+
+    # ========================================================================
+    # EDGE WEIGHTS VISIBILITY
+    # ========================================================================
+    
+    def set_edge_weights_visible(self, visible: bool):
+        """Set visibility of edge weight visualization (interior and boundary edges)."""
+        self._edge_weights_visible = visible
+        
+        if self._tet_interior_actor is not None:
+            self._tet_interior_actor.SetVisibility(visible)
+        if self._tet_boundary_actor is not None:
+            self._tet_boundary_actor.SetVisibility(visible)
+        
+        self.plotter.update()
+    
+    @property
+    def edge_weights_visible(self) -> bool:
+        """Check if edge weights are visible."""
+        return self._edge_weights_visible
+    
+    @property
+    def has_edge_weights(self) -> bool:
+        """Check if edge weight visualization exists."""
+        return self._tet_interior_actor is not None or self._tet_boundary_actor is not None
+
+    # ========================================================================
+    # ORIGINAL TETRAHEDRAL MESH VISUALIZATION
+    # ========================================================================
+    
+    def set_original_tetrahedral_mesh(
+        self,
+        vertices: np.ndarray,
+        edges: np.ndarray
+    ):
+        """
+        Display the original (non-inflated) tetrahedral mesh edges.
+        
+        Args:
+            vertices: (N, 3) original vertex positions
+            edges: (E, 2) edge vertex indices
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        # Remove existing actor
+        self.clear_original_tetrahedral_mesh()
+        
+        n_edges = len(edges)
+        logger.info(f"Setting original tetrahedral mesh: {len(vertices)} verts, {n_edges} edges")
+        
+        # Build PyVista PolyData for edges
+        mesh = pv.PolyData()
+        mesh.points = vertices.astype(np.float32)
+        
+        # Create cells array: for lines, each cell is [2, v0, v1]
+        cells = np.column_stack([
+            np.full(n_edges, 2, dtype=np.int64),
+            edges[:, 0],
+            edges[:, 1]
+        ]).ravel()
+        
+        mesh.lines = cells
+        
+        self._tet_original_actor = self.plotter.add_mesh(
+            mesh,
+            color='#666666',  # Gray for original
+            line_width=1.0,
+            render_lines_as_tubes=False,
+            opacity=0.5
+        )
+        
+        # Initially hidden
+        self._tet_original_actor.SetVisibility(self._tet_original_visible)
+        
+        self.plotter.update()
+    
+    def clear_original_tetrahedral_mesh(self):
+        """Remove original tetrahedral mesh visualization."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        if self._tet_original_actor is not None:
+            try:
+                self.plotter.remove_actor(self._tet_original_actor)
+            except Exception:
+                pass
+            self._tet_original_actor = None
+    
+    def set_original_tet_visible(self, visible: bool):
+        """Set visibility of original tetrahedral mesh."""
+        self._tet_original_visible = visible
+        
+        if self._tet_original_actor is not None:
+            self._tet_original_actor.SetVisibility(visible)
+            self.plotter.update()
+    
+    @property
+    def original_tet_visible(self) -> bool:
+        """Check if original tet mesh is visible."""
+        return self._tet_original_visible
+    
+    @property
+    def has_original_tet(self) -> bool:
+        """Check if original tet mesh exists."""
+        return self._tet_original_actor is not None
+
+    # ========================================================================
+    # DIJKSTRA RESULT VISUALIZATION
+    # ========================================================================
+    
+    def set_dijkstra_result(
+        self,
+        vertices: np.ndarray,
+        tetrahedra: np.ndarray,
+        tetrahedra_labels: np.ndarray
+    ):
+        """
+        Display tetrahedra colored by Dijkstra escape labels.
+        
+        Args:
+            vertices: (N, 3) vertex positions (use original for parting surface)
+            tetrahedra: (M, 4) tetrahedron vertex indices
+            tetrahedra_labels: (M,) labels: 1=H1, 2=H2, 0=undecided
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        # Remove existing actor
+        self.clear_dijkstra_result()
+        
+        n_tets = len(tetrahedra)
+        logger.info(f"Setting Dijkstra result: {n_tets} tetrahedra")
+        
+        # Create UnstructuredGrid for tetrahedra
+        # PyVista expects cells in format: [n_points, p0, p1, p2, p3, ...]
+        cells = np.hstack([
+            np.full((n_tets, 1), 4, dtype=np.int64),  # 4 vertices per tet
+            tetrahedra
+        ]).ravel()
+        
+        # Cell types: VTK_TETRA = 10
+        cell_types = np.full(n_tets, 10, dtype=np.uint8)
+        
+        grid = pv.UnstructuredGrid(cells, cell_types, vertices.astype(np.float64))
+        
+        # Create colors for tetrahedra
+        colors = np.zeros((n_tets, 4), dtype=np.uint8)
+        
+        # H1 = green (semi-transparent)
+        h1_mask = tetrahedra_labels == 1
+        colors[h1_mask] = [76, 175, 80, 180]  # #4CAF50 with alpha
+        
+        # H2 = orange (semi-transparent)
+        h2_mask = tetrahedra_labels == 2
+        colors[h2_mask] = [255, 152, 0, 180]  # #FF9800 with alpha
+        
+        # Undecided = light gray (more transparent)
+        undecided_mask = tetrahedra_labels == 0
+        colors[undecided_mask] = [150, 150, 150, 100]
+        
+        grid.cell_data['colors'] = colors
+        
+        self._dijkstra_actor = self.plotter.add_mesh(
+            grid,
+            scalars='colors',
+            rgb=True,
+            show_edges=True,
+            edge_color='#333333',
+            line_width=0.5,
+            opacity=1.0,  # Overall opacity (colors have their own alpha)
+            show_scalar_bar=False
+        )
+        
+        self._dijkstra_actor.SetVisibility(self._dijkstra_visible)
+        
+        self.plotter.update()
+        
+        n_h1 = np.sum(h1_mask)
+        n_h2 = np.sum(h2_mask)
+        n_undecided = np.sum(undecided_mask)
+        logger.info(f"Dijkstra visualization: H1={n_h1}, H2={n_h2}, undecided={n_undecided}")
+    
+    def clear_dijkstra_result(self):
+        """Remove Dijkstra result visualization."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        if self._dijkstra_actor is not None:
+            try:
+                self.plotter.remove_actor(self._dijkstra_actor)
+            except Exception:
+                pass
+            self._dijkstra_actor = None
+    
+    def set_dijkstra_visible(self, visible: bool):
+        """Set visibility of Dijkstra result."""
+        self._dijkstra_visible = visible
+        
+        if self._dijkstra_actor is not None:
+            self._dijkstra_actor.SetVisibility(visible)
+            self.plotter.update()
+    
+    @property
+    def dijkstra_visible(self) -> bool:
+        """Check if Dijkstra result is visible."""
+        return self._dijkstra_visible
+    
+    @property
+    def has_dijkstra(self) -> bool:
+        """Check if Dijkstra result exists."""
+        return self._dijkstra_actor is not None
