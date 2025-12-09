@@ -13,7 +13,7 @@ vertices than a convex hull would, resulting in better triangle distribution.
 """
 
 import logging
-from typing import Optional, Tuple, List, NamedTuple
+from typing import Optional, Tuple, List
 from dataclasses import dataclass
 import numpy as np
 from scipy.spatial import ConvexHull

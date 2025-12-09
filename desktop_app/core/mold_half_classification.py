@@ -23,7 +23,6 @@ Algorithm matches the React frontend implementation exactly.
 import logging
 from dataclasses import dataclass
 from typing import Dict, Set, List, Optional, Tuple
-from collections import defaultdict
 
 import numpy as np
 import trimesh
@@ -152,7 +151,7 @@ def build_triangle_adjacency(mesh: trimesh.Trimesh) -> Dict[int, List[int]]:
     return adjacency
 
 
-def classify_mold_halves_fast(
+def classify_mold_halves_fast_gpu(
     boundary_mesh: trimesh.Trimesh,
     outer_triangles: Set[int],
     d1: np.ndarray,
@@ -160,15 +159,11 @@ def classify_mold_halves_fast(
     adjacency: Dict[int, List[int]] = None
 ) -> Dict[int, int]:
     """
-    Fast mold half classification using greedy region growing (per research paper).
+    GPU-accelerated mold half classification using parallel label propagation.
     
-    Algorithm from paper:
-    "Given the two parting directions, we partition the boundary ∂H into two parts, 
-    ∂H1 and ∂H2: we select the two faces F1 and F2 of ∂H whose normals best align 
-    with d1 and d2 and then use a greedy region-growing approach from F1 and F2 
-    to assign faces to ∂H1 and ∂H2, according to the alignment of their normal to d1 and d2"
-    
-    This is O(n) where n = number of triangles, much faster than the proximity-based approach.
+    Instead of sequential greedy region-growing, this uses:
+    1. Batch compute all dot products on GPU
+    2. Parallel label propagation iterations
     
     Args:
         boundary_mesh: The boundary mesh
@@ -180,13 +175,145 @@ def classify_mold_halves_fast(
     Returns:
         Dict mapping triangle index to mold half (1 or 2)
     """
+    import torch
+    
     if len(outer_triangles) == 0:
         return {}
+    
+    device = torch.device('cuda')
     
     # Get face normals
     face_normals = boundary_mesh.face_normals
     outer_array = np.array(list(outer_triangles), dtype=np.int32)
     n_outer = len(outer_array)
+    
+    # Build adjacency if not provided
+    if adjacency is None:
+        adjacency = build_triangle_adjacency(boundary_mesh)
+    
+    # Create mapping from global index to local index
+    global_to_local = {int(outer_array[i]): i for i in range(n_outer)}
+    
+    # Build adjacency in local indices (CSR format for GPU)
+    adj_list = []
+    adj_ptr = [0]
+    for i in range(n_outer):
+        global_idx = int(outer_array[i])
+        neighbors = [global_to_local[n] for n in adjacency.get(global_idx, []) 
+                    if n in global_to_local]
+        adj_list.extend(neighbors)
+        adj_ptr.append(len(adj_list))
+    
+    # Move data to GPU
+    normals_t = torch.tensor(face_normals[outer_array], dtype=torch.float32, device=device)
+    d1_t = torch.tensor(d1, dtype=torch.float32, device=device)
+    d2_t = torch.tensor(d2, dtype=torch.float32, device=device)
+    
+    # Compute all dot products in one go (fully vectorized)
+    dot1 = normals_t @ d1_t  # (n_outer,)
+    dot2 = normals_t @ d2_t  # (n_outer,)
+    
+    # Initial classification based on directional preference
+    labels = torch.where(dot1 >= dot2, 
+                        torch.ones(n_outer, dtype=torch.int32, device=device),
+                        torch.full((n_outer,), 2, dtype=torch.int32, device=device))
+    
+    # Convert adjacency to GPU tensors for parallel propagation
+    adj_indices = torch.tensor(adj_list, dtype=torch.int64, device=device)
+    adj_ptr_t = torch.tensor(adj_ptr, dtype=torch.int64, device=device)
+    
+    # Parallel label propagation iterations
+    # Each iteration, vertices can switch if majority of neighbors disagree
+    max_iterations = 20
+    for iteration in range(max_iterations):
+        old_labels = labels.clone()
+        
+        # For each vertex, count H1 and H2 neighbors
+        h1_counts = torch.zeros(n_outer, dtype=torch.int32, device=device)
+        h2_counts = torch.zeros(n_outer, dtype=torch.int32, device=device)
+        
+        # Process in parallel using scatter_add
+        for i in range(n_outer):
+            start = adj_ptr_t[i].item()
+            end = adj_ptr_t[i + 1].item()
+            if end > start:
+                neighbor_labels = labels[adj_indices[start:end]]
+                h1_counts[i] = (neighbor_labels == 1).sum()
+                h2_counts[i] = (neighbor_labels == 2).sum()
+        
+        # Apply voting with hysteresis (require strong majority to flip)
+        total_neighbors = h1_counts + h2_counts
+        valid = total_neighbors > 0
+        
+        # Flip H2->H1 if h1_count > h2_count * 1.5 OR strong alignment with d1
+        flip_to_h1 = valid & (labels == 2) & (
+            (h1_counts > h2_counts * 1.5) | (dot1 > dot2 + 0.3)
+        )
+        # Flip H1->H2 if h2_count > h1_count * 1.5 OR strong alignment with d2  
+        flip_to_h2 = valid & (labels == 1) & (
+            (h2_counts > h1_counts * 1.5) | (dot2 > dot1 + 0.3)
+        )
+        
+        labels[flip_to_h1] = 1
+        labels[flip_to_h2] = 2
+        
+        # Check convergence
+        changed = (labels != old_labels).sum().item()
+        if changed == 0:
+            logger.debug(f"GPU label propagation converged at iteration {iteration}")
+            break
+    
+    # Convert back to dict
+    labels_cpu = labels.cpu().numpy()
+    result = {int(outer_array[i]): int(labels_cpu[i]) for i in range(n_outer)}
+    
+    torch.cuda.empty_cache()
+    return result
+
+
+def classify_mold_halves_fast(
+    boundary_mesh: trimesh.Trimesh,
+    outer_triangles: Set[int],
+    d1: np.ndarray,
+    d2: np.ndarray,
+    adjacency: Dict[int, List[int]] = None,
+    use_gpu: bool = True
+) -> Dict[int, int]:
+    """
+    Fast mold half classification using greedy region growing (per research paper).
+    
+    Algorithm from paper:
+    "Given the two parting directions, we partition the boundary ∂H into two parts, 
+    ∂H1 and ∂H2: we select the two faces F1 and F2 of ∂H whose normals best align 
+    with d1 and d2 and then use a greedy region-growing approach from F1 and F2 
+    to assign faces to ∂H1 and ∂H2, according to the alignment of their normal to d1 and d2"
+    
+    This is O(n) where n = number of triangles, much faster than the proximity-based approach.
+    Uses GPU acceleration when available for large meshes.
+    
+    Args:
+        boundary_mesh: The boundary mesh
+        outer_triangles: Set of outer boundary triangle indices to classify
+        d1: First parting direction (normalized)
+        d2: Second parting direction (normalized)
+        adjacency: Pre-computed adjacency map (optional, will compute if not provided)
+        use_gpu: Whether to use GPU acceleration if available
+    
+    Returns:
+        Dict mapping triangle index to mold half (1 or 2)
+    """
+    if len(outer_triangles) == 0:
+        return {}
+    
+    # Use GPU path for large meshes
+    n_outer = len(outer_triangles)
+    if use_gpu and CUDA_AVAILABLE and n_outer > 10000:
+        logger.debug(f"Using GPU classification for {n_outer} outer triangles")
+        return classify_mold_halves_fast_gpu(boundary_mesh, outer_triangles, d1, d2, adjacency)
+    
+    # Get face normals
+    face_normals = boundary_mesh.face_normals
+    outer_array = np.array(list(outer_triangles), dtype=np.int32)
     
     # Compute dot products with parting directions (vectorized)
     normals = face_normals[outer_array]  # (n_outer, 3)
@@ -1008,6 +1135,7 @@ def classify_mold_halves(
     part_mesh: trimesh.Trimesh = None,
     use_proximity_method: bool = False,
     use_fast_method: bool = True,
+    use_gpu: bool = True,
     tet_vertices: np.ndarray = None,
     tet_boundary_labels: np.ndarray = None
 ) -> MoldHalfClassificationResult:
@@ -1015,6 +1143,8 @@ def classify_mold_halves(
     Classify boundary triangles of mold cavity into two mold halves.
     
     Only classifies the OUTER boundary (hull surface), not the inner boundary (part surface).
+    
+    Uses GPU acceleration when available for large meshes (>10k triangles).
     
     Args:
         cavity_mesh: The mold cavity mesh (or tetrahedral boundary mesh)
@@ -1088,7 +1218,8 @@ def classify_mold_halves(
     # Step 3: Classify using chosen method
     if use_fast_method:
         # Fast O(n) greedy region-growing (per research paper)
-        side = classify_mold_halves_fast(cavity_mesh, effective_outer_triangles, d1, d2, adjacency)
+        # Uses GPU when available for large meshes
+        side = classify_mold_halves_fast(cavity_mesh, effective_outer_triangles, d1, d2, adjacency, use_gpu=use_gpu)
     else:
         # Original morphological smoothing approach (requires triangle info)
         triangles_info = extract_triangle_info(cavity_mesh)

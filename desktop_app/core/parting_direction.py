@@ -8,6 +8,10 @@ Key constraints:
 - Directions must be > 135° apart (suitable for two-piece molds)
 - Each triangle is owned by at most one direction (no double-counting)
 - Self-occlusion is handled via Embree raycasting
+
+GPU Acceleration:
+- CUDA-accelerated batch visibility computation when available
+- Falls back to Embree raycasting on CPU
 """
 
 import logging
@@ -15,11 +19,28 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Set, Dict
 import multiprocessing
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import trimesh
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# TORCH/CUDA AVAILABILITY CHECK
+# ============================================================================
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+    CUDA_AVAILABLE = torch.cuda.is_available()
+    if CUDA_AVAILABLE:
+        logger.info(f"PyTorch CUDA available: {torch.cuda.get_device_name(0)}")
+except ImportError:
+    TORCH_AVAILABLE = False
+    CUDA_AVAILABLE = False
+    logger.info("PyTorch not available - GPU acceleration disabled for parting direction")
 
 
 # ============================================================================
@@ -231,6 +252,97 @@ def compute_visibility_for_direction(
     return visible_indices, visible_area
 
 
+def compute_visibility_for_direction_worker(args) -> Tuple[int, List[int], float]:
+    """
+    Worker function for parallel visibility computation.
+    
+    Args:
+        args: Tuple of (direction_idx, direction, mesh, normals, centroids, areas, ray_offset)
+    
+    Returns:
+        Tuple of (direction_idx, visible_indices, visible_area)
+    """
+    direction_idx, direction, mesh, normals, centroids, areas, ray_offset = args
+    visible_indices, visible_area = compute_visibility_for_direction(
+        direction, mesh, normals, centroids, areas, ray_offset
+    )
+    return direction_idx, visible_indices, visible_area
+
+
+def compute_all_visibility_parallel(
+    directions: np.ndarray,
+    mesh: trimesh.Trimesh,
+    normals: np.ndarray,
+    centroids: np.ndarray,
+    areas: np.ndarray,
+    ray_offset: float,
+    num_workers: int = 4,
+    progress_callback: Optional[callable] = None
+) -> Dict[int, DirectionScore]:
+    """
+    Compute visibility for all directions in parallel using thread pool.
+    
+    Embree is thread-safe, so we can run multiple ray queries in parallel.
+    
+    Args:
+        directions: Array of shape (k, 3) with unit vectors
+        mesh: Trimesh mesh object  
+        normals: Face normals (n_faces, 3)
+        centroids: Face centroids (n_faces, 3)
+        areas: Face areas (n_faces,)
+        ray_offset: Distance to offset ray origins
+        num_workers: Number of parallel workers
+        progress_callback: Optional callback(current, total) for progress updates
+        
+    Returns:
+        Dict mapping direction index to DirectionScore
+    """
+    k = len(directions)
+    direction_scores: Dict[int, DirectionScore] = {}
+    completed = 0
+    
+    # Use ThreadPoolExecutor for parallel ray tracing
+    # (Embree releases the GIL during ray tracing)
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all tasks
+        futures = {}
+        for i in range(k):
+            future = executor.submit(
+                compute_visibility_for_direction,
+                directions[i],
+                mesh,
+                normals,
+                centroids,
+                areas,
+                ray_offset
+            )
+            futures[future] = i
+        
+        # Collect results as they complete
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                visible_indices, visible_area = future.result()
+                direction_scores[i] = DirectionScore(
+                    direction=directions[i].copy(),
+                    visible_area=visible_area,
+                    visible_triangles=set(visible_indices)
+                )
+            except Exception as e:
+                logger.warning(f"Direction {i} failed: {e}")
+                direction_scores[i] = DirectionScore(
+                    direction=directions[i].copy(),
+                    visible_area=0.0,
+                    visible_triangles=set()
+                )
+            
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, k)
+    
+    return direction_scores
+
+
 # ============================================================================
 # BEST PAIR SELECTION
 # ============================================================================
@@ -367,24 +479,13 @@ def find_parting_directions(
     # Generate candidate directions
     directions = fibonacci_sphere(k)
     
-    # Compute visibility for all directions
-    direction_scores: Dict[int, DirectionScore] = {}
-    
-    for i in range(k):
-        direction = directions[i]
-        
-        visible_indices, visible_area = compute_visibility_for_direction(
-            direction, mesh, normals, centroids, areas, ray_offset
-        )
-        
-        direction_scores[i] = DirectionScore(
-            direction=direction.copy(),
-            visible_area=visible_area,
-            visible_triangles=set(visible_indices)
-        )
-        
-        if progress_callback:
-            progress_callback(i + 1, k)
+    # Compute visibility for all directions in parallel
+    # This uses ThreadPoolExecutor since Embree releases the GIL
+    logger.info(f"Computing visibility for {k} directions using {num_workers} workers")
+    direction_scores = compute_all_visibility_parallel(
+        directions, mesh, normals, centroids, areas, ray_offset,
+        num_workers=num_workers, progress_callback=progress_callback
+    )
     
     # Find best pair
     best_d1, best_d2 = find_best_pair(direction_scores, areas, total_area)

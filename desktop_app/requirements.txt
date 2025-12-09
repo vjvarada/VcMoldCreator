@@ -1,4 +1,5 @@
 # VcMoldCreator Desktop App Dependencies
+# Python 3.10+ recommended
 
 # GUI Framework
 PyQt6>=6.5.0
@@ -6,19 +7,16 @@ PyQt6>=6.5.0
 # Mesh Processing
 trimesh>=4.0.0
 numpy>=1.24.0
+scipy>=1.11.0
 
 # 3D Visualization
 pyvista>=0.42.0
 pyvistaqt>=0.11.0
 
-# Optional: Advanced mesh repair (if needed)
-# manifold3d>=2.3.0
+# CSG Operations (manifold3d is HIGHLY recommended for mold cavity creation)
+manifold3d>=2.3.0
 
-# Utilities
-scipy>=1.11.0
-networkx>=3.0
-
-# Tetrahedral meshing
+# Tetrahedral meshing (required for parting surface computation)
 pytetwild>=0.1.0
 
 # GPU acceleration (optional - for faster distance computation)

@@ -39,13 +39,11 @@ from core.parting_direction import (
     get_face_colors,
     PartingDirectionResult,
     VisibilityPaintData,
-    PartingColors,
 )
 from core.inflated_hull import (
     generate_inflated_hull,
     compute_default_offset,
     InflatedHullResult,
-    ManifoldValidation,
 )
 from core.mold_cavity import (
     create_mold_cavity,
@@ -55,10 +53,8 @@ from core.mold_half_classification import (
     classify_mold_halves,
     get_mold_half_face_colors,
     MoldHalfClassificationResult,
-    MoldHalfColors,
 )
 from core.tetrahedral_mesh import (
-    compute_edge_costs,
     TetrahedralMeshResult,
     PYTETWILD_AVAILABLE,
 )
@@ -80,8 +76,7 @@ class Step(Enum):
     MOLD_HALVES = 'mold-halves'        # Now operates on tet boundary
     EDGE_WEIGHTS = 'edge-weights'
     DIJKSTRA = 'dijkstra'              # Dijkstra walk to find parting surface
-    # Future steps will be added here as we implement more features
-    # PARTING_SURFACE = 'parting-surface'
+    SECONDARY_CUTS = 'secondary-cuts'  # Secondary cutting edges detection
 
 
 STEPS = [
@@ -93,7 +88,7 @@ STEPS = [
     {'id': Step.MOLD_HALVES, 'icon': '🎨', 'title': 'Mold Halves', 'description': 'Classify tetrahedral boundary into H₁ and H₂ mold halves'},
     {'id': Step.EDGE_WEIGHTS, 'icon': '⚖️', 'title': 'Edge Weights', 'description': 'Compute edge weights based on distance to part surface'},
     {'id': Step.DIJKSTRA, 'icon': '🛤️', 'title': 'Dijkstra Walk', 'description': 'Find shortest paths from part surface to mold halves'},
-    # Future steps will be added here
+    {'id': Step.SECONDARY_CUTS, 'icon': '✂️', 'title': 'Secondary Cuts', 'description': 'Detect secondary cutting edges where membrane intersects part'},
 ]
 
 
@@ -1302,7 +1297,8 @@ class DijkstraWorker(QThread):
             
             self.progress.emit("Running Dijkstra from seed vertices to H1/H2...")
             
-            seed_escape_labels, seed_vertex_indices, seed_distances = run_dijkstra_escape_labeling(
+            (seed_escape_labels, seed_vertex_indices, seed_distances, 
+             seed_escape_destinations, seed_escape_paths) = run_dijkstra_escape_labeling(
                 self.tet_result,
                 use_weighted_edges=True
             )
@@ -1311,6 +1307,8 @@ class DijkstraWorker(QThread):
             self.tet_result.seed_escape_labels = seed_escape_labels
             self.tet_result.seed_vertex_indices = seed_vertex_indices
             self.tet_result.seed_distances = seed_distances
+            self.tet_result.seed_escape_destinations = seed_escape_destinations
+            self.tet_result.seed_escape_paths = seed_escape_paths
             
             elapsed = (time.time() - start_time) * 1000
             
@@ -1323,6 +1321,60 @@ class DijkstraWorker(QThread):
             
         except Exception as e:
             logger.exception(f"Error in Dijkstra: {e}")
+            self.error.emit(str(e))
+
+
+class SecondaryCutsWorker(QThread):
+    """Background worker for detecting secondary cutting edges."""
+    
+    progress = pyqtSignal(str)
+    complete = pyqtSignal(object)  # Updated TetrahedralMeshResult
+    error = pyqtSignal(str)
+    
+    def __init__(self, tet_result, part_mesh, sensitivity: float = 0.5, use_gpu: bool = True):
+        """
+        Initialize secondary cuts worker.
+        
+        Args:
+            tet_result: TetrahedralMeshResult with Dijkstra results (paths, destinations)
+            part_mesh: The original part mesh to check intersection against
+            sensitivity: Detection sensitivity 0.0-1.0 (higher = more sensitive)
+            use_gpu: Whether to use GPU acceleration if available
+        """
+        super().__init__()
+        self.tet_result = tet_result
+        self.part_mesh = part_mesh
+        self.sensitivity = sensitivity
+        self.use_gpu = use_gpu
+    
+    def run(self):
+        try:
+            from core.tetrahedral_mesh import find_secondary_cutting_edges, CUDA_AVAILABLE
+            import time
+            
+            gpu_status = "GPU" if (self.use_gpu and CUDA_AVAILABLE) else "CPU"
+            logger.info(f"Finding secondary cutting edges (sensitivity={self.sensitivity:.2f}, {gpu_status})...")
+            start_time = time.time()
+            
+            self.progress.emit(f"Detecting secondary cuts ({gpu_status}, sensitivity={self.sensitivity:.0%})...")
+            
+            secondary_cuts = find_secondary_cutting_edges(
+                self.tet_result,
+                self.part_mesh,
+                sensitivity=self.sensitivity,
+                use_gpu=self.use_gpu
+            )
+            
+            # Store results in tet_result
+            self.tet_result.secondary_cut_edges = secondary_cuts
+            
+            elapsed = (time.time() - start_time) * 1000
+            
+            self.progress.emit(f"Complete in {elapsed:.0f}ms: {len(secondary_cuts)} secondary cuts found")
+            self.complete.emit(self.tet_result)
+            
+        except Exception as e:
+            logger.exception(f"Error in secondary cuts detection: {e}")
             self.error.emit(str(e))
 
 
@@ -2077,6 +2129,10 @@ class DisplayOptionsPanel(QFrame):
     
     # Dijkstra result signal
     show_dijkstra_result_changed = pyqtSignal(bool)  # Toggle Dijkstra result visualization
+    show_dijkstra_h1h2_changed = pyqtSignal(bool)  # Toggle H1/H2 edges visibility (hide to show only yellow primary cuts)
+    
+    # Secondary cuts signal
+    show_secondary_cuts_changed = pyqtSignal(bool)  # Toggle secondary cuts visualization
     
     # Must match MeshViewer.BACKGROUND_COLOR for rounded corners to blend
     VIEWER_BG = "#1a1a1a"  # Matches React frontend BACKGROUND_COLOR
@@ -2250,6 +2306,20 @@ class DisplayOptionsPanel(QFrame):
         self.show_dijkstra_result_cb.hide()
         layout.addWidget(self.show_dijkstra_result_cb)
         
+        # Show H1/H2 edges checkbox (uncheck to see only yellow primary cuts)
+        self.show_dijkstra_h1h2_cb = QCheckBox('Show H1/H2 Edges')
+        self.show_dijkstra_h1h2_cb.setChecked(True)
+        self.show_dijkstra_h1h2_cb.stateChanged.connect(lambda s: self.show_dijkstra_h1h2_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_dijkstra_h1h2_cb.hide()
+        layout.addWidget(self.show_dijkstra_h1h2_cb)
+        
+        # Secondary cuts checkbox
+        self.show_secondary_cuts_cb = QCheckBox('Secondary Cuts (Red)')
+        self.show_secondary_cuts_cb.setChecked(True)
+        self.show_secondary_cuts_cb.stateChanged.connect(lambda s: self.show_secondary_cuts_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_secondary_cuts_cb.hide()
+        layout.addWidget(self.show_secondary_cuts_cb)
+        
         self.adjustSize()
         self.hide()
     
@@ -2331,12 +2401,24 @@ class DisplayOptionsPanel(QFrame):
         self.adjustSize()
     
     def show_dijkstra_result_option(self, show: bool = True):
-        """Show or hide the Dijkstra result visibility checkbox."""
+        """Show or hide the Dijkstra result visibility checkboxes."""
         if show:
             self.show_dijkstra_result_cb.show()
             self.show_dijkstra_result_cb.setChecked(True)  # Reset to showing result
+            self.show_dijkstra_h1h2_cb.show()
+            self.show_dijkstra_h1h2_cb.setChecked(True)  # Reset to showing H1/H2 edges
         else:
             self.show_dijkstra_result_cb.hide()
+            self.show_dijkstra_h1h2_cb.hide()
+        self.adjustSize()
+    
+    def show_secondary_cuts_option(self, show: bool = True):
+        """Show or hide the secondary cuts visibility checkbox."""
+        if show:
+            self.show_secondary_cuts_cb.show()
+            self.show_secondary_cuts_cb.setChecked(True)  # Reset to showing cuts
+        else:
+            self.show_secondary_cuts_cb.hide()
         self.adjustSize()
 
 
@@ -2386,6 +2468,9 @@ class MainWindow(QMainWindow):
         
         # Dijkstra state
         self._dijkstra_worker = None
+        
+        # Secondary cuts state
+        self._secondary_cuts_worker = None
         
         self._setup_window()
         self._setup_ui()
@@ -2666,6 +2751,12 @@ class MainWindow(QMainWindow):
         self.display_options.show_dijkstra_result_changed.connect(
             lambda show: self.mesh_viewer.set_dijkstra_visible(show)
         )
+        self.display_options.show_dijkstra_h1h2_changed.connect(
+            lambda show: self.mesh_viewer.set_dijkstra_show_h1h2(show)
+        )
+        self.display_options.show_secondary_cuts_changed.connect(
+            lambda show: self.mesh_viewer.set_secondary_cuts_visible(show)
+        )
         
         return wrapper
     
@@ -2720,6 +2811,8 @@ class MainWindow(QMainWindow):
             self._setup_edge_weights_step()
         elif self._active_step == Step.DIJKSTRA:
             self._setup_dijkstra_step()
+        elif self._active_step == Step.SECONDARY_CUTS:
+            self._setup_secondary_cuts_step()
         
         self.context_layout.addStretch()
     
@@ -5016,26 +5109,56 @@ class MainWindow(QMainWindow):
             self.dijkstra_stats.show()
             
             result = self._tet_result
-            seed_labels = result.seed_escape_labels
-            seed_distances = result.seed_distances
+            interior_labels = result.seed_escape_labels
+            interior_indices = result.seed_vertex_indices
+            interior_distances = result.seed_distances
+            boundary_labels = result.boundary_labels
             
-            n_seeds = len(seed_labels)
-            n_h1_seeds = np.sum(seed_labels == 1)
-            n_h2_seeds = np.sum(seed_labels == 2)
-            n_unreached = np.sum(seed_labels == 0)
+            n_interior = len(interior_labels)
+            n_h1 = np.sum(interior_labels == 1)
+            n_h2 = np.sum(interior_labels == 2)
+            n_unreached = np.sum(interior_labels == 0)
+            
+            # Count parting edges (yellow) - edges between different label vertices
+            n_parting_edges = 0
+            interior_set = set(interior_indices)
+            vertex_labels = np.full(len(result.vertices), -1, dtype=np.int8)
+            for i, idx in enumerate(interior_indices):
+                vertex_labels[idx] = interior_labels[i]
+            
+            for v0, v1 in result.edges:
+                if v0 in interior_set and v1 in interior_set:
+                    l0 = vertex_labels[v0]
+                    l1 = vertex_labels[v1]
+                    if (l0 == 1 and l1 == 2) or (l0 == 2 and l1 == 1):
+                        n_parting_edges += 1
+            
+            # Count vertices on part surface vs cavity interior
+            n_on_part = 0
+            n_in_cavity = 0
+            if boundary_labels is not None:
+                for idx in interior_indices:
+                    if boundary_labels[idx] == -1:
+                        n_on_part += 1
+                    else:
+                        n_in_cavity += 1
             
             self.dijkstra_stats.add_header('✅ Dijkstra Complete', Colors.SUCCESS)
-            self.dijkstra_stats.add_row(f'Total seeds: {n_seeds:,}')
-            self.dijkstra_stats.add_row(f'Seeds → H₁ (green): {n_h1_seeds:,}')
-            self.dijkstra_stats.add_row(f'Seeds → H₂ (orange): {n_h2_seeds:,}')
+            self.dijkstra_stats.add_row(f'Total interior vertices: {n_interior:,}')
+            if n_on_part > 0 or n_in_cavity > 0:
+                self.dijkstra_stats.add_row(f'  On part surface: {n_on_part:,}')
+                self.dijkstra_stats.add_row(f'  In cavity: {n_in_cavity:,}')
+            self.dijkstra_stats.add_row(f'Vertices → H₁ (green): {n_h1:,}')
+            self.dijkstra_stats.add_row(f'Vertices → H₂ (orange): {n_h2:,}')
+            self.dijkstra_stats.add_row(f'Parting edges (yellow): {n_parting_edges:,}')
             if n_unreached > 0:
                 self.dijkstra_stats.add_row(f'Unreachable: {n_unreached:,}')
             
-            if seed_distances is not None:
-                # Show distance stats for reached seeds
-                reached_mask = seed_labels != 0
+            if interior_distances is not None:
+                # Show distance stats for reached vertices
+                reached_mask = interior_labels != 0
                 if np.any(reached_mask):
-                    reached_dists = seed_distances[reached_mask]
+                    reached_dists = interior_distances[reached_mask]
                     self.dijkstra_stats.add_header('Path Distances', Colors.INFO)
                     self.dijkstra_stats.add_row(f'Min: {reached_dists.min():.4f}')
                     self.dijkstra_stats.add_row(f'Max: {reached_dists.max():.4f}')
@@ -5089,13 +5212,15 @@ class MainWindow(QMainWindow):
         vertices_for_viz = result.vertices_original if result.vertices_original is not None else result.vertices
         boundary_mesh_for_viz = result.boundary_mesh_original if result.boundary_mesh_original is not None else result.boundary_mesh
         
-        # Show seed vertices colored by their escape labels as edges
+        # Show interior vertices colored by their escape labels as edges
+        # Pass tet edges so we can show ALL interior edges (not just surface edges)
         self.mesh_viewer.set_dijkstra_result(
             vertices_for_viz,
             result.seed_vertex_indices,
             result.seed_escape_labels,
             boundary_mesh_for_viz,
-            result.seed_distances
+            result.seed_distances,
+            result.edges  # Pass tet edges to find all interior edges
         )
         
         # Show Dijkstra result option in display panel
@@ -5103,6 +5228,10 @@ class MainWindow(QMainWindow):
         
         # Update step status
         self.step_buttons[Step.DIJKSTRA].set_status('completed')
+        
+        # Unlock secondary cuts step
+        if Step.SECONDARY_CUTS in self.step_buttons:
+            self.step_buttons[Step.SECONDARY_CUTS].set_status('ready')
         
         n_h1 = np.sum(result.seed_escape_labels == 1)
         n_h2 = np.sum(result.seed_escape_labels == 2)
@@ -5131,6 +5260,373 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 pass
         self._dijkstra_worker = None
+
+    # =========================================================================
+    # SECONDARY CUTS STEP
+    # =========================================================================
+    
+    def _setup_secondary_cuts_step(self):
+        """Setup the secondary cuts step UI."""
+        # Check prerequisites
+        if self._tet_result is None or self._tet_result.seed_escape_paths is None:
+            no_dijkstra_label = QLabel("⚠️ Please run Dijkstra first.")
+            no_dijkstra_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_dijkstra_label.setWordWrap(True)
+            self.context_layout.addWidget(no_dijkstra_label)
+            return
+        
+        # Description section
+        info_group = QGroupBox("Secondary Cutting Edges")
+        info_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        info_layout = QVBoxLayout(info_group)
+        
+        info_text = QLabel(
+            "For ALL interior edges with the SAME escape label (both→H₁ or both→H₂), "
+            "we form a 'membrane' bounded by:\n\n"
+            "• The edge (vi, vj)\n"
+            "• Escape paths vi→wi and vj→wj\n"
+            "• Shortest path wi→wj on boundary\n\n"
+            "If this membrane intersects the part mesh representation, the edge is a "
+            "secondary cutting edge (shown in red). This identifies where the parting "
+            "surface would cut through the part."
+        )
+        info_text.setWordWrap(True)
+        info_text.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px; line-height: 1.4;')
+        info_layout.addWidget(info_text)
+        
+        self.context_layout.addWidget(info_group)
+        
+        # Info about current state
+        result = self._tet_result
+        state_info = StatsBox()
+        state_info.add_header('Current State', Colors.INFO)
+        
+        if result.seed_escape_labels is not None:
+            n_interior = len(result.seed_escape_labels)
+            n_h1 = np.sum(result.seed_escape_labels == 1)
+            n_h2 = np.sum(result.seed_escape_labels == 2)
+            state_info.add_row(f'Interior vertices: {n_interior:,}')
+            state_info.add_row(f'Vertices → H₁: {n_h1:,}')
+            state_info.add_row(f'Vertices → H₂: {n_h2:,}')
+        
+        self.context_layout.addWidget(state_info)
+        
+        # Sensitivity slider section
+        sensitivity_group = QGroupBox("Detection Sensitivity")
+        sensitivity_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        sensitivity_layout = QVBoxLayout(sensitivity_group)
+        
+        # Sensitivity description
+        sensitivity_desc = QLabel(
+            "Controls how aggressively to detect secondary cuts.\n"
+            "Lower = only clear intersections, Higher = catches near-misses."
+        )
+        sensitivity_desc.setWordWrap(True)
+        sensitivity_desc.setStyleSheet(f'color: {Colors.GRAY}; font-size: 11px;')
+        sensitivity_layout.addWidget(sensitivity_desc)
+        
+        # Slider row
+        slider_row = QHBoxLayout()
+        
+        slider_label_low = QLabel("Strict")
+        slider_label_low.setStyleSheet(f'color: {Colors.GRAY}; font-size: 11px;')
+        slider_row.addWidget(slider_label_low)
+        
+        self.secondary_cuts_sensitivity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.secondary_cuts_sensitivity_slider.setRange(0, 200)
+        self.secondary_cuts_sensitivity_slider.setValue(100)  # Default 100% = exact intersection
+        self.secondary_cuts_sensitivity_slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{
+                border: 1px solid {Colors.BORDER};
+                height: 6px;
+                background: {Colors.LIGHT};
+                border-radius: 3px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {Colors.DANGER};
+                border: none;
+                width: 16px;
+                height: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
+            }}
+            QSlider::handle:horizontal:hover {{
+                background: #c82333;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {Colors.DANGER};
+                border-radius: 3px;
+            }}
+        """)
+        self.secondary_cuts_sensitivity_slider.valueChanged.connect(self._on_sensitivity_changed)
+        slider_row.addWidget(self.secondary_cuts_sensitivity_slider)
+        
+        slider_label_high = QLabel("Sensitive")
+        slider_label_high.setStyleSheet(f'color: {Colors.GRAY}; font-size: 11px;')
+        slider_row.addWidget(slider_label_high)
+        
+        sensitivity_layout.addLayout(slider_row)
+        
+        # Value display
+        self.secondary_cuts_sensitivity_value = QLabel("100%")
+        self.secondary_cuts_sensitivity_value.setStyleSheet(f'color: {Colors.DARK}; font-size: 12px; font-weight: 500;')
+        self.secondary_cuts_sensitivity_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sensitivity_layout.addWidget(self.secondary_cuts_sensitivity_value)
+        
+        # GPU acceleration checkbox
+        from core.tetrahedral_mesh import CUDA_AVAILABLE
+        self.secondary_cuts_gpu_checkbox = QCheckBox("🚀 Use GPU Acceleration (CUDA)")
+        self.secondary_cuts_gpu_checkbox.setChecked(CUDA_AVAILABLE)  # Auto-enable if available
+        self.secondary_cuts_gpu_checkbox.setEnabled(CUDA_AVAILABLE)  # Disable if not available
+        
+        if CUDA_AVAILABLE:
+            gpu_tooltip = "CUDA GPU acceleration - significantly faster"
+            checkbox_style = f'color: {Colors.SUCCESS}; font-size: 12px; font-weight: 500;'
+        else:
+            gpu_tooltip = "CUDA not available - using CPU"
+            checkbox_style = f'color: {Colors.GRAY}; font-size: 12px;'
+        
+        self.secondary_cuts_gpu_checkbox.setToolTip(gpu_tooltip)
+        self.secondary_cuts_gpu_checkbox.setStyleSheet(f"""
+            QCheckBox {{
+                {checkbox_style}
+                padding: 4px;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+            }}
+            QCheckBox::indicator:unchecked {{
+                border: 2px solid {Colors.BORDER};
+                background: white;
+                border-radius: 3px;
+            }}
+            QCheckBox::indicator:checked {{
+                border: 2px solid {Colors.SUCCESS};
+                background: {Colors.SUCCESS};
+                border-radius: 3px;
+            }}
+        """)
+        sensitivity_layout.addWidget(self.secondary_cuts_gpu_checkbox)
+        
+        self.context_layout.addWidget(sensitivity_group)
+        
+        # Compute button
+        self.secondary_cuts_btn = QPushButton("✂️ Find Secondary Cuts")
+        self.secondary_cuts_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.secondary_cuts_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {Colors.DANGER};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: #c82333;
+            }}
+            QPushButton:disabled {{
+                background-color: {Colors.GRAY_LIGHT};
+                color: {Colors.GRAY};
+            }}
+        """)
+        self.secondary_cuts_btn.clicked.connect(self._on_run_secondary_cuts)
+        self.context_layout.addWidget(self.secondary_cuts_btn)
+        
+        # Progress bar
+        self.secondary_cuts_progress = QProgressBar()
+        self.secondary_cuts_progress.setStyleSheet(f"""
+            QProgressBar {{
+                border: none;
+                border-radius: 4px;
+                background-color: {Colors.LIGHT};
+                height: 8px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {Colors.DANGER};
+                border-radius: 4px;
+            }}
+        """)
+        self.secondary_cuts_progress.setTextVisible(False)
+        self.secondary_cuts_progress.setRange(0, 0)  # Indeterminate
+        self.secondary_cuts_progress.hide()
+        self.context_layout.addWidget(self.secondary_cuts_progress)
+        
+        # Progress label
+        self.secondary_cuts_progress_label = QLabel("")
+        self.secondary_cuts_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.secondary_cuts_progress_label.hide()
+        self.context_layout.addWidget(self.secondary_cuts_progress_label)
+        
+        # Stats (show if computed)
+        self.secondary_cuts_stats = StatsBox()
+        self.secondary_cuts_stats.hide()
+        self.context_layout.addWidget(self.secondary_cuts_stats)
+        
+        # Update UI with current state
+        self._update_secondary_cuts_step_ui()
+    
+    def _on_sensitivity_changed(self, value: int):
+        """Handle sensitivity slider change."""
+        if hasattr(self, 'secondary_cuts_sensitivity_value'):
+            self.secondary_cuts_sensitivity_value.setText(f"{value}%")
+    
+    def _update_secondary_cuts_step_ui(self):
+        """Update secondary cuts step UI based on current state."""
+        if not hasattr(self, 'secondary_cuts_stats'):
+            return
+        
+        if self._tet_result is not None and self._tet_result.secondary_cut_edges is not None:
+            # Show stats
+            self.secondary_cuts_stats.clear()
+            self.secondary_cuts_stats.show()
+            
+            n_secondary = len(self._tet_result.secondary_cut_edges)
+            
+            self.secondary_cuts_stats.add_header('✅ Secondary Cuts Complete', Colors.SUCCESS)
+            self.secondary_cuts_stats.add_row(f'Secondary cut edges: {n_secondary:,}')
+            
+            if n_secondary > 0:
+                self.secondary_cuts_stats.add_row('(Shown in red)')
+        else:
+            self.secondary_cuts_stats.hide()
+    
+    def _on_run_secondary_cuts(self):
+        """Handle run secondary cuts button click."""
+        if self._secondary_cuts_worker is not None:
+            return
+        
+        if self._current_mesh is None:
+            QMessageBox.warning(self, "Warning", "No part mesh loaded.")
+            return
+        
+        # Clear previous secondary cuts visualization before re-running
+        self.mesh_viewer.clear_secondary_cuts()
+        
+        # Get sensitivity from slider (0-200 -> 0.0-2.0)
+        # 0% = strict (large tolerance), 100% = exact, 200% = very sensitive (negative tolerance = expanded detection)
+        sensitivity = 1.0
+        if hasattr(self, 'secondary_cuts_sensitivity_slider'):
+            sensitivity = self.secondary_cuts_sensitivity_slider.value() / 100.0
+        
+        # Get GPU preference
+        use_gpu = True
+        if hasattr(self, 'secondary_cuts_gpu_checkbox'):
+            use_gpu = self.secondary_cuts_gpu_checkbox.isChecked()
+        
+        # Show progress
+        self.secondary_cuts_btn.setEnabled(False)
+        self.secondary_cuts_progress.show()
+        self.secondary_cuts_progress_label.show()
+        self.secondary_cuts_progress_label.setText("Initializing...")
+        self.secondary_cuts_stats.hide()
+        
+        # Start worker with sensitivity and GPU preference
+        self._secondary_cuts_worker = SecondaryCutsWorker(
+            self._tet_result, 
+            self._current_mesh,
+            sensitivity=sensitivity,
+            use_gpu=use_gpu
+        )
+        self._secondary_cuts_worker.progress.connect(self._on_secondary_cuts_progress)
+        self._secondary_cuts_worker.complete.connect(self._on_secondary_cuts_complete)
+        self._secondary_cuts_worker.error.connect(self._on_secondary_cuts_error)
+        self._secondary_cuts_worker.finished.connect(self._on_secondary_cuts_worker_finished)
+        self._secondary_cuts_worker.start()
+    
+    def _on_secondary_cuts_progress(self, message: str):
+        """Handle secondary cuts progress update."""
+        if hasattr(self, 'secondary_cuts_progress_label') and self.secondary_cuts_progress_label is not None:
+            try:
+                self.secondary_cuts_progress_label.setText(message)
+            except RuntimeError:
+                pass
+    
+    def _on_secondary_cuts_complete(self, result: TetrahedralMeshResult):
+        """Handle secondary cuts complete."""
+        self._tet_result = result
+        
+        # Update stats
+        self._update_secondary_cuts_step_ui()
+        
+        # Visualize result - show secondary cuts in red
+        if result.secondary_cut_edges is not None and len(result.secondary_cut_edges) > 0:
+            vertices_for_viz = result.vertices_original if result.vertices_original is not None else result.vertices
+            self.mesh_viewer.set_secondary_cuts(
+                vertices_for_viz,
+                result.secondary_cut_edges
+            )
+            # Show secondary cuts option in display panel
+            self.display_options.show_secondary_cuts_option(True)
+        
+        # Update step status
+        self.step_buttons[Step.SECONDARY_CUTS].set_status('completed')
+        
+        n_secondary = len(result.secondary_cut_edges) if result.secondary_cut_edges else 0
+        logger.info(f"Secondary cuts complete: {n_secondary} secondary cutting edges found")
+    
+    def _on_secondary_cuts_error(self, message: str):
+        """Handle secondary cuts error."""
+        if hasattr(self, 'secondary_cuts_progress_label') and self.secondary_cuts_progress_label is not None:
+            try:
+                self.secondary_cuts_progress_label.setText(f"Error: {message}")
+                self.secondary_cuts_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+            except RuntimeError:
+                pass
+        QMessageBox.critical(self, "Error", f"Secondary cuts failed:\n{message}")
+    
+    def _on_secondary_cuts_worker_finished(self):
+        """Handle secondary cuts worker finished."""
+        if hasattr(self, 'secondary_cuts_btn') and self.secondary_cuts_btn is not None:
+            try:
+                self.secondary_cuts_btn.setEnabled(True)
+            except RuntimeError:
+                pass
+        if hasattr(self, 'secondary_cuts_progress') and self.secondary_cuts_progress is not None:
+            try:
+                self.secondary_cuts_progress.hide()
+            except RuntimeError:
+                pass
+        self._secondary_cuts_worker = None
 
     def _load_mesh(self, file_path: str, scale_factor: float = 1.0):
         """Load and process a mesh file."""

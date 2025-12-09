@@ -14,7 +14,7 @@ Fallback methods:
 """
 
 import logging
-from typing import Optional, Tuple
+from typing import Optional
 from dataclasses import dataclass
 import numpy as np
 

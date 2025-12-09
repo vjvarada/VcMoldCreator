@@ -5,12 +5,10 @@ Handles loading of STL files (both ASCII and binary formats) using trimesh.
 Provides mesh validation and basic preprocessing.
 """
 
-import os
 from pathlib import Path
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-import numpy as np
 import trimesh
 
 

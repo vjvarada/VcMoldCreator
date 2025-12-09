@@ -100,15 +100,26 @@ class TetrahedralMeshResult:
     num_edges: int = 0
     num_boundary_faces: int = 0
     
-    # Dijkstra results - seed vertex escape labels
-    # seed_escape_labels: (S,) int8 - 1=escapes to H1, 2=escapes to H2, 0=unreachable
+    # Dijkstra results - interior vertex escape labels (includes both part surface and cavity interior)
+    # seed_escape_labels: (I,) int8 - 1=escapes to H1, 2=escapes to H2, 0=unreachable
     seed_escape_labels: Optional[np.ndarray] = None
     
-    # Seed vertex indices in the tet mesh (S,) - indices of inner boundary vertices
+    # Interior vertex indices in the tet mesh (I,) - indices of all interior vertices (not on H1/H2)
     seed_vertex_indices: Optional[np.ndarray] = None
     
-    # Seed distances to boundary (S,) - shortest path distance to H1/H2
+    # Interior vertex distances to boundary (I,) - shortest path distance to H1/H2
     seed_distances: Optional[np.ndarray] = None
+    
+    # Escape destination vertices for each interior vertex (I,) - the boundary vertex reached
+    seed_escape_destinations: Optional[np.ndarray] = None
+    
+    # Escape paths for each interior vertex - list of vertex index lists
+    # seed_escape_paths[i] = [start_v, v1, v2, ..., dest_v] path from interior vertex to boundary
+    seed_escape_paths: Optional[List[List[int]]] = None
+    
+    # Secondary cutting edges - edges between same-label seeds where membrane intersects part
+    # List of (vi, vj) tuples representing secondary cut edges
+    secondary_cut_edges: Optional[List[Tuple[int, int]]] = None
     
     # Timing
     tetrahedralize_time_ms: float = 0.0
@@ -1508,13 +1519,16 @@ def compute_edge_costs(
 def run_dijkstra_escape_labeling(
     tet_result: 'TetrahedralMeshResult',
     use_weighted_edges: bool = True
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[List[int]]]:
     """
-    Run Dijkstra's algorithm FROM each seed vertex (inner boundary / part surface)
+    Run Dijkstra's algorithm FROM each INTERIOR vertex (not on H1/H2 boundary)
     TO the external boundary (H1 or H2).
     
-    Each seed vertex independently walks through the tetrahedral mesh graph to reach
-    either the H1 or H2 boundary. The seed is labeled based on which boundary it 
+    This runs from ALL interior vertices - both those on the part surface (seeds)
+    and those in the cavity interior - to classify every interior vertex and edge.
+    
+    Each interior vertex independently walks through the tetrahedral mesh graph to reach
+    either the H1 or H2 boundary. The vertex is labeled based on which boundary it 
     reaches first via the cheapest path.
     
     Args:
@@ -1525,12 +1539,14 @@ def run_dijkstra_escape_labeling(
     
     Returns:
         Tuple of:
-            - seed_escape_labels: (S,) int8 array for each seed vertex where:
-                1 = seed walks to H1
-                2 = seed walks to H2
+            - interior_escape_labels: (I,) int8 array for each interior vertex where:
+                1 = vertex walks to H1
+                2 = vertex walks to H2
                 0 = unreachable (no path to H1 or H2)
-            - seed_vertex_indices: (S,) int array of seed vertex indices in the tet mesh
-            - seed_distances: (S,) float array of shortest path distances to boundary
+            - interior_vertex_indices: (I,) int array of interior vertex indices in the tet mesh
+            - interior_distances: (I,) float array of shortest path distances to boundary
+            - interior_escape_destinations: (I,) int array of destination boundary vertex indices
+            - interior_escape_paths: List of paths, each path is a list of vertex indices
     """
     import heapq
     import time
@@ -1566,32 +1582,50 @@ def run_dijkstra_escape_labeling(
         adjacency[v0].append((v1, cost))
         adjacency[v1].append((v0, cost))
     
-    # Identify seed vertices (inner boundary) and target vertices (H1, H2)
-    seed_vertex_indices = np.where(boundary_labels == -1)[0]
+    # Identify ALL interior vertices (both seeds on part surface AND cavity interior)
+    # Interior = NOT on H1 and NOT on H2
+    # boundary_labels: 0=interior, 1=H1, 2=H2, -1=inner boundary (part surface)
+    interior_vertex_indices = np.where((boundary_labels != 1) & (boundary_labels != 2))[0]
     h1_vertices = set(np.where(boundary_labels == 1)[0])
     h2_vertices = set(np.where(boundary_labels == 2)[0])
     
-    n_seeds = len(seed_vertex_indices)
-    logger.info(f"Dijkstra: {n_seeds} seeds, {len(h1_vertices)} H1 targets, {len(h2_vertices)} H2 targets")
+    # Also track which interior vertices are on the part surface (seeds) vs truly interior
+    seed_vertex_set = set(np.where(boundary_labels == -1)[0])
+    n_seeds = len(seed_vertex_set)
+    n_interior = len(interior_vertex_indices)
+    n_truly_interior = n_interior - n_seeds
     
-    if n_seeds == 0:
-        logger.warning("No seed vertices (inner boundary) found")
-        return np.array([], dtype=np.int8), np.array([], dtype=np.int64), np.array([], dtype=np.float64)
+    logger.info(f"Dijkstra: {n_interior} interior vertices ({n_seeds} on part surface, {n_truly_interior} in cavity)")
+    logger.info(f"Dijkstra: {len(h1_vertices)} H1 targets, {len(h2_vertices)} H2 targets")
+    
+    if n_interior == 0:
+        logger.warning("No interior vertices found")
+        return (np.array([], dtype=np.int8), np.array([], dtype=np.int64), 
+                np.array([], dtype=np.float64), np.array([], dtype=np.int64), [])
     
     if len(h1_vertices) == 0 and len(h2_vertices) == 0:
         logger.warning("No H1 or H2 boundary vertices found")
-        return np.zeros(n_seeds, dtype=np.int8), seed_vertex_indices, np.full(n_seeds, np.inf)
+        return (np.zeros(n_interior, dtype=np.int8), interior_vertex_indices, 
+                np.full(n_interior, np.inf), np.full(n_interior, -1, dtype=np.int64), 
+                [[] for _ in range(n_interior)])
     
-    # Run Dijkstra FROM each seed to find shortest path to H1 or H2
-    seed_escape_labels = np.zeros(n_seeds, dtype=np.int8)
-    seed_distances = np.full(n_seeds, np.inf, dtype=np.float64)
+    # Run Dijkstra FROM each interior vertex to find shortest path to H1 or H2
+    interior_escape_labels = np.zeros(n_interior, dtype=np.int8)
+    interior_distances = np.full(n_interior, np.inf, dtype=np.float64)
+    interior_escape_destinations = np.full(n_interior, -1, dtype=np.int64)
+    interior_escape_paths: List[List[int]] = []
     
-    for seed_idx, seed_v in enumerate(seed_vertex_indices):
+    for idx, start_v in enumerate(interior_vertex_indices):
         dist = np.full(n_vertices, np.inf, dtype=np.float64)
-        dist[seed_v] = 0.0
+        dist[start_v] = 0.0
         
-        pq = [(0.0, seed_v)]
+        # Predecessor array to reconstruct path
+        predecessor = np.full(n_vertices, -1, dtype=np.int64)
+        
+        pq = [(0.0, start_v)]
         visited = np.zeros(n_vertices, dtype=bool)
+        
+        destination = -1
         
         while pq:
             d, u = heapq.heappop(pq)
@@ -1602,12 +1636,14 @@ def run_dijkstra_escape_labeling(
             
             # Check if we reached a target
             if u in h1_vertices:
-                seed_escape_labels[seed_idx] = 1
-                seed_distances[seed_idx] = d
+                interior_escape_labels[idx] = 1
+                interior_distances[idx] = d
+                destination = u
                 break
             elif u in h2_vertices:
-                seed_escape_labels[seed_idx] = 2
-                seed_distances[seed_idx] = d
+                interior_escape_labels[idx] = 2
+                interior_distances[idx] = d
+                destination = u
                 break
             
             # Propagate to neighbors
@@ -1617,14 +1653,1029 @@ def run_dijkstra_escape_labeling(
                 new_dist = d + cost
                 if new_dist < dist[v]:
                     dist[v] = new_dist
+                    predecessor[v] = u
                     heapq.heappush(pq, (new_dist, v))
+        
+        interior_escape_destinations[idx] = destination
+        
+        # Reconstruct path from start to destination
+        if destination >= 0:
+            path = []
+            current = destination
+            while current >= 0:
+                path.append(current)
+                current = predecessor[current]
+            path.reverse()  # Now path goes from start to destination
+            interior_escape_paths.append(path)
+        else:
+            interior_escape_paths.append([])
     
     # Count results
-    n_h1_seeds = np.sum(seed_escape_labels == 1)
-    n_h2_seeds = np.sum(seed_escape_labels == 2)
-    n_unreached = np.sum(seed_escape_labels == 0)
+    n_h1 = np.sum(interior_escape_labels == 1)
+    n_h2 = np.sum(interior_escape_labels == 2)
+    n_unreached = np.sum(interior_escape_labels == 0)
     
     elapsed = (time.time() - start_time) * 1000
-    logger.info(f"Dijkstra complete in {elapsed:.0f}ms: {n_h1_seeds} seeds→H1, {n_h2_seeds} seeds→H2, {n_unreached} unreached")
+    logger.info(f"Dijkstra complete in {elapsed:.0f}ms: {n_h1} vertices→H1, {n_h2} vertices→H2, {n_unreached} unreached")
     
-    return seed_escape_labels, seed_vertex_indices, seed_distances
+    return interior_escape_labels, interior_vertex_indices, interior_distances, interior_escape_destinations, interior_escape_paths
+
+
+def find_secondary_cutting_edges(
+    tet_result: TetrahedralMeshResult,
+    part_mesh: trimesh.Trimesh,
+    boundary_mesh: trimesh.Trimesh = None,
+    sensitivity: float = 0.5,
+    use_gpu: bool = True
+) -> List[Tuple[int, int]]:
+    """
+    Find secondary cutting edges where the membrane between same-label interior vertices 
+    intersects the part mesh representation.
+    
+    This works on ALL interior edges (edges between any two interior vertices that
+    both escape to the same boundary H1 or H2), not just edges on the part surface.
+    
+    For each interior edge e = (vi, vj) between two interior vertices with the SAME escape label
+    (both escape to H1 or both escape to H2):
+    
+    1. Get escape paths: vi → wi (on ∂H) and vj → wj (on ∂H)
+    2. Compute shortest path wi → wj on the boundary mesh ∂H
+    3. Form a "membrane" surface bounded by:
+       - Edge (vi, vj)
+       - Path vi → wi  
+       - Path vj → wj
+       - Path wi → wj on ∂H
+    4. If this membrane intersects the part mesh M, mark edge as secondary cut
+    
+    Args:
+        tet_result: TetrahedralMeshResult with Dijkstra results (paths, destinations)
+        part_mesh: The original part mesh M to check intersection against
+        boundary_mesh: The boundary mesh ∂H (uses tet_result.boundary_mesh_original if not provided)
+        sensitivity: 0.0 to 1.0, controls how aggressively to detect secondary cuts
+                    0.0 = very strict (only clear intersections)
+                    1.0 = very sensitive (catches near-misses)
+        use_gpu: Whether to use CUDA acceleration if available (default True)
+    
+    Returns:
+        List of (vi, vj) tuples representing secondary cutting edges
+    """
+    import time
+    import heapq
+    
+    start_time = time.time()
+    
+    if tet_result.seed_escape_labels is None:
+        raise ValueError("Dijkstra must be run before finding secondary cuts")
+    
+    if tet_result.seed_escape_paths is None:
+        raise ValueError("Escape paths must be computed (run updated Dijkstra)")
+    
+    # Use the INFLATED geometry for membrane construction - this is where Dijkstra paths were computed
+    # The escape paths are vertex indices that refer to the inflated mesh vertices
+    vertices = tet_result.vertices  # Inflated mesh for membrane geometry
+    
+    # For the boundary mesh, use the current (inflated) boundary mesh
+    if boundary_mesh is None:
+        boundary_mesh = tet_result.boundary_mesh
+    
+    if boundary_mesh is None:
+        logger.warning("No boundary mesh available for secondary cuts")
+        return []
+    
+    logger.info(f"Secondary cuts: using inflated vertices ({len(vertices)} verts), boundary_mesh ({len(boundary_mesh.vertices)} verts)")
+    
+    # These now contain ALL interior vertices (not just those on part surface)
+    interior_vertex_indices = tet_result.seed_vertex_indices
+    interior_escape_labels = tet_result.seed_escape_labels
+    interior_escape_destinations = tet_result.seed_escape_destinations
+    interior_escape_paths = tet_result.seed_escape_paths
+    boundary_labels = tet_result.boundary_labels
+    
+    n_interior = len(interior_vertex_indices)
+    
+    # Build mapping from vertex index to interior array index
+    vertex_to_interior_idx = {}
+    for idx, v in enumerate(interior_vertex_indices):
+        vertex_to_interior_idx[v] = idx
+    
+    interior_set = set(interior_vertex_indices)
+    
+    # Identify which interior vertices are on the part surface (seeds)
+    # boundary_labels == -1 means on part surface
+    part_surface_vertices = set()
+    if boundary_labels is not None:
+        for v in interior_vertex_indices:
+            if boundary_labels[v] == -1:
+                part_surface_vertices.add(v)
+    else:
+        # If no boundary labels, assume all interior vertices could be part surface
+        part_surface_vertices = interior_set
+    
+    logger.info(f"Secondary cuts: {n_interior} interior vertices, {len(part_surface_vertices)} on part surface")
+    
+    # Build seed triangles from PART MESH faces
+    # These represent the part cross-section that membranes should not pass through
+    from scipy.spatial import cKDTree
+    
+    # Map part mesh vertices to tet mesh vertices
+    part_verts = np.asarray(part_mesh.vertices)
+    tet_tree = cKDTree(vertices)
+    _, part_to_tet = tet_tree.query(part_verts, k=1)
+    
+    # Find TRIANGULAR FACES from PART MESH where ALL THREE vertices map to part surface vertices
+    # These triangles represent the part surface in tetrahedral mesh resolution
+    seed_triangles = []  # List of (v0, v1, v2) tet vertex indices
+    seed_triangle_positions = []  # List of (pos0, pos1, pos2) positions
+    
+    for face in part_mesh.faces:
+        tet_v0 = part_to_tet[face[0]]
+        tet_v1 = part_to_tet[face[1]]
+        tet_v2 = part_to_tet[face[2]]
+        
+        # Check if all three vertices are on part surface
+        if tet_v0 in part_surface_vertices and tet_v1 in part_surface_vertices and tet_v2 in part_surface_vertices:
+            # Avoid degenerate triangles
+            if tet_v0 != tet_v1 and tet_v1 != tet_v2 and tet_v2 != tet_v0:
+                seed_triangles.append((tet_v0, tet_v1, tet_v2))
+                seed_triangle_positions.append((
+                    vertices[tet_v0].copy(),
+                    vertices[tet_v1].copy(),
+                    vertices[tet_v2].copy()
+                ))
+    
+    logger.info(f"Secondary cuts: found {len(seed_triangles)} seed triangles (part surface representation)")
+    
+    # Find ALL interior edges from tetrahedral mesh where both vertices are interior
+    # and have the SAME escape label (both H1 or both H2)
+    # IMPORTANT: Exclude edges where BOTH vertices are on the part surface - those are
+    # not secondary cuts, they're edges ON the part itself. Their membranes would
+    # trivially intersect the part surface, causing false positives.
+    candidate_edges = []
+    tet_edges = tet_result.edges
+    n_both_on_part_surface = 0  # Counter for edges filtered out
+    
+    for v0, v1 in tet_edges:
+        if v0 in interior_set and v1 in interior_set:
+            # Skip edges where BOTH vertices are on the part surface
+            # These are not secondary cuts - the membrane would trivially touch the part
+            if v0 in part_surface_vertices and v1 in part_surface_vertices:
+                n_both_on_part_surface += 1
+                continue
+            
+            idx0 = vertex_to_interior_idx[v0]
+            idx1 = vertex_to_interior_idx[v1]
+            
+            label0 = interior_escape_labels[idx0]
+            label1 = interior_escape_labels[idx1]
+            
+            # Only consider same-label edges (both H1 or both H2)
+            # Different label edges are primary cuts (yellow), not secondary
+            if label0 == label1 and label0 > 0:
+                candidate_edges.append((v0, v1, idx0, idx1))
+    
+    logger.info(f"Secondary cuts: {len(candidate_edges)} same-label interior edges to check (skipped {n_both_on_part_surface} edges on part surface)")
+    
+    if len(candidate_edges) == 0 or len(seed_triangles) == 0:
+        return []
+    
+    # Build outer boundary mesh adjacency for shortest path computation
+    boundary_verts = np.asarray(boundary_mesh.vertices)
+    boundary_adjacency = _build_boundary_adjacency(boundary_mesh)
+    
+    # Calculate minimum membrane thickness to filter out nearly-degenerate membranes
+    # Higher sensitivity = smaller threshold = more detections
+    # Lower sensitivity = larger threshold = fewer detections (filters out borderline cases)
+    # NOTE: Disabled for now as it was causing issues - set to 0 to not filter
+    avg_edge_length = np.mean(tet_result.edge_lengths) if tet_result.edge_lengths is not None else 1.0
+    # min_membrane_thickness = avg_edge_length * 0.1 * (1.0 - sensitivity)
+    min_membrane_thickness = 0.0  # Disabled - rely on triangle intersection only
+    
+    logger.info(f"Secondary cuts: sensitivity={sensitivity:.2f}, avg_edge_length={avg_edge_length:.4f}")
+    
+    # Gather all membrane data first
+    edge_membrane_data = []
+    
+    for vi, vj, idx_i, idx_j in candidate_edges:
+        # Get escape paths
+        path_i = interior_escape_paths[idx_i]  # vi → wi
+        path_j = interior_escape_paths[idx_j]  # vj → wj
+        
+        if len(path_i) < 1 or len(path_j) < 1:
+            continue
+        
+        wi = interior_escape_destinations[idx_i]
+        wj = interior_escape_destinations[idx_j]
+        
+        if wi < 0 or wj < 0:
+            continue
+        
+        # Verify that path ends at the boundary destination
+        # The path should be [start_vertex, ..., boundary_vertex]
+        if path_i[-1] != wi:
+            logger.warning(f"Path {idx_i} does not end at destination: path[-1]={path_i[-1]}, wi={wi}")
+        if path_j[-1] != wj:
+            logger.warning(f"Path {idx_j} does not end at destination: path[-1]={path_j[-1]}, wj={wj}")
+        
+        # Map wi, wj to boundary mesh vertex indices
+        wi_boundary = _find_nearest_boundary_vertex(vertices[wi], boundary_verts)
+        wj_boundary = _find_nearest_boundary_vertex(vertices[wj], boundary_verts)
+        
+        # Compute shortest path wi → wj on boundary mesh
+        boundary_path = _shortest_path_on_boundary(
+            wi_boundary, wj_boundary, boundary_mesh, boundary_adjacency
+        )
+        
+        edge_membrane_data.append((vi, vj, path_i, path_j, boundary_path))
+    
+    logger.info(f"Secondary cuts: built {len(edge_membrane_data)} membranes to check")
+    logger.info(f"Secondary cuts: min_membrane_thickness={min_membrane_thickness:.4f}")
+    
+    if len(edge_membrane_data) == 0:
+        return []
+    
+    # Check if membrane cuts through seed TRIANGLES (faces representing the part)
+    # This uses tetrahedral mesh resolution and checks against actual surface area
+    secondary_cuts = _find_secondary_cuts_by_triangle_intersection(
+        edge_membrane_data, 
+        seed_triangles,
+        seed_triangle_positions,
+        vertices, 
+        boundary_verts,
+        sensitivity,
+        min_membrane_thickness,
+        use_gpu=use_gpu
+    )
+    
+    elapsed = (time.time() - start_time) * 1000
+    logger.info(f"Secondary cuts complete in {elapsed:.0f}ms: {len(secondary_cuts)} secondary cutting edges found")
+    
+    return secondary_cuts
+
+
+def _find_secondary_cuts_by_triangle_intersection(
+    edge_membrane_data: List[Tuple],
+    seed_triangles: List[Tuple[int, int, int]],
+    seed_triangle_positions: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
+    vertices: np.ndarray,
+    boundary_verts: np.ndarray,
+    sensitivity: float,
+    min_membrane_thickness: float = 0.0,
+    use_gpu: bool = True
+) -> List[Tuple[int, int]]:
+    """
+    Find secondary cuts by checking if membranes intersect seed TRIANGLES (faces).
+    
+    This approach checks if the membrane surface cuts through the triangular faces
+    formed by seed vertices, which represent the part surface in tetrahedral mesh
+    resolution. This is more robust than checking individual edges.
+    
+    Args:
+        min_membrane_thickness: Skip membranes thinner than this (avoids false positives
+                               on flat surfaces where escape paths are nearly identical)
+    
+    Uses GPU acceleration if available for massive speedup.
+    """
+    n_triangles = len(seed_triangles)
+    n_membranes = len(edge_membrane_data)
+    logger.info(f"Secondary cuts: checking {n_membranes} membranes against {n_triangles} seed triangles")
+    
+    if n_triangles == 0:
+        logger.warning("No seed triangles found - cannot check for secondary cuts")
+        return []
+    
+    # Check GPU availability
+    gpu_available = use_gpu and CUDA_AVAILABLE and TORCH_AVAILABLE
+    
+    if gpu_available:
+        logger.info("Secondary cuts: Using GPU acceleration")
+        return _find_secondary_cuts_triangle_gpu(
+            edge_membrane_data, seed_triangles, seed_triangle_positions,
+            vertices, boundary_verts, sensitivity, min_membrane_thickness
+        )
+    else:
+        logger.info("Secondary cuts: Using CPU")
+        return _find_secondary_cuts_triangle_cpu(
+            edge_membrane_data, seed_triangles, seed_triangle_positions,
+            vertices, boundary_verts, sensitivity, min_membrane_thickness
+        )
+
+
+def _find_secondary_cuts_triangle_cpu(
+    edge_membrane_data: List[Tuple],
+    seed_triangles: List[Tuple[int, int, int]],
+    seed_triangle_positions: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
+    vertices: np.ndarray,
+    boundary_verts: np.ndarray,
+    sensitivity: float,
+    min_membrane_thickness: float = 0.0
+) -> List[Tuple[int, int]]:
+    """CPU implementation of secondary cuts by triangle-triangle intersection."""
+    secondary_cuts = []
+    
+    for vi, vj, path_i, path_j, boundary_path in edge_membrane_data:
+        # Build membrane triangles (skip if too thin - flat surface case)
+        membrane_triangles = _build_membrane_triangles(
+            path_i, path_j, boundary_path, vertices, boundary_verts,
+            min_thickness=min_membrane_thickness
+        )
+        
+        if len(membrane_triangles) == 0:
+            continue
+        
+        # Skip triangles that share vertices with the test edge
+        skip_vertices = {vi, vj}
+        for v in path_i[:min(3, len(path_i))]:
+            skip_vertices.add(v)
+        for v in path_j[:min(3, len(path_j))]:
+            skip_vertices.add(v)
+        
+        # Check if any membrane triangle intersects any seed triangle
+        has_intersection = False
+        for tri_idx, (tv0, tv1, tv2) in enumerate(seed_triangles):
+            # Skip triangles that share vertices with the membrane edges
+            if tv0 in skip_vertices or tv1 in skip_vertices or tv2 in skip_vertices:
+                continue
+            
+            seed_tri_pos = seed_triangle_positions[tri_idx]
+            
+            for mem_tri in membrane_triangles:
+                if _triangles_intersect(mem_tri, seed_tri_pos, sensitivity):
+                    has_intersection = True
+                    break
+            
+            if has_intersection:
+                break
+        
+        if has_intersection:
+            secondary_cuts.append((vi, vj))
+    
+    return secondary_cuts
+
+
+def _find_secondary_cuts_triangle_gpu(
+    edge_membrane_data: List[Tuple],
+    seed_triangles: List[Tuple[int, int, int]],
+    seed_triangle_positions: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
+    vertices: np.ndarray,
+    boundary_verts: np.ndarray,
+    sensitivity: float,
+    min_membrane_thickness: float = 0.0
+) -> List[Tuple[int, int]]:
+    """
+    GPU-accelerated secondary cuts using triangle-triangle intersection.
+    
+    For each membrane, we check if any of its triangles intersect any seed triangle.
+    We use a two-step approach:
+    1. Check if membrane edges intersect seed triangles
+    2. Check if seed triangle edges intersect membrane triangles
+    """
+    import torch
+    device = torch.device('cuda')
+    
+    # Pre-compute all seed triangle data on GPU
+    n_seed_tris = len(seed_triangles)
+    seed_tri_v0 = np.array([pos[0] for pos in seed_triangle_positions], dtype=np.float32)
+    seed_tri_v1 = np.array([pos[1] for pos in seed_triangle_positions], dtype=np.float32)
+    seed_tri_v2 = np.array([pos[2] for pos in seed_triangle_positions], dtype=np.float32)
+    
+    seed_v0_gpu = torch.tensor(seed_tri_v0, device=device)  # (S, 3)
+    seed_v1_gpu = torch.tensor(seed_tri_v1, device=device)  # (S, 3)
+    seed_v2_gpu = torch.tensor(seed_tri_v2, device=device)  # (S, 3)
+    
+    # Pre-compute seed triangle edges for intersection tests
+    # Each triangle has 3 edges
+    seed_edge_p0 = np.concatenate([seed_tri_v0, seed_tri_v1, seed_tri_v2], axis=0)  # (3S, 3)
+    seed_edge_p1 = np.concatenate([seed_tri_v1, seed_tri_v2, seed_tri_v0], axis=0)  # (3S, 3)
+    seed_edge_p0_gpu = torch.tensor(seed_edge_p0, device=device)
+    seed_edge_p1_gpu = torch.tensor(seed_edge_p1, device=device)
+    
+    # Map from edge index to triangle index
+    edge_to_tri_idx = np.concatenate([
+        np.arange(n_seed_tris),
+        np.arange(n_seed_tris),
+        np.arange(n_seed_tris)
+    ])
+    
+    secondary_cuts = []
+    
+    for membrane_idx, (vi, vj, path_i, path_j, boundary_path) in enumerate(edge_membrane_data):
+        # Build membrane triangles (skip if too thin - flat surface case)
+        membrane_triangles = _build_membrane_triangles(
+            path_i, path_j, boundary_path, vertices, boundary_verts,
+            min_thickness=min_membrane_thickness
+        )
+        
+        if len(membrane_triangles) == 0:
+            continue
+        
+        # Skip triangles that share vertices with the test edge
+        skip_vertices = {vi, vj}
+        for v in path_i[:min(3, len(path_i))]:
+            skip_vertices.add(v)
+        for v in path_j[:min(3, len(path_j))]:
+            skip_vertices.add(v)
+        
+        # Build skip mask for seed triangles
+        skip_mask = torch.zeros(n_seed_tris, dtype=torch.bool, device=device)
+        for tri_idx, (tv0, tv1, tv2) in enumerate(seed_triangles):
+            if tv0 in skip_vertices or tv1 in skip_vertices or tv2 in skip_vertices:
+                skip_mask[tri_idx] = True
+        
+        # Expand skip mask to edges (3 edges per triangle)
+        skip_edge_mask = skip_mask.repeat(3)  # (3S,)
+        
+        # Convert membrane triangles to GPU tensors
+        mem_tri_v0 = np.array([t[0] for t in membrane_triangles], dtype=np.float32)
+        mem_tri_v1 = np.array([t[1] for t in membrane_triangles], dtype=np.float32)
+        mem_tri_v2 = np.array([t[2] for t in membrane_triangles], dtype=np.float32)
+        
+        mem_v0_gpu = torch.tensor(mem_tri_v0, device=device)  # (M, 3)
+        mem_v1_gpu = torch.tensor(mem_tri_v1, device=device)  # (M, 3)
+        mem_v2_gpu = torch.tensor(mem_tri_v2, device=device)  # (M, 3)
+        
+        # Membrane edges
+        mem_edge_p0 = np.concatenate([mem_tri_v0, mem_tri_v1, mem_tri_v2], axis=0)  # (3M, 3)
+        mem_edge_p1 = np.concatenate([mem_tri_v1, mem_tri_v2, mem_tri_v0], axis=0)  # (3M, 3)
+        mem_edge_p0_gpu = torch.tensor(mem_edge_p0, device=device)
+        mem_edge_p1_gpu = torch.tensor(mem_edge_p1, device=device)
+        
+        # Test 1: Do membrane edges intersect seed triangles?
+        intersects_1 = _batch_segment_triangle_intersection_gpu(
+            mem_edge_p0_gpu, mem_edge_p1_gpu,
+            seed_v0_gpu, seed_v1_gpu, seed_v2_gpu,
+            skip_mask, sensitivity
+        )
+        
+        # Test 2: Do seed triangle edges intersect membrane triangles?
+        # (No skip mask for membrane triangles - we check all)
+        no_skip = torch.zeros(len(mem_edge_p0_gpu), dtype=torch.bool, device=device)
+        intersects_2 = _batch_segment_triangle_intersection_gpu(
+            seed_edge_p0_gpu, seed_edge_p1_gpu,
+            mem_v0_gpu, mem_v1_gpu, mem_v2_gpu,
+            skip_edge_mask, sensitivity
+        )
+        
+        if intersects_1 or intersects_2:
+            secondary_cuts.append((vi, vj))
+        
+        # Periodic cleanup
+        if membrane_idx % 100 == 0:
+            torch.cuda.empty_cache()
+    
+    torch.cuda.empty_cache()
+    return secondary_cuts
+
+
+def _triangles_intersect(
+    tri1: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    tri2: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    sensitivity: float
+) -> bool:
+    """
+    Check if two triangles intersect.
+    
+    Two triangles intersect if:
+    1. Any edge of tri1 passes through tri2, OR
+    2. Any edge of tri2 passes through tri1
+    """
+    v0, v1, v2 = tri1
+    u0, u1, u2 = tri2
+    
+    # Check edges of tri1 against tri2
+    if _segment_intersects_triangle(v0, v1, u0, u1, u2, sensitivity):
+        return True
+    if _segment_intersects_triangle(v1, v2, u0, u1, u2, sensitivity):
+        return True
+    if _segment_intersects_triangle(v2, v0, u0, u1, u2, sensitivity):
+        return True
+    
+    # Check edges of tri2 against tri1
+    if _segment_intersects_triangle(u0, u1, v0, v1, v2, sensitivity):
+        return True
+    if _segment_intersects_triangle(u1, u2, v0, v1, v2, sensitivity):
+        return True
+    if _segment_intersects_triangle(u2, u0, v0, v1, v2, sensitivity):
+        return True
+    
+    return False
+
+
+def _batch_segment_triangle_intersection_gpu(
+    seg_p0: 'torch.Tensor',  # (E, 3) segment start points
+    seg_p1: 'torch.Tensor',  # (E, 3) segment end points
+    tri_v0: 'torch.Tensor',  # (T, 3) triangle vertex 0
+    tri_v1: 'torch.Tensor',  # (T, 3) triangle vertex 1
+    tri_v2: 'torch.Tensor',  # (T, 3) triangle vertex 2
+    skip_mask: 'torch.Tensor',  # (T,) or (E,) bool - True to skip
+    sensitivity: float
+) -> bool:
+    """
+    GPU-batched Möller–Trumbore intersection test.
+    
+    Tests all segments against all triangles in parallel.
+    Returns True if ANY non-skipped segment intersects ANY triangle.
+    """
+    import torch
+    
+    EPSILON = 1e-7
+    
+    n_segs = seg_p0.shape[0]
+    n_tris = tri_v0.shape[0]
+    
+    if n_segs == 0 or n_tris == 0:
+        return False
+    
+    # Expand dimensions for broadcasting: (E, 1, 3) x (1, T, 3)
+    p0 = seg_p0.unsqueeze(1)  # (E, 1, 3)
+    p1 = seg_p1.unsqueeze(1)  # (E, 1, 3)
+    v0 = tri_v0.unsqueeze(0)  # (1, T, 3)
+    v1 = tri_v1.unsqueeze(0)  # (1, T, 3)
+    v2 = tri_v2.unsqueeze(0)  # (1, T, 3)
+    
+    # Segment direction and length
+    direction = p1 - p0  # (E, 1, 3)
+    seg_length = torch.norm(direction, dim=-1, keepdim=True)  # (E, 1, 1)
+    seg_length = seg_length.clamp(min=EPSILON)
+    direction = direction / seg_length  # Normalized (E, 1, 3)
+    seg_length = seg_length.squeeze(-1)  # (E, 1)
+    
+    # Triangle edges
+    edge1 = v1 - v0  # (1, T, 3)
+    edge2 = v2 - v0  # (1, T, 3)
+    
+    # Cross product: h = direction × edge2
+    h = torch.cross(direction.expand(-1, n_tris, -1), edge2.expand(n_segs, -1, -1), dim=-1)  # (E, T, 3)
+    
+    # Determinant: a = edge1 · h
+    a = (edge1.expand(n_segs, -1, -1) * h).sum(dim=-1)  # (E, T)
+    
+    # Check for parallel rays (|a| < epsilon)
+    parallel_mask = torch.abs(a) < EPSILON  # (E, T)
+    
+    # Avoid division by zero
+    a_safe = torch.where(parallel_mask, torch.ones_like(a), a)
+    f = 1.0 / a_safe  # (E, T)
+    
+    # s = p0 - v0
+    s = p0 - v0  # (E, T, 3)
+    
+    # u = f * (s · h)
+    u = f * (s * h).sum(dim=-1)  # (E, T)
+    
+    # Check u bounds
+    u_valid = (u >= -EPSILON) & (u <= 1.0 + EPSILON)  # (E, T)
+    
+    # q = s × edge1
+    q = torch.cross(s, edge1.expand(n_segs, -1, -1), dim=-1)  # (E, T, 3)
+    
+    # v = f * (direction · q)
+    v = f * (direction.expand(-1, n_tris, -1) * q).sum(dim=-1)  # (E, T)
+    
+    # Check v bounds and u+v bounds
+    v_valid = (v >= -EPSILON) & ((u + v) <= 1.0 + EPSILON)  # (E, T)
+    
+    # t = f * (edge2 · q) - distance along ray to intersection
+    t = f * (edge2.expand(n_segs, -1, -1) * q).sum(dim=-1)  # (E, T)
+    
+    # Tolerance based on sensitivity
+    # sensitivity < 1.0: positive tolerance (more lenient, fewer detections)
+    # sensitivity = 1.0: zero tolerance (exact intersection)
+    # sensitivity > 1.0: negative tolerance (expanded detection zone, more detections)
+    tolerance = seg_length * 0.05 * (1.0 - sensitivity)  # (E, 1)
+    
+    # Check if t is within segment bounds
+    t_valid = (t > -tolerance) & (t < seg_length + tolerance)  # (E, T)
+    
+    # Combine all conditions
+    intersects = ~parallel_mask & u_valid & v_valid & t_valid  # (E, T)
+    
+    # Apply skip mask - handle both (T,) and (E,) shapes
+    if skip_mask.shape[0] == n_tris:
+        # Skip mask is for triangles - broadcast across edges
+        intersects = intersects & ~skip_mask.unsqueeze(0)  # (E, T)
+    elif skip_mask.shape[0] == n_segs:
+        # Skip mask is for edges - broadcast across triangles
+        intersects = intersects & ~skip_mask.unsqueeze(1)  # (E, T)
+    
+    # Return True if any intersection
+    return intersects.any().item()
+
+
+def _build_membrane_triangles(
+    path_i: List[int],
+    path_j: List[int],
+    boundary_path: List[int],
+    tet_vertices: np.ndarray,
+    boundary_vertices: np.ndarray,
+    min_thickness: float = 0.0
+) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """
+    Build triangulated membrane surface from escape paths.
+    
+    Returns empty list if the membrane is too thin (paths nearly identical),
+    which happens on flat surfaces where adjacent vertices escape the same way.
+    """
+    path_i_positions = tet_vertices[path_i]
+    path_j_positions = tet_vertices[path_j]
+    
+    n_i = len(path_i_positions)
+    n_j = len(path_j_positions)
+    
+    if n_i < 1 or n_j < 1:
+        return []
+    
+    # Check if paths are too similar (flat surface case)
+    # Compare positions along the paths - if they're nearly identical, skip
+    if min_thickness > 0:
+        max_separation = 0.0
+        n_check = min(n_i, n_j, 5)
+        for k in range(n_check):
+            t = k / max(1, n_check - 1)
+            idx_i = min(int(t * (n_i - 1)), n_i - 1)
+            idx_j = min(int(t * (n_j - 1)), n_j - 1)
+            sep = np.linalg.norm(path_i_positions[idx_i] - path_j_positions[idx_j])
+            max_separation = max(max_separation, sep)
+        
+        if max_separation < min_thickness:
+            # Paths are nearly identical - membrane is too thin
+            return []
+    
+    membrane_triangles = []
+    
+    # Resample paths to have same number of points
+    n_samples = max(n_i, n_j, 5)
+    
+    path_i_resampled = []
+    path_j_resampled = []
+    
+    for s in range(n_samples):
+        t = s / max(1, n_samples - 1)
+        
+        # Interpolate along path_i
+        idx_i = min(int(t * (n_i - 1)), n_i - 1)
+        frac_i = t * (n_i - 1) - idx_i
+        if idx_i < n_i - 1:
+            pos_i = path_i_positions[idx_i] * (1 - frac_i) + path_i_positions[idx_i + 1] * frac_i
+        else:
+            pos_i = path_i_positions[idx_i]
+        path_i_resampled.append(pos_i)
+        
+        # Interpolate along path_j
+        idx_j = min(int(t * (n_j - 1)), n_j - 1)
+        frac_j = t * (n_j - 1) - idx_j
+        if idx_j < n_j - 1:
+            pos_j = path_j_positions[idx_j] * (1 - frac_j) + path_j_positions[idx_j + 1] * frac_j
+        else:
+            pos_j = path_j_positions[idx_j]
+        path_j_resampled.append(pos_j)
+    
+    # Create triangles between the two paths
+    for s in range(n_samples - 1):
+        p0 = path_i_resampled[s]
+        p1 = path_i_resampled[s + 1]
+        p2 = path_j_resampled[s]
+        p3 = path_j_resampled[s + 1]
+        
+        membrane_triangles.append((p0, p1, p2))
+        membrane_triangles.append((p1, p3, p2))
+    
+    # Add boundary path lid
+    if len(boundary_path) > 1:
+        boundary_path_positions = boundary_vertices[boundary_path]
+        wi_pos = path_i_resampled[-1]
+        wj_pos = path_j_resampled[-1]
+        mid = (wi_pos + wj_pos) / 2
+        
+        for i in range(len(boundary_path_positions) - 1):
+            bp0 = boundary_path_positions[i]
+            bp1 = boundary_path_positions[i + 1]
+            membrane_triangles.append((bp0, bp1, mid))
+    
+    return membrane_triangles
+
+
+def _segment_intersects_triangle(
+    p0: np.ndarray, p1: np.ndarray,
+    v0: np.ndarray, v1: np.ndarray, v2: np.ndarray,
+    sensitivity: float = 0.5
+) -> bool:
+    """
+    Check if line segment (p0, p1) intersects triangle (v0, v1, v2).
+    
+    Uses Möller–Trumbore intersection algorithm.
+    """
+    EPSILON = 1e-9
+    
+    # Direction of segment
+    direction = p1 - p0
+    seg_length = np.linalg.norm(direction)
+    if seg_length < EPSILON:
+        return False
+    direction = direction / seg_length
+    
+    # Triangle edges
+    edge1 = v1 - v0
+    edge2 = v2 - v0
+    
+    # Begin calculating determinant
+    h = np.cross(direction, edge2)
+    a = np.dot(edge1, h)
+    
+    if abs(a) < EPSILON:
+        # Ray is parallel to triangle
+        return False
+    
+    f = 1.0 / a
+    s = p0 - v0
+    u = f * np.dot(s, h)
+    
+    if u < -EPSILON or u > 1.0 + EPSILON:
+        return False
+    
+    q = np.cross(s, edge1)
+    v = f * np.dot(direction, q)
+    
+    if v < -EPSILON or u + v > 1.0 + EPSILON:
+        return False
+    
+    # Compute t to find intersection point
+    t = f * np.dot(edge2, q)
+    
+    # Check if intersection is within the segment (0 <= t <= seg_length)
+    # Tolerance based on sensitivity:
+    # sensitivity < 1.0: positive tolerance (more lenient, fewer detections)
+    # sensitivity = 1.0: zero tolerance (exact intersection)
+    # sensitivity > 1.0: negative tolerance (expanded detection, more detections)
+    tolerance = seg_length * 0.05 * (1.0 - sensitivity)
+    
+    if t > -tolerance and t < seg_length + tolerance:
+        return True
+    
+    return False
+    
+    # Create triangles between the two paths
+    for s in range(n_samples - 1):
+        p0 = path_i_resampled[s]
+        p1 = path_i_resampled[s + 1]
+        p2 = path_j_resampled[s]
+        p3 = path_j_resampled[s + 1]
+        
+        membrane_triangles.append((p0, p1, p2))
+        membrane_triangles.append((p1, p3, p2))
+    
+    # Add boundary path lid
+    if len(boundary_path) > 1:
+        boundary_path_positions = boundary_vertices[boundary_path]
+        wi_pos = path_i_resampled[-1]
+        wj_pos = path_j_resampled[-1]
+        mid = (wi_pos + wj_pos) / 2
+        
+        for i in range(len(boundary_path_positions) - 1):
+            bp0 = boundary_path_positions[i]
+            bp1 = boundary_path_positions[i + 1]
+            membrane_triangles.append((bp0, bp1, mid))
+    
+    return membrane_triangles
+    
+    for vi, vj, path_i, path_j, boundary_path in edge_membrane_data:
+        # The edge being tested - we skip intersection tests with this edge and its adjacent edges
+        test_edge = (min(vi, vj), max(vi, vj))
+        
+        # Check if membrane from (vi, vj) intersects any OTHER seed edge
+        if _membrane_intersects_seed_edges(
+            vi, vj, path_i, path_j, boundary_path,
+            vertices, boundary_verts,
+            all_seed_edges, all_seed_edge_positions,
+            test_edge, sensitivity
+        ):
+            secondary_cuts.append((vi, vj))
+    
+    return secondary_cuts
+
+
+def _build_boundary_adjacency(boundary_mesh: trimesh.Trimesh) -> Dict[int, List[Tuple[int, float]]]:
+    """Build adjacency list for boundary mesh with edge lengths."""
+    n_verts = len(boundary_mesh.vertices)
+    adjacency: Dict[int, List[Tuple[int, float]]] = {i: [] for i in range(n_verts)}
+    
+    vertices = boundary_mesh.vertices
+    
+    # Extract edges from faces
+    edges_seen = set()
+    for face in boundary_mesh.faces:
+        for i in range(3):
+            v0, v1 = face[i], face[(i + 1) % 3]
+            edge_key = (min(v0, v1), max(v0, v1))
+            if edge_key not in edges_seen:
+                edges_seen.add(edge_key)
+                length = np.linalg.norm(vertices[v1] - vertices[v0])
+                adjacency[v0].append((v1, length))
+                adjacency[v1].append((v0, length))
+    
+    return adjacency
+
+
+def _find_nearest_boundary_vertex(point: np.ndarray, boundary_verts: np.ndarray) -> int:
+    """Find nearest vertex in boundary mesh to a given point."""
+    distances = np.linalg.norm(boundary_verts - point, axis=1)
+    return int(np.argmin(distances))
+
+
+def _shortest_path_on_boundary(
+    start: int, 
+    end: int, 
+    boundary_mesh: trimesh.Trimesh,
+    adjacency: Dict[int, List[Tuple[int, float]]]
+) -> List[int]:
+    """
+    Compute shortest path between two vertices on the boundary mesh using Dijkstra.
+    
+    Returns list of boundary mesh vertex indices from start to end.
+    """
+    import heapq
+    
+    if start == end:
+        return [start]
+    
+    n_verts = len(boundary_mesh.vertices)
+    dist = np.full(n_verts, np.inf, dtype=np.float64)
+    dist[start] = 0.0
+    predecessor = np.full(n_verts, -1, dtype=np.int64)
+    
+    pq = [(0.0, start)]
+    visited = np.zeros(n_verts, dtype=bool)
+    
+    while pq:
+        d, u = heapq.heappop(pq)
+        
+        if visited[u]:
+            continue
+        visited[u] = True
+        
+        if u == end:
+            break
+        
+        for v, cost in adjacency.get(u, []):
+            if visited[v]:
+                continue
+            new_dist = d + cost
+            if new_dist < dist[v]:
+                dist[v] = new_dist
+                predecessor[v] = u
+                heapq.heappush(pq, (new_dist, v))
+    
+    # Reconstruct path
+    if predecessor[end] < 0 and start != end:
+        return []  # No path found
+    
+    path = []
+    current = end
+    while current >= 0:
+        path.append(current)
+        current = predecessor[current]
+    path.reverse()
+    
+    return path
+
+
+def _membrane_intersects_part_v2(
+    vi: int, vj: int,
+    path_i: List[int], path_j: List[int],
+    boundary_path: List[int],
+    tet_vertices: np.ndarray,
+    boundary_vertices: np.ndarray,
+    part_mesh: trimesh.Trimesh,
+    distance_tolerance: float,
+    sensitivity: float
+) -> bool:
+    """
+    Check if the membrane surface bounded by the given paths intersects the part mesh.
+    
+    The membrane is bounded by 4 edges (all paths go OUTWARD from seeds):
+    1. Edge (vi, vj) - on the part surface (inner boundary)
+    2. Path vi → wi - escape path from seed vi outward to boundary point wi
+    3. Path vj → wj - escape path from seed vj outward to boundary point wj
+    4. Path wi → wj - shortest path on outer boundary ∂H
+    
+    Visually:
+    
+        wi -----(boundary path)---- wj
+        ↑                            ↑
+     path_i                       path_j
+     (outward)                   (outward)
+        |                            |
+        vi -----(part edge)------- vj
+    
+    If this membrane passes THROUGH the part mesh, the mold cannot separate
+    without cutting through the part at this edge → secondary cut needed.
+    """
+    # Get positions of escape path vertices (paths contain tet mesh vertex indices)
+    # path_i: [vi, v1, v2, ..., wi] - from seed OUTWARD to boundary
+    # path_j: [vj, v1, v2, ..., wj] - from seed OUTWARD to boundary
+    path_i_positions = tet_vertices[path_i]
+    path_j_positions = tet_vertices[path_j]
+    
+    # Get boundary path positions (indices into boundary mesh)
+    # boundary_path: [wi_idx, ..., wj_idx] on the outer boundary mesh
+    if len(boundary_path) > 0:
+        boundary_path_positions = boundary_vertices[boundary_path]
+    else:
+        boundary_path_positions = np.empty((0, 3))
+    
+    # The membrane is a quadrilateral-like surface with 4 sides:
+    # Side 1: vi → vj (part surface edge) - implicit, connects the two seeds
+    # Side 2: vi → wi (path_i going outward)
+    # Side 3: wi → wj (boundary path)
+    # Side 4: wj → vj (NOT the reverse of path_j, but the boundary path connects to vj via path_j end)
+    
+    # Sample points across the membrane surface
+    # The key sampling is between the two OUTWARD paths (path_i and path_j)
+    sample_points = []
+    
+    n_i = len(path_i_positions)
+    n_j = len(path_j_positions)
+    
+    if n_i < 1 or n_j < 1:
+        return False
+    
+    # Sample across the "ribbon" between the two outward escape paths
+    # At each depth level t (0=seeds, 1=boundary), sample across from path_i to path_j
+    n_depth_samples = max(n_i, n_j, 5)
+    
+    for s in range(n_depth_samples):
+        t = s / max(1, n_depth_samples - 1)
+        
+        # Get position along path_i at parameter t (0=vi, 1=wi)
+        idx_i = min(int(t * (n_i - 1)), n_i - 1)
+        pos_i = path_i_positions[idx_i]
+        
+        # Get position along path_j at parameter t (0=vj, 1=wj)
+        idx_j = min(int(t * (n_j - 1)), n_j - 1)
+        pos_j = path_j_positions[idx_j]
+        
+        # Sample across the ribbon at this depth (between the two paths)
+        for u in [0.2, 0.35, 0.5, 0.65, 0.8]:
+            sample = pos_i * (1 - u) + pos_j * u
+            sample_points.append(sample)
+    
+    # Also sample the "top" of the membrane (boundary path wi → wj)
+    if len(boundary_path_positions) > 1:
+        wi_pos = path_i_positions[-1] if n_i > 0 else None
+        wj_pos = path_j_positions[-1] if n_j > 0 else None
+        
+        if wi_pos is not None and wj_pos is not None:
+            # Sample along the boundary path and slightly inward
+            for i in range(len(boundary_path_positions)):
+                bp = boundary_path_positions[i]
+                # Sample points between boundary and the membrane interior
+                # (toward the midpoint of the escape paths)
+                mid_depth_i = path_i_positions[n_i // 2] if n_i > 1 else path_i_positions[0]
+                mid_depth_j = path_j_positions[n_j // 2] if n_j > 1 else path_j_positions[0]
+                interior_target = (mid_depth_i + mid_depth_j) / 2
+                
+                for t in [0.2, 0.4]:
+                    sample = bp * (1 - t) + interior_target * t
+                    sample_points.append(sample)
+    
+    if len(sample_points) == 0:
+        return False
+    
+    sample_points = np.array(sample_points)
+    
+    # Filter out points that are ON the part surface (seeds are on the surface)
+    # We only want to check interior membrane points
+    try:
+        _, distances_to_surface, _ = part_mesh.nearest.on_surface(sample_points)
+        
+        # Only keep points that are NOT on the surface
+        surface_threshold = distance_tolerance * 0.1
+        interior_mask = distances_to_surface > surface_threshold
+        
+        if not np.any(interior_mask):
+            # All samples are on the surface - no interior to check
+            return False
+        
+        interior_samples = sample_points[interior_mask]
+        
+        # Check if any interior sample point is INSIDE the part mesh
+        inside = part_mesh.contains(interior_samples)
+        n_inside = np.sum(inside)
+        
+        if n_inside > 0:
+            logger.debug(f"Edge ({vi}, {vj}): {n_inside}/{len(interior_samples)} membrane samples inside part")
+            return True
+        
+        # With higher sensitivity, check for samples close to surface
+        if sensitivity > 0.3:
+            interior_distances = distances_to_surface[interior_mask]
+            n_close = np.sum(interior_distances < distance_tolerance)
+            threshold_fraction = 0.1 * (1.0 - sensitivity)
+            if n_close > len(interior_distances) * threshold_fraction:
+                logger.debug(f"Edge ({vi}, {vj}): {n_close}/{len(interior_distances)} samples within tolerance")
+                return True
+                
+                
+    except Exception as e:
+        logger.warning(f"Error checking membrane intersection: {e}")
+    
+    return False

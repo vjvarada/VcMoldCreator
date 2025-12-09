@@ -10,7 +10,7 @@ Provides interactive 3D viewing of STL meshes with:
 """
 
 import logging
-from typing import Optional, List, Tuple
+from typing import Optional, List
 import numpy as np
 
 try:
@@ -133,8 +133,14 @@ class MeshViewer(QWidget):
         self._tet_original_visible = False
         
         # Dijkstra result visualization (tetrahedra colored by escape label)
-        self._dijkstra_actor = None
+        self._dijkstra_actor = None  # H1/H2 edges (green/orange)
+        self._dijkstra_primary_cuts_actor = None  # Primary cuts only (yellow)
         self._dijkstra_visible = True
+        self._dijkstra_show_h1h2 = True  # Toggle for H1/H2 edges visibility
+        
+        # Secondary cuts visualization (edges in red)
+        self._secondary_cuts_actor = None
+        self._secondary_cuts_visible = True
         
         # Inflated boundary mesh visualization
         self._inflated_boundary_actor = None
@@ -944,6 +950,10 @@ class MeshViewer(QWidget):
         # Reset Dijkstra visualization state
         self._dijkstra_actor = None
         self._dijkstra_visible = True
+        
+        # Reset secondary cuts visualization state
+        self._secondary_cuts_actor = None
+        self._secondary_cuts_visible = True
         
         # Reset inflated boundary mesh state
         self._inflated_boundary_actor = None
@@ -3056,23 +3066,31 @@ class MeshViewer(QWidget):
     def set_dijkstra_result(
         self,
         vertices: np.ndarray,
-        seed_vertex_indices: np.ndarray,
-        seed_escape_labels: np.ndarray,
+        interior_vertex_indices: np.ndarray,
+        interior_escape_labels: np.ndarray,
         boundary_mesh: 'trimesh.Trimesh' = None,
-        seed_distances: np.ndarray = None
+        interior_distances: np.ndarray = None,
+        tet_edges: np.ndarray = None
     ):
         """
-        Display Dijkstra results as colored edges on the inner boundary mesh.
+        Display Dijkstra results as colored edges for ALL interior vertices.
         
-        Shows the inner boundary (part surface) with edges colored by which 
-        boundary (H1 or H2) each seed vertex walks to via the shortest weighted path.
+        Shows all interior edges (edges where both vertices are interior - not on H1/H2)
+        colored by which boundary (H1 or H2) each vertex walks to via the shortest weighted path.
+        
+        Edge colors:
+        - Green: both endpoints walk to H1
+        - Orange: both endpoints walk to H2  
+        - Yellow: endpoints walk to opposite boundaries (parting surface passes through)
+        - Gray: one or both endpoints unreachable
         
         Args:
             vertices: (N, 3) vertex positions (use original for proper geometry)
-            seed_vertex_indices: (S,) indices of seed vertices in the tet mesh
-            seed_escape_labels: (S,) labels: 1=walks to H1, 2=walks to H2, 0=unreachable
-            boundary_mesh: The tetrahedral boundary mesh (to extract inner boundary edges)
-            seed_distances: (S,) optional distances to boundary
+            interior_vertex_indices: (I,) indices of interior vertices in the tet mesh
+            interior_escape_labels: (I,) labels: 1=walks to H1, 2=walks to H2, 0=unreachable
+            boundary_mesh: The tetrahedral boundary mesh (fallback for edge extraction)
+            interior_distances: (I,) optional distances to boundary
+            tet_edges: (E, 2) tetrahedral mesh edges - used to find all interior edges
         """
         if not PYVISTA_AVAILABLE:
             return
@@ -3080,25 +3098,34 @@ class MeshViewer(QWidget):
         # Remove existing actor
         self.clear_dijkstra_result()
         
-        n_seeds = len(seed_vertex_indices)
-        if n_seeds == 0:
-            logger.warning("No seed vertices to visualize")
+        n_interior = len(interior_vertex_indices)
+        if n_interior == 0:
+            logger.warning("No interior vertices to visualize")
             return
             
-        logger.info(f"Setting Dijkstra result: {n_seeds} seed vertices")
+        logger.info(f"Setting Dijkstra result: {n_interior} interior vertices")
         
         # Create a mapping from tet vertex index to escape label
-        # Initialize all vertices as 0 (not a seed)
-        vertex_escape_labels = np.zeros(len(vertices), dtype=np.int8)
-        for i, seed_idx in enumerate(seed_vertex_indices):
-            vertex_escape_labels[seed_idx] = seed_escape_labels[i]
+        # Initialize all vertices as -1 (not interior / on boundary)
+        vertex_escape_labels = np.full(len(vertices), -1, dtype=np.int8)
+        for i, vert_idx in enumerate(interior_vertex_indices):
+            vertex_escape_labels[vert_idx] = interior_escape_labels[i]
         
-        # Get seed vertex positions for building edges
-        seed_set = set(seed_vertex_indices)
+        # Get interior vertex set for fast lookup
+        interior_set = set(interior_vertex_indices)
         
-        # Build edges connecting seed vertices
-        # Use boundary mesh faces to find edges between seeds
-        if boundary_mesh is not None:
+        # Build edges connecting interior vertices
+        # Use tetrahedral mesh edges if provided, otherwise fall back to boundary mesh
+        edge_set = set()
+        
+        if tet_edges is not None:
+            # Use all tet edges where BOTH vertices are interior
+            for v0, v1 in tet_edges:
+                if v0 in interior_set and v1 in interior_set:
+                    edge_set.add((min(v0, v1), max(v0, v1)))
+            logger.info(f"Found {len(edge_set)} interior edges from {len(tet_edges)} tet edges")
+        elif boundary_mesh is not None:
+            # Fallback: use boundary mesh faces
             from scipy.spatial import cKDTree
             
             # Map boundary mesh vertices to tet vertices
@@ -3106,8 +3133,7 @@ class MeshViewer(QWidget):
             tet_tree = cKDTree(vertices)
             _, boundary_to_tet = tet_tree.query(boundary_verts, k=1)
             
-            # Find edges from boundary mesh faces where BOTH vertices are seeds
-            edge_set = set()
+            # Find edges from boundary mesh faces where BOTH vertices are interior
             for face in boundary_mesh.faces:
                 tet_v0 = boundary_to_tet[face[0]]
                 tet_v1 = boundary_to_tet[face[1]]
@@ -3115,71 +3141,102 @@ class MeshViewer(QWidget):
                 
                 # Check each edge of this face
                 for va, vb in [(tet_v0, tet_v1), (tet_v1, tet_v2), (tet_v2, tet_v0)]:
-                    if va in seed_set and vb in seed_set:
+                    if va in interior_set and vb in interior_set:
                         edge_set.add((min(va, vb), max(va, vb)))
-            
-            edges = np.array(list(edge_set)) if edge_set else np.empty((0, 2), dtype=np.int64)
-        else:
-            # Fallback: just show points if no boundary mesh
-            edges = np.empty((0, 2), dtype=np.int64)
+        
+        edges = np.array(list(edge_set)) if edge_set else np.empty((0, 2), dtype=np.int64)
         
         n_edges = len(edges)
-        logger.info(f"Found {n_edges} edges between seed vertices")
+        logger.info(f"Found {n_edges} edges between interior vertices")
         
         if n_edges > 0:
-            # Assign edge colors based on endpoint escape labels
-            edge_colors = np.zeros((n_edges, 3), dtype=np.uint8)
+            # Separate edges into H1/H2 edges and primary cut (yellow) edges
+            h1h2_edges = []  # Green and orange edges
+            primary_cut_edges = []  # Yellow edges
+            h1h2_colors = []
             
             for i, (v0, v1) in enumerate(edges):
                 l0 = vertex_escape_labels[v0]
                 l1 = vertex_escape_labels[v1]
                 
-                # Color based on labels
-                if l0 == 1 and l1 == 1:
-                    edge_colors[i] = [76, 175, 80]  # Green - both walk to H1
+                # Classify edge
+                if (l0 == 1 and l1 == 2) or (l0 == 2 and l1 == 1):
+                    # Yellow - primary cut (interface between H1 and H2)
+                    primary_cut_edges.append((v0, v1))
+                elif l0 == 1 and l1 == 1:
+                    h1h2_edges.append((v0, v1))
+                    h1h2_colors.append([76, 175, 80])  # Green - both walk to H1
                 elif l0 == 2 and l1 == 2:
-                    edge_colors[i] = [255, 152, 0]  # Orange - both walk to H2
-                elif (l0 == 1 and l1 == 2) or (l0 == 2 and l1 == 1):
-                    edge_colors[i] = [255, 255, 0]  # Yellow - interface between H1 and H2
+                    h1h2_edges.append((v0, v1))
+                    h1h2_colors.append([255, 152, 0])  # Orange - both walk to H2
                 elif l0 == 1 or l1 == 1:
-                    edge_colors[i] = [76, 175, 80]  # Green - at least one walks to H1
+                    h1h2_edges.append((v0, v1))
+                    h1h2_colors.append([76, 175, 80])  # Green - at least one walks to H1
                 elif l0 == 2 or l1 == 2:
-                    edge_colors[i] = [255, 152, 0]  # Orange - at least one walks to H2
+                    h1h2_edges.append((v0, v1))
+                    h1h2_colors.append([255, 152, 0])  # Orange - at least one walks to H2
                 else:
-                    edge_colors[i] = [150, 150, 150]  # Gray - unreachable
+                    h1h2_edges.append((v0, v1))
+                    h1h2_colors.append([150, 150, 150])  # Gray - unreachable
             
-            # Build cells array for lines: [2, p0, p1, 2, p0, p1, ...]
-            cells = np.empty((n_edges, 3), dtype=np.int64)
-            cells[:, 0] = 2  # Each line has 2 points
-            cells[:, 1] = edges[:, 0]
-            cells[:, 2] = edges[:, 1]
-            cells = cells.ravel()
+            # Create actor for H1/H2 edges (green/orange/gray)
+            if len(h1h2_edges) > 0:
+                h1h2_edges_arr = np.array(h1h2_edges)
+                h1h2_colors_arr = np.array(h1h2_colors, dtype=np.uint8)
+                
+                cells = np.empty((len(h1h2_edges), 3), dtype=np.int64)
+                cells[:, 0] = 2
+                cells[:, 1] = h1h2_edges_arr[:, 0]
+                cells[:, 2] = h1h2_edges_arr[:, 1]
+                cells = cells.ravel()
+                
+                cell_types = np.full(len(h1h2_edges), 3, dtype=np.uint8)
+                edge_grid = pv.UnstructuredGrid(cells, cell_types, vertices.astype(np.float64))
+                edge_grid.cell_data['colors'] = h1h2_colors_arr
+                
+                self._dijkstra_actor = self.plotter.add_mesh(
+                    edge_grid,
+                    scalars='colors',
+                    rgb=True,
+                    line_width=4,
+                    show_edges=False,
+                    show_scalar_bar=False
+                )
             
-            # Cell types: VTK_LINE = 3
-            cell_types = np.full(n_edges, 3, dtype=np.uint8)
+            # Create separate actor for primary cut edges (yellow)
+            if len(primary_cut_edges) > 0:
+                primary_edges_arr = np.array(primary_cut_edges)
+                primary_colors = np.full((len(primary_cut_edges), 3), [255, 255, 0], dtype=np.uint8)
+                
+                cells = np.empty((len(primary_cut_edges), 3), dtype=np.int64)
+                cells[:, 0] = 2
+                cells[:, 1] = primary_edges_arr[:, 0]
+                cells[:, 2] = primary_edges_arr[:, 1]
+                cells = cells.ravel()
+                
+                cell_types = np.full(len(primary_cut_edges), 3, dtype=np.uint8)
+                edge_grid = pv.UnstructuredGrid(cells, cell_types, vertices.astype(np.float64))
+                edge_grid.cell_data['colors'] = primary_colors
+                
+                self._dijkstra_primary_cuts_actor = self.plotter.add_mesh(
+                    edge_grid,
+                    scalars='colors',
+                    rgb=True,
+                    line_width=5,  # Slightly thicker for emphasis
+                    show_edges=False,
+                    show_scalar_bar=False
+                )
             
-            # Create unstructured grid for lines
-            edge_grid = pv.UnstructuredGrid(cells, cell_types, vertices.astype(np.float64))
-            edge_grid.cell_data['colors'] = edge_colors
-            
-            # Add edges as colored lines
-            self._dijkstra_actor = self.plotter.add_mesh(
-                edge_grid,
-                scalars='colors',
-                rgb=True,
-                line_width=4,
-                show_edges=False,
-                show_scalar_bar=False
-            )
+            logger.info(f"Created {len(h1h2_edges)} H1/H2 edges, {len(primary_cut_edges)} primary cut edges")
         else:
-            # Fallback: show seed points if no edges
-            seed_positions = vertices[seed_vertex_indices]
-            point_cloud = pv.PolyData(seed_positions.astype(np.float64))
+            # Fallback: show interior points if no edges
+            interior_positions = vertices[interior_vertex_indices]
+            point_cloud = pv.PolyData(interior_positions.astype(np.float64))
             
-            colors = np.zeros((n_seeds, 3), dtype=np.uint8)
-            colors[seed_escape_labels == 1] = [76, 175, 80]  # Green
-            colors[seed_escape_labels == 2] = [255, 152, 0]  # Orange
-            colors[seed_escape_labels == 0] = [150, 150, 150]  # Gray
+            colors = np.zeros((n_interior, 3), dtype=np.uint8)
+            colors[interior_escape_labels == 1] = [76, 175, 80]  # Green
+            colors[interior_escape_labels == 2] = [255, 152, 0]  # Orange
+            colors[interior_escape_labels == 0] = [150, 150, 150]  # Gray
             
             point_cloud.point_data['colors'] = colors
             
@@ -3192,15 +3249,22 @@ class MeshViewer(QWidget):
                 show_scalar_bar=False
             )
         
+        # Set visibility based on current state
         if self._dijkstra_actor is not None:
-            self._dijkstra_actor.SetVisibility(self._dijkstra_visible)
+            self._dijkstra_actor.SetVisibility(self._dijkstra_visible and self._dijkstra_show_h1h2)
+        if self._dijkstra_primary_cuts_actor is not None:
+            self._dijkstra_primary_cuts_actor.SetVisibility(self._dijkstra_visible)
         
         self.plotter.update()
         
-        n_h1 = np.sum(seed_escape_labels == 1)
-        n_h2 = np.sum(seed_escape_labels == 2)
-        n_unreached = np.sum(seed_escape_labels == 0)
-        logger.info(f"Dijkstra visualization: {n_h1} seeds→H1 (green), {n_h2} seeds→H2 (orange), {n_unreached} unreached")
+        n_h1 = np.sum(interior_escape_labels == 1)
+        n_h2 = np.sum(interior_escape_labels == 2)
+        n_unreached = np.sum(interior_escape_labels == 0)
+        
+        # Count yellow (parting) edges
+        n_yellow = len(primary_cut_edges) if n_edges > 0 else 0
+        
+        logger.info(f"Dijkstra visualization: {n_h1} verts→H1 (green), {n_h2} verts→H2 (orange), {n_yellow} parting edges (yellow), {n_unreached} unreached")
     
     def clear_dijkstra_result(self):
         """Remove Dijkstra result visualization."""
@@ -3213,13 +3277,30 @@ class MeshViewer(QWidget):
             except Exception:
                 pass
             self._dijkstra_actor = None
+        
+        if self._dijkstra_primary_cuts_actor is not None:
+            try:
+                self.plotter.remove_actor(self._dijkstra_primary_cuts_actor)
+            except Exception:
+                pass
+            self._dijkstra_primary_cuts_actor = None
     
     def set_dijkstra_visible(self, visible: bool):
-        """Set visibility of Dijkstra result."""
+        """Set visibility of Dijkstra result (both H1/H2 and primary cuts)."""
         self._dijkstra_visible = visible
         
         if self._dijkstra_actor is not None:
-            self._dijkstra_actor.SetVisibility(visible)
+            self._dijkstra_actor.SetVisibility(visible and self._dijkstra_show_h1h2)
+        if self._dijkstra_primary_cuts_actor is not None:
+            self._dijkstra_primary_cuts_actor.SetVisibility(visible)
+        self.plotter.update()
+    
+    def set_dijkstra_show_h1h2(self, show: bool):
+        """Set visibility of H1/H2 edges only (green/orange). Primary cuts (yellow) always shown when dijkstra visible."""
+        self._dijkstra_show_h1h2 = show
+        
+        if self._dijkstra_actor is not None:
+            self._dijkstra_actor.SetVisibility(self._dijkstra_visible and show)
             self.plotter.update()
     
     @property
@@ -3228,6 +3309,107 @@ class MeshViewer(QWidget):
         return self._dijkstra_visible
     
     @property
+    def dijkstra_show_h1h2(self) -> bool:
+        """Check if H1/H2 edges are visible."""
+        return self._dijkstra_show_h1h2
+    
+    @property
     def has_dijkstra(self) -> bool:
         """Check if Dijkstra result exists."""
-        return self._dijkstra_actor is not None
+        return self._dijkstra_actor is not None or self._dijkstra_primary_cuts_actor is not None
+
+    # =========================================================================
+    # SECONDARY CUTS VISUALIZATION
+    # =========================================================================
+    
+    def set_secondary_cuts(
+        self,
+        vertices: np.ndarray,
+        secondary_cut_edges: list
+    ):
+        """
+        Display secondary cutting edges in red.
+        
+        Args:
+            vertices: (N, 3) vertex positions
+            secondary_cut_edges: List of (vi, vj) tuples representing secondary cut edges
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        # Remove existing actor
+        self.clear_secondary_cuts()
+        
+        n_edges = len(secondary_cut_edges)
+        if n_edges == 0:
+            logger.info("No secondary cutting edges to visualize")
+            return
+        
+        logger.info(f"Setting secondary cuts visualization: {n_edges} edges")
+        
+        # Convert to numpy array
+        edges = np.array(secondary_cut_edges, dtype=np.int64)
+        
+        # All edges are red
+        edge_colors = np.full((n_edges, 3), [255, 0, 0], dtype=np.uint8)
+        
+        # Build cells array for lines: [2, p0, p1, 2, p0, p1, ...]
+        cells = np.empty((n_edges, 3), dtype=np.int64)
+        cells[:, 0] = 2  # Each line has 2 points
+        cells[:, 1] = edges[:, 0]
+        cells[:, 2] = edges[:, 1]
+        cells = cells.ravel()
+        
+        # Cell types: VTK_LINE = 3
+        cell_types = np.full(n_edges, 3, dtype=np.uint8)
+        
+        # Create unstructured grid for lines
+        edge_grid = pv.UnstructuredGrid(cells, cell_types, vertices.astype(np.float64))
+        edge_grid.cell_data['colors'] = edge_colors
+        
+        # Add edges as red lines - thicker than Dijkstra edges
+        self._secondary_cuts_actor = self.plotter.add_mesh(
+            edge_grid,
+            scalars='colors',
+            rgb=True,
+            line_width=5,
+            show_edges=False,
+            show_scalar_bar=False
+        )
+        
+        if self._secondary_cuts_actor is not None:
+            self._secondary_cuts_actor.SetVisibility(self._secondary_cuts_visible)
+        
+        self.plotter.update()
+        logger.info(f"Secondary cuts visualization: {n_edges} edges shown in red")
+    
+    def clear_secondary_cuts(self):
+        """Remove secondary cuts visualization."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        if self._secondary_cuts_actor is not None:
+            try:
+                self.plotter.remove_actor(self._secondary_cuts_actor)
+                self.plotter.update()  # Force visual update after removal
+            except Exception:
+                pass
+            self._secondary_cuts_actor = None
+    
+    def set_secondary_cuts_visible(self, visible: bool):
+        """Set visibility of secondary cuts."""
+        self._secondary_cuts_visible = visible
+        
+        if self._secondary_cuts_actor is not None:
+            self._secondary_cuts_actor.SetVisibility(visible)
+            self.plotter.update()
+    
+    @property
+    def secondary_cuts_visible(self) -> bool:
+        """Check if secondary cuts are visible."""
+        return self._secondary_cuts_visible
+    
+    @property
+    def has_secondary_cuts(self) -> bool:
+        """Check if secondary cuts exist."""
+        return self._secondary_cuts_actor is not None
