@@ -37,7 +37,20 @@ except ImportError:
     TORCH_AVAILABLE = False
     CUDA_AVAILABLE = False
 
+# Check for C++ fast algorithms
+try:
+    from . import fast_algorithms as _cpp_fast
+    CPP_FAST_AVAILABLE = True
+except ImportError:
+    CPP_FAST_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
+
+if CPP_FAST_AVAILABLE:
+    logger.info("C++ fast_algorithms available - using optimized Dijkstra and edge labeling")
+else:
+    logger.info("C++ fast_algorithms not compiled - using Python implementations. "
+                "For 10-20x speedup: cd desktop_app/core && python setup_cpp.py build_ext --inplace")
 
 
 @dataclass
@@ -615,12 +628,74 @@ def compute_edge_boundary_labels(
     as boundary edges. Tetrahedral edges that connect boundary vertices but pass through
     the interior (through concave regions) are labeled as interior edges (0).
     
+    Uses C++ implementation when available for faster performance.
+    
     Args:
         tet_result: Tetrahedral mesh result with boundary_labels computed
     
     Returns:
         (E,) int8 array of edge boundary labels
     """
+    # Use C++ implementation if available
+    if CPP_FAST_AVAILABLE:
+        return _compute_edge_boundary_labels_cpp(tet_result)
+    else:
+        return _compute_edge_boundary_labels_python(tet_result)
+
+
+def _compute_edge_boundary_labels_cpp(
+    tet_result: 'TetrahedralMeshResult'
+) -> np.ndarray:
+    """C++ implementation of edge boundary label computation."""
+    import time
+    start_time = time.time()
+    
+    edges = tet_result.edges
+    n_edges = len(edges)
+    
+    boundary_labels = tet_result.boundary_labels
+    if boundary_labels is None:
+        logger.warning("No boundary labels available for edge labeling")
+        return np.zeros(n_edges, dtype=np.int8)
+    
+    boundary_mesh = tet_result.boundary_mesh
+    if boundary_mesh is None:
+        logger.warning("No boundary_mesh available for edge labeling")
+        return np.zeros(n_edges, dtype=np.int8)
+    
+    # Prepare arrays for C++ call
+    edges_arr = np.asarray(edges, dtype=np.int64)
+    boundary_labels_arr = np.asarray(boundary_labels, dtype=np.int8)
+    boundary_faces = np.asarray(boundary_mesh.faces, dtype=np.int64)
+    boundary_mesh_vertices = np.asarray(boundary_mesh.vertices, dtype=np.float64)
+    tet_vertices = np.asarray(tet_result.vertices, dtype=np.float64)
+    
+    # Call C++ implementation
+    edge_labels = _cpp_fast.compute_edge_boundary_labels(
+        edges_arr, boundary_labels_arr, boundary_faces, boundary_mesh_vertices, tet_vertices
+    )
+    
+    elapsed = (time.time() - start_time) * 1000
+    
+    # Count stats
+    n_interior = np.sum(edge_labels == 0)
+    n_h1 = np.sum(edge_labels == 1)
+    n_h2 = np.sum(edge_labels == 2)
+    n_inner = np.sum(edge_labels == -1)
+    n_mixed = np.sum(edge_labels == -2)
+    
+    logger.info(
+        f"[C++] Edge boundary labels computed in {elapsed:.0f}ms: "
+        f"interior={n_interior}, H1={n_h1}, H2={n_h2}, inner={n_inner}, mixed={n_mixed}"
+    )
+    
+    return np.asarray(edge_labels)
+
+
+def _compute_edge_boundary_labels_python(
+    tet_result: 'TetrahedralMeshResult'
+) -> np.ndarray:
+    """Python fallback implementation of edge boundary label computation."""
     edges = tet_result.edges
     n_edges = len(edges)
     
@@ -1531,6 +1606,8 @@ def run_dijkstra_escape_labeling(
     either the H1 or H2 boundary. The vertex is labeled based on which boundary it 
     reaches first via the cheapest path.
     
+    Uses C++ implementation when available for 10-20x speedup.
+    
     Args:
         tet_result: Tetrahedral mesh result with boundary_labels and edge_weights computed
                    (uses the INFLATED mesh where edge weights were computed)
@@ -1547,6 +1624,72 @@ def run_dijkstra_escape_labeling(
             - interior_distances: (I,) float array of shortest path distances to boundary
             - interior_escape_destinations: (I,) int array of destination boundary vertex indices
             - interior_escape_paths: List of paths, each path is a list of vertex indices
+    """
+    # Use C++ implementation if available
+    if CPP_FAST_AVAILABLE:
+        return _run_dijkstra_escape_labeling_cpp(tet_result, use_weighted_edges)
+    else:
+        return _run_dijkstra_escape_labeling_python(tet_result, use_weighted_edges)
+
+
+def _run_dijkstra_escape_labeling_cpp(
+    tet_result: 'TetrahedralMeshResult',
+    use_weighted_edges: bool = True
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[List[int]]]:
+    """
+    C++ implementation of Dijkstra escape labeling - 10-20x faster than Python.
+    """
+    import time
+    start_time = time.time()
+    
+    boundary_labels = tet_result.boundary_labels
+    if boundary_labels is None:
+        raise ValueError("boundary_labels must be computed before running Dijkstra")
+    
+    # Prepare arrays for C++ call
+    edges = np.asarray(tet_result.edges, dtype=np.int64)
+    edge_lengths = np.asarray(tet_result.edge_lengths, dtype=np.float64)
+    edge_weights = np.asarray(tet_result.edge_weights, dtype=np.float64)
+    boundary_labels_arr = np.asarray(boundary_labels, dtype=np.int8)
+    
+    # Log info about interior vertices
+    interior_count = np.sum((boundary_labels_arr != 1) & (boundary_labels_arr != 2))
+    seed_count = np.sum(boundary_labels_arr == -1)
+    h1_count = np.sum(boundary_labels_arr == 1)
+    h2_count = np.sum(boundary_labels_arr == 2)
+    
+    logger.info(f"[C++] Dijkstra: {interior_count} interior ({seed_count} seeds), {h1_count} H1, {h2_count} H2 targets")
+    
+    # Call C++ implementation
+    result = _cpp_fast.dijkstra_escape_labeling(
+        edges, edge_lengths, edge_weights, boundary_labels_arr, use_weighted_edges
+    )
+    
+    elapsed = (time.time() - start_time) * 1000
+    
+    # Extract results
+    escape_labels = np.asarray(result.escape_labels)
+    vertex_indices = np.asarray(result.vertex_indices)
+    distances = np.asarray(result.distances)
+    destinations = np.asarray(result.destinations)
+    paths = [list(p) for p in result.paths]
+    
+    # Count results
+    n_h1 = np.sum(escape_labels == 1)
+    n_h2 = np.sum(escape_labels == 2)
+    n_unreached = np.sum(escape_labels == 0)
+    
+    logger.info(f"[C++] Dijkstra complete in {elapsed:.0f}ms: {n_h1}→H1, {n_h2}→H2, {n_unreached} unreached")
+    
+    return escape_labels, vertex_indices, distances, destinations, paths
+
+
+def _run_dijkstra_escape_labeling_python(
+    tet_result: 'TetrahedralMeshResult',
+    use_weighted_edges: bool = True
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[List[int]]]:
+    """
+    Python fallback implementation of Dijkstra escape labeling.
     """
     import heapq
     import time
