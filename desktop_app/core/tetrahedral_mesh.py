@@ -147,6 +147,9 @@ def tetrahedralize_mesh(
     """
     Generate tetrahedral mesh from a surface mesh using fTetWild.
     
+    fTetWild is extremely robust - handles non-manifold, self-intersecting,
+    and defective meshes gracefully.
+    
     Args:
         cavity_mesh: The cavity surface mesh (should be watertight)
         edge_length_fac: Target edge length as fraction of bounding box diagonal
@@ -160,6 +163,9 @@ def tetrahedralize_mesh(
     """
     if not PYTETWILD_AVAILABLE:
         raise ImportError("pytetwild is not installed. Install with: pip install pytetwild")
+    
+    import time
+    start = time.time()
     
     # Get vertices and faces from trimesh
     vertices = np.asarray(cavity_mesh.vertices, dtype=np.float64)
@@ -176,7 +182,45 @@ def tetrahedralize_mesh(
         edge_length_fac=edge_length_fac
     )
     
-    logger.info(f"Generated {len(tet_vertices)} vertices, {len(tetrahedra)} tetrahedra")
+    elapsed = (time.time() - start) * 1000
+    logger.info(f"Generated {len(tet_vertices)} vertices, {len(tetrahedra)} tetrahedra in {elapsed:.0f}ms")
+    
+    return tet_vertices, tetrahedra
+
+
+def _tetrahedralize_ftetwild(
+    cavity_mesh: trimesh.Trimesh,
+    edge_length_fac: float = 0.05,
+    optimize: bool = True
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Robust tetrahedralization using fTetWild.
+    
+    fTetWild is slower but extremely robust - handles non-manifold,
+    self-intersecting, and defective meshes gracefully.
+    """
+    import time
+    start = time.time()
+    
+    # Get vertices and faces from trimesh
+    vertices = np.asarray(cavity_mesh.vertices, dtype=np.float64)
+    faces = np.asarray(cavity_mesh.faces, dtype=np.int32)
+    
+    logger.info(f"[fTetWild] Tetrahedralizing mesh with {len(vertices)} vertices, {len(faces)} faces")
+    logger.info(f"Parameters: edge_length_fac={edge_length_fac}, optimize={optimize}")
+    
+    # Run fTetWild
+    tet_vertices, tetrahedra = pytetwild.tetrahedralize(
+        vertices, 
+        faces,
+        optimize=optimize,
+        edge_length_fac=edge_length_fac
+    )
+    
+    elapsed = (time.time() - start) * 1000
+    logger.info(f"[fTetWild] Generated {len(tet_vertices)} vertices, {len(tetrahedra)} tetrahedra in {elapsed:.0f}ms")
+    
+    return tet_vertices, tetrahedra
     
     return tet_vertices, tetrahedra
 
@@ -318,11 +362,15 @@ def extract_boundary_surface(
     # Merge any duplicate vertices (within tolerance)
     boundary_mesh.merge_vertices()
     
-    # Remove any degenerate faces (zero area)
-    boundary_mesh.remove_degenerate_faces()
+    # Remove any degenerate faces (zero area) - trimesh 4.x API
+    nondegenerate = boundary_mesh.nondegenerate_faces()
+    if nondegenerate.sum() < len(boundary_mesh.faces):
+        boundary_mesh.update_faces(nondegenerate)
     
-    # Remove any duplicate faces
-    boundary_mesh.remove_duplicate_faces()
+    # Remove any duplicate faces - trimesh 4.x API
+    unique_mask = boundary_mesh.unique_faces()
+    if unique_mask.sum() < len(boundary_mesh.faces):
+        boundary_mesh.update_faces(unique_mask)
     
     # Fix normals to point outward (consistent winding)
     boundary_mesh.fix_normals()
