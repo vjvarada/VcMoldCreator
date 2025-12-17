@@ -130,9 +130,32 @@ class TetrahedralMeshResult:
     # seed_escape_paths[i] = [start_v, v1, v2, ..., dest_v] path from interior vertex to boundary
     seed_escape_paths: Optional[List[List[int]]] = None
     
+    # Primary cutting edges - edges where one vertex escapes to H1 and the other to H2
+    # These are the edges the parting surface passes through (shown in yellow)
+    # List of (vi, vj) tuples representing primary cut edges
+    primary_cut_edges: Optional[List[Tuple[int, int]]] = None
+    
     # Secondary cutting edges - edges between same-label seeds where membrane intersects part
     # List of (vi, vj) tuples representing secondary cut edges
     secondary_cut_edges: Optional[List[Tuple[int, int]]] = None
+    
+    # =========================================================================
+    # PARTING SURFACE EXTRACTION DATA
+    # =========================================================================
+    
+    # Cut edge flags - True if edge is cut (primary OR secondary)
+    # Indexed by global edge ID (same ordering as self.edges)
+    # cut_edge_flags[e] = 1 means edge e is cut by parting/secondary surface
+    cut_edge_flags: Optional[np.ndarray] = None  # (E,) bool or int8
+    
+    # Edge index lookup - maps (min(vi,vj), max(vi,vj)) to global edge index
+    # Used for fast edge-to-index lookup during marching tets
+    edge_to_index: Optional[Dict[Tuple[int, int], int]] = None
+    
+    # Tet-to-edge mapping - for each tet, its 6 global edge indices
+    # tet_edge_indices[t, :] = [e0, e1, e2, e3, e4, e5] for tet t
+    # Edge order: (0,1), (0,2), (0,3), (1,2), (1,3), (2,3)
+    tet_edge_indices: Optional[np.ndarray] = None  # (M, 6) int64
     
     # Timing
     tetrahedralize_time_ms: float = 0.0
@@ -598,6 +621,153 @@ def compute_edge_lengths(vertices: np.ndarray, edges: np.ndarray) -> np.ndarray:
     v1 = vertices[edges[:, 1]]
     lengths = np.linalg.norm(v1 - v0, axis=1)
     return lengths
+
+
+# =============================================================================
+# PARTING SURFACE EXTRACTION HELPERS
+# =============================================================================
+
+def build_edge_to_index_map(edges: np.ndarray) -> Dict[Tuple[int, int], int]:
+    """
+    Build a dictionary mapping (vi, vj) edge tuples to global edge indices.
+    
+    Args:
+        edges: (E, 2) array of unique edges (sorted so v0 < v1)
+    
+    Returns:
+        Dictionary mapping (min(vi, vj), max(vi, vj)) -> edge index
+    """
+    edge_to_index = {}
+    for idx, (v0, v1) in enumerate(edges):
+        # Edges are already sorted, but ensure consistency
+        key = (int(min(v0, v1)), int(max(v0, v1)))
+        edge_to_index[key] = idx
+    return edge_to_index
+
+
+def build_tet_edge_indices(
+    tetrahedra: np.ndarray,
+    edge_to_index: Dict[Tuple[int, int], int]
+) -> np.ndarray:
+    """
+    Build tet-to-edge mapping: for each tetrahedron, get its 6 global edge indices.
+    
+    Edge order within each tet: (0,1), (0,2), (0,3), (1,2), (1,3), (2,3)
+    
+    Args:
+        tetrahedra: (M, 4) array of tetrahedron vertex indices
+        edge_to_index: Dictionary mapping (vi, vj) -> global edge index
+    
+    Returns:
+        (M, 6) array where tet_edge_indices[t, k] is the global edge index
+        for the k-th edge of tetrahedron t
+    """
+    n_tets = len(tetrahedra)
+    tet_edge_indices = np.zeros((n_tets, 6), dtype=np.int64)
+    
+    # Edge pairs within a tetrahedron (local vertex indices)
+    edge_pairs = [
+        (0, 1), (0, 2), (0, 3),
+        (1, 2), (1, 3), (2, 3)
+    ]
+    
+    for t in range(n_tets):
+        tet = tetrahedra[t]
+        for k, (i, j) in enumerate(edge_pairs):
+            vi, vj = int(tet[i]), int(tet[j])
+            key = (min(vi, vj), max(vi, vj))
+            tet_edge_indices[t, k] = edge_to_index[key]
+    
+    return tet_edge_indices
+
+
+def compute_cut_edge_flags(
+    edges: np.ndarray,
+    primary_cut_edges: Optional[List[Tuple[int, int]]],
+    secondary_cut_edges: Optional[List[Tuple[int, int]]],
+    edge_to_index: Optional[Dict[Tuple[int, int], int]] = None
+) -> np.ndarray:
+    """
+    Compute boolean array marking which edges are cut (primary OR secondary).
+    
+    Args:
+        edges: (E, 2) array of unique edges
+        primary_cut_edges: List of (vi, vj) primary cut edge tuples
+        secondary_cut_edges: List of (vi, vj) secondary cut edge tuples
+        edge_to_index: Optional pre-computed edge-to-index map
+    
+    Returns:
+        (E,) boolean array where cut_edge_flags[e] = True if edge e is cut
+    """
+    n_edges = len(edges)
+    cut_flags = np.zeros(n_edges, dtype=np.int8)
+    
+    # Build edge-to-index map if not provided
+    if edge_to_index is None:
+        edge_to_index = build_edge_to_index_map(edges)
+    
+    # Mark primary cut edges
+    if primary_cut_edges is not None:
+        for vi, vj in primary_cut_edges:
+            key = (min(vi, vj), max(vi, vj))
+            if key in edge_to_index:
+                cut_flags[edge_to_index[key]] = 1
+    
+    # Mark secondary cut edges
+    if secondary_cut_edges is not None:
+        for vi, vj in secondary_cut_edges:
+            key = (min(vi, vj), max(vi, vj))
+            if key in edge_to_index:
+                cut_flags[edge_to_index[key]] = 1
+    
+    return cut_flags
+
+
+def prepare_parting_surface_data(tet_result: 'TetrahedralMeshResult') -> 'TetrahedralMeshResult':
+    """
+    Prepare all data structures needed for parting surface extraction.
+    
+    This computes:
+    - edge_to_index: Dict mapping (vi, vj) -> global edge index
+    - tet_edge_indices: (M, 6) mapping from tet to its 6 edge indices
+    - cut_edge_flags: (E,) boolean marking cut edges
+    
+    Args:
+        tet_result: TetrahedralMeshResult with primary_cut_edges and secondary_cut_edges
+    
+    Returns:
+        Updated TetrahedralMeshResult with parting surface data populated
+    """
+    import time
+    start = time.time()
+    
+    # Build edge-to-index map
+    tet_result.edge_to_index = build_edge_to_index_map(tet_result.edges)
+    
+    # Build tet-to-edge mapping
+    tet_result.tet_edge_indices = build_tet_edge_indices(
+        tet_result.tetrahedra,
+        tet_result.edge_to_index
+    )
+    
+    # Compute cut edge flags
+    tet_result.cut_edge_flags = compute_cut_edge_flags(
+        tet_result.edges,
+        tet_result.primary_cut_edges,
+        tet_result.secondary_cut_edges,
+        tet_result.edge_to_index
+    )
+    
+    elapsed_ms = (time.time() - start) * 1000
+    
+    n_primary = len(tet_result.primary_cut_edges) if tet_result.primary_cut_edges else 0
+    n_secondary = len(tet_result.secondary_cut_edges) if tet_result.secondary_cut_edges else 0
+    n_cut = np.sum(tet_result.cut_edge_flags)
+    
+    logger.info(f"Prepared parting surface data in {elapsed_ms:.1f}ms: "
+                f"{n_primary} primary + {n_secondary} secondary = {n_cut} cut edges")
+    
+    return tet_result
 
 
 def compute_edge_weights_simple(

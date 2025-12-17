@@ -6,7 +6,7 @@ Designed to match the React frontend's UI/UX with Shards Dashboard theme.
 """
 
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
 from enum import Enum
 from datetime import datetime
@@ -77,6 +77,7 @@ class Step(Enum):
     EDGE_WEIGHTS = 'edge-weights'
     DIJKSTRA = 'dijkstra'              # Dijkstra walk to find parting surface
     SECONDARY_CUTS = 'secondary-cuts'  # Secondary cutting edges detection
+    PARTING_SURFACE = 'parting-surface'  # Primary parting surface generation
 
 
 STEPS = [
@@ -89,6 +90,7 @@ STEPS = [
     {'id': Step.EDGE_WEIGHTS, 'icon': '⚖️', 'title': 'Edge Weights', 'description': 'Compute edge weights based on distance to part surface'},
     {'id': Step.DIJKSTRA, 'icon': '🛤️', 'title': 'Dijkstra Walk', 'description': 'Find shortest paths from part surface to mold halves'},
     {'id': Step.SECONDARY_CUTS, 'icon': '✂️', 'title': 'Secondary Cuts', 'description': 'Detect secondary cutting edges where membrane intersects part'},
+    {'id': Step.PARTING_SURFACE, 'icon': '🔲', 'title': 'Parting Surface', 'description': 'Generate the primary parting surface mesh'},
 ]
 
 
@@ -1310,18 +1312,66 @@ class DijkstraWorker(QThread):
             self.tet_result.seed_escape_destinations = seed_escape_destinations
             self.tet_result.seed_escape_paths = seed_escape_paths
             
+            # Compute primary cut edges (edges where one vertex → H1, other → H2)
+            self.progress.emit("Computing primary cut edges...")
+            primary_cut_edges = self._compute_primary_cut_edges(
+                self.tet_result.edges,
+                seed_vertex_indices,
+                seed_escape_labels
+            )
+            self.tet_result.primary_cut_edges = primary_cut_edges
+            
             elapsed = (time.time() - start_time) * 1000
             
             n_h1 = np.sum(seed_escape_labels == 1)
             n_h2 = np.sum(seed_escape_labels == 2)
             n_unreached = np.sum(seed_escape_labels == 0)
             
-            self.progress.emit(f"Complete in {elapsed:.0f}ms: {n_h1} seeds→H1, {n_h2} seeds→H2")
+            self.progress.emit(f"Complete in {elapsed:.0f}ms: {n_h1} seeds→H1, {n_h2} seeds→H2, {len(primary_cut_edges)} primary cuts")
             self.complete.emit(self.tet_result)
             
         except Exception as e:
             logger.exception(f"Error in Dijkstra: {e}")
             self.error.emit(str(e))
+    
+    def _compute_primary_cut_edges(
+        self,
+        edges: np.ndarray,
+        interior_vertex_indices: np.ndarray,
+        interior_escape_labels: np.ndarray
+    ) -> List[Tuple[int, int]]:
+        """
+        Compute primary cut edges - edges where one vertex escapes to H1 and other to H2.
+        
+        These are the edges the parting surface passes through.
+        
+        Args:
+            edges: (E, 2) all tetrahedral mesh edges
+            interior_vertex_indices: (I,) indices of interior vertices
+            interior_escape_labels: (I,) escape labels (1=H1, 2=H2, 0=unreachable)
+        
+        Returns:
+            List of (vi, vj) tuples for primary cut edges
+        """
+        # Build vertex -> escape label mapping
+        n_verts = np.max(edges) + 1 if len(edges) > 0 else 0
+        vertex_labels = np.full(n_verts, -1, dtype=np.int8)  # -1 = boundary or not interior
+        
+        for i, vert_idx in enumerate(interior_vertex_indices):
+            vertex_labels[vert_idx] = interior_escape_labels[i]
+        
+        # Find edges where one endpoint → H1 and other → H2
+        primary_cuts = []
+        for v0, v1 in edges:
+            l0 = vertex_labels[v0]
+            l1 = vertex_labels[v1]
+            
+            # Primary cut: one goes to H1 (1), other goes to H2 (2)
+            if (l0 == 1 and l1 == 2) or (l0 == 2 and l1 == 1):
+                primary_cuts.append((int(v0), int(v1)))
+        
+        logger.info(f"Found {len(primary_cuts)} primary cut edges")
+        return primary_cuts
 
 
 class SecondaryCutsWorker(QThread):
@@ -2813,6 +2863,8 @@ class MainWindow(QMainWindow):
             self._setup_dijkstra_step()
         elif self._active_step == Step.SECONDARY_CUTS:
             self._setup_secondary_cuts_step()
+        elif self._active_step == Step.PARTING_SURFACE:
+            self._setup_parting_surface_step()
         
         self.context_layout.addStretch()
     
@@ -5600,6 +5652,10 @@ class MainWindow(QMainWindow):
         # Update step status
         self.step_buttons[Step.SECONDARY_CUTS].set_status('completed')
         
+        # Unlock parting surface step
+        if Step.PARTING_SURFACE in self.step_buttons:
+            self.step_buttons[Step.PARTING_SURFACE].set_status('ready')
+        
         n_secondary = len(result.secondary_cut_edges) if result.secondary_cut_edges else 0
         logger.info(f"Secondary cuts complete: {n_secondary} secondary cutting edges found")
     
@@ -5626,6 +5682,174 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 pass
         self._secondary_cuts_worker = None
+
+    # ========================================================================
+    # PARTING SURFACE STEP
+    # ========================================================================
+    
+    def _setup_parting_surface_step(self):
+        """Setup the parting surface step UI."""
+        # Check prerequisites
+        if self._tet_result is None or self._tet_result.secondary_cut_edges is None:
+            no_secondary_label = QLabel("⚠️ Please run Secondary Cuts first.")
+            no_secondary_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_secondary_label.setWordWrap(True)
+            self.context_layout.addWidget(no_secondary_label)
+            return
+        
+        # Description section
+        info_group = QGroupBox("Primary Parting Surface")
+        info_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        info_layout = QVBoxLayout(info_group)
+        
+        info_text = QLabel(
+            "Generate the primary parting surface mesh that separates "
+            "the two mold halves H₁ and H₂.\n\n"
+            "The parting surface is constructed from:\n"
+            "• Escape paths from interior vertices to mold halves\n"
+            "• Shortest paths along the mold half interface\n"
+            "• Primary cutting edges (seed edges)\n\n"
+            "This surface defines where the mold will split."
+        )
+        info_text.setWordWrap(True)
+        info_text.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px; line-height: 1.4;')
+        info_layout.addWidget(info_text)
+        
+        self.context_layout.addWidget(info_group)
+        
+        # Info about current state
+        result = self._tet_result
+        state_info = StatsBox()
+        state_info.add_header('Current State', Colors.INFO)
+        
+        if result.seed_escape_paths is not None:
+            n_paths = len(result.seed_escape_paths)
+            state_info.add_row(f'Escape paths computed: {n_paths:,}')
+        
+        if result.secondary_cut_edges is not None:
+            n_secondary = len(result.secondary_cut_edges)
+            state_info.add_row(f'Secondary cut edges: {n_secondary:,}')
+        
+        if result.primary_cut_edges is not None:
+            n_primary = len(result.primary_cut_edges)
+            state_info.add_row(f'Primary cut edges: {n_primary:,}')
+        
+        self.context_layout.addWidget(state_info)
+        
+        # Compute button
+        self.parting_surface_btn = QPushButton("🔲 Generate Parting Surface")
+        self.parting_surface_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.parting_surface_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {Colors.PRIMARY};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: #0069d9;
+            }}
+            QPushButton:disabled {{
+                background-color: {Colors.GRAY_LIGHT};
+                color: {Colors.GRAY};
+            }}
+        """)
+        self.parting_surface_btn.clicked.connect(self._on_run_parting_surface)
+        self.context_layout.addWidget(self.parting_surface_btn)
+        
+        # Progress bar
+        self.parting_surface_progress = QProgressBar()
+        self.parting_surface_progress.setStyleSheet(f"""
+            QProgressBar {{
+                border: none;
+                border-radius: 4px;
+                background-color: {Colors.LIGHT};
+                height: 8px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {Colors.PRIMARY};
+                border-radius: 4px;
+            }}
+        """)
+        self.parting_surface_progress.setTextVisible(False)
+        self.parting_surface_progress.setRange(0, 0)  # Indeterminate
+        self.parting_surface_progress.hide()
+        self.context_layout.addWidget(self.parting_surface_progress)
+        
+        # Progress label
+        self.parting_surface_progress_label = QLabel("")
+        self.parting_surface_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.parting_surface_progress_label.hide()
+        self.context_layout.addWidget(self.parting_surface_progress_label)
+        
+        # Stats (show if computed)
+        self.parting_surface_stats = StatsBox()
+        self.parting_surface_stats.hide()
+        self.context_layout.addWidget(self.parting_surface_stats)
+        
+        # Update UI with current state
+        self._update_parting_surface_step_ui()
+    
+    def _update_parting_surface_step_ui(self):
+        """Update parting surface step UI based on current state."""
+        if not hasattr(self, 'parting_surface_stats'):
+            return
+        
+        # TODO: Check if parting surface has been computed and update stats
+        pass
+    
+    def _on_run_parting_surface(self):
+        """Start parting surface generation."""
+        if self._tet_result is None:
+            QMessageBox.warning(self, "Warning", "No tetrahedral mesh data available")
+            return
+        
+        # Show progress
+        self.parting_surface_btn.setEnabled(False)
+        self.parting_surface_progress.show()
+        self.parting_surface_progress_label.show()
+        self.parting_surface_progress_label.setText("Generating parting surface...")
+        self.parting_surface_stats.hide()
+        
+        # TODO: Implement parting surface generation
+        # For now, just show a placeholder message
+        QMessageBox.information(
+            self, 
+            "Coming Soon", 
+            "Parting surface generation will be implemented in the next step.\n\n"
+            "This will create a triangulated mesh representing the primary parting surface "
+            "that separates the two mold halves."
+        )
+        
+        # Reset UI
+        self.parting_surface_btn.setEnabled(True)
+        self.parting_surface_progress.hide()
+        self.parting_surface_progress_label.hide()
 
     def _load_mesh(self, file_path: str, scale_factor: float = 1.0):
         """Load and process a mesh file."""
