@@ -723,6 +723,76 @@ def compute_cut_edge_flags(
     return cut_flags
 
 
+def compute_primary_cut_edge_flags(
+    edges: np.ndarray,
+    primary_cut_edges: Optional[List[Tuple[int, int]]],
+    edge_to_index: Optional[Dict[Tuple[int, int], int]] = None
+) -> np.ndarray:
+    """
+    Compute boolean array marking which edges are PRIMARY cut edges only.
+    
+    Args:
+        edges: (E, 2) array of unique edges
+        primary_cut_edges: List of (vi, vj) primary cut edge tuples
+        edge_to_index: Optional pre-computed edge-to-index map
+    
+    Returns:
+        (E,) boolean array where flags[e] = True if edge e is a primary cut
+    """
+    n_edges = len(edges)
+    cut_flags = np.zeros(n_edges, dtype=np.int8)
+    
+    if primary_cut_edges is None:
+        return cut_flags
+    
+    # Build edge-to-index map if not provided
+    if edge_to_index is None:
+        edge_to_index = build_edge_to_index_map(edges)
+    
+    # Mark primary cut edges
+    for vi, vj in primary_cut_edges:
+        key = (min(vi, vj), max(vi, vj))
+        if key in edge_to_index:
+            cut_flags[edge_to_index[key]] = 1
+    
+    return cut_flags
+
+
+def compute_secondary_cut_edge_flags(
+    edges: np.ndarray,
+    secondary_cut_edges: Optional[List[Tuple[int, int]]],
+    edge_to_index: Optional[Dict[Tuple[int, int], int]] = None
+) -> np.ndarray:
+    """
+    Compute boolean array marking which edges are SECONDARY cut edges only.
+    
+    Args:
+        edges: (E, 2) array of unique edges
+        secondary_cut_edges: List of (vi, vj) secondary cut edge tuples
+        edge_to_index: Optional pre-computed edge-to-index map
+    
+    Returns:
+        (E,) boolean array where flags[e] = True if edge e is a secondary cut
+    """
+    n_edges = len(edges)
+    cut_flags = np.zeros(n_edges, dtype=np.int8)
+    
+    if secondary_cut_edges is None:
+        return cut_flags
+    
+    # Build edge-to-index map if not provided
+    if edge_to_index is None:
+        edge_to_index = build_edge_to_index_map(edges)
+    
+    # Mark secondary cut edges
+    for vi, vj in secondary_cut_edges:
+        key = (min(vi, vj), max(vi, vj))
+        if key in edge_to_index:
+            cut_flags[edge_to_index[key]] = 1
+    
+    return cut_flags
+
+
 def prepare_parting_surface_data(tet_result: 'TetrahedralMeshResult') -> 'TetrahedralMeshResult':
     """
     Prepare all data structures needed for parting surface extraction.

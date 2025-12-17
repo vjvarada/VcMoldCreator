@@ -142,6 +142,16 @@ class MeshViewer(QWidget):
         self._secondary_cuts_actor = None
         self._secondary_cuts_visible = True
         
+        # Primary parting surface visualization (blue)
+        self._parting_surface_mesh: Optional[trimesh.Trimesh] = None
+        self._parting_surface_actor = None
+        self._parting_surface_visible = True
+        
+        # Secondary parting surface visualization (red)
+        self._secondary_parting_surface_mesh: Optional[trimesh.Trimesh] = None
+        self._secondary_parting_surface_actor = None
+        self._secondary_parting_surface_visible = True
+        
         # Inflated boundary mesh visualization
         self._inflated_boundary_actor = None
         self._inflated_boundary_visible = True
@@ -3413,3 +3423,218 @@ class MeshViewer(QWidget):
     def has_secondary_cuts(self) -> bool:
         """Check if secondary cuts exist."""
         return self._secondary_cuts_actor is not None
+
+    # =========================================================================
+    # PARTING SURFACE VISUALIZATION
+    # =========================================================================
+    
+    # Color for primary parting surface (blue, semi-transparent)
+    PARTING_SURFACE_COLOR = "#3399ff"  # Blue
+    PARTING_SURFACE_OPACITY = 0.7
+    
+    # Color for secondary parting surface (red, semi-transparent)
+    SECONDARY_PARTING_SURFACE_COLOR = "#ff4444"  # Red
+    SECONDARY_PARTING_SURFACE_OPACITY = 0.7
+    
+    def set_parting_surface(self, parting_mesh: trimesh.Trimesh):
+        """
+        Set and display the parting surface mesh.
+        
+        Args:
+            parting_mesh: The parting surface mesh (triangulated surface separating mold halves)
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        self._parting_surface_mesh = parting_mesh
+        
+        # Convert to PyVista
+        pv_surface = self._trimesh_to_pyvista(parting_mesh)
+        
+        # Remove existing actor
+        if self._parting_surface_actor is not None:
+            try:
+                self.plotter.remove_actor(self._parting_surface_actor)
+            except Exception:
+                pass
+            self._parting_surface_actor = None
+        
+        # Add parting surface mesh (semi-transparent blue)
+        self._parting_surface_actor = self.plotter.add_mesh(
+            pv_surface,
+            color=self.PARTING_SURFACE_COLOR,
+            opacity=self.PARTING_SURFACE_OPACITY,
+            smooth_shading=True,
+            show_edges=True,
+            edge_color='#1166cc',  # Darker blue for edges
+            line_width=1,
+            style='surface',
+            render_points_as_spheres=False,
+        )
+        
+        # Set up rendering properties for better visibility
+        if self._parting_surface_actor is not None:
+            prop = self._parting_surface_actor.GetProperty()
+            if prop:
+                prop.SetInterpolationToPhong()
+                # Make it slightly emissive so it's visible even in shadows
+                prop.SetAmbient(0.3)
+                prop.SetDiffuse(0.7)
+        
+        self.plotter.update()
+        logger.info(f"Parting surface displayed: {len(parting_mesh.vertices)} vertices, {len(parting_mesh.faces)} faces")
+    
+    def clear_parting_surface(self):
+        """Remove parting surface visualization from the scene."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        if self._parting_surface_actor is not None:
+            try:
+                self.plotter.remove_actor(self._parting_surface_actor)
+            except Exception:
+                pass
+            self._parting_surface_actor = None
+        
+        self._parting_surface_mesh = None
+        self.plotter.update()
+        logger.info("Parting surface cleared")
+    
+    def set_parting_surface_visible(self, visible: bool):
+        """
+        Set visibility of the parting surface.
+        
+        Args:
+            visible: True to show parting surface, False to hide
+        """
+        self._parting_surface_visible = visible
+        if self._parting_surface_actor is not None:
+            self._parting_surface_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Parting surface visibility set to {visible}")
+    
+    def set_parting_surface_opacity(self, opacity: float):
+        """
+        Set the opacity of the parting surface.
+        
+        Args:
+            opacity: Opacity value from 0.0 (transparent) to 1.0 (opaque)
+        """
+        if self._parting_surface_actor is not None:
+            prop = self._parting_surface_actor.GetProperty()
+            if prop:
+                prop.SetOpacity(opacity)
+            self.plotter.update()
+    
+    @property
+    def parting_surface_visible(self) -> bool:
+        """Check if parting surface is visible."""
+        return self._parting_surface_visible
+    
+    @property
+    def has_parting_surface(self) -> bool:
+        """Check if parting surface exists."""
+        return self._parting_surface_mesh is not None
+
+    # =========================================================================
+    # SECONDARY PARTING SURFACE VISUALIZATION
+    # =========================================================================
+    
+    def set_secondary_parting_surface(self, parting_mesh: trimesh.Trimesh):
+        """
+        Set and display the secondary parting surface mesh.
+        
+        Args:
+            parting_mesh: The secondary parting surface mesh (from secondary cut edges)
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        self._secondary_parting_surface_mesh = parting_mesh
+        
+        # Convert to PyVista
+        pv_surface = self._trimesh_to_pyvista(parting_mesh)
+        
+        # Remove existing actor
+        if self._secondary_parting_surface_actor is not None:
+            try:
+                self.plotter.remove_actor(self._secondary_parting_surface_actor)
+            except Exception:
+                pass
+            self._secondary_parting_surface_actor = None
+        
+        # Add secondary parting surface mesh (semi-transparent red)
+        self._secondary_parting_surface_actor = self.plotter.add_mesh(
+            pv_surface,
+            color=self.SECONDARY_PARTING_SURFACE_COLOR,
+            opacity=self.SECONDARY_PARTING_SURFACE_OPACITY,
+            smooth_shading=True,
+            show_edges=True,
+            edge_color='#cc2222',  # Darker red for edges
+            line_width=1,
+            style='surface',
+            render_points_as_spheres=False,
+        )
+        
+        # Set up rendering properties for better visibility
+        if self._secondary_parting_surface_actor is not None:
+            prop = self._secondary_parting_surface_actor.GetProperty()
+            if prop:
+                prop.SetInterpolationToPhong()
+                prop.SetAmbient(0.3)
+                prop.SetDiffuse(0.7)
+        
+        self.plotter.update()
+        logger.info(f"Secondary parting surface displayed: {len(parting_mesh.vertices)} vertices, {len(parting_mesh.faces)} faces")
+    
+    def clear_secondary_parting_surface(self):
+        """Remove secondary parting surface visualization from the scene."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        if self._secondary_parting_surface_actor is not None:
+            try:
+                self.plotter.remove_actor(self._secondary_parting_surface_actor)
+            except Exception:
+                pass
+            self._secondary_parting_surface_actor = None
+        
+        self._secondary_parting_surface_mesh = None
+        self.plotter.update()
+        logger.info("Secondary parting surface cleared")
+    
+    def set_secondary_parting_surface_visible(self, visible: bool):
+        """
+        Set visibility of the secondary parting surface.
+        
+        Args:
+            visible: True to show secondary parting surface, False to hide
+        """
+        self._secondary_parting_surface_visible = visible
+        if self._secondary_parting_surface_actor is not None:
+            self._secondary_parting_surface_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Secondary parting surface visibility set to {visible}")
+    
+    def set_secondary_parting_surface_opacity(self, opacity: float):
+        """
+        Set the opacity of the secondary parting surface.
+        
+        Args:
+            opacity: Opacity value from 0.0 (transparent) to 1.0 (opaque)
+        """
+        if self._secondary_parting_surface_actor is not None:
+            prop = self._secondary_parting_surface_actor.GetProperty()
+            if prop:
+                prop.SetOpacity(opacity)
+            self.plotter.update()
+    
+    @property
+    def secondary_parting_surface_visible(self) -> bool:
+        """Check if secondary parting surface is visible."""
+        return self._secondary_parting_surface_visible
+    
+    @property
+    def has_secondary_parting_surface(self) -> bool:
+        """Check if secondary parting surface exists."""
+        return self._secondary_parting_surface_mesh is not None

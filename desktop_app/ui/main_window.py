@@ -1428,6 +1428,82 @@ class SecondaryCutsWorker(QThread):
             self.error.emit(str(e))
 
 
+class PartingSurfaceWorker(QThread):
+    """Background worker for extracting the parting surface mesh using Marching Tetrahedra."""
+    
+    progress = pyqtSignal(str)
+    complete = pyqtSignal(object)  # PartingSurfaceResult
+    error = pyqtSignal(str)
+    
+    def __init__(self, tet_result, use_original_vertices: bool = True, smooth_iterations: int = 0, repair_surface: bool = True, cut_type: str = 'primary'):
+        """
+        Initialize parting surface worker.
+        
+        Args:
+            tet_result: TetrahedralMeshResult with primary/secondary cut edges
+            use_original_vertices: If True, use non-inflated vertex positions
+            smooth_iterations: Number of Laplacian smoothing iterations (0 = none)
+            repair_surface: If True, repair surface to fill holes and fix issues
+            cut_type: Which cut edges to use: 'primary', 'secondary', or 'both'
+        """
+        super().__init__()
+        self.tet_result = tet_result
+        self.use_original_vertices = use_original_vertices
+        self.smooth_iterations = smooth_iterations
+        self.repair_surface = repair_surface
+        self.cut_type = cut_type
+    
+    def run(self):
+        try:
+            from core.parting_surface import (
+                extract_parting_surface_from_tet_result,
+                smooth_parting_surface,
+                repair_parting_surface
+            )
+            from core.tetrahedral_mesh import prepare_parting_surface_data
+            import time
+            
+            start_time = time.time()
+            
+            # Step 1: Prepare data structures if needed
+            if self.tet_result.tet_edge_indices is None:
+                self.progress.emit("Building edge index maps...")
+                self.tet_result = prepare_parting_surface_data(self.tet_result)
+            
+            # Step 2: Extract parting surface using Marching Tetrahedra
+            cut_type_label = self.cut_type.capitalize()
+            self.progress.emit(f"Extracting {cut_type_label} surface with Marching Tetrahedra...")
+            result = extract_parting_surface_from_tet_result(
+                self.tet_result,
+                use_original_vertices=self.use_original_vertices,
+                prepare_data=False,  # Already prepared above
+                cut_type=self.cut_type
+            )
+            
+            # Step 3: Repair surface (fill holes, merge vertices)
+            if self.repair_surface and result.mesh is not None:
+                self.progress.emit(f"Repairing {cut_type_label} surface (filling holes)...")
+                result = repair_parting_surface(result, fill_holes=True, merge_vertices=True)
+            
+            # Step 4: Optional smoothing
+            if self.smooth_iterations > 0 and result.mesh is not None:
+                self.progress.emit(f"Smoothing surface ({self.smooth_iterations} iterations)...")
+                result = smooth_parting_surface(result, iterations=self.smooth_iterations)
+            
+            elapsed = (time.time() - start_time) * 1000
+            
+            if result.num_faces > 0:
+                self.progress.emit(f"{cut_type_label}: {result.num_vertices:,} verts, {result.num_faces:,} faces in {elapsed:.0f}ms")
+            else:
+                self.progress.emit(f"No {cut_type_label} surface generated in {elapsed:.0f}ms")
+            
+            self.complete.emit(result)
+            
+        except Exception as e:
+            logger.exception(f"Error in parting surface extraction: {e}")
+            self.error.emit(str(e))
+
+
 # ============================================================================
 # STYLED WIDGETS
 # ============================================================================
@@ -2184,6 +2260,10 @@ class DisplayOptionsPanel(QFrame):
     # Secondary cuts signal
     show_secondary_cuts_changed = pyqtSignal(bool)  # Toggle secondary cuts visualization
     
+    # Parting surface signals
+    show_primary_parting_surface_changed = pyqtSignal(bool)  # Toggle primary parting surface (blue)
+    show_secondary_parting_surface_changed = pyqtSignal(bool)  # Toggle secondary parting surface (red)
+    
     # Must match MeshViewer.BACKGROUND_COLOR for rounded corners to blend
     VIEWER_BG = "#1a1a1a"  # Matches React frontend BACKGROUND_COLOR
     
@@ -2370,6 +2450,33 @@ class DisplayOptionsPanel(QFrame):
         self.show_secondary_cuts_cb.hide()
         layout.addWidget(self.show_secondary_cuts_cb)
         
+        # Parting surface section separator
+        self.parting_surface_separator = QFrame()
+        self.parting_surface_separator.setFixedHeight(1)
+        self.parting_surface_separator.setStyleSheet("background-color: #3a3f47;")
+        self.parting_surface_separator.hide()
+        layout.addWidget(self.parting_surface_separator)
+        
+        # Parting surface section label
+        self.parting_surface_label = QLabel('Parting Surfaces')
+        self.parting_surface_label.setStyleSheet("font-size: 10px; font-weight: bold; padding-top: 4px; color: rgba(255, 255, 255, 0.7);")
+        self.parting_surface_label.hide()
+        layout.addWidget(self.parting_surface_label)
+        
+        # Primary parting surface checkbox (blue)
+        self.show_primary_parting_surface_cb = QCheckBox('Primary Surface (Blue)')
+        self.show_primary_parting_surface_cb.setChecked(True)
+        self.show_primary_parting_surface_cb.stateChanged.connect(lambda s: self.show_primary_parting_surface_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_primary_parting_surface_cb.hide()
+        layout.addWidget(self.show_primary_parting_surface_cb)
+        
+        # Secondary parting surface checkbox (red)
+        self.show_secondary_parting_surface_cb = QCheckBox('Secondary Surface (Red)')
+        self.show_secondary_parting_surface_cb.setChecked(True)
+        self.show_secondary_parting_surface_cb.stateChanged.connect(lambda s: self.show_secondary_parting_surface_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_secondary_parting_surface_cb.hide()
+        layout.addWidget(self.show_secondary_parting_surface_cb)
+        
         self.adjustSize()
         self.hide()
     
@@ -2470,6 +2577,31 @@ class DisplayOptionsPanel(QFrame):
         else:
             self.show_secondary_cuts_cb.hide()
         self.adjustSize()
+    
+    def show_parting_surface_options(self, show_primary: bool = False, show_secondary: bool = False):
+        """Show or hide the parting surface visibility checkboxes."""
+        show_any = show_primary or show_secondary
+        
+        if show_any:
+            self.parting_surface_separator.show()
+            self.parting_surface_label.show()
+        else:
+            self.parting_surface_separator.hide()
+            self.parting_surface_label.hide()
+        
+        if show_primary:
+            self.show_primary_parting_surface_cb.show()
+            self.show_primary_parting_surface_cb.setChecked(True)  # Reset to showing
+        else:
+            self.show_primary_parting_surface_cb.hide()
+        
+        if show_secondary:
+            self.show_secondary_parting_surface_cb.show()
+            self.show_secondary_parting_surface_cb.setChecked(True)  # Reset to showing
+        else:
+            self.show_secondary_parting_surface_cb.hide()
+        
+        self.adjustSize()
 
 
 # ============================================================================
@@ -2521,6 +2653,14 @@ class MainWindow(QMainWindow):
         
         # Secondary cuts state
         self._secondary_cuts_worker = None
+        
+        # Parting surface state
+        self._parting_surface_worker = None
+        self._parting_surface_result = None
+        
+        # Secondary parting surface state
+        self._secondary_parting_surface_worker = None
+        self._secondary_parting_surface_result = None
         
         self._setup_window()
         self._setup_ui()
@@ -2806,6 +2946,12 @@ class MainWindow(QMainWindow):
         )
         self.display_options.show_secondary_cuts_changed.connect(
             lambda show: self.mesh_viewer.set_secondary_cuts_visible(show)
+        )
+        self.display_options.show_primary_parting_surface_changed.connect(
+            lambda show: self.mesh_viewer.set_parting_surface_visible(show)
+        )
+        self.display_options.show_secondary_parting_surface_changed.connect(
+            lambda show: self.mesh_viewer.set_secondary_parting_surface_visible(show)
         )
         
         return wrapper
@@ -5423,7 +5569,7 @@ class MainWindow(QMainWindow):
         
         self.secondary_cuts_threshold_slider = QSlider(Qt.Orientation.Horizontal)
         self.secondary_cuts_threshold_slider.setRange(1, 50)
-        self.secondary_cuts_threshold_slider.setValue(20)  # Default = 20 intersections required
+        self.secondary_cuts_threshold_slider.setValue(5)  # Default = 5 intersections required
         self.secondary_cuts_threshold_slider.setStyleSheet(f"""
             QSlider::groove:horizontal {{
                 border: 1px solid {Colors.BORDER};
@@ -5595,7 +5741,7 @@ class MainWindow(QMainWindow):
         self.mesh_viewer.clear_secondary_cuts()
         
         # Get min_intersection_count from slider (1-50)
-        min_intersection_count = 20
+        min_intersection_count = 5
         if hasattr(self, 'secondary_cuts_threshold_slider'):
             min_intersection_count = self.secondary_cuts_threshold_slider.value()
         
@@ -5812,6 +5958,70 @@ class MainWindow(QMainWindow):
         self.parting_surface_stats.hide()
         self.context_layout.addWidget(self.parting_surface_stats)
         
+        # Separator for secondary surface
+        secondary_separator = QLabel("")
+        secondary_separator.setFixedHeight(10)
+        self.context_layout.addWidget(secondary_separator)
+        
+        # Secondary parting surface button (only available if secondary cuts exist)
+        self.secondary_parting_surface_btn = QPushButton("🔴 Generate Secondary Surface")
+        self.secondary_parting_surface_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.secondary_parting_surface_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #dc3545;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: #c82333;
+            }}
+            QPushButton:disabled {{
+                background-color: {Colors.GRAY_LIGHT};
+                color: {Colors.GRAY};
+            }}
+        """)
+        self.secondary_parting_surface_btn.clicked.connect(self._on_run_secondary_parting_surface)
+        # Only enable if secondary cuts exist
+        has_secondary = (self._tet_result is not None and 
+                        self._tet_result.secondary_cut_edges is not None and
+                        len(self._tet_result.secondary_cut_edges) > 0)
+        self.secondary_parting_surface_btn.setEnabled(has_secondary)
+        self.context_layout.addWidget(self.secondary_parting_surface_btn)
+        
+        # Secondary surface progress bar
+        self.secondary_parting_surface_progress = QProgressBar()
+        self.secondary_parting_surface_progress.setStyleSheet(f"""
+            QProgressBar {{
+                border: none;
+                border-radius: 4px;
+                background-color: {Colors.LIGHT};
+                height: 8px;
+            }}
+            QProgressBar::chunk {{
+                background-color: #dc3545;
+                border-radius: 4px;
+            }}
+        """)
+        self.secondary_parting_surface_progress.setTextVisible(False)
+        self.secondary_parting_surface_progress.setRange(0, 0)  # Indeterminate
+        self.secondary_parting_surface_progress.hide()
+        self.context_layout.addWidget(self.secondary_parting_surface_progress)
+        
+        # Secondary surface progress label
+        self.secondary_parting_surface_progress_label = QLabel("")
+        self.secondary_parting_surface_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.secondary_parting_surface_progress_label.hide()
+        self.context_layout.addWidget(self.secondary_parting_surface_progress_label)
+        
+        # Secondary surface stats (show if computed)
+        self.secondary_parting_surface_stats = StatsBox()
+        self.secondary_parting_surface_stats.hide()
+        self.context_layout.addWidget(self.secondary_parting_surface_stats)
+        
         # Update UI with current state
         self._update_parting_surface_step_ui()
     
@@ -5820,8 +6030,18 @@ class MainWindow(QMainWindow):
         if not hasattr(self, 'parting_surface_stats'):
             return
         
-        # TODO: Check if parting surface has been computed and update stats
-        pass
+        # Enable/disable secondary parting surface button based on secondary cuts availability
+        if hasattr(self, 'secondary_parting_surface_btn'):
+            has_secondary = (self._tet_result is not None and 
+                            self._tet_result.secondary_cut_edges is not None and
+                            len(self._tet_result.secondary_cut_edges) > 0)
+            self.secondary_parting_surface_btn.setEnabled(has_secondary)
+            
+            if has_secondary:
+                n_secondary = len(self._tet_result.secondary_cut_edges)
+                self.secondary_parting_surface_btn.setText(f"🔴 Generate Secondary Surface ({n_secondary} edges)")
+            else:
+                self.secondary_parting_surface_btn.setText("🔴 No Secondary Cuts Available")
     
     def _on_run_parting_surface(self):
         """Start parting surface generation."""
@@ -5833,23 +6053,182 @@ class MainWindow(QMainWindow):
         self.parting_surface_btn.setEnabled(False)
         self.parting_surface_progress.show()
         self.parting_surface_progress_label.show()
-        self.parting_surface_progress_label.setText("Generating parting surface...")
+        self.parting_surface_progress_label.setText("Preparing data structures...")
         self.parting_surface_stats.hide()
         
-        # TODO: Implement parting surface generation
-        # For now, just show a placeholder message
-        QMessageBox.information(
-            self, 
-            "Coming Soon", 
-            "Parting surface generation will be implemented in the next step.\n\n"
-            "This will create a triangulated mesh representing the primary parting surface "
-            "that separates the two mold halves."
-        )
+        # Start worker thread for PRIMARY parting surface
+        self._parting_surface_worker = PartingSurfaceWorker(self._tet_result, cut_type='primary')
+        self._parting_surface_worker.progress.connect(self._on_parting_surface_progress)
+        self._parting_surface_worker.complete.connect(self._on_parting_surface_complete)
+        self._parting_surface_worker.error.connect(self._on_parting_surface_error)
+        self._parting_surface_worker.start()
+    
+    def _on_parting_surface_progress(self, message: str):
+        """Handle parting surface progress updates."""
+        if hasattr(self, 'parting_surface_progress_label'):
+            self.parting_surface_progress_label.setText(message)
+    
+    def _on_parting_surface_complete(self, result):
+        """Handle parting surface extraction complete."""
+        from core.parting_surface import PartingSurfaceResult
+        
+        self._parting_surface_result = result
         
         # Reset UI
         self.parting_surface_btn.setEnabled(True)
         self.parting_surface_progress.hide()
         self.parting_surface_progress_label.hide()
+        
+        if result.mesh is None or result.num_faces == 0:
+            self.parting_surface_progress_label.setText("No surface generated")
+            self.parting_surface_progress_label.show()
+            self.parting_surface_progress_label.setStyleSheet(f'color: {Colors.WARNING}; font-size: 12px;')
+            return
+        
+        # Update stats
+        self.parting_surface_stats.clear()
+        self.parting_surface_stats.add_header('Parting Surface', Colors.SUCCESS)
+        self.parting_surface_stats.add_row(f'Vertices: {result.num_vertices:,}')
+        self.parting_surface_stats.add_row(f'Faces: {result.num_faces:,}')
+        self.parting_surface_stats.add_row(f'Tets contributing: {result.num_tets_contributing:,}/{result.num_tets_processed:,}')
+        self.parting_surface_stats.add_row(f'Time: {result.extraction_time_ms:.1f} ms')
+        self.parting_surface_stats.show()
+        
+        # Visualize the parting surface
+        self._visualize_parting_surface(result)
+        
+        # Mark step complete
+        if Step.PARTING_SURFACE in self.step_buttons:
+            self.step_buttons[Step.PARTING_SURFACE].set_status('completed')
+    
+    def _on_parting_surface_error(self, error_msg: str):
+        """Handle parting surface generation error."""
+        self.parting_surface_btn.setEnabled(True)
+        self.parting_surface_progress.hide()
+        self.parting_surface_progress_label.setText(f"Error: {error_msg}")
+        self.parting_surface_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+        QMessageBox.critical(self, "Error", f"Parting surface generation failed:\n{error_msg}")
+    
+    def _visualize_parting_surface(self, result):
+        """Visualize the parting surface mesh in the viewer."""
+        if result.mesh is None:
+            logger.warning("No parting surface mesh to visualize")
+            return
+        
+        try:
+            # Use the mesh viewer's set_parting_surface method
+            self.mesh_viewer.set_parting_surface(result.mesh)
+            
+            # Show display option for primary parting surface
+            self.display_options.show_parting_surface_options(show_primary=True)
+            
+            logger.info(f"Parting surface visualized: {result.num_vertices} vertices, {result.num_faces} faces")
+                    
+        except Exception as e:
+            logger.exception(f"Error visualizing parting surface: {e}")
+            QMessageBox.warning(
+                self,
+                "Visualization Warning",
+                f"Parting surface generated but visualization failed:\n{str(e)}\n\n"
+                f"Surface has {result.num_vertices:,} vertices and {result.num_faces:,} faces."
+            )
+
+    # =========================================================================
+    # SECONDARY PARTING SURFACE METHODS
+    # =========================================================================
+
+    def _on_run_secondary_parting_surface(self):
+        """Start secondary parting surface generation."""
+        if self._tet_result is None:
+            QMessageBox.warning(self, "Warning", "No tetrahedral mesh data available")
+            return
+        
+        if (self._tet_result.secondary_cut_edges is None or 
+            len(self._tet_result.secondary_cut_edges) == 0):
+            QMessageBox.warning(self, "Warning", "No secondary cut edges available.\nThe mold may not have any secondary features.")
+            return
+        
+        # Show progress
+        self.secondary_parting_surface_btn.setEnabled(False)
+        self.secondary_parting_surface_progress.show()
+        self.secondary_parting_surface_progress_label.show()
+        self.secondary_parting_surface_progress_label.setText("Preparing data structures...")
+        self.secondary_parting_surface_stats.hide()
+        
+        # Start worker thread for SECONDARY parting surface
+        self._secondary_parting_surface_worker = PartingSurfaceWorker(self._tet_result, cut_type='secondary')
+        self._secondary_parting_surface_worker.progress.connect(self._on_secondary_parting_surface_progress)
+        self._secondary_parting_surface_worker.complete.connect(self._on_secondary_parting_surface_complete)
+        self._secondary_parting_surface_worker.error.connect(self._on_secondary_parting_surface_error)
+        self._secondary_parting_surface_worker.start()
+    
+    def _on_secondary_parting_surface_progress(self, message: str):
+        """Handle secondary parting surface progress updates."""
+        if hasattr(self, 'secondary_parting_surface_progress_label'):
+            self.secondary_parting_surface_progress_label.setText(message)
+    
+    def _on_secondary_parting_surface_complete(self, result):
+        """Handle secondary parting surface extraction complete."""
+        from core.parting_surface import PartingSurfaceResult
+        
+        self._secondary_parting_surface_result = result
+        
+        # Reset UI
+        self.secondary_parting_surface_btn.setEnabled(True)
+        self.secondary_parting_surface_progress.hide()
+        self.secondary_parting_surface_progress_label.hide()
+        
+        if result.mesh is None or result.num_faces == 0:
+            self.secondary_parting_surface_progress_label.setText("No secondary surface generated")
+            self.secondary_parting_surface_progress_label.show()
+            self.secondary_parting_surface_progress_label.setStyleSheet(f'color: {Colors.WARNING}; font-size: 12px;')
+            return
+        
+        # Update stats
+        self.secondary_parting_surface_stats.clear()
+        self.secondary_parting_surface_stats.add_header('Secondary Surface', '#dc3545')  # Red header
+        self.secondary_parting_surface_stats.add_row(f'Vertices: {result.num_vertices:,}')
+        self.secondary_parting_surface_stats.add_row(f'Faces: {result.num_faces:,}')
+        self.secondary_parting_surface_stats.add_row(f'Tets contributing: {result.num_tets_contributing:,}/{result.num_tets_processed:,}')
+        self.secondary_parting_surface_stats.add_row(f'Time: {result.extraction_time_ms:.1f} ms')
+        self.secondary_parting_surface_stats.show()
+        
+        # Visualize the secondary parting surface
+        self._visualize_secondary_parting_surface(result)
+    
+    def _on_secondary_parting_surface_error(self, error_msg: str):
+        """Handle secondary parting surface generation error."""
+        self.secondary_parting_surface_btn.setEnabled(True)
+        self.secondary_parting_surface_progress.hide()
+        self.secondary_parting_surface_progress_label.setText(f"Error: {error_msg}")
+        self.secondary_parting_surface_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+        QMessageBox.critical(self, "Error", f"Secondary parting surface generation failed:\n{error_msg}")
+    
+    def _visualize_secondary_parting_surface(self, result):
+        """Visualize the secondary parting surface mesh in the viewer."""
+        if result.mesh is None:
+            logger.warning("No secondary parting surface mesh to visualize")
+            return
+        
+        try:
+            # Use the mesh viewer's set_secondary_parting_surface method
+            self.mesh_viewer.set_secondary_parting_surface(result.mesh)
+            
+            # Update display options to show secondary surface checkbox
+            # Check if primary is also visible
+            has_primary = self.mesh_viewer.has_parting_surface
+            self.display_options.show_parting_surface_options(show_primary=has_primary, show_secondary=True)
+            
+            logger.info(f"Secondary parting surface visualized: {result.num_vertices} vertices, {result.num_faces} faces")
+                    
+        except Exception as e:
+            logger.exception(f"Error visualizing secondary parting surface: {e}")
+            QMessageBox.warning(
+                self,
+                "Visualization Warning",
+                f"Secondary parting surface generated but visualization failed:\n{str(e)}\n\n"
+                f"Surface has {result.num_vertices:,} vertices and {result.num_faces:,} faces."
+            )
 
     def _load_mesh(self, file_path: str, scale_factor: float = 1.0):
         """Load and process a mesh file."""

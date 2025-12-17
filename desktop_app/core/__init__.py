@@ -44,8 +44,22 @@ from core.tetrahedral_mesh import (
     build_edge_index_map,
     compute_edge_weights,
     compute_edge_costs,
+    prepare_parting_surface_data,
+    build_edge_to_index_map,
+    build_tet_edge_indices,
+    compute_cut_edge_flags,
     TetrahedralMeshResult,
     PYTETWILD_AVAILABLE,
+)
+from core.parting_surface import (
+    extract_parting_surface,
+    extract_parting_surface_from_tet_result,
+    smooth_parting_surface,
+    fill_holes_in_surface,
+    repair_parting_surface,
+    PartingSurfaceResult,
+    MARCHING_TET_TABLE,
+    TET_EDGES,
 )
 
 __all__ = [
@@ -93,6 +107,19 @@ __all__ = [
     'build_edge_index_map',
     'compute_edge_weights',
     'compute_edge_costs',
+    'prepare_parting_surface_data',
+    'build_edge_to_index_map',
+    'build_tet_edge_indices',
+    'compute_cut_edge_flags',
     'TetrahedralMeshResult',
     'PYTETWILD_AVAILABLE',
+    # Parting surface extraction
+    'extract_parting_surface',
+    'extract_parting_surface_from_tet_result',
+    'smooth_parting_surface',
+    'fill_holes_in_surface',
+    'repair_parting_surface',
+    'PartingSurfaceResult',
+    'MARCHING_TET_TABLE',
+    'TET_EDGES',
 ]
