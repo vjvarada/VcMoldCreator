@@ -249,6 +249,262 @@ def _compute_edge_labels_python(tet_result) -> np.ndarray:
     return _original(tet_result)
 
 
+def find_secondary_cuts_fast(
+    edge_membrane_data: list,
+    seed_triangles: list,
+    seed_triangle_positions: list,
+    vertices: np.ndarray,
+    boundary_verts: np.ndarray,
+    min_intersection_count: int = 20,
+    min_membrane_thickness: float = 0.0
+) -> list:
+    """
+    Find secondary cutting edges using C++ if available, with Python fallback.
+    
+    This function automatically selects between C++ (fast, with OpenMP parallelization)
+    and Python (fallback) implementations based on availability.
+    
+    Uses boolean intersection detection with minimum count threshold.
+    
+    Args:
+        edge_membrane_data: List of (vi, vj, path_i, path_j, boundary_path) tuples
+        seed_triangles: List of (v0, v1, v2) vertex index tuples
+        seed_triangle_positions: List of (pos0, pos1, pos2) position tuples
+        vertices: (N, 3) array of tetrahedral mesh vertices
+        boundary_verts: (B, 3) array of boundary mesh vertices
+        min_intersection_count: Minimum number of segment-triangle intersections required (1-50)
+        min_membrane_thickness: Skip membranes thinner than this
+    
+    Returns:
+        List of (vi, vj) tuples representing secondary cutting edges
+    """
+    if CPP_AVAILABLE:
+        return _find_secondary_cuts_cpp(
+            edge_membrane_data, seed_triangles, seed_triangle_positions,
+            vertices, boundary_verts, min_intersection_count, min_membrane_thickness
+        )
+    else:
+        return _find_secondary_cuts_python(
+            edge_membrane_data, seed_triangles, seed_triangle_positions,
+            vertices, boundary_verts, min_intersection_count, min_membrane_thickness
+        )
+
+
+def _find_secondary_cuts_cpp(
+    edge_membrane_data: list,
+    seed_triangles: list,
+    seed_triangle_positions: list,
+    vertices: np.ndarray,
+    boundary_verts: np.ndarray,
+    min_intersection_count: int,
+    min_membrane_thickness: float
+) -> list:
+    """C++ implementation wrapper for secondary cuts detection."""
+    start_time = time.time()
+    
+    n_membranes = len(edge_membrane_data)
+    n_seed_tris = len(seed_triangles)
+    
+    if n_membranes == 0 or n_seed_tris == 0:
+        return []
+    
+    # Prepare flattened arrays for C++ (membrane data)
+    membrane_edge_vi = np.zeros(n_membranes, dtype=np.int64)
+    membrane_edge_vj = np.zeros(n_membranes, dtype=np.int64)
+    
+    path_i_list = []
+    path_i_offsets = np.zeros(n_membranes, dtype=np.int64)
+    path_j_list = []
+    path_j_offsets = np.zeros(n_membranes, dtype=np.int64)
+    boundary_list = []
+    boundary_offsets = np.zeros(n_membranes, dtype=np.int64)
+    
+    for m, (vi, vj, path_i, path_j, boundary_path) in enumerate(edge_membrane_data):
+        membrane_edge_vi[m] = vi
+        membrane_edge_vj[m] = vj
+        
+        path_i_offsets[m] = len(path_i_list)
+        path_i_list.extend(path_i)
+        
+        path_j_offsets[m] = len(path_j_list)
+        path_j_list.extend(path_j)
+        
+        boundary_offsets[m] = len(boundary_list)
+        boundary_list.extend(boundary_path)
+    
+    membrane_path_i = np.array(path_i_list, dtype=np.int64)
+    membrane_path_j = np.array(path_j_list, dtype=np.int64)
+    membrane_boundary_path = np.array(boundary_list, dtype=np.int64)
+    
+    # Prepare seed triangle arrays for C++
+    # seed_triangles: (T, 3, 3) positions
+    # seed_triangle_vertices: (T, 3) vertex indices
+    seed_tri_positions = np.zeros((n_seed_tris, 3, 3), dtype=np.float64)
+    seed_tri_vertices = np.zeros((n_seed_tris, 3), dtype=np.int64)
+    
+    for t, ((v0, v1, v2), (p0, p1, p2)) in enumerate(zip(seed_triangles, seed_triangle_positions)):
+        seed_tri_vertices[t] = [v0, v1, v2]
+        seed_tri_positions[t, 0] = p0
+        seed_tri_positions[t, 1] = p1
+        seed_tri_positions[t, 2] = p2
+    
+    # Ensure vertices arrays are contiguous
+    tet_vertices = np.ascontiguousarray(vertices, dtype=np.float64)
+    boundary_vertices = np.ascontiguousarray(boundary_verts, dtype=np.float64)
+    
+    # Call C++ implementation
+    result = _cpp.find_secondary_cuts(
+        membrane_edge_vi,
+        membrane_edge_vj,
+        membrane_path_i,
+        path_i_offsets,
+        membrane_path_j,
+        path_j_offsets,
+        membrane_boundary_path,
+        boundary_offsets,
+        seed_tri_positions,
+        seed_tri_vertices,
+        tet_vertices,
+        boundary_vertices,
+        min_intersection_count,
+        min_membrane_thickness
+    )
+    
+    elapsed = (time.time() - start_time) * 1000
+    
+    # Convert result to list of tuples
+    cutting_edges = [(vi, vj) for vi, vj in result.cutting_edges]
+    
+    logger.info(
+        f"[C++] Secondary cuts complete in {elapsed:.0f}ms: "
+        f"{len(cutting_edges)} cuts found from {result.n_membranes_checked} membranes "
+        f"(min_intersection_count={min_intersection_count})"
+    )
+    
+    return cutting_edges
+
+
+def _find_secondary_cuts_python(
+    edge_membrane_data: list,
+    seed_triangles: list,
+    seed_triangle_positions: list,
+    vertices: np.ndarray,
+    boundary_verts: np.ndarray,
+    min_intersection_count: int,
+    min_membrane_thickness: float
+) -> list:
+    """Python fallback - calls the original implementation."""
+    # Import here to avoid circular imports
+    from .tetrahedral_mesh import _find_secondary_cuts_by_triangle_intersection
+    return _find_secondary_cuts_by_triangle_intersection(
+        edge_membrane_data, seed_triangles, seed_triangle_positions,
+        vertices, boundary_verts, min_intersection_count, min_membrane_thickness,
+        use_gpu=True  # Let Python implementation decide GPU vs CPU
+    )
+
+
+# ============================================================================
+# MOLD HALF CLASSIFICATION
+# ============================================================================
+
+def classify_mold_halves_fast(
+    boundary_mesh,  # trimesh.Trimesh
+    outer_triangles: set,
+    d1: np.ndarray,
+    d2: np.ndarray,
+    adjacency: dict = None
+) -> dict:
+    """
+    Fast mold half classification using C++ with OpenMP if available.
+    
+    Args:
+        boundary_mesh: The boundary mesh
+        outer_triangles: Set of outer boundary triangle indices to classify
+        d1: First parting direction (normalized)
+        d2: Second parting direction (normalized)
+        adjacency: Pre-computed adjacency map (optional)
+    
+    Returns:
+        Dict mapping triangle index to mold half (1 or 2)
+    """
+    if CPP_AVAILABLE and len(outer_triangles) > 1000:
+        return _classify_mold_halves_cpp(boundary_mesh, outer_triangles, d1, d2)
+    else:
+        # Use Python implementation for small meshes or if C++ unavailable
+        from .mold_half_classification import classify_mold_halves_fast as _python_impl
+        return _python_impl(boundary_mesh, outer_triangles, d1, d2, adjacency, use_gpu=True)
+
+
+def _classify_mold_halves_cpp(
+    boundary_mesh,
+    outer_triangles: set,
+    d1: np.ndarray,
+    d2: np.ndarray
+) -> dict:
+    """C++ implementation wrapper for mold half classification."""
+    start_time = time.time()
+    
+    n_faces = len(boundary_mesh.faces)
+    n_outer = len(outer_triangles)
+    
+    if n_outer == 0:
+        return {}
+    
+    # Get face normals
+    face_normals = np.ascontiguousarray(boundary_mesh.face_normals, dtype=np.float64)
+    
+    # Convert outer_triangles set to array
+    outer_indices = np.array(list(outer_triangles), dtype=np.int64)
+    
+    # Normalize directions
+    d1 = d1.astype(np.float64) / np.linalg.norm(d1)
+    d2 = d2.astype(np.float64) / np.linalg.norm(d2)
+    
+    # Build CSR adjacency from trimesh face_adjacency
+    # trimesh.face_adjacency is (n, 2) pairs of adjacent faces
+    adj_lists = [[] for _ in range(n_faces)]
+    for i in range(len(boundary_mesh.face_adjacency)):
+        a, b = boundary_mesh.face_adjacency[i]
+        adj_lists[a].append(b)
+        adj_lists[b].append(a)
+    
+    # Convert to CSR format
+    adj_indices_list = []
+    adj_ptr = [0]
+    for fi in range(n_faces):
+        adj_indices_list.extend(adj_lists[fi])
+        adj_ptr.append(len(adj_indices_list))
+    
+    adj_indices = np.array(adj_indices_list, dtype=np.int64)
+    adj_ptr = np.array(adj_ptr, dtype=np.int64)
+    
+    # Call C++ implementation
+    result = _cpp.classify_mold_halves(
+        face_normals,
+        outer_indices,
+        d1,
+        d2,
+        adj_indices,
+        adj_ptr,
+        n_faces
+    )
+    
+    elapsed = (time.time() - start_time) * 1000
+    
+    # Convert result to dict
+    labels = np.asarray(result.side_labels)
+    indices = np.asarray(result.outer_indices)
+    
+    side_map = {int(indices[i]): int(labels[i]) for i in range(len(indices))}
+    
+    logger.info(
+        f"[C++] Mold half classification complete in {elapsed:.0f}ms: "
+        f"H1={result.n_h1}, H2={result.n_h2} from {n_outer} outer triangles"
+    )
+    
+    return side_map
+
+
 def is_cpp_available() -> bool:
     """Check if C++ module is available."""
     return CPP_AVAILABLE
@@ -260,5 +516,7 @@ def get_implementation_info() -> dict:
         'cpp_available': CPP_AVAILABLE,
         'dijkstra': 'C++' if CPP_AVAILABLE else 'Python',
         'edge_labels': 'C++' if CPP_AVAILABLE else 'Python',
-        'speedup_estimate': '10-20x' if CPP_AVAILABLE else 'N/A (using Python)',
+        'secondary_cuts': 'C++ (OpenMP)' if CPP_AVAILABLE else 'Python/GPU',
+        'mold_half_classification': 'C++ (OpenMP)' if CPP_AVAILABLE else 'Python/GPU',
+        'speedup_estimate': '10-50x' if CPP_AVAILABLE else 'N/A (using Python)',
     }

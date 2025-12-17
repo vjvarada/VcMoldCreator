@@ -1331,20 +1331,20 @@ class SecondaryCutsWorker(QThread):
     complete = pyqtSignal(object)  # Updated TetrahedralMeshResult
     error = pyqtSignal(str)
     
-    def __init__(self, tet_result, part_mesh, sensitivity: float = 0.5, use_gpu: bool = True):
+    def __init__(self, tet_result, part_mesh, min_intersection_count: int = 20, use_gpu: bool = True):
         """
         Initialize secondary cuts worker.
         
         Args:
             tet_result: TetrahedralMeshResult with Dijkstra results (paths, destinations)
             part_mesh: The original part mesh to check intersection against
-            sensitivity: Detection sensitivity 0.0-1.0 (higher = more sensitive)
+            min_intersection_count: Minimum number of segment-triangle intersections required (1-50)
             use_gpu: Whether to use GPU acceleration if available
         """
         super().__init__()
         self.tet_result = tet_result
         self.part_mesh = part_mesh
-        self.sensitivity = sensitivity
+        self.min_intersection_count = min_intersection_count
         self.use_gpu = use_gpu
     
     def run(self):
@@ -1353,15 +1353,15 @@ class SecondaryCutsWorker(QThread):
             import time
             
             gpu_status = "GPU" if (self.use_gpu and CUDA_AVAILABLE) else "CPU"
-            logger.info(f"Finding secondary cutting edges (sensitivity={self.sensitivity:.2f}, {gpu_status})...")
+            logger.info(f"Finding secondary cutting edges (min_intersections={self.min_intersection_count}, {gpu_status})...")
             start_time = time.time()
             
-            self.progress.emit(f"Detecting secondary cuts ({gpu_status}, sensitivity={self.sensitivity:.0%})...")
+            self.progress.emit(f"Detecting secondary cuts ({gpu_status}, min_intersections={self.min_intersection_count})...")
             
             secondary_cuts = find_secondary_cutting_edges(
                 self.tet_result,
                 self.part_mesh,
-                sensitivity=self.sensitivity,
+                min_intersection_count=self.min_intersection_count,
                 use_gpu=self.use_gpu
             )
             
@@ -5333,9 +5333,9 @@ class MainWindow(QMainWindow):
         
         self.context_layout.addWidget(state_info)
         
-        # Sensitivity slider section
-        sensitivity_group = QGroupBox("Detection Sensitivity")
-        sensitivity_group.setStyleSheet(f"""
+        # Min intersection count section
+        threshold_group = QGroupBox("Intersection Threshold")
+        threshold_group.setStyleSheet(f"""
             QGroupBox {{
                 font-size: 13px;
                 font-weight: 500;
@@ -5351,28 +5351,28 @@ class MainWindow(QMainWindow):
                 padding: 0 5px;
             }}
         """)
-        sensitivity_layout = QVBoxLayout(sensitivity_group)
+        threshold_layout = QVBoxLayout(threshold_group)
         
-        # Sensitivity description
-        sensitivity_desc = QLabel(
-            "Controls how aggressively to detect secondary cuts.\n"
-            "Lower = only clear intersections, Higher = catches near-misses."
+        # Threshold description
+        threshold_desc = QLabel(
+            "Minimum segment-triangle intersections required.\n"
+            "Higher = fewer false positives, may miss some cuts."
         )
-        sensitivity_desc.setWordWrap(True)
-        sensitivity_desc.setStyleSheet(f'color: {Colors.GRAY}; font-size: 11px;')
-        sensitivity_layout.addWidget(sensitivity_desc)
+        threshold_desc.setWordWrap(True)
+        threshold_desc.setStyleSheet(f'color: {Colors.GRAY}; font-size: 11px;')
+        threshold_layout.addWidget(threshold_desc)
         
         # Slider row
         slider_row = QHBoxLayout()
         
-        slider_label_low = QLabel("Strict")
+        slider_label_low = QLabel("1")
         slider_label_low.setStyleSheet(f'color: {Colors.GRAY}; font-size: 11px;')
         slider_row.addWidget(slider_label_low)
         
-        self.secondary_cuts_sensitivity_slider = QSlider(Qt.Orientation.Horizontal)
-        self.secondary_cuts_sensitivity_slider.setRange(0, 200)
-        self.secondary_cuts_sensitivity_slider.setValue(100)  # Default 100% = exact intersection
-        self.secondary_cuts_sensitivity_slider.setStyleSheet(f"""
+        self.secondary_cuts_threshold_slider = QSlider(Qt.Orientation.Horizontal)
+        self.secondary_cuts_threshold_slider.setRange(1, 50)
+        self.secondary_cuts_threshold_slider.setValue(20)  # Default = 20 intersections required
+        self.secondary_cuts_threshold_slider.setStyleSheet(f"""
             QSlider::groove:horizontal {{
                 border: 1px solid {Colors.BORDER};
                 height: 6px;
@@ -5395,20 +5395,20 @@ class MainWindow(QMainWindow):
                 border-radius: 3px;
             }}
         """)
-        self.secondary_cuts_sensitivity_slider.valueChanged.connect(self._on_sensitivity_changed)
-        slider_row.addWidget(self.secondary_cuts_sensitivity_slider)
+        self.secondary_cuts_threshold_slider.valueChanged.connect(self._on_threshold_changed)
+        slider_row.addWidget(self.secondary_cuts_threshold_slider)
         
-        slider_label_high = QLabel("Sensitive")
+        slider_label_high = QLabel("50")
         slider_label_high.setStyleSheet(f'color: {Colors.GRAY}; font-size: 11px;')
         slider_row.addWidget(slider_label_high)
         
-        sensitivity_layout.addLayout(slider_row)
+        threshold_layout.addLayout(slider_row)
         
         # Value display
-        self.secondary_cuts_sensitivity_value = QLabel("100%")
-        self.secondary_cuts_sensitivity_value.setStyleSheet(f'color: {Colors.DARK}; font-size: 12px; font-weight: 500;')
-        self.secondary_cuts_sensitivity_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sensitivity_layout.addWidget(self.secondary_cuts_sensitivity_value)
+        self.secondary_cuts_threshold_value = QLabel("Min intersections: 20")
+        self.secondary_cuts_threshold_value.setStyleSheet(f'color: {Colors.DARK}; font-size: 12px; font-weight: 500;')
+        self.secondary_cuts_threshold_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        threshold_layout.addWidget(self.secondary_cuts_threshold_value)
         
         # GPU acceleration checkbox
         from core.tetrahedral_mesh import CUDA_AVAILABLE
@@ -5444,9 +5444,9 @@ class MainWindow(QMainWindow):
                 border-radius: 3px;
             }}
         """)
-        sensitivity_layout.addWidget(self.secondary_cuts_gpu_checkbox)
+        threshold_layout.addWidget(self.secondary_cuts_gpu_checkbox)
         
-        self.context_layout.addWidget(sensitivity_group)
+        self.context_layout.addWidget(threshold_group)
         
         # Compute button
         self.secondary_cuts_btn = QPushButton("✂️ Find Secondary Cuts")
@@ -5505,10 +5505,10 @@ class MainWindow(QMainWindow):
         # Update UI with current state
         self._update_secondary_cuts_step_ui()
     
-    def _on_sensitivity_changed(self, value: int):
-        """Handle sensitivity slider change."""
-        if hasattr(self, 'secondary_cuts_sensitivity_value'):
-            self.secondary_cuts_sensitivity_value.setText(f"{value}%")
+    def _on_threshold_changed(self, value: int):
+        """Handle threshold slider change."""
+        if hasattr(self, 'secondary_cuts_threshold_value'):
+            self.secondary_cuts_threshold_value.setText(f"Min intersections: {value}")
     
     def _update_secondary_cuts_step_ui(self):
         """Update secondary cuts step UI based on current state."""
@@ -5542,11 +5542,10 @@ class MainWindow(QMainWindow):
         # Clear previous secondary cuts visualization before re-running
         self.mesh_viewer.clear_secondary_cuts()
         
-        # Get sensitivity from slider (0-200 -> 0.0-2.0)
-        # 0% = strict (large tolerance), 100% = exact, 200% = very sensitive (negative tolerance = expanded detection)
-        sensitivity = 1.0
-        if hasattr(self, 'secondary_cuts_sensitivity_slider'):
-            sensitivity = self.secondary_cuts_sensitivity_slider.value() / 100.0
+        # Get min_intersection_count from slider (1-50)
+        min_intersection_count = 20
+        if hasattr(self, 'secondary_cuts_threshold_slider'):
+            min_intersection_count = self.secondary_cuts_threshold_slider.value()
         
         # Get GPU preference
         use_gpu = True
@@ -5560,11 +5559,11 @@ class MainWindow(QMainWindow):
         self.secondary_cuts_progress_label.setText("Initializing...")
         self.secondary_cuts_stats.hide()
         
-        # Start worker with sensitivity and GPU preference
+        # Start worker with min_intersection_count and GPU preference
         self._secondary_cuts_worker = SecondaryCutsWorker(
             self._tet_result, 
             self._current_mesh,
-            sensitivity=sensitivity,
+            min_intersection_count=min_intersection_count,
             use_gpu=use_gpu
         )
         self._secondary_cuts_worker.progress.connect(self._on_secondary_cuts_progress)

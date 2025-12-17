@@ -1876,7 +1876,7 @@ def find_secondary_cutting_edges(
     tet_result: TetrahedralMeshResult,
     part_mesh: trimesh.Trimesh,
     boundary_mesh: trimesh.Trimesh = None,
-    sensitivity: float = 0.5,
+    min_intersection_count: int = 1,
     use_gpu: bool = True
 ) -> List[Tuple[int, int]]:
     """
@@ -1896,15 +1896,16 @@ def find_secondary_cutting_edges(
        - Path vi → wi  
        - Path vj → wj
        - Path wi → wj on ∂H
-    4. If this membrane intersects the part mesh M, mark edge as secondary cut
+    4. If this membrane intersects the part mesh M enough times, mark edge as secondary cut
     
     Args:
         tet_result: TetrahedralMeshResult with Dijkstra results (paths, destinations)
         part_mesh: The original part mesh M to check intersection against
         boundary_mesh: The boundary mesh ∂H (uses tet_result.boundary_mesh_original if not provided)
-        sensitivity: 0.0 to 1.0, controls how aggressively to detect secondary cuts
-                    0.0 = very strict (only clear intersections)
-                    1.0 = very sensitive (catches near-misses)
+        min_intersection_count: Minimum number of segment-triangle intersections required (1-20)
+                               Higher values filter out false positives from edge cases
+                               1 = any intersection triggers secondary cut
+                               Higher = requires multiple intersections (more confidence)
         use_gpu: Whether to use CUDA acceleration if available (default True)
     
     Returns:
@@ -1998,21 +1999,15 @@ def find_secondary_cutting_edges(
     
     # Find ALL interior edges from tetrahedral mesh where both vertices are interior
     # and have the SAME escape label (both H1 or both H2)
-    # IMPORTANT: Exclude edges where BOTH vertices are on the part surface - those are
-    # not secondary cuts, they're edges ON the part itself. Their membranes would
-    # trivially intersect the part surface, causing false positives.
+    # NOTE: We include edges where both vertices are on the part surface.
+    # Self-intersection is prevented by skipping seed triangles that share vertices
+    # with the membrane edge (handled in _find_secondary_cuts_triangle_cpu/gpu and C++).
     candidate_edges = []
     tet_edges = tet_result.edges
-    n_both_on_part_surface = 0  # Counter for edges filtered out
+    n_on_part_surface = 0  # Counter for edges on part surface (for logging)
     
     for v0, v1 in tet_edges:
         if v0 in interior_set and v1 in interior_set:
-            # Skip edges where BOTH vertices are on the part surface
-            # These are not secondary cuts - the membrane would trivially touch the part
-            if v0 in part_surface_vertices and v1 in part_surface_vertices:
-                n_both_on_part_surface += 1
-                continue
-            
             idx0 = vertex_to_interior_idx[v0]
             idx1 = vertex_to_interior_idx[v1]
             
@@ -2023,8 +2018,11 @@ def find_secondary_cutting_edges(
             # Different label edges are primary cuts (yellow), not secondary
             if label0 == label1 and label0 > 0:
                 candidate_edges.append((v0, v1, idx0, idx1))
+                # Track how many are on part surface for logging
+                if v0 in part_surface_vertices and v1 in part_surface_vertices:
+                    n_on_part_surface += 1
     
-    logger.info(f"Secondary cuts: {len(candidate_edges)} same-label interior edges to check (skipped {n_both_on_part_surface} edges on part surface)")
+    logger.info(f"Secondary cuts: {len(candidate_edges)} same-label interior edges to check ({n_on_part_surface} on part surface)")
     
     if len(candidate_edges) == 0 or len(seed_triangles) == 0:
         return []
@@ -2034,14 +2032,11 @@ def find_secondary_cutting_edges(
     boundary_adjacency = _build_boundary_adjacency(boundary_mesh)
     
     # Calculate minimum membrane thickness to filter out nearly-degenerate membranes
-    # Higher sensitivity = smaller threshold = more detections
-    # Lower sensitivity = larger threshold = fewer detections (filters out borderline cases)
-    # NOTE: Disabled for now as it was causing issues - set to 0 to not filter
+    # NOTE: Disabled for now - rely on min_intersection_count for filtering false positives
     avg_edge_length = np.mean(tet_result.edge_lengths) if tet_result.edge_lengths is not None else 1.0
-    # min_membrane_thickness = avg_edge_length * 0.1 * (1.0 - sensitivity)
-    min_membrane_thickness = 0.0  # Disabled - rely on triangle intersection only
+    min_membrane_thickness = 0.0  # Disabled - rely on intersection counting
     
-    logger.info(f"Secondary cuts: sensitivity={sensitivity:.2f}, avg_edge_length={avg_edge_length:.4f}")
+    logger.info(f"Secondary cuts: min_intersection_count={min_intersection_count}, avg_edge_length={avg_edge_length:.4f}")
     
     # Gather all membrane data first
     edge_membrane_data = []
@@ -2086,16 +2081,32 @@ def find_secondary_cutting_edges(
     
     # Check if membrane cuts through seed TRIANGLES (faces representing the part)
     # This uses tetrahedral mesh resolution and checks against actual surface area
-    secondary_cuts = _find_secondary_cuts_by_triangle_intersection(
-        edge_membrane_data, 
-        seed_triangles,
-        seed_triangle_positions,
-        vertices, 
-        boundary_verts,
-        sensitivity,
-        min_membrane_thickness,
-        use_gpu=use_gpu
-    )
+    # Try C++ implementation first (with OpenMP parallelization), fall back to Python/GPU
+    if CPP_FAST_AVAILABLE:
+        # Use C++ with OpenMP for CPU-based parallel processing
+        # This is often faster than GPU for this workload due to the irregular access patterns
+        from .fast_algorithms_wrapper import find_secondary_cuts_fast
+        secondary_cuts = find_secondary_cuts_fast(
+            edge_membrane_data, 
+            seed_triangles,
+            seed_triangle_positions,
+            vertices, 
+            boundary_verts,
+            min_intersection_count,
+            min_membrane_thickness
+        )
+    else:
+        # Fall back to Python/GPU implementation
+        secondary_cuts = _find_secondary_cuts_by_triangle_intersection(
+            edge_membrane_data, 
+            seed_triangles,
+            seed_triangle_positions,
+            vertices, 
+            boundary_verts,
+            min_intersection_count,
+            min_membrane_thickness,
+            use_gpu=use_gpu
+        )
     
     elapsed = (time.time() - start_time) * 1000
     logger.info(f"Secondary cuts complete in {elapsed:.0f}ms: {len(secondary_cuts)} secondary cutting edges found")
@@ -2109,7 +2120,7 @@ def _find_secondary_cuts_by_triangle_intersection(
     seed_triangle_positions: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
     vertices: np.ndarray,
     boundary_verts: np.ndarray,
-    sensitivity: float,
+    min_intersection_count: int = 1,
     min_membrane_thickness: float = 0.0,
     use_gpu: bool = True
 ) -> List[Tuple[int, int]]:
@@ -2121,6 +2132,7 @@ def _find_secondary_cuts_by_triangle_intersection(
     resolution. This is more robust than checking individual edges.
     
     Args:
+        min_intersection_count: Minimum number of segment-triangle intersections required (1-20)
         min_membrane_thickness: Skip membranes thinner than this (avoids false positives
                                on flat surfaces where escape paths are nearly identical)
     
@@ -2128,7 +2140,7 @@ def _find_secondary_cuts_by_triangle_intersection(
     """
     n_triangles = len(seed_triangles)
     n_membranes = len(edge_membrane_data)
-    logger.info(f"Secondary cuts: checking {n_membranes} membranes against {n_triangles} seed triangles")
+    logger.info(f"Secondary cuts: checking {n_membranes} membranes against {n_triangles} seed triangles (min_intersections={min_intersection_count})")
     
     if n_triangles == 0:
         logger.warning("No seed triangles found - cannot check for secondary cuts")
@@ -2141,13 +2153,13 @@ def _find_secondary_cuts_by_triangle_intersection(
         logger.info("Secondary cuts: Using GPU acceleration")
         return _find_secondary_cuts_triangle_gpu(
             edge_membrane_data, seed_triangles, seed_triangle_positions,
-            vertices, boundary_verts, sensitivity, min_membrane_thickness
+            vertices, boundary_verts, min_intersection_count, min_membrane_thickness
         )
     else:
         logger.info("Secondary cuts: Using CPU")
         return _find_secondary_cuts_triangle_cpu(
             edge_membrane_data, seed_triangles, seed_triangle_positions,
-            vertices, boundary_verts, sensitivity, min_membrane_thickness
+            vertices, boundary_verts, min_intersection_count, min_membrane_thickness
         )
 
 
@@ -2157,7 +2169,7 @@ def _find_secondary_cuts_triangle_cpu(
     seed_triangle_positions: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
     vertices: np.ndarray,
     boundary_verts: np.ndarray,
-    sensitivity: float,
+    min_intersection_count: int = 1,
     min_membrane_thickness: float = 0.0
 ) -> List[Tuple[int, int]]:
     """CPU implementation of secondary cuts by triangle-triangle intersection."""
@@ -2180,8 +2192,9 @@ def _find_secondary_cuts_triangle_cpu(
         for v in path_j[:min(3, len(path_j))]:
             skip_vertices.add(v)
         
-        # Check if any membrane triangle intersects any seed triangle
-        has_intersection = False
+        # Count intersections (require minimum threshold to trigger)
+        intersection_count = 0
+        
         for tri_idx, (tv0, tv1, tv2) in enumerate(seed_triangles):
             # Skip triangles that share vertices with the membrane edges
             if tv0 in skip_vertices or tv1 in skip_vertices or tv2 in skip_vertices:
@@ -2190,14 +2203,15 @@ def _find_secondary_cuts_triangle_cpu(
             seed_tri_pos = seed_triangle_positions[tri_idx]
             
             for mem_tri in membrane_triangles:
-                if _triangles_intersect(mem_tri, seed_tri_pos, sensitivity):
-                    has_intersection = True
-                    break
+                if _triangles_intersect(mem_tri, seed_tri_pos):
+                    intersection_count += 1
+                    if intersection_count >= min_intersection_count:
+                        break
             
-            if has_intersection:
+            if intersection_count >= min_intersection_count:
                 break
         
-        if has_intersection:
+        if intersection_count >= min_intersection_count:
             secondary_cuts.append((vi, vj))
     
     return secondary_cuts
@@ -2209,7 +2223,7 @@ def _find_secondary_cuts_triangle_gpu(
     seed_triangle_positions: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
     vertices: np.ndarray,
     boundary_verts: np.ndarray,
-    sensitivity: float,
+    min_intersection_count: int = 1,
     min_membrane_thickness: float = 0.0
 ) -> List[Tuple[int, int]]:
     """
@@ -2219,6 +2233,8 @@ def _find_secondary_cuts_triangle_gpu(
     We use a two-step approach:
     1. Check if membrane edges intersect seed triangles
     2. Check if seed triangle edges intersect membrane triangles
+    
+    Now counts intersections and requires minimum threshold to trigger.
     """
     import torch
     device = torch.device('cuda')
@@ -2291,22 +2307,23 @@ def _find_secondary_cuts_triangle_gpu(
         mem_edge_p1_gpu = torch.tensor(mem_edge_p1, device=device)
         
         # Test 1: Do membrane edges intersect seed triangles?
-        intersects_1 = _batch_segment_triangle_intersection_gpu(
+        count_1 = _batch_segment_triangle_intersection_gpu(
             mem_edge_p0_gpu, mem_edge_p1_gpu,
             seed_v0_gpu, seed_v1_gpu, seed_v2_gpu,
-            skip_mask, sensitivity
+            skip_mask
         )
         
         # Test 2: Do seed triangle edges intersect membrane triangles?
         # (No skip mask for membrane triangles - we check all)
         no_skip = torch.zeros(len(mem_edge_p0_gpu), dtype=torch.bool, device=device)
-        intersects_2 = _batch_segment_triangle_intersection_gpu(
+        count_2 = _batch_segment_triangle_intersection_gpu(
             seed_edge_p0_gpu, seed_edge_p1_gpu,
             mem_v0_gpu, mem_v1_gpu, mem_v2_gpu,
-            skip_edge_mask, sensitivity
+            skip_edge_mask
         )
         
-        if intersects_1 or intersects_2:
+        total_intersections = count_1 + count_2
+        if total_intersections >= min_intersection_count:
             secondary_cuts.append((vi, vj))
         
         # Periodic cleanup
@@ -2319,8 +2336,7 @@ def _find_secondary_cuts_triangle_gpu(
 
 def _triangles_intersect(
     tri1: Tuple[np.ndarray, np.ndarray, np.ndarray],
-    tri2: Tuple[np.ndarray, np.ndarray, np.ndarray],
-    sensitivity: float
+    tri2: Tuple[np.ndarray, np.ndarray, np.ndarray]
 ) -> bool:
     """
     Check if two triangles intersect.
@@ -2333,19 +2349,19 @@ def _triangles_intersect(
     u0, u1, u2 = tri2
     
     # Check edges of tri1 against tri2
-    if _segment_intersects_triangle(v0, v1, u0, u1, u2, sensitivity):
+    if _segment_intersects_triangle(v0, v1, u0, u1, u2):
         return True
-    if _segment_intersects_triangle(v1, v2, u0, u1, u2, sensitivity):
+    if _segment_intersects_triangle(v1, v2, u0, u1, u2):
         return True
-    if _segment_intersects_triangle(v2, v0, u0, u1, u2, sensitivity):
+    if _segment_intersects_triangle(v2, v0, u0, u1, u2):
         return True
     
     # Check edges of tri2 against tri1
-    if _segment_intersects_triangle(u0, u1, v0, v1, v2, sensitivity):
+    if _segment_intersects_triangle(u0, u1, v0, v1, v2):
         return True
-    if _segment_intersects_triangle(u1, u2, v0, v1, v2, sensitivity):
+    if _segment_intersects_triangle(u1, u2, v0, v1, v2):
         return True
-    if _segment_intersects_triangle(u2, u0, v0, v1, v2, sensitivity):
+    if _segment_intersects_triangle(u2, u0, v0, v1, v2):
         return True
     
     return False
@@ -2357,14 +2373,14 @@ def _batch_segment_triangle_intersection_gpu(
     tri_v0: 'torch.Tensor',  # (T, 3) triangle vertex 0
     tri_v1: 'torch.Tensor',  # (T, 3) triangle vertex 1
     tri_v2: 'torch.Tensor',  # (T, 3) triangle vertex 2
-    skip_mask: 'torch.Tensor',  # (T,) or (E,) bool - True to skip
-    sensitivity: float
-) -> bool:
+    skip_mask: 'torch.Tensor'  # (T,) or (E,) bool - True to skip
+) -> int:
     """
     GPU-batched Möller–Trumbore intersection test.
     
     Tests all segments against all triangles in parallel.
-    Returns True if ANY non-skipped segment intersects ANY triangle.
+    Returns COUNT of non-skipped segment-triangle intersections.
+    Boolean intersection detection - no tolerance scaling.
     """
     import torch
     
@@ -2374,7 +2390,7 @@ def _batch_segment_triangle_intersection_gpu(
     n_tris = tri_v0.shape[0]
     
     if n_segs == 0 or n_tris == 0:
-        return False
+        return 0
     
     # Expand dimensions for broadcasting: (E, 1, 3) x (1, T, 3)
     p0 = seg_p0.unsqueeze(1)  # (E, 1, 3)
@@ -2428,14 +2444,8 @@ def _batch_segment_triangle_intersection_gpu(
     # t = f * (edge2 · q) - distance along ray to intersection
     t = f * (edge2.expand(n_segs, -1, -1) * q).sum(dim=-1)  # (E, T)
     
-    # Tolerance based on sensitivity
-    # sensitivity < 1.0: positive tolerance (more lenient, fewer detections)
-    # sensitivity = 1.0: zero tolerance (exact intersection)
-    # sensitivity > 1.0: negative tolerance (expanded detection zone, more detections)
-    tolerance = seg_length * 0.05 * (1.0 - sensitivity)  # (E, 1)
-    
-    # Check if t is within segment bounds
-    t_valid = (t > -tolerance) & (t < seg_length + tolerance)  # (E, T)
+    # Check if t is within segment bounds (boolean - no tolerance scaling)
+    t_valid = (t >= -EPSILON) & (t <= seg_length + EPSILON)  # (E, T)
     
     # Combine all conditions
     intersects = ~parallel_mask & u_valid & v_valid & t_valid  # (E, T)
@@ -2448,8 +2458,8 @@ def _batch_segment_triangle_intersection_gpu(
         # Skip mask is for edges - broadcast across triangles
         intersects = intersects & ~skip_mask.unsqueeze(1)  # (E, T)
     
-    # Return True if any intersection
-    return intersects.any().item()
+    # Return count of intersections
+    return intersects.sum().item()
 
 
 def _build_membrane_triangles(
@@ -2547,13 +2557,13 @@ def _build_membrane_triangles(
 
 def _segment_intersects_triangle(
     p0: np.ndarray, p1: np.ndarray,
-    v0: np.ndarray, v1: np.ndarray, v2: np.ndarray,
-    sensitivity: float = 0.5
+    v0: np.ndarray, v1: np.ndarray, v2: np.ndarray
 ) -> bool:
     """
     Check if line segment (p0, p1) intersects triangle (v0, v1, v2).
     
     Uses Möller–Trumbore intersection algorithm.
+    Returns True if segment passes through triangle (boolean, no tolerance scaling).
     """
     EPSILON = 1e-9
     
@@ -2592,15 +2602,8 @@ def _segment_intersects_triangle(
     # Compute t to find intersection point
     t = f * np.dot(edge2, q)
     
-    # Check if intersection is within the segment (0 <= t <= seg_length)
-    # Tolerance based on sensitivity:
-    # sensitivity < 1.0: positive tolerance (more lenient, fewer detections)
-    # sensitivity = 1.0: zero tolerance (exact intersection)
-    # sensitivity > 1.0: negative tolerance (expanded detection, more detections)
-    tolerance = seg_length * 0.05 * (1.0 - sensitivity)
-    
-    if t > -tolerance and t < seg_length + tolerance:
-        return True
+    # Check if intersection is within the segment (boolean - no tolerance scaling)
+    return (t >= -EPSILON) and (t <= seg_length + EPSILON)
     
     return False
     
