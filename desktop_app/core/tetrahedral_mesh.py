@@ -793,6 +793,100 @@ def compute_secondary_cut_edge_flags(
     return cut_flags
 
 
+def compute_extended_secondary_cut_edge_flags(
+    edges: np.ndarray,
+    tetrahedra: np.ndarray,
+    tet_edge_indices: np.ndarray,
+    primary_cut_edges: Optional[List[Tuple[int, int]]],
+    secondary_cut_edges: Optional[List[Tuple[int, int]]],
+    edge_to_index: Optional[Dict[Tuple[int, int], int]] = None
+) -> np.ndarray:
+    """
+    Compute extended secondary cut edge flags that include primary edges in tets
+    where both primary and secondary edges exist.
+    
+    This allows the secondary parting surface to extend and connect to the 
+    primary parting surface where they meet.
+    
+    Logic:
+    - Start with all secondary cut edges marked
+    - For each tetrahedron that has at least one secondary edge:
+      - If it also has primary edges, mark those primary edges as "cut" too
+    - This makes the secondary surface extend through primary edges in shared tets
+    
+    Args:
+        edges: (E, 2) array of unique edges
+        tetrahedra: (M, 4) tetrahedron vertex indices
+        tet_edge_indices: (M, 6) mapping from tet to its 6 edge indices
+        primary_cut_edges: List of (vi, vj) primary cut edge tuples
+        secondary_cut_edges: List of (vi, vj) secondary cut edge tuples
+        edge_to_index: Optional pre-computed edge-to-index map
+    
+    Returns:
+        (E,) boolean array - extended secondary cut flags
+    """
+    n_edges = len(edges)
+    
+    # Build edge-to-index map if not provided
+    if edge_to_index is None:
+        edge_to_index = build_edge_to_index_map(edges)
+    
+    # Start with basic secondary flags
+    secondary_flags = np.zeros(n_edges, dtype=np.int8)
+    if secondary_cut_edges is not None:
+        for vi, vj in secondary_cut_edges:
+            key = (min(vi, vj), max(vi, vj))
+            if key in edge_to_index:
+                secondary_flags[edge_to_index[key]] = 1
+    
+    # Compute primary flags
+    primary_flags = np.zeros(n_edges, dtype=np.int8)
+    if primary_cut_edges is not None:
+        for vi, vj in primary_cut_edges:
+            key = (min(vi, vj), max(vi, vj))
+            if key in edge_to_index:
+                primary_flags[edge_to_index[key]] = 1
+    
+    # If no secondary edges, nothing to extend
+    if secondary_cut_edges is None or len(secondary_cut_edges) == 0:
+        return secondary_flags
+    
+    # If no primary edges, just return secondary
+    if primary_cut_edges is None or len(primary_cut_edges) == 0:
+        return secondary_flags
+    
+    # Extended flags start as copy of secondary
+    extended_flags = secondary_flags.copy()
+    
+    # For each tetrahedron, check if it has both primary and secondary edges
+    n_extended = 0
+    for t in range(len(tetrahedra)):
+        tet_edges = tet_edge_indices[t]  # 6 edge indices
+        
+        has_secondary = False
+        has_primary = False
+        primary_edges_in_tet = []
+        
+        for local_e in range(6):
+            global_e = tet_edges[local_e]
+            if secondary_flags[global_e]:
+                has_secondary = True
+            if primary_flags[global_e]:
+                has_primary = True
+                primary_edges_in_tet.append(global_e)
+        
+        # If this tet has both, extend secondary to include primary edges
+        if has_secondary and has_primary:
+            for global_e in primary_edges_in_tet:
+                if extended_flags[global_e] == 0:
+                    extended_flags[global_e] = 1
+                    n_extended += 1
+    
+    logger.info(f"Extended secondary cut edges: {np.sum(secondary_flags)} -> {np.sum(extended_flags)} (+{n_extended} from shared tets)")
+    
+    return extended_flags
+
+
 def prepare_parting_surface_data(tet_result: 'TetrahedralMeshResult') -> 'TetrahedralMeshResult':
     """
     Prepare all data structures needed for parting surface extraction.

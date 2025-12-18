@@ -83,10 +83,45 @@ def main():
     # Import and show main window
     logger.info("Loading main window...")
     from ui import MainWindow
+    from PyQt6.QtGui import QScreen
     
     window = MainWindow()
+    logger.debug(f"MainWindow created, geometry: {window.geometry()}")
+    
+    # Center window on primary screen to ensure visibility
+    primary_screen = app.primaryScreen()
+    if primary_screen:
+        screen_geometry = primary_screen.availableGeometry()
+        logger.debug(f"Primary screen: {primary_screen.name()}, geometry: {screen_geometry}")
+        
+        # Use 80% of screen size or max 1400x900, whichever is smaller
+        target_width = min(1400, int(screen_geometry.width() * 0.8))
+        target_height = min(900, int(screen_geometry.height() * 0.8))
+        window.resize(target_width, target_height)
+        
+        # Center the window
+        x = screen_geometry.x() + (screen_geometry.width() - target_width) // 2
+        y = screen_geometry.y() + (screen_geometry.height() - target_height) // 2
+        window.move(x, y)
+        logger.debug(f"Window resized to: {target_width}x{target_height}, moved to: ({x}, {y})")
+    
+    logger.debug(f"MainWindow isVisible before show(): {window.isVisible()}")
+    
     window.show()
+    window.raise_()  # Bring to front
+    window.activateWindow()  # Make it the active window
     logger.info("Main window displayed")
+    
+    logger.debug(f"MainWindow isVisible after show(): {window.isVisible()}")
+    logger.debug(f"MainWindow geometry after show(): {window.geometry()}")
+    logger.debug(f"MainWindow screen: {window.screen().name() if window.screen() else 'None'}")
+    logger.debug(f"MainWindow windowState: {window.windowState()}")
+    
+    # Process events to ensure window is fully rendered
+    app.processEvents()
+    logger.debug("Processed pending events")
+    logger.debug(f"MainWindow isVisible after processEvents: {window.isVisible()}")
+    logger.info("Starting Qt event loop...")
     
     # Run event loop
     return app.exec()
