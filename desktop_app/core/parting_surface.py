@@ -524,98 +524,25 @@ def smooth_parting_surface(
     return result
 
 
-def fill_holes_in_surface(
-    surface: PartingSurfaceResult,
-    max_hole_edges: int = 200
-) -> PartingSurfaceResult:
-    """
-    Fill holes in the parting surface mesh.
-    
-    Uses trimesh's hole filling capabilities to close gaps
-    in the surface that may result from labeling inconsistencies.
-    
-    Args:
-        surface: PartingSurfaceResult with holes
-        max_hole_edges: Maximum number of edges in a hole to fill (larger holes skipped)
-                       Default increased to 200 for better hole detection.
-    
-    Returns:
-        New PartingSurfaceResult with holes filled
-    """
-    if surface.mesh is None:
-        return surface
-    
-    import time
-    start = time.time()
-    
-    try:
-        mesh = surface.mesh.copy()
-        
-        # Get initial hole count
-        initial_holes = len(mesh.outline().entities) if hasattr(mesh.outline(), 'entities') else 0
-        
-        # Fill holes using trimesh
-        # This triangulates boundary loops
-        filled = mesh.fill_holes()
-        
-        if filled:
-            # Get final hole count
-            final_holes = len(mesh.outline().entities) if hasattr(mesh.outline(), 'entities') else 0
-            
-            # Update result
-            result = PartingSurfaceResult(
-                mesh=mesh,
-                vertices=np.array(mesh.vertices),
-                faces=np.array(mesh.faces),
-                vertex_to_edge=surface.vertex_to_edge,  # May be stale for new verts
-                num_vertices=len(mesh.vertices),
-                num_faces=len(mesh.faces),
-                num_tets_processed=surface.num_tets_processed,
-                num_tets_contributing=surface.num_tets_contributing,
-                extraction_time_ms=surface.extraction_time_ms
-            )
-            
-            elapsed = (time.time() - start) * 1000
-            holes_filled = initial_holes - final_holes
-            new_faces = result.num_faces - surface.num_faces
-            logger.info(f"Filled {holes_filled} holes, added {new_faces} faces in {elapsed:.1f}ms")
-            
-            return result
-        else:
-            logger.info("No holes to fill")
-            return surface
-            
-    except Exception as e:
-        logger.warning(f"Hole filling failed: {e}")
-        return surface
-
-
 def repair_parting_surface(
     surface: PartingSurfaceResult,
-    fill_holes: bool = True,
     merge_vertices: bool = True,
-    merge_threshold: float = 1e-8,
-    max_hole_edges: int = 500
+    merge_threshold: float = 1e-8
 ) -> PartingSurfaceResult:
     """
-    Repair the parting surface mesh to ensure it's watertight.
+    Clean the parting surface mesh by merging vertices and removing degenerate faces.
     
-    This performs several repair operations:
+    This performs:
     1. Merge duplicate/close vertices
-    2. Remove degenerate faces
-    3. Fill holes (including larger holes up to max_hole_edges)
-    4. Fix normals for consistency
+    2. Remove degenerate faces (zero area)
     
     Args:
-        surface: PartingSurfaceResult to repair
-        fill_holes: Whether to fill holes
+        surface: PartingSurfaceResult to clean
         merge_vertices: Whether to merge close vertices
         merge_threshold: Distance threshold for vertex merging
-        max_hole_edges: Maximum hole size to fill (number of boundary edges)
-                       Increased default (500) to catch larger holes.
     
     Returns:
-        Repaired PartingSurfaceResult
+        Cleaned PartingSurfaceResult
     """
     if surface.mesh is None:
         return surface
@@ -626,7 +553,6 @@ def repair_parting_surface(
     try:
         mesh = surface.mesh.copy()
         initial_verts = len(mesh.vertices)
-        initial_faces = len(mesh.faces)
         
         # Step 1: Merge close vertices
         if merge_vertices:
@@ -640,18 +566,6 @@ def repair_parting_surface(
                 faces=mesh.faces[valid_faces]
             )
         
-        # Step 3: Remove duplicate faces
-        mesh.remove_duplicate_faces()
-        
-        # Step 4: Fill holes - use custom implementation for larger holes
-        if fill_holes:
-            holes_filled = _fill_holes_comprehensive(mesh, max_hole_edges=max_hole_edges)
-            logger.debug(f"Filled {holes_filled} holes")
-        
-        # Step 5: Fix normals
-        mesh.fix_normals()
-        
-        # Create result
         result = PartingSurfaceResult(
             mesh=mesh,
             vertices=np.array(mesh.vertices),
@@ -666,570 +580,34 @@ def repair_parting_surface(
         
         elapsed = (time.time() - start) * 1000
         vert_diff = initial_verts - result.num_vertices
-        face_diff = result.num_faces - initial_faces
-        logger.info(f"Repaired parting surface: merged {vert_diff} verts, "
-                    f"added {face_diff} faces in {elapsed:.1f}ms")
+        logger.info(f"Cleaned parting surface: merged {vert_diff} verts in {elapsed:.1f}ms")
         
         return result
         
     except Exception as e:
-        logger.warning(f"Surface repair failed: {e}")
+        logger.warning(f"Surface cleaning failed: {e}")
         return surface
-
-
-def _fill_holes_comprehensive(mesh: trimesh.Trimesh, max_hole_edges: int = 500) -> int:
-    """
-    Fill holes in a mesh, including larger holes.
-    
-    This function finds boundary loops and triangulates them to fill holes.
-    Unlike trimesh's default fill_holes(), it can handle larger holes.
-    
-    Args:
-        mesh: Trimesh to modify in-place
-        max_hole_edges: Maximum number of edges in a hole to fill
-        
-    Returns:
-        Number of holes filled
-    """
-    from scipy.spatial import Delaunay
-    
-    holes_filled = 0
-    
-    try:
-        # Get boundary edges (edges that appear in only one face)
-        edges = mesh.edges_unique
-        edges_sorted = np.sort(edges, axis=1)
-        
-        # Count edge occurrences in faces
-        face_edges = mesh.faces_unique_edges
-        edge_counts = np.zeros(len(edges), dtype=np.int32)
-        for fe in face_edges:
-            edge_counts[fe] += 1
-        
-        # Boundary edges appear exactly once
-        boundary_mask = edge_counts == 1
-        boundary_edges = edges[boundary_mask]
-        
-        if len(boundary_edges) == 0:
-            return 0
-        
-        # Find connected boundary loops
-        loops = _find_boundary_loops(boundary_edges)
-        
-        for loop in loops:
-            if len(loop) > max_hole_edges:
-                logger.debug(f"Skipping large hole with {len(loop)} edges")
-                continue
-            
-            if len(loop) < 3:
-                continue
-            
-            # Get the vertices in order around the loop
-            loop_vertices = mesh.vertices[loop]
-            
-            # Triangulate the hole using ear clipping or fan triangulation
-            new_faces = _triangulate_polygon_3d(loop, loop_vertices)
-            
-            if new_faces is not None and len(new_faces) > 0:
-                # Add new faces to mesh
-                current_faces = list(mesh.faces)
-                current_faces.extend(new_faces)
-                mesh.faces = np.array(current_faces)
-                holes_filled += 1
-        
-        # Let trimesh clean up - remove degenerate faces
-        valid_faces = mesh.nondegenerate_faces()
-        if np.sum(~valid_faces) > 0:
-            mesh.update_faces(valid_faces)
-        mesh.remove_duplicate_faces()
-        
-    except Exception as e:
-        logger.warning(f"Comprehensive hole filling failed: {e}")
-        # Fallback to trimesh's default
-        try:
-            mesh.fill_holes()
-        except:
-            pass
-    
-    return holes_filled
-
-
-def _find_boundary_loops(edges: np.ndarray) -> List[List[int]]:
-    """
-    Find closed loops from boundary edges.
-    
-    Args:
-        edges: (N, 2) array of edge vertex indices
-        
-    Returns:
-        List of vertex index lists, each forming a closed loop
-    """
-    if len(edges) == 0:
-        return []
-    
-    # Build adjacency from edges
-    adj = {}
-    for e in edges:
-        v0, v1 = int(e[0]), int(e[1])
-        if v0 not in adj:
-            adj[v0] = []
-        if v1 not in adj:
-            adj[v1] = []
-        adj[v0].append(v1)
-        adj[v1].append(v0)
-    
-    # Find loops by walking
-    visited_edges = set()
-    loops = []
-    
-    for start in adj.keys():
-        if len(adj[start]) != 2:
-            continue  # Not a manifold boundary vertex
-        
-        # Try to walk a loop starting from this vertex
-        for next_v in adj[start]:
-            edge_key = (min(start, next_v), max(start, next_v))
-            if edge_key in visited_edges:
-                continue
-            
-            # Walk the loop
-            loop = [start]
-            current = next_v
-            prev = start
-            
-            while current != start and len(loop) < 10000:
-                loop.append(current)
-                visited_edges.add((min(prev, current), max(prev, current)))
-                
-                # Find next vertex (not the one we came from)
-                neighbors = adj.get(current, [])
-                next_candidates = [n for n in neighbors if n != prev]
-                
-                if not next_candidates:
-                    break
-                
-                prev = current
-                current = next_candidates[0]
-            
-            if current == start and len(loop) >= 3:
-                # Mark the closing edge as visited
-                visited_edges.add((min(prev, start), max(prev, start)))
-                loops.append(loop)
-    
-    return loops
-
-
-def _triangulate_polygon_3d(vertex_indices: List[int], vertices: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Triangulate a 3D polygon using fan triangulation.
-    
-    For convex or near-convex polygons, fan triangulation works well.
-    For complex polygons, we project to 2D and use ear clipping.
-    
-    Args:
-        vertex_indices: List of vertex indices forming the polygon boundary
-        vertices: (N, 3) array of vertex positions
-        
-    Returns:
-        (M, 3) array of triangle vertex indices, or None if failed
-    """
-    n = len(vertex_indices)
-    if n < 3:
-        return None
-    
-    if n == 3:
-        return np.array([vertex_indices])
-    
-    try:
-        # Compute polygon normal
-        v0 = vertices[0]
-        edges_vec = vertices[1:] - v0
-        
-        # Use cross product of first two edges as normal estimate
-        if len(edges_vec) >= 2:
-            normal = np.cross(edges_vec[0], edges_vec[1])
-            norm_len = np.linalg.norm(normal)
-            if norm_len > 1e-10:
-                normal = normal / norm_len
-            else:
-                normal = np.array([0, 0, 1])
-        else:
-            normal = np.array([0, 0, 1])
-        
-        # Project to 2D
-        # Find two orthogonal axes in the polygon plane
-        up = np.array([0, 1, 0]) if abs(normal[1]) < 0.9 else np.array([1, 0, 0])
-        axis_x = np.cross(up, normal)
-        axis_x = axis_x / np.linalg.norm(axis_x)
-        axis_y = np.cross(normal, axis_x)
-        
-        # Project vertices to 2D
-        centered = vertices - vertices.mean(axis=0)
-        pts_2d = np.column_stack([
-            np.dot(centered, axis_x),
-            np.dot(centered, axis_y)
-        ])
-        
-        # Use ear clipping triangulation
-        triangles = _ear_clip_triangulate(pts_2d)
-        
-        if triangles is not None and len(triangles) > 0:
-            # Map back to original vertex indices
-            return np.array([[vertex_indices[t[0]], vertex_indices[t[1]], vertex_indices[t[2]]] 
-                           for t in triangles])
-        
-    except Exception as e:
-        logger.debug(f"Polygon triangulation failed: {e}")
-    
-    # Fallback: simple fan triangulation from centroid
-    # This works for convex polygons
-    triangles = []
-    for i in range(1, n - 1):
-        triangles.append([vertex_indices[0], vertex_indices[i], vertex_indices[i + 1]])
-    
-    return np.array(triangles) if triangles else None
-
-
-def _ear_clip_triangulate(points: np.ndarray) -> Optional[List[Tuple[int, int, int]]]:
-    """
-    Simple ear clipping triangulation for 2D polygon.
-    
-    Args:
-        points: (N, 2) array of 2D points in order around polygon
-        
-    Returns:
-        List of (i, j, k) triangle index tuples
-    """
-    n = len(points)
-    if n < 3:
-        return None
-    if n == 3:
-        return [(0, 1, 2)]
-    
-    # Initialize vertex list
-    remaining = list(range(n))
-    triangles = []
-    
-    max_iterations = n * n  # Safety limit
-    iterations = 0
-    
-    while len(remaining) > 3 and iterations < max_iterations:
-        iterations += 1
-        found_ear = False
-        
-        for i in range(len(remaining)):
-            prev_idx = remaining[(i - 1) % len(remaining)]
-            curr_idx = remaining[i]
-            next_idx = remaining[(i + 1) % len(remaining)]
-            
-            # Check if this is an ear (convex vertex with no points inside)
-            if _is_ear(points, remaining, prev_idx, curr_idx, next_idx):
-                triangles.append((prev_idx, curr_idx, next_idx))
-                remaining.remove(curr_idx)
-                found_ear = True
-                break
-        
-        if not found_ear:
-            # No ear found, polygon might be degenerate
-            # Fall back to fan triangulation for remaining
-            for i in range(1, len(remaining) - 1):
-                triangles.append((remaining[0], remaining[i], remaining[i + 1]))
-            break
-    
-    # Handle final triangle
-    if len(remaining) == 3:
-        triangles.append((remaining[0], remaining[1], remaining[2]))
-    
-    return triangles
-
-
-def _is_ear(points: np.ndarray, remaining: List[int], 
-            prev_idx: int, curr_idx: int, next_idx: int) -> bool:
-    """Check if vertex curr_idx forms an ear in the polygon."""
-    p0 = points[prev_idx]
-    p1 = points[curr_idx]
-    p2 = points[next_idx]
-    
-    # Check if the vertex is convex (left turn)
-    cross = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0])
-    if cross <= 0:
-        return False
-    
-    # Check if any other vertex is inside the triangle
-    for idx in remaining:
-        if idx in (prev_idx, curr_idx, next_idx):
-            continue
-        if _point_in_triangle(points[idx], p0, p1, p2):
-            return False
-    
-    return True
-
-
-def _point_in_triangle(p: np.ndarray, a: np.ndarray, b: np.ndarray, c: np.ndarray) -> bool:
-    """Check if point p is inside triangle abc using barycentric coordinates."""
-    v0 = c - a
-    v1 = b - a
-    v2 = p - a
-    
-    dot00 = np.dot(v0, v0)
-    dot01 = np.dot(v0, v1)
-    dot02 = np.dot(v0, v2)
-    dot11 = np.dot(v1, v1)
-    dot12 = np.dot(v1, v2)
-    
-    denom = dot00 * dot11 - dot01 * dot01
-    if abs(denom) < 1e-10:
-        return False
-    
-    inv_denom = 1.0 / denom
-    u = (dot11 * dot02 - dot01 * dot12) * inv_denom
-    v = (dot00 * dot12 - dot01 * dot02) * inv_denom
-    
-    return (u >= 0) and (v >= 0) and (u + v < 1)
-
-
-# =============================================================================
-# BRIDGE GAPS TO PART MESH
-# =============================================================================
-
-def bridge_to_part_mesh(
-    surface: PartingSurfaceResult,
-    part_mesh: trimesh.Trimesh,
-    max_bridge_distance: float = 5.0,
-    min_edge_length: float = 0.1
-) -> PartingSurfaceResult:
-    """
-    Bridge gaps between the parting surface boundary and the part mesh.
-    
-    This function finds boundary edges of the parting surface that are close
-    to the part mesh and creates triangles to close the gap.
-    
-    Args:
-        surface: PartingSurfaceResult with potential gaps
-        part_mesh: The original part mesh to bridge to
-        max_bridge_distance: Maximum distance to bridge (vertices farther away are ignored)
-        min_edge_length: Minimum edge length to consider (avoids degenerate triangles)
-    
-    Returns:
-        New PartingSurfaceResult with gaps bridged
-    """
-    if surface.mesh is None or part_mesh is None:
-        return surface
-    
-    import time
-    from trimesh.proximity import ProximityQuery
-    
-    start = time.time()
-    
-    try:
-        mesh = surface.mesh.copy()
-        initial_faces = len(mesh.faces)
-        
-        # Find boundary vertices
-        boundary_verts = _get_boundary_vertices(mesh)
-        
-        if len(boundary_verts) == 0:
-            logger.debug("No boundary vertices found - surface may be closed")
-            return surface
-        
-        # Create proximity query for part mesh
-        proximity = ProximityQuery(part_mesh)
-        
-        # Get boundary vertex positions
-        boundary_positions = mesh.vertices[boundary_verts]
-        
-        # Find closest points on part mesh
-        closest_points, distances, face_indices = proximity.on_surface(boundary_positions)
-        
-        # Filter by distance - only bridge vertices close enough to part mesh
-        close_mask = distances < max_bridge_distance
-        
-        if not np.any(close_mask):
-            logger.debug(f"No boundary vertices within {max_bridge_distance} of part mesh")
-            return surface
-        
-        # Get the boundary loops for ordered traversal
-        boundary_edges = _get_boundary_edges(mesh)
-        loops = _find_boundary_loops(boundary_edges)
-        
-        new_faces = []
-        new_vertices = list(mesh.vertices)
-        
-        for loop in loops:
-            if len(loop) < 3:
-                continue
-            
-            # For each edge in the loop, check if we should bridge
-            for i in range(len(loop)):
-                v0_idx = loop[i]
-                v1_idx = loop[(i + 1) % len(loop)]
-                
-                # Check if both vertices are in our boundary set and close to part mesh
-                if v0_idx not in boundary_verts or v1_idx not in boundary_verts:
-                    continue
-                
-                # Get indices into boundary_verts array
-                bv0_pos = np.where(boundary_verts == v0_idx)[0]
-                bv1_pos = np.where(boundary_verts == v1_idx)[0]
-                
-                if len(bv0_pos) == 0 or len(bv1_pos) == 0:
-                    continue
-                
-                bv0_idx = bv0_pos[0]
-                bv1_idx = bv1_pos[0]
-                
-                # Check if close enough to bridge
-                if not close_mask[bv0_idx] or not close_mask[bv1_idx]:
-                    continue
-                
-                # Get the closest points on part mesh
-                p0_on_part = closest_points[bv0_idx]
-                p1_on_part = closest_points[bv1_idx]
-                
-                # Get parting surface boundary positions
-                p0_boundary = mesh.vertices[v0_idx]
-                p1_boundary = mesh.vertices[v1_idx]
-                
-                # Check if the projection points are different enough
-                proj_dist = np.linalg.norm(p0_on_part - p1_on_part)
-                if proj_dist < min_edge_length:
-                    # Points project to nearly same location - make single triangle
-                    # Add the midpoint on part mesh as new vertex
-                    mid_on_part = 0.5 * (p0_on_part + p1_on_part)
-                    new_vert_idx = len(new_vertices)
-                    new_vertices.append(mid_on_part)
-                    
-                    # Triangle from boundary edge to new point
-                    new_faces.append([v0_idx, v1_idx, new_vert_idx])
-                else:
-                    # Create two triangles (a quad between boundary edge and part mesh)
-                    # Add two new vertices on part mesh
-                    new_v0_idx = len(new_vertices)
-                    new_vertices.append(p0_on_part)
-                    new_v1_idx = len(new_vertices)
-                    new_vertices.append(p1_on_part)
-                    
-                    # Two triangles forming a quad
-                    new_faces.append([v0_idx, v1_idx, new_v1_idx])
-                    new_faces.append([v0_idx, new_v1_idx, new_v0_idx])
-        
-        if not new_faces:
-            logger.debug("No bridging faces created")
-            return surface
-        
-        # Build new mesh with added vertices and faces
-        all_vertices = np.array(new_vertices)
-        all_faces = np.vstack([mesh.faces, np.array(new_faces)])
-        
-        new_mesh = trimesh.Trimesh(
-            vertices=all_vertices,
-            faces=all_faces,
-            process=False
-        )
-        
-        # Clean up
-        new_mesh.merge_vertices()
-        valid_faces = new_mesh.nondegenerate_faces()
-        if np.sum(~valid_faces) > 0:
-            new_mesh = trimesh.Trimesh(
-                vertices=new_mesh.vertices,
-                faces=new_mesh.faces[valid_faces]
-            )
-        new_mesh.remove_duplicate_faces()
-        new_mesh.fix_normals()
-        
-        result = PartingSurfaceResult(
-            mesh=new_mesh,
-            vertices=np.array(new_mesh.vertices),
-            faces=np.array(new_mesh.faces),
-            vertex_to_edge=None,
-            num_vertices=len(new_mesh.vertices),
-            num_faces=len(new_mesh.faces),
-            num_tets_processed=surface.num_tets_processed,
-            num_tets_contributing=surface.num_tets_contributing,
-            extraction_time_ms=surface.extraction_time_ms
-        )
-        
-        elapsed = (time.time() - start) * 1000
-        faces_added = result.num_faces - initial_faces
-        logger.info(f"Bridged parting surface to part mesh: added {faces_added} faces in {elapsed:.1f}ms")
-        
-        return result
-        
-    except Exception as e:
-        logger.warning(f"Bridge to part mesh failed: {e}")
-        return surface
-
-
-def _get_boundary_vertices(mesh: trimesh.Trimesh) -> np.ndarray:
-    """Get indices of boundary vertices (vertices on boundary edges)."""
-    boundary_edges = _get_boundary_edges(mesh)
-    if len(boundary_edges) == 0:
-        return np.array([], dtype=np.int64)
-    
-    return np.unique(boundary_edges.flatten())
-
-
-def _get_boundary_edges(mesh: trimesh.Trimesh) -> np.ndarray:
-    """Get boundary edges (edges appearing in exactly one face)."""
-    edges = mesh.edges_unique
-    
-    # Count how many faces each edge belongs to
-    edge_counts = np.zeros(len(edges), dtype=np.int32)
-    face_edges = mesh.faces_unique_edges
-    for fe in face_edges:
-        edge_counts[fe] += 1
-    
-    # Boundary edges appear exactly once
-    boundary_mask = edge_counts == 1
-    return edges[boundary_mask]
 
 
 def repair_parting_surface_with_part(
     surface: PartingSurfaceResult,
-    part_mesh: trimesh.Trimesh,
-    fill_internal_holes: bool = True,
-    bridge_to_part: bool = True,
-    max_hole_edges: int = 500,
-    max_bridge_distance: float = 5.0
+    part_mesh: trimesh.Trimesh
 ) -> PartingSurfaceResult:
     """
-    Comprehensive repair of parting surface including bridging to part mesh.
-    
-    This is an enhanced version of repair_parting_surface that also
-    closes gaps between the parting surface boundary and the original part.
+    Clean parting surface (merge vertices, remove degenerates).
     
     Args:
-        surface: PartingSurfaceResult to repair
-        part_mesh: The original part mesh
-        fill_internal_holes: Whether to fill internal holes in the surface
-        bridge_to_part: Whether to bridge gaps to the part mesh
-        max_hole_edges: Maximum hole size to fill
-        max_bridge_distance: Maximum distance to bridge to part mesh
+        surface: PartingSurfaceResult to clean
+        part_mesh: The original part mesh (reserved for future use)
     
     Returns:
-        Repaired PartingSurfaceResult
+        Cleaned PartingSurfaceResult
     """
     if surface.mesh is None:
         return surface
     
-    # Step 1: Basic repair (merge vertices, remove degenerates, fill internal holes)
-    result = repair_parting_surface(
-        surface,
-        fill_holes=fill_internal_holes,
-        merge_vertices=True,
-        max_hole_edges=max_hole_edges
-    )
-    
-    # Step 2: Bridge gaps to part mesh
-    if bridge_to_part and part_mesh is not None:
-        result = bridge_to_part_mesh(
-            result,
-            part_mesh,
-            max_bridge_distance=max_bridge_distance
-        )
-    
-    return result
+    # Basic cleanup: merge vertices and remove degenerate faces
+    return repair_parting_surface(surface, merge_vertices=True)
 
 
 # Log table stats on module load (debug level)

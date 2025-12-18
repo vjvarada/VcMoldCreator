@@ -3115,6 +3115,10 @@ class MeshViewer(QWidget):
             
         logger.info(f"Setting Dijkstra result: {n_interior} interior vertices")
         
+        # Ensure interior_vertex_indices is a 1D numpy array of integers
+        interior_vertex_indices = np.asarray(interior_vertex_indices).flatten().astype(int)
+        interior_escape_labels = np.asarray(interior_escape_labels).flatten()
+        
         # Create a mapping from tet vertex index to escape label
         # Initialize all vertices as -1 (not interior / on boundary)
         vertex_escape_labels = np.full(len(vertices), -1, dtype=np.int8)
@@ -3122,7 +3126,7 @@ class MeshViewer(QWidget):
             vertex_escape_labels[vert_idx] = interior_escape_labels[i]
         
         # Get interior vertex set for fast lookup
-        interior_set = set(interior_vertex_indices)
+        interior_set = set(interior_vertex_indices.tolist())
         
         # Build edges connecting interior vertices
         # Use tetrahedral mesh edges if provided, otherwise fall back to boundary mesh

@@ -1457,11 +1457,11 @@ class ComprehensiveSurfaceResult:
 
 class ComprehensivePrimarySurfaceWorker(QThread):
     """
-    Background worker for comprehensive primary surface processing.
+    Background worker for primary surface processing.
     
-    Combines all primary surface tasks in one step:
+    Performs:
     1. Extract surface using Marching Tetrahedra
-    2. Repair surface (fill holes, bridge to part mesh)
+    2. Clean surface (merge vertices, remove degenerates)
     3. Smooth surface with boundary re-projection
     """
     
@@ -1470,19 +1470,16 @@ class ComprehensivePrimarySurfaceWorker(QThread):
     error = pyqtSignal(str)
     
     def __init__(self, tet_result, part_mesh=None, hull_mesh=None,
-                 smooth_iterations: int = 5, damping_factor: float = 0.5,
-                 max_hole_edges: int = 500, max_bridge_distance: float = 10.0):
+                 smooth_iterations: int = 5, damping_factor: float = 0.5):
         """
-        Initialize comprehensive primary surface worker.
+        Initialize primary surface worker.
         
         Args:
             tet_result: TetrahedralMeshResult with primary cut edges
-            part_mesh: Original part mesh for bridging and boundary re-projection
+            part_mesh: Original part mesh for boundary re-projection
             hull_mesh: Hull mesh for boundary re-projection
             smooth_iterations: Number of smoothing iterations
             damping_factor: Smoothing damping factor
-            max_hole_edges: Maximum hole size to fill
-            max_bridge_distance: Maximum distance to bridge to part mesh
         """
         super().__init__()
         self.tet_result = tet_result
@@ -1490,8 +1487,6 @@ class ComprehensivePrimarySurfaceWorker(QThread):
         self.hull_mesh = hull_mesh
         self.smooth_iterations = smooth_iterations
         self.damping_factor = damping_factor
-        self.max_hole_edges = max_hole_edges
-        self.max_bridge_distance = max_bridge_distance
     
     def run(self):
         try:
@@ -1538,23 +1533,19 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             
             self.progress.emit(f"Extracted: {extraction_result.num_vertices:,} verts, {extraction_result.num_faces:,} faces")
             
-            # === Step 3: Repair surface (fill holes, bridge to part) ===
-            self.progress.emit("Repairing surface (filling holes + bridging to part)...")
+            # === Step 3: Clean surface (merge vertices, remove degenerates) ===
+            self.progress.emit("Cleaning surface...")
             repair_start = time.time()
             
             repaired_result = repair_parting_surface_with_part(
                 extraction_result,
-                self.part_mesh,
-                fill_internal_holes=True,
-                bridge_to_part=True,
-                max_hole_edges=self.max_hole_edges,
-                max_bridge_distance=self.max_bridge_distance
+                self.part_mesh
             )
             
             result.repair_time_ms = (time.time() - repair_start) * 1000
             
             if repaired_result.mesh is None:
-                self.progress.emit("Surface repair failed")
+                self.progress.emit("Surface cleaning failed")
                 result.mesh = extraction_result.mesh
                 result.num_vertices = extraction_result.num_vertices
                 result.num_faces = extraction_result.num_faces
@@ -1562,7 +1553,7 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                 self.complete.emit(result)
                 return
             
-            self.progress.emit(f"Repaired: {repaired_result.num_vertices:,} verts, {repaired_result.num_faces:,} faces")
+            self.progress.emit(f"Cleaned: {repaired_result.num_vertices:,} verts, {repaired_result.num_faces:,} faces")
             
             # === Step 4: Smooth surface with boundary re-projection ===
             if self.smooth_iterations > 0:
@@ -1747,15 +1738,11 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
             
             self.progress.emit(f"Extracted: {extraction_result.num_vertices:,} verts, {extraction_result.num_faces:,} faces")
             
-            # === Step 3: Repair and fill holes ===
-            self.progress.emit("Repairing secondary surface...")
+            # === Step 3: Clean surface (merge vertices, remove degenerates) ===
+            self.progress.emit("Cleaning secondary surface...")
             repair_result = repair_parting_surface_with_part(
                 extraction_result,
-                self.part_mesh,
-                fill_internal_holes=True,
-                bridge_to_part=True,
-                max_hole_edges=500,
-                max_bridge_distance=10.0
+                self.part_mesh
             )
             
             secondary_mesh = repair_result.mesh if repair_result.mesh is not None else extraction_result.mesh
@@ -1847,7 +1834,7 @@ class PartingSurfaceWorker(QThread):
     
     def __init__(self, tet_result, use_original_vertices: bool = True, smooth_iterations: int = 0, 
                  repair_surface: bool = True, cut_type: str = 'primary', extend_to_primary: bool = True,
-                 part_mesh=None, bridge_to_part: bool = True):
+                 part_mesh=None):
         """
         Initialize parting surface worker.
         
@@ -1855,12 +1842,11 @@ class PartingSurfaceWorker(QThread):
             tet_result: TetrahedralMeshResult with primary/secondary cut edges
             use_original_vertices: If True, use non-inflated vertex positions
             smooth_iterations: Number of Laplacian smoothing iterations (0 = none)
-            repair_surface: If True, repair surface to fill holes and fix issues
+            repair_surface: If True, clean surface (merge vertices, remove degenerates)
             cut_type: Which cut edges to use: 'primary', 'secondary', or 'both'
             extend_to_primary: If True and cut_type='secondary', extend secondary surface
                               to connect with primary surface in shared tetrahedra
-            part_mesh: Original part mesh for bridging gaps (optional)
-            bridge_to_part: If True and part_mesh provided, bridge gaps to part mesh
+            part_mesh: Original part mesh (reserved for future use)
         """
         super().__init__()
         self.tet_result = tet_result
@@ -1870,7 +1856,6 @@ class PartingSurfaceWorker(QThread):
         self.cut_type = cut_type
         self.extend_to_primary = extend_to_primary
         self.part_mesh = part_mesh
-        self.bridge_to_part = bridge_to_part
     
     def run(self):
         try:
@@ -1905,21 +1890,13 @@ class PartingSurfaceWorker(QThread):
                 extend_to_primary=self.extend_to_primary
             )
             
-            # Step 3: Repair surface (fill holes, merge vertices, bridge to part mesh)
+            # Step 3: Clean surface (merge vertices, remove degenerates)
             if self.repair_surface and result.mesh is not None:
-                if self.part_mesh is not None and self.bridge_to_part:
-                    self.progress.emit(f"Repairing {cut_type_label} surface (filling holes + bridging to part)...")
-                    result = repair_parting_surface_with_part(
-                        result,
-                        self.part_mesh,
-                        fill_internal_holes=True,
-                        bridge_to_part=True,
-                        max_hole_edges=500,
-                        max_bridge_distance=10.0
-                    )
+                self.progress.emit(f"Cleaning {cut_type_label} surface...")
+                if self.part_mesh is not None:
+                    result = repair_parting_surface_with_part(result, self.part_mesh)
                 else:
-                    self.progress.emit(f"Repairing {cut_type_label} surface (filling holes)...")
-                    result = repair_parting_surface(result, fill_holes=True, merge_vertices=True)
+                    result = repair_parting_surface(result, merge_vertices=True)
             
             # Step 4: Optional smoothing
             if self.smooth_iterations > 0 and result.mesh is not None:
@@ -2084,6 +2061,8 @@ class TitleBar(QFrame):
     reset_clicked = pyqtSignal()
     undo_clicked = pyqtSignal()
     redo_clicked = pyqtSignal()
+    save_clicked = pyqtSignal()
+    load_clicked = pyqtSignal()
     view_changed = pyqtSignal(str)  # Emits view name: 'front', 'back', 'left', 'right', 'top', 'bottom', 'iso'
     
     def __init__(self, parent=None):
@@ -2134,6 +2113,20 @@ class TitleBar(QFrame):
         self.redo_btn.clicked.connect(self.redo_clicked.emit)
         self.redo_btn.setEnabled(False)
         left_section.addWidget(self.redo_btn)
+        
+        # Separator before save/load
+        sep2 = self._create_separator()
+        left_section.addWidget(sep2)
+        
+        # Save button
+        self.save_btn = self._create_icon_button("💾", "Save Session (Ctrl+S)")
+        self.save_btn.clicked.connect(self.save_clicked.emit)
+        left_section.addWidget(self.save_btn)
+        
+        # Load button
+        self.load_btn = self._create_icon_button("📂", "Load Session (Ctrl+O)")
+        self.load_btn.clicked.connect(self.load_clicked.emit)
+        left_section.addWidget(self.load_btn)
         
         layout.addLayout(left_section)
         
@@ -3256,7 +3249,24 @@ class MainWindow(QMainWindow):
         logger.debug("MainWindow: Calling _setup_ui...")
         self._setup_ui()
         logger.debug("MainWindow: _setup_ui complete")
+        
+        # Setup keyboard shortcuts
+        self._setup_shortcuts()
         logger.debug("MainWindow.__init__ complete")
+    
+    def _setup_shortcuts(self):
+        """Setup keyboard shortcuts."""
+        from PyQt6.QtGui import QShortcut, QKeySequence
+        
+        # Ctrl+S - Save session
+        save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
+        save_shortcut.activated.connect(self._on_save_session)
+        
+        # Ctrl+O - Load session  
+        load_shortcut = QShortcut(QKeySequence("Ctrl+O"), self)
+        load_shortcut.activated.connect(self._on_load_session)
+        
+        logger.debug("Keyboard shortcuts configured")
     
     def _setup_window(self):
         logger.debug("_setup_window: Setting window title...")
@@ -3291,6 +3301,8 @@ class MainWindow(QMainWindow):
         self.title_bar.reset_clicked.connect(self._on_reset_all)
         self.title_bar.undo_clicked.connect(self._on_undo)
         self.title_bar.redo_clicked.connect(self._on_redo)
+        self.title_bar.save_clicked.connect(self._on_save_session)
+        self.title_bar.load_clicked.connect(self._on_load_session)
         self.title_bar.view_changed.connect(self._on_view_changed)
         outer_layout.addWidget(self.title_bar)
         logger.debug("_setup_ui: Title bar created and connected")
@@ -4312,6 +4324,399 @@ class MainWindow(QMainWindow):
         # TODO: Implement redo stack
         logger.info("Redo clicked (not yet implemented)")
     
+    # =========================================================================
+    # SESSION SAVE/LOAD
+    # =========================================================================
+    
+    def _on_save_session(self):
+        """Handle save session button click - save all computed data."""
+        from PyQt6.QtWidgets import QFileDialog
+        import pickle
+        import gzip
+        import os
+        
+        # Get save file path
+        default_name = "mold_session.vcm"
+        if self._loaded_filename:
+            base_name = os.path.splitext(os.path.basename(self._loaded_filename))[0]
+            default_name = f"{base_name}_session.vcm"
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Session",
+            default_name,
+            "VcMoldCreator Session (*.vcm);;All Files (*)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            # Collect all state data
+            session_data = self._collect_session_data()
+            
+            # Save with gzip compression
+            with gzip.open(file_path, 'wb') as f:
+                pickle.dump(session_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            logger.info(f"Session saved to: {file_path}")
+            QMessageBox.information(
+                self,
+                "Session Saved",
+                f"Session saved successfully to:\n{file_path}"
+            )
+            
+        except Exception as e:
+            logger.exception(f"Failed to save session: {e}")
+            QMessageBox.critical(
+                self,
+                "Save Error",
+                f"Failed to save session:\n{str(e)}"
+            )
+    
+    def _on_load_session(self):
+        """Handle load session button click - restore all computed data."""
+        from PyQt6.QtWidgets import QFileDialog
+        import pickle
+        import gzip
+        
+        # Get load file path
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Session",
+            "",
+            "VcMoldCreator Session (*.vcm);;All Files (*)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            # Load session data
+            with gzip.open(file_path, 'rb') as f:
+                session_data = pickle.load(f)
+            
+            # Restore state
+            self._restore_session_data(session_data)
+            
+            logger.info(f"Session loaded from: {file_path}")
+            QMessageBox.information(
+                self,
+                "Session Loaded",
+                f"Session loaded successfully from:\n{file_path}"
+            )
+            
+        except Exception as e:
+            logger.exception(f"Failed to load session: {e}")
+            QMessageBox.critical(
+                self,
+                "Load Error",
+                f"Failed to load session:\n{str(e)}"
+            )
+    
+    def _collect_session_data(self) -> dict:
+        """Collect all session data for saving."""
+        import trimesh
+        
+        def mesh_to_dict(mesh):
+            """Convert trimesh to serializable dict."""
+            if mesh is None:
+                return None
+            return {
+                'vertices': mesh.vertices.copy(),
+                'faces': mesh.faces.copy(),
+            }
+        
+        def result_to_dict(result, mesh_attrs=None):
+            """Convert a result dataclass to a serializable dict."""
+            if result is None:
+                return None
+            data = {}
+            for key, value in result.__dict__.items():
+                if isinstance(value, trimesh.Trimesh):
+                    data[key] = mesh_to_dict(value)
+                elif isinstance(value, np.ndarray):
+                    data[key] = value.copy()
+                elif isinstance(value, (int, float, str, bool, type(None), list, tuple)):
+                    data[key] = value
+                elif isinstance(value, dict):
+                    # Try to serialize dict items
+                    data[key] = {}
+                    for k, v in value.items():
+                        if isinstance(v, np.ndarray):
+                            data[key][k] = v.copy()
+                        elif isinstance(v, (int, float, str, bool, type(None), list, tuple)):
+                            data[key][k] = v
+                        else:
+                            data[key][k] = str(v)  # Fallback
+                else:
+                    # Skip non-serializable objects
+                    pass
+            return data
+        
+        session = {
+            'version': 1,
+            'filename': self._loaded_filename,
+            'active_step': self._active_step.value if self._active_step else None,
+            
+            # Step completion status
+            'step_status': {
+                step.value: btn._status for step, btn in self.step_buttons.items()
+            },
+            
+            # Original mesh
+            'current_mesh': mesh_to_dict(self._current_mesh),
+            
+            # Parting direction
+            'parting_result': result_to_dict(self._parting_result),
+            'visibility_paint_data': result_to_dict(self._visibility_paint_data),
+            
+            # Hull
+            'hull_result': result_to_dict(self._hull_result),
+            
+            # Cavity
+            'cavity_result': result_to_dict(self._cavity_result),
+            
+            # Mold halves
+            'mold_halves_result': result_to_dict(self._mold_halves_result),
+            'boundary_zone_threshold': self._boundary_zone_threshold,
+            
+            # Tetrahedral mesh
+            'tet_result': result_to_dict(self._tet_result),
+            'tet_edge_length_fac': self._tet_edge_length_fac,
+            'tet_optimize': self._tet_optimize,
+            
+            # Parting surface
+            'parting_surface_result': result_to_dict(self._parting_surface_result),
+            'primary_smoothing_result': result_to_dict(self._primary_smoothing_result),
+            
+            # Secondary surface
+            'secondary_parting_surface_result': result_to_dict(self._secondary_parting_surface_result),
+            'propagation_result': result_to_dict(self._propagation_result),
+            'secondary_smoothing_result': result_to_dict(self._secondary_smoothing_result),
+            'secondary_surface_result': result_to_dict(self._secondary_surface_result),
+        }
+        
+        return session
+    
+    def _restore_session_data(self, session: dict):
+        """Restore session data from loaded dict."""
+        import trimesh
+        import os
+        from dataclasses import fields, is_dataclass
+        
+        def dict_to_mesh(data):
+            """Convert dict back to trimesh."""
+            if data is None:
+                return None
+            return trimesh.Trimesh(
+                vertices=data['vertices'],
+                faces=data['faces']
+            )
+        
+        def dict_to_result(data, result_class):
+            """Convert dict back to result dataclass."""
+            if data is None:
+                return None
+            
+            # Process data - convert mesh dicts back to trimesh objects
+            processed_data = {}
+            for key, value in data.items():
+                if isinstance(value, dict) and 'vertices' in value and 'faces' in value:
+                    # This is a mesh
+                    processed_data[key] = dict_to_mesh(value)
+                else:
+                    processed_data[key] = value
+            
+            # Try to create instance using **kwargs if it's a dataclass
+            if is_dataclass(result_class):
+                # Get the field names for this dataclass
+                field_names = {f.name for f in fields(result_class)}
+                # Filter to only include valid fields
+                valid_data = {k: v for k, v in processed_data.items() if k in field_names}
+                try:
+                    return result_class(**valid_data)
+                except TypeError:
+                    # If that fails, try creating with defaults and setting attrs
+                    pass
+            
+            # Fallback: create empty instance and set attributes
+            try:
+                result = result_class()
+                for key, value in processed_data.items():
+                    if hasattr(result, key):
+                        setattr(result, key, value)
+                return result
+            except TypeError:
+                # Can't create instance - return a simple object with attrs
+                result = type('RestoredResult', (), processed_data)()
+                return result
+        
+        # First reset everything
+        self._on_reset_all()
+        
+        # Restore filename
+        self._loaded_filename = session.get('filename')
+        
+        # Restore meshes and results
+        if session.get('current_mesh'):
+            self._current_mesh = dict_to_mesh(session['current_mesh'])
+            # Update viewer
+            if self._current_mesh is not None:
+                self.mesh_viewer.set_mesh(self._current_mesh)
+                # Update title bar
+                if self._loaded_filename:
+                    self.title_bar.set_file_info(
+                        os.path.basename(self._loaded_filename),
+                        len(self._current_mesh.faces),
+                        0  # Size not stored
+                    )
+        
+        # Restore parting result
+        if session.get('parting_result'):
+            from core.parting_direction import PartingDirectionResult
+            self._parting_result = dict_to_result(session['parting_result'], PartingDirectionResult)
+        
+        if session.get('visibility_paint_data'):
+            from core.parting_direction import VisibilityPaintData, get_face_colors
+            self._visibility_paint_data = dict_to_result(session['visibility_paint_data'], VisibilityPaintData)
+            if self._visibility_paint_data and hasattr(self._visibility_paint_data, 'triangle_classes') and self._visibility_paint_data.triangle_classes is not None:
+                # Recompute face colors from triangle_classes
+                face_colors = get_face_colors(self._visibility_paint_data)
+                self.mesh_viewer.apply_visibility_paint(face_colors)
+                self.display_options.show_parting_option(True)
+        
+        # Restore hull result
+        if session.get('hull_result'):
+            from core.inflated_hull import InflatedHullResult
+            self._hull_result = dict_to_result(session['hull_result'], InflatedHullResult)
+            if self._hull_result and hasattr(self._hull_result, 'mesh') and self._hull_result.mesh:
+                self.mesh_viewer.set_hull_mesh(self._hull_result.mesh)
+                self.display_options.show_hull_option(True)
+        
+        # Restore cavity result
+        if session.get('cavity_result'):
+            from core.mold_cavity import MoldCavityResult
+            self._cavity_result = dict_to_result(session['cavity_result'], MoldCavityResult)
+            if self._cavity_result and hasattr(self._cavity_result, 'cavity_mesh') and self._cavity_result.cavity_mesh:
+                self.mesh_viewer.set_cavity_mesh(self._cavity_result.cavity_mesh)
+                self.display_options.show_cavity_option(True)
+        
+        # Restore mold halves result
+        if session.get('mold_halves_result'):
+            from core.mold_half_classification import MoldHalfClassificationResult
+            self._mold_halves_result = dict_to_result(session['mold_halves_result'], MoldHalfClassificationResult)
+            self._boundary_zone_threshold = session.get('boundary_zone_threshold', 0.15)
+            if self._mold_halves_result and hasattr(self._mold_halves_result, 'classification') and self._mold_halves_result.classification is not None:
+                # Update viewer with mold halves colors
+                self.display_options.show_mold_halves_option(True)
+        
+        # Restore tet result
+        if session.get('tet_result'):
+            from core.tetrahedral_mesh import TetrahedralMeshResult
+            self._tet_result = dict_to_result(session['tet_result'], TetrahedralMeshResult)
+            self._tet_edge_length_fac = session.get('tet_edge_length_fac', 0.05)
+            self._tet_optimize = session.get('tet_optimize', True)
+            if self._tet_result:
+                self.display_options.show_tet_mesh_option(True)
+                
+                # Restore tetrahedral mesh visualization if edge weights computed
+                if hasattr(self._tet_result, 'edge_weights') and self._tet_result.edge_weights is not None:
+                    self.mesh_viewer.set_tetrahedral_mesh(
+                        self._tet_result.vertices,
+                        self._tet_result.edges,
+                        edge_weights=self._tet_result.edge_weights,
+                        edge_boundary_labels=self._tet_result.edge_boundary_labels,
+                        colormap='coolwarm'
+                    )
+                    # Show original tet mesh if available
+                    if hasattr(self._tet_result, 'vertices_original') and self._tet_result.vertices_original is not None:
+                        self.mesh_viewer.set_original_tetrahedral_mesh(self._tet_result.vertices_original, self._tet_result.edges)
+                    # Show edge weight options
+                    self.display_options.show_edge_weight_options(True)
+                
+                # Restore Dijkstra visualization if results exist
+                if hasattr(self._tet_result, 'seed_escape_labels') and self._tet_result.seed_escape_labels is not None:
+                    if hasattr(self._tet_result, 'seed_vertex_indices') and self._tet_result.seed_vertex_indices is not None:
+                        self.mesh_viewer.set_dijkstra_result(
+                            self._tet_result.vertices,
+                            self._tet_result.seed_vertex_indices,
+                            self._tet_result.seed_escape_labels,
+                            boundary_mesh=None,
+                            interior_distances=getattr(self._tet_result, 'seed_distances', None),
+                            tet_edges=self._tet_result.edges
+                        )
+                        self.display_options.show_dijkstra_result_option(True)
+                    
+                    # Show secondary cuts if they exist
+                    if hasattr(self._tet_result, 'secondary_cut_edges') and self._tet_result.secondary_cut_edges is not None:
+                        self.display_options.show_secondary_cuts_option(True)
+        
+        # Restore parting surface results
+        if session.get('parting_surface_result'):
+            from core.parting_surface import PartingSurfaceResult
+            self._parting_surface_result = dict_to_result(session['parting_surface_result'], PartingSurfaceResult)
+        
+        if session.get('primary_smoothing_result'):
+            # This could be a ComprehensiveSurfaceResult or SmoothingResult
+            self._primary_smoothing_result = type('Result', (), session['primary_smoothing_result'])()
+            for k, v in session['primary_smoothing_result'].items():
+                if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
+                    setattr(self._primary_smoothing_result, k, dict_to_mesh(v))
+                else:
+                    setattr(self._primary_smoothing_result, k, v)
+        
+        # Show primary parting surface in viewer
+        if self._primary_smoothing_result and hasattr(self._primary_smoothing_result, 'mesh') and self._primary_smoothing_result.mesh:
+            self.mesh_viewer.set_parting_surface(self._primary_smoothing_result.mesh)
+            self.display_options.show_parting_surface_options(show_primary=True)
+        elif self._parting_surface_result and hasattr(self._parting_surface_result, 'mesh') and self._parting_surface_result.mesh:
+            self.mesh_viewer.set_parting_surface(self._parting_surface_result.mesh)
+            self.display_options.show_parting_surface_options(show_primary=True)
+        
+        # Restore secondary surface results
+        if session.get('secondary_surface_result'):
+            self._secondary_surface_result = type('Result', (), session['secondary_surface_result'])()
+            for k, v in session['secondary_surface_result'].items():
+                if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
+                    setattr(self._secondary_surface_result, k, dict_to_mesh(v))
+                else:
+                    setattr(self._secondary_surface_result, k, v)
+            
+            if self._secondary_surface_result and hasattr(self._secondary_surface_result, 'mesh') and self._secondary_surface_result.mesh:
+                self.mesh_viewer.set_secondary_parting_surface(self._secondary_surface_result.mesh)
+                self.display_options.show_parting_surface_options(show_primary=True, show_secondary=True)
+        
+        # Restore step statuses
+        step_status = session.get('step_status', {})
+        for step_val, status in step_status.items():
+            try:
+                step = Step(step_val)
+                if step in self.step_buttons:
+                    self.step_buttons[step].set_status(status)
+            except ValueError:
+                pass
+        
+        # Restore active step
+        active_step_val = session.get('active_step')
+        if active_step_val:
+            try:
+                self._active_step = Step(active_step_val)
+                for step, btn in self.step_buttons.items():
+                    btn.set_active(step == self._active_step)
+            except ValueError:
+                pass
+        
+        # Update context panel for current step
+        self._update_context_panel()
+        
+        # Show display options panel if we have any results to display
+        if self._current_mesh is not None:
+            self.display_options.show()
+            self.display_options.raise_()  # Bring to front
+        
+        logger.info(f"Session restored, active step: {self._active_step}")
+
     def _on_view_changed(self, view: str):
         """Handle view change from title bar."""
         if self.mesh_viewer:
@@ -6480,10 +6885,10 @@ class MainWindow(QMainWindow):
         info_layout = QVBoxLayout(info_group)
         
         info_text = QLabel(
-            "Generate, repair, and smooth the primary parting surface mesh.\n\n"
-            "This comprehensive step performs:\n"
+            "Generate and smooth the primary parting surface mesh.\n\n"
+            "This step performs:\n"
             "• Extract surface using Marching Tetrahedra\n"
-            "• Fill holes and bridge gaps to part mesh\n"
+            "• Clean mesh (merge vertices, remove degenerates)\n"
             "• Smooth with boundary re-projection to part/hull"
         )
         info_text.setWordWrap(True)
@@ -6538,14 +6943,6 @@ class MainWindow(QMainWindow):
         smooth_layout = QFormLayout(smooth_group)
         smooth_layout.setContentsMargins(12, 12, 12, 12)
         smooth_layout.setSpacing(10)
-        
-        # Max bridge distance - for gap filling in corners
-        self.primary_max_bridge_spin = QDoubleSpinBox()
-        self.primary_max_bridge_spin.setRange(1.0, 100.0)
-        self.primary_max_bridge_spin.setValue(15.0)
-        self.primary_max_bridge_spin.setSingleStep(1.0)
-        self.primary_max_bridge_spin.setToolTip("Max distance to bridge gaps to part mesh (increase for corners)")
-        smooth_layout.addRow("Max bridge dist:", self.primary_max_bridge_spin)
         
         # Smoothing iterations
         self.primary_smooth_iterations_spin = QSpinBox()
@@ -6640,15 +7037,12 @@ class MainWindow(QMainWindow):
                 self.secondary_parting_surface_btn.setText("🔴 No Secondary Cuts Available")
     
     def _on_run_parting_surface(self):
-        """Start comprehensive parting surface generation (extract + repair + smooth)."""
+        """Start parting surface generation (extract + clean + smooth)."""
         if self._tet_result is None:
             QMessageBox.warning(self, "Warning", "No tetrahedral mesh data available")
             return
         
         # Get parameters from UI
-        max_bridge_distance = getattr(self, 'primary_max_bridge_spin', None)
-        max_bridge_distance = max_bridge_distance.value() if max_bridge_distance else 15.0
-        
         smooth_iterations = getattr(self, 'primary_smooth_iterations_spin', None)
         smooth_iterations = smooth_iterations.value() if smooth_iterations else 5
         
@@ -6662,8 +7056,8 @@ class MainWindow(QMainWindow):
         self.parting_surface_progress_label.setText("Preparing data structures...")
         self.parting_surface_stats.hide()
         
-        # Start comprehensive worker thread for PRIMARY parting surface
-        # This does: extraction + repair (hole filling + bridging) + smoothing
+        # Start worker thread for PRIMARY parting surface
+        # This does: extraction + cleanup + smoothing
         hull_mesh = self._hull_result.mesh if self._hull_result is not None else None
         
         self._parting_surface_worker = ComprehensivePrimarySurfaceWorker(
@@ -6671,9 +7065,7 @@ class MainWindow(QMainWindow):
             part_mesh=self._current_mesh,
             hull_mesh=hull_mesh,
             smooth_iterations=smooth_iterations,
-            damping_factor=damping_factor,
-            max_hole_edges=500,
-            max_bridge_distance=max_bridge_distance
+            damping_factor=damping_factor
         )
         self._parting_surface_worker.progress.connect(self._on_parting_surface_progress)
         self._parting_surface_worker.complete.connect(self._on_parting_surface_complete)
@@ -6715,7 +7107,7 @@ class MainWindow(QMainWindow):
         # Show timing breakdown
         self.parting_surface_stats.add_row('')
         self.parting_surface_stats.add_row(f'⏱ Extraction: {result.extraction_time_ms:.0f}ms')
-        self.parting_surface_stats.add_row(f'⏱ Repair: {result.repair_time_ms:.0f}ms')
+        self.parting_surface_stats.add_row(f'⏱ Cleanup: {result.repair_time_ms:.0f}ms')
         
         if result.smooth_iterations > 0:
             self.parting_surface_stats.add_row(f'⏱ Smoothing ({result.smooth_iterations} iter): {result.smoothing_time_ms:.0f}ms')
@@ -6790,12 +7182,10 @@ class MainWindow(QMainWindow):
         self.secondary_parting_surface_stats.hide()
         
         # Start worker thread for SECONDARY parting surface
-        # Pass part mesh for bridging gaps between parting surface and part
         self._secondary_parting_surface_worker = PartingSurfaceWorker(
             self._tet_result, 
             cut_type='secondary',
-            part_mesh=self._current_mesh,
-            bridge_to_part=True
+            part_mesh=self._current_mesh
         )
         self._secondary_parting_surface_worker.progress.connect(self._on_secondary_parting_surface_progress)
         self._secondary_parting_surface_worker.complete.connect(self._on_secondary_parting_surface_complete)
