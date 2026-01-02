@@ -599,26 +599,67 @@ class MeshLoadWorker(QThread):
             self.load_complete.emit(result)
             self.progress.emit(f"Loaded in {result.load_time_ms:.1f}ms")
             
+            # === PHASE 1: Initial analysis ===
             logger.info("Analyzing mesh...")
-            self.progress.emit("Analyzing mesh...")
+            self.progress.emit("Analyzing mesh quality...")
             analyzer = MeshAnalyzer(result.mesh)
             diagnostics = analyzer.analyze()
             logger.info(f"Analysis complete: manifold={diagnostics.is_manifold}, watertight={diagnostics.is_watertight}")
-            self.analysis_complete.emit(diagnostics)
             
-            if self._should_repair and not diagnostics.is_watertight:
-                logger.info("Repairing mesh...")
-                self.progress.emit("Repairing mesh...")
+            # === PHASE 2: Always run mesh cleanup (even on watertight meshes) ===
+            # This ensures consistent mesh quality for downstream operations
+            if self._should_repair:
+                logger.info("Running mesh cleanup...")
+                self.progress.emit("Cleaning up mesh (merging vertices, removing degenerates)...")
+                
                 repairer = MeshRepairer(result.mesh)
-                # IMPORTANT: Disable convex hull fallback to preserve original geometry
-                # Convex hull would destroy the original shape of non-watertight meshes
-                repair_result = repairer.repair(use_convex_hull_fallback=False)
-                logger.info(f"Repair complete: was_repaired={repair_result.was_repaired}")
+                # Always run cleanup operations but don't use convex hull fallback
+                repair_result = repairer.repair(
+                    merge_vertices=True,
+                    remove_degenerate=True,
+                    remove_duplicates=True,
+                    fix_normals=True,
+                    fill_holes=not diagnostics.is_watertight,  # Only fill holes if needed
+                    use_convex_hull_fallback=False  # Never destroy original geometry
+                )
+                
+                # Log what was done
+                if repair_result.was_repaired:
+                    logger.info(f"Mesh cleaned: {repair_result.repair_method}")
+                    for step in repair_result.repair_steps:
+                        logger.info(f"  - {step}")
+                    
+                    # Build summary message
+                    summary_parts = []
+                    for step in repair_result.repair_steps:
+                        if "Merged" in step:
+                            summary_parts.append(step)
+                        elif "Removed" in step:
+                            summary_parts.append(step)
+                        elif "Filled" in step:
+                            summary_parts.append(step)
+                        elif "Fixed" in step and "normal" in step.lower():
+                            summary_parts.append("Fixed normals")
+                    
+                    if summary_parts:
+                        self.progress.emit(f"Cleanup: {'; '.join(summary_parts[:3])}")
+                    else:
+                        self.progress.emit("Mesh cleanup complete")
+                else:
+                    logger.info("Mesh is clean, no repairs needed")
+                    self.progress.emit("Mesh is clean, no repairs needed")
+                
+                # Emit repair complete (updates mesh in viewer if needed)
                 self.repair_complete.emit(repair_result)
-                self.progress.emit("Mesh processing complete")
-            else:
-                logger.info("Mesh is valid, no repair needed")
-                self.progress.emit("Mesh is valid, no repair needed")
+                
+                # Re-analyze after repair
+                if repair_result.was_repaired:
+                    analyzer = MeshAnalyzer(repair_result.mesh)
+                    diagnostics = analyzer.analyze()
+            
+            # Emit analysis complete (with potentially updated diagnostics)
+            self.analysis_complete.emit(diagnostics)
+            self.progress.emit("Mesh processing complete")
                 
         except Exception as e:
             logger.exception(f"Error in mesh processing: {e}")
@@ -1434,13 +1475,24 @@ class SecondaryCutsWorker(QThread):
 
 @dataclass
 class ComprehensiveSurfaceResult:
-    """Result of comprehensive primary surface processing (generation + repair + smoothing)."""
+    """Result of comprehensive primary surface processing (generation + repair + gap fill + smoothing)."""
     # From extraction
     mesh: Optional[trimesh.Trimesh] = None
     num_vertices: int = 0
     num_faces: int = 0
     num_tets_contributing: int = 0
     num_tets_processed: int = 0
+    
+    # Mapping from surface vertex index to tet mesh edge index (for debugging)
+    vertex_to_edge: Optional[np.ndarray] = None
+    
+    # From gap filling
+    gaps_detected: int = 0
+    gaps_filled: int = 0
+    fill_faces_added: int = 0
+    gap_fill_time_ms: float = 0.0
+    # Indices of gap-fill faces (for visualization in different color)
+    fill_face_indices: Optional[np.ndarray] = None
     
     # From smoothing
     boundary_vertices: int = 0
@@ -1492,7 +1544,8 @@ class ComprehensivePrimarySurfaceWorker(QThread):
         try:
             from core.parting_surface import (
                 extract_parting_surface_from_tet_result,
-                repair_parting_surface_with_part
+                repair_parting_surface_with_part,
+                close_parting_surface_gaps
             )
             from core.surface_propagation import smooth_membrane_with_boundary_reprojection
             from core.tetrahedral_mesh import prepare_parting_surface_data
@@ -1525,6 +1578,9 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             result.num_tets_processed = extraction_result.num_tets_processed
             result.num_tets_contributing = extraction_result.num_tets_contributing
             
+            # Store vertex_to_edge mapping for debugging
+            result.vertex_to_edge = extraction_result.vertex_to_edge
+            
             if extraction_result.mesh is None or extraction_result.num_faces == 0:
                 self.progress.emit("No primary surface generated")
                 result.total_time_ms = (time.time() - total_start) * 1000
@@ -1555,7 +1611,59 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             
             self.progress.emit(f"Cleaned: {repaired_result.num_vertices:,} verts, {repaired_result.num_faces:,} faces")
             
-            # === Step 4: Smooth surface with boundary re-projection ===
+            # Current mesh after cleaning
+            current_mesh = repaired_result.mesh
+            
+            # Track gap-fill info for smoothing exclusion
+            excluded_vertices = None
+            fill_face_start_idx = None
+            
+            # === Step 3.5: Close gaps between parting surface and part (BEFORE smoothing) ===
+            # Gap-fill adds triangles to connect parting surface boundary to the part mesh.
+            # These fill triangles will NOT be smoothed - only the original parting surface is.
+            if self.part_mesh is not None:
+                self.progress.emit("Closing gaps between parting surface and part...")
+                gap_start = time.time()
+                
+                gap_result = close_parting_surface_gaps(
+                    repaired_result,
+                    self.part_mesh,
+                    distance_threshold=None,  # Auto-compute
+                    method='smart_curtain'
+                )
+                
+                result.gap_fill_time_ms = (time.time() - gap_start) * 1000
+                result.gaps_detected = gap_result.boundary_edges_near_part
+                result.gaps_filled = gap_result.boundary_loops_found
+                result.fill_faces_added = gap_result.fill_faces_added
+                
+                if gap_result.mesh is not None and gap_result.fill_faces_added > 0:
+                    # Record where fill faces start (for visualization)
+                    fill_face_start_idx = len(current_mesh.faces)
+                    result.fill_face_indices = np.arange(
+                        fill_face_start_idx,
+                        fill_face_start_idx + gap_result.fill_faces_added
+                    )
+                    current_mesh = gap_result.mesh
+                    
+                    # Collect vertices to exclude from smoothing (fill vertices)
+                    # part_constrained_vertices are the new projected vertices
+                    # fill_boundary_vertices are the original boundary used in fill
+                    excluded_verts_set = set()
+                    if gap_result.part_constrained_vertices is not None:
+                        excluded_verts_set.update(gap_result.part_constrained_vertices.tolist())
+                    if gap_result.fill_boundary_vertices is not None:
+                        excluded_verts_set.update(gap_result.fill_boundary_vertices.tolist())
+                    if excluded_verts_set:
+                        excluded_vertices = np.array(list(excluded_verts_set), dtype=np.int64)
+                    
+                    self.progress.emit(f"Gap fill: {gap_result.fill_faces_added} faces added, "
+                                      f"{gap_result.boundary_loops_found} loops closed")
+                else:
+                    self.progress.emit("No gaps to fill (or already closed)")
+            
+            # === Step 4: Smooth surface with boundary re-projection (AFTER gap fill) ===
+            # Smooth only the original parting surface, NOT the gap-fill triangles.
             if self.smooth_iterations > 0:
                 self.progress.emit(f"Smoothing surface ({self.smooth_iterations} iterations, λ={self.damping_factor})...")
                 
@@ -1568,12 +1676,13 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                 smoothing_start = time.time()
                 
                 smoothing_result = smooth_membrane_with_boundary_reprojection(
-                    repaired_result.mesh,
+                    current_mesh,
                     part_mesh=self.part_mesh,
                     hull_mesh=self.hull_mesh,
                     primary_mesh=None,  # No primary for primary surface smoothing
                     iterations=self.smooth_iterations,
-                    damping_factor=self.damping_factor
+                    damping_factor=self.damping_factor,
+                    excluded_vertices=excluded_vertices  # Don't smooth gap-fill vertices
                 )
                 
                 result.smoothing_time_ms = (time.time() - smoothing_start) * 1000
@@ -1581,26 +1690,51 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                 result.interior_vertices = smoothing_result.interior_vertices
                 
                 if smoothing_result.mesh is not None:
-                    result.mesh = smoothing_result.mesh
-                    result.num_vertices = len(smoothing_result.mesh.vertices)
-                    result.num_faces = len(smoothing_result.mesh.faces)
+                    current_mesh = smoothing_result.mesh
                 else:
-                    # Smoothing failed, use repaired mesh
-                    result.mesh = repaired_result.mesh
-                    result.num_vertices = repaired_result.num_vertices
-                    result.num_faces = repaired_result.num_faces
-            else:
-                # No smoothing requested
-                result.mesh = repaired_result.mesh
-                result.num_vertices = repaired_result.num_vertices
-                result.num_faces = repaired_result.num_faces
+                    self.progress.emit("Smoothing returned no mesh, using unsmoothed")
+            
+            # === Step 5: Weld gap-fill triangles to smoothed parting surface ===
+            # After smoothing, merge vertices at the boundary between gap-fill and parting surface
+            if result.fill_face_indices is not None and len(result.fill_face_indices) > 0:
+                self.progress.emit("Welding gap-fill triangles to parting surface...")
+                try:
+                    # Use trimesh's merge_vertices to weld close vertices
+                    pre_weld_verts = len(current_mesh.vertices)
+                    current_mesh.merge_vertices(merge_tex=False, merge_norm=False)
+                    post_weld_verts = len(current_mesh.vertices)
+                    merged_count = pre_weld_verts - post_weld_verts
+                    
+                    if merged_count > 0:
+                        self.progress.emit(f"Welded {merged_count} vertices")
+                        # Update fill_face_indices since faces may have been renumbered
+                        # After merge, we can't reliably track fill faces, so clear the indices
+                        # (They're already welded into the mesh now)
+                        result.fill_face_indices = None
+                    else:
+                        self.progress.emit("No vertices needed welding")
+                except Exception as e:
+                    logger.warning(f"Weld step failed: {e}")
+                    self.progress.emit(f"Weld warning: {e}")
+            
+            # Set final result
+            result.mesh = current_mesh
+            result.num_vertices = len(current_mesh.vertices)
+            result.num_faces = len(current_mesh.faces)
             
             result.total_time_ms = (time.time() - total_start) * 1000
             
+            # Build timing summary
+            timing_parts = [f"extract: {result.extraction_time_ms:.0f}ms"]
+            timing_parts.append(f"repair: {result.repair_time_ms:.0f}ms")
+            if result.gap_fill_time_ms > 0:
+                timing_parts.append(f"gap-fill: {result.gap_fill_time_ms:.0f}ms")
+            if self.smooth_iterations > 0:
+                timing_parts.append(f"smooth: {result.smoothing_time_ms:.0f}ms")
+            
             self.progress.emit(
                 f"Complete: {result.num_vertices:,} verts, {result.num_faces:,} faces "
-                f"(extract: {result.extraction_time_ms:.0f}ms, repair: {result.repair_time_ms:.0f}ms, "
-                f"smooth: {result.smoothing_time_ms:.0f}ms)"
+                f"({', '.join(timing_parts)})"
             )
             
             self.complete.emit(result)
@@ -3706,7 +3840,22 @@ class MainWindow(QMainWindow):
         self.mesh_stats.add_row(f'Surface Area: {diag.surface_area:,.2f}')
         
         if self._repair_result and self._repair_result.was_repaired:
-            self.mesh_stats.add_row(f'Repaired: {self._repair_result.repair_method}', Colors.PRIMARY)
+            # Show repair summary
+            repair_info = self._repair_result.repair_method
+            if len(repair_info) > 30:
+                repair_info = repair_info[:27] + "..."
+            self.mesh_stats.add_row(f'Repaired: {repair_info}', Colors.PRIMARY)
+            
+            # Show vertex/face changes if significant
+            vert_change = self._repair_result.original_vertex_count - diag.vertex_count
+            face_change = self._repair_result.original_face_count - diag.face_count
+            if vert_change > 0 or face_change > 0:
+                changes = []
+                if vert_change > 0:
+                    changes.append(f"-{vert_change} verts")
+                if face_change > 0:
+                    changes.append(f"-{face_change} faces")
+                self.mesh_stats.add_row(f'  Cleaned: {", ".join(changes)}', Colors.SUCCESS)
     
     def _setup_parting_step(self):
         """Setup the parting direction step UI."""
@@ -7109,6 +7258,15 @@ class MainWindow(QMainWindow):
         self.parting_surface_stats.add_row(f'⏱ Extraction: {result.extraction_time_ms:.0f}ms')
         self.parting_surface_stats.add_row(f'⏱ Cleanup: {result.repair_time_ms:.0f}ms')
         
+        # Show gap filling stats if gaps were detected
+        if result.gaps_detected > 0:
+            self.parting_surface_stats.add_row(f'⏱ Gap filling: {result.gap_fill_time_ms:.0f}ms')
+            self.parting_surface_stats.add_row(f'   Gaps detected: {result.gaps_detected:,}')
+            self.parting_surface_stats.add_row(f'   Gaps filled: {result.gaps_filled:,}')
+            self.parting_surface_stats.add_row(f'   Faces added: {result.fill_faces_added:,}')
+        elif result.gap_fill_time_ms > 0:
+            self.parting_surface_stats.add_row(f'⏱ Gap filling: {result.gap_fill_time_ms:.0f}ms (no gaps)')
+        
         if result.smooth_iterations > 0:
             self.parting_surface_stats.add_row(f'⏱ Smoothing ({result.smooth_iterations} iter): {result.smoothing_time_ms:.0f}ms')
             self.parting_surface_stats.add_row(f'   Boundary verts: {result.boundary_vertices:,}')
@@ -7143,12 +7301,15 @@ class MainWindow(QMainWindow):
         
         try:
             # Use the mesh viewer's set_parting_surface method
-            self.mesh_viewer.set_parting_surface(result.mesh)
+            # Pass fill_face_indices if available (to show in yellow)
+            fill_face_indices = getattr(result, 'fill_face_indices', None)
+            self.mesh_viewer.set_parting_surface(result.mesh, fill_face_indices=fill_face_indices)
             
             # Show display option for primary parting surface
             self.display_options.show_parting_surface_options(show_primary=True)
             
-            logger.info(f"Parting surface visualized: {result.num_vertices} vertices, {result.num_faces} faces")
+            logger.info(f"Parting surface visualized: {result.num_vertices} vertices, {result.num_faces} faces"
+                       f"{f', {len(fill_face_indices)} fill faces in yellow' if fill_face_indices is not None else ''}")
                     
         except Exception as e:
             logger.exception(f"Error visualizing parting surface: {e}")
@@ -7677,8 +7838,21 @@ class MainWindow(QMainWindow):
         self._current_mesh = result.mesh
         self._current_diagnostics = result.diagnostics
         
-        # Update viewer with repaired mesh (green tint)
-        self.mesh_viewer.set_mesh(result.mesh, color='#66ff99')
+        # Only change mesh color if actual repairs were made
+        if result.was_repaired:
+            # Update viewer with repaired mesh (green tint to indicate changes)
+            self.mesh_viewer.set_mesh(result.mesh, color='#66ff99')
+            
+            # Update title bar with new triangle count
+            if self._loaded_filename:
+                filename = Path(self._loaded_filename).name
+                triangle_count = len(result.mesh.faces)
+                try:
+                    file_size = Path(self._loaded_filename).stat().st_size
+                except:
+                    file_size = 0
+                self.title_bar.set_file_info(filename, triangle_count, file_size)
+        
         self._update_mesh_stats()
     
     def _on_error(self, message: str):

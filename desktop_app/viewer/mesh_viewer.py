@@ -161,6 +161,15 @@ class MeshViewer(QWidget):
         self._r_point_actors = []  # Spheres at endpoints
         self._r_label_actor = None
         
+        # Edge debug mode for parting surface
+        self._edge_debug_mode = False
+        self._boundary_edges_actor = None  # Highlight boundary edges
+        self._selected_edge_actor = None  # Currently selected edge
+        self._boundary_edges_data = None  # Store edge data for picking
+        self._part_mesh_ref = None  # Reference to part mesh for distance calculations
+        self._tet_result_ref = None  # Reference to tet result for escape label analysis
+        self._parting_surface_result_ref = None  # Reference to parting surface result for vertex_to_edge mapping
+        
         self._setup_ui()
     
     def _setup_ui(self):
@@ -3436,26 +3445,28 @@ class MeshViewer(QWidget):
     PARTING_SURFACE_COLOR = "#3399ff"  # Blue
     PARTING_SURFACE_OPACITY = 0.7
     
+    # Color for gap-fill triangles (yellow)
+    GAP_FILL_COLOR = "#ffcc00"  # Yellow
+    GAP_FILL_OPACITY = 0.8
+    
     # Color for secondary parting surface (red, semi-transparent)
     SECONDARY_PARTING_SURFACE_COLOR = "#ff4444"  # Red
     SECONDARY_PARTING_SURFACE_OPACITY = 0.7
     
-    def set_parting_surface(self, parting_mesh: trimesh.Trimesh):
+    def set_parting_surface(self, parting_mesh: trimesh.Trimesh, fill_face_indices: np.ndarray = None):
         """
         Set and display the parting surface mesh.
         
         Args:
             parting_mesh: The parting surface mesh (triangulated surface separating mold halves)
+            fill_face_indices: Optional array of face indices that are gap-fill triangles (shown in yellow)
         """
         if not PYVISTA_AVAILABLE:
             return
         
         self._parting_surface_mesh = parting_mesh
         
-        # Convert to PyVista
-        pv_surface = self._trimesh_to_pyvista(parting_mesh)
-        
-        # Remove existing actor
+        # Remove existing actors
         if self._parting_surface_actor is not None:
             try:
                 self.plotter.remove_actor(self._parting_surface_actor)
@@ -3463,25 +3474,79 @@ class MeshViewer(QWidget):
                 pass
             self._parting_surface_actor = None
         
-        # Add parting surface mesh (semi-transparent blue)
-        self._parting_surface_actor = self.plotter.add_mesh(
-            pv_surface,
-            color=self.PARTING_SURFACE_COLOR,
-            opacity=self.PARTING_SURFACE_OPACITY,
-            smooth_shading=True,
-            show_edges=True,
-            edge_color='#1166cc',  # Darker blue for edges
-            line_width=1,
-            style='surface',
-            render_points_as_spheres=False,
-        )
+        # Remove existing gap-fill actor if any
+        if hasattr(self, '_gap_fill_actor') and self._gap_fill_actor is not None:
+            try:
+                self.plotter.remove_actor(self._gap_fill_actor)
+            except Exception:
+                pass
+            self._gap_fill_actor = None
+        
+        # If we have fill face indices, split into two meshes
+        if fill_face_indices is not None and len(fill_face_indices) > 0:
+            # Create mask for main surface (non-fill faces)
+            all_faces = np.arange(len(parting_mesh.faces))
+            fill_set = set(fill_face_indices.tolist())
+            main_face_mask = np.array([i not in fill_set for i in all_faces])
+            fill_face_mask = np.array([i in fill_set for i in all_faces])
+            
+            # Main parting surface (blue)
+            if np.any(main_face_mask):
+                main_mesh = trimesh.Trimesh(
+                    vertices=parting_mesh.vertices,
+                    faces=parting_mesh.faces[main_face_mask],
+                    process=False
+                )
+                pv_main = self._trimesh_to_pyvista(main_mesh)
+                self._parting_surface_actor = self.plotter.add_mesh(
+                    pv_main,
+                    color=self.PARTING_SURFACE_COLOR,
+                    opacity=self.PARTING_SURFACE_OPACITY,
+                    smooth_shading=True,
+                    show_edges=True,
+                    edge_color='#1166cc',
+                    line_width=1,
+                    style='surface',
+                )
+            
+            # Gap-fill triangles (yellow)
+            if np.any(fill_face_mask):
+                fill_mesh = trimesh.Trimesh(
+                    vertices=parting_mesh.vertices,
+                    faces=parting_mesh.faces[fill_face_mask],
+                    process=False
+                )
+                pv_fill = self._trimesh_to_pyvista(fill_mesh)
+                self._gap_fill_actor = self.plotter.add_mesh(
+                    pv_fill,
+                    color=self.GAP_FILL_COLOR,
+                    opacity=self.GAP_FILL_OPACITY,
+                    smooth_shading=True,
+                    show_edges=True,
+                    edge_color='#cc9900',  # Darker yellow for edges
+                    line_width=1,
+                    style='surface',
+                )
+                logger.info(f"Gap-fill triangles displayed in yellow: {len(fill_face_indices)} faces")
+        else:
+            # No fill faces - show entire mesh in blue
+            pv_surface = self._trimesh_to_pyvista(parting_mesh)
+            self._parting_surface_actor = self.plotter.add_mesh(
+                pv_surface,
+                color=self.PARTING_SURFACE_COLOR,
+                opacity=self.PARTING_SURFACE_OPACITY,
+                smooth_shading=True,
+                show_edges=True,
+                edge_color='#1166cc',
+                line_width=1,
+                style='surface',
+            )
         
         # Set up rendering properties for better visibility
         if self._parting_surface_actor is not None:
             prop = self._parting_surface_actor.GetProperty()
             if prop:
                 prop.SetInterpolationToPhong()
-                # Make it slightly emissive so it's visible even in shadows
                 prop.SetAmbient(0.3)
                 prop.SetDiffuse(0.7)
         
@@ -3500,6 +3565,14 @@ class MeshViewer(QWidget):
                 pass
             self._parting_surface_actor = None
         
+        # Also clear gap-fill actor
+        if hasattr(self, '_gap_fill_actor') and self._gap_fill_actor is not None:
+            try:
+                self.plotter.remove_actor(self._gap_fill_actor)
+            except Exception:
+                pass
+            self._gap_fill_actor = None
+        
         self._parting_surface_mesh = None
         self.plotter.update()
         logger.info("Parting surface cleared")
@@ -3514,8 +3587,11 @@ class MeshViewer(QWidget):
         self._parting_surface_visible = visible
         if self._parting_surface_actor is not None:
             self._parting_surface_actor.SetVisibility(visible)
-            self.plotter.update()
-            logger.debug(f"Parting surface visibility set to {visible}")
+        # Also set visibility for gap-fill actor
+        if hasattr(self, '_gap_fill_actor') and self._gap_fill_actor is not None:
+            self._gap_fill_actor.SetVisibility(visible)
+        self.plotter.update()
+        logger.debug(f"Parting surface visibility set to {visible}")
     
     def set_parting_surface_opacity(self, opacity: float):
         """
@@ -3528,7 +3604,12 @@ class MeshViewer(QWidget):
             prop = self._parting_surface_actor.GetProperty()
             if prop:
                 prop.SetOpacity(opacity)
-            self.plotter.update()
+        # Also set opacity for gap-fill actor
+        if hasattr(self, '_gap_fill_actor') and self._gap_fill_actor is not None:
+            prop = self._gap_fill_actor.GetProperty()
+            if prop:
+                prop.SetOpacity(opacity)
+        self.plotter.update()
     
     @property
     def parting_surface_visible(self) -> bool:
@@ -3642,3 +3723,454 @@ class MeshViewer(QWidget):
     def has_secondary_parting_surface(self) -> bool:
         """Check if secondary parting surface exists."""
         return self._secondary_parting_surface_mesh is not None
+
+    # =========================================================================
+    # EDGE DEBUG MODE FOR PARTING SURFACE
+    # =========================================================================
+    
+    def set_part_mesh_reference(self, part_mesh: trimesh.Trimesh):
+        """
+        Store reference to the part mesh for edge distance calculations.
+        
+        Args:
+            part_mesh: The original part mesh (for computing distances to parting surface edges)
+        """
+        self._part_mesh_ref = part_mesh
+        logger.debug("Part mesh reference stored for edge debug mode")
+    
+    def set_tet_result_reference(self, tet_result):
+        """
+        Store reference to the tetrahedral mesh result for escape label analysis.
+        
+        Args:
+            tet_result: TetrahedralMeshResult with Dijkstra escape labels
+        """
+        self._tet_result_ref = tet_result
+        logger.debug("Tet result reference stored for edge debug mode")
+    
+    def set_parting_surface_result_reference(self, parting_surface_result):
+        """
+        Store reference to the parting surface result for vertex_to_edge mapping.
+        
+        Args:
+            parting_surface_result: PartingSurfaceResult with vertex_to_edge mapping
+        """
+        self._parting_surface_result_ref = parting_surface_result
+        logger.debug("Parting surface result reference stored for edge debug mode")
+    
+    def enable_edge_debug_mode(self, enabled: bool = True):
+        """
+        Enable or disable edge debug mode for the parting surface.
+        
+        When enabled:
+        - Boundary edges of the parting surface are highlighted in yellow
+        - Click on an edge to see debug info in the terminal
+        - The edge closest to click is selected and highlighted in red
+        
+        Args:
+            enabled: True to enable, False to disable
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        self._edge_debug_mode = enabled
+        
+        if enabled:
+            if self._parting_surface_mesh is None:
+                logger.warning("No parting surface mesh available for edge debug mode")
+                return
+            
+            # Extract and visualize boundary edges
+            self._extract_and_show_boundary_edges()
+            
+            # Enable point picking for edge selection
+            self._enable_edge_picking()
+            
+            logger.info("Edge debug mode ENABLED - click on boundary edges to inspect")
+        else:
+            # Disable picking and clear visualization
+            self._disable_edge_picking()
+            self._clear_boundary_edges_visualization()
+            logger.info("Edge debug mode DISABLED")
+    
+    def _extract_and_show_boundary_edges(self):
+        """Extract boundary edges from parting surface and visualize them."""
+        if self._parting_surface_mesh is None:
+            return
+        
+        mesh = self._parting_surface_mesh
+        
+        # Find boundary edges (edges that appear in only one face)
+        # In trimesh, edges_unique gives unique edges, edges_unique_inverse maps faces to edges
+        edges = mesh.edges_unique
+        
+        # Count how many faces each edge belongs to
+        edge_face_counts = np.zeros(len(edges), dtype=np.int32)
+        for face in mesh.faces:
+            # Get edges for this face
+            for i in range(3):
+                v0, v1 = face[i], face[(i+1) % 3]
+                # Find this edge in edges_unique
+                edge_key = tuple(sorted([v0, v1]))
+                # Search for matching edge
+                for e_idx, e in enumerate(edges):
+                    if tuple(sorted(e)) == edge_key:
+                        edge_face_counts[e_idx] += 1
+                        break
+        
+        # Boundary edges have count == 1
+        boundary_mask = edge_face_counts == 1
+        boundary_edges = edges[boundary_mask]
+        
+        if len(boundary_edges) == 0:
+            logger.info("No boundary edges found (mesh is watertight)")
+            return
+        
+        logger.info(f"Found {len(boundary_edges)} boundary edges on parting surface")
+        
+        # Store boundary edge data for picking
+        vertices = mesh.vertices
+        self._boundary_edges_data = {
+            'edges': boundary_edges,
+            'vertices': vertices,
+            'midpoints': np.array([(vertices[e[0]] + vertices[e[1]]) / 2 for e in boundary_edges]),
+            'lengths': np.array([np.linalg.norm(vertices[e[1]] - vertices[e[0]]) for e in boundary_edges]),
+        }
+        
+        # Compute distances to part mesh if available
+        if self._part_mesh_ref is not None:
+            self._compute_edge_to_part_distances()
+        
+        # Visualize boundary edges
+        self._visualize_boundary_edges()
+    
+    def _compute_edge_to_part_distances(self):
+        """Compute distance from each boundary edge to the part mesh."""
+        if self._boundary_edges_data is None or self._part_mesh_ref is None:
+            return
+        
+        from scipy.spatial import KDTree
+        
+        # Build KDTree from part mesh vertices
+        part_vertices = np.array(self._part_mesh_ref.vertices)
+        part_tree = KDTree(part_vertices)
+        
+        midpoints = self._boundary_edges_data['midpoints']
+        edges = self._boundary_edges_data['edges']
+        vertices = self._boundary_edges_data['vertices']
+        
+        # For each boundary edge, find distance to nearest part vertex
+        # and also sample along the edge
+        distances = []
+        nearest_part_points = []
+        nearest_part_vertex_indices = []
+        
+        for i, edge in enumerate(edges):
+            v0, v1 = vertices[edge[0]], vertices[edge[1]]
+            midpoint = midpoints[i]
+            
+            # Sample edge at multiple points
+            sample_points = np.array([
+                v0,
+                (v0 + midpoint) / 2,
+                midpoint,
+                (midpoint + v1) / 2,
+                v1
+            ])
+            
+            # Find minimum distance across all sample points
+            dists, indices = part_tree.query(sample_points)
+            min_idx = np.argmin(dists)
+            min_dist = dists[min_idx]
+            
+            distances.append(min_dist)
+            nearest_part_points.append(part_vertices[indices[min_idx]])
+            nearest_part_vertex_indices.append(indices[min_idx])
+        
+        self._boundary_edges_data['part_distances'] = np.array(distances)
+        self._boundary_edges_data['nearest_part_points'] = np.array(nearest_part_points)
+        self._boundary_edges_data['nearest_part_vertex_indices'] = np.array(nearest_part_vertex_indices)
+        
+        # Log statistics
+        dist_arr = np.array(distances)
+        logger.info(f"Edge-to-part distances: min={dist_arr.min():.4f}, max={dist_arr.max():.4f}, "
+                   f"mean={dist_arr.mean():.4f}, median={np.median(dist_arr):.4f}")
+    
+    def _visualize_boundary_edges(self):
+        """Visualize boundary edges with color coding based on distance."""
+        if self._boundary_edges_data is None:
+            return
+        
+        # Clear existing visualization
+        if self._boundary_edges_actor is not None:
+            try:
+                self.plotter.remove_actor(self._boundary_edges_actor)
+            except Exception:
+                pass
+            self._boundary_edges_actor = None
+        
+        edges = self._boundary_edges_data['edges']
+        vertices = self._boundary_edges_data['vertices']
+        
+        # Build line segments for PyVista
+        n_edges = len(edges)
+        lines = np.zeros((n_edges, 3), dtype=np.int64)
+        lines[:, 0] = 2  # Each line has 2 points
+        lines[:, 1] = np.arange(n_edges) * 2      # First point index
+        lines[:, 2] = np.arange(n_edges) * 2 + 1  # Second point index
+        
+        # Flatten points: each edge contributes 2 vertices
+        points = np.zeros((n_edges * 2, 3))
+        for i, edge in enumerate(edges):
+            points[i * 2] = vertices[edge[0]]
+            points[i * 2 + 1] = vertices[edge[1]]
+        
+        # Create PyVista PolyData with lines
+        edge_mesh = pv.PolyData(points, lines=lines.flatten())
+        
+        # Color by distance if available
+        if 'part_distances' in self._boundary_edges_data:
+            distances = self._boundary_edges_data['part_distances']
+            # Assign same distance to both vertices of each edge
+            scalars = np.repeat(distances, 2)
+            edge_mesh['distance'] = scalars
+            
+            self._boundary_edges_actor = self.plotter.add_mesh(
+                edge_mesh,
+                scalars='distance',
+                cmap='coolwarm',  # Blue (close) to Red (far)
+                line_width=4,
+                render_lines_as_tubes=True,
+                show_scalar_bar=True,
+                scalar_bar_args={
+                    'title': 'Distance to Part',
+                    'vertical': True,
+                    'position_x': 0.85,
+                    'position_y': 0.1,
+                    'width': 0.1,
+                    'height': 0.3,
+                }
+            )
+        else:
+            # No distance data - use yellow
+            self._boundary_edges_actor = self.plotter.add_mesh(
+                edge_mesh,
+                color='yellow',
+                line_width=4,
+                render_lines_as_tubes=True,
+            )
+        
+        self.plotter.update()
+        logger.info(f"Visualized {n_edges} boundary edges")
+    
+    def _enable_edge_picking(self):
+        """Enable point picking for edge selection."""
+        try:
+            # Use point picking to select nearest edge
+            self.plotter.enable_point_picking(
+                callback=self._on_edge_picked,
+                show_message=True,
+                color='red',
+                point_size=15,
+                show_point=True,
+                tolerance=0.025,  # Tolerance for picking
+            )
+            logger.debug("Edge picking enabled")
+        except Exception as e:
+            logger.error(f"Failed to enable edge picking: {e}")
+    
+    def _disable_edge_picking(self):
+        """Disable point picking."""
+        try:
+            self.plotter.disable_picking()
+            logger.debug("Edge picking disabled")
+        except Exception as e:
+            logger.debug(f"Could not disable picking: {e}")
+    
+    def _on_edge_picked(self, point):
+        """Handle point pick event - find nearest boundary edge and show debug info."""
+        if point is None or self._boundary_edges_data is None:
+            return
+        
+        picked_point = np.array(point)
+        midpoints = self._boundary_edges_data['midpoints']
+        
+        # Find nearest edge by midpoint distance
+        distances_to_pick = np.linalg.norm(midpoints - picked_point, axis=1)
+        nearest_idx = np.argmin(distances_to_pick)
+        
+        # Get edge data (parting surface edge)
+        ps_edge = self._boundary_edges_data['edges'][nearest_idx]
+        ps_vertices = self._boundary_edges_data['vertices']
+        v0, v1 = ps_vertices[ps_edge[0]], ps_vertices[ps_edge[1]]
+        midpoint = midpoints[nearest_idx]
+        length = self._boundary_edges_data['lengths'][nearest_idx]
+        
+        # Highlight selected edge
+        self._highlight_selected_edge(v0, v1)
+        
+        # Print debug info
+        print("\n" + "="*70)
+        print("🔍 PARTING SURFACE BOUNDARY EDGE DEBUG")
+        print("="*70)
+        print(f"Boundary edge index: {nearest_idx}")
+        print(f"PS vertex indices: {ps_edge[0]} → {ps_edge[1]}")
+        print(f"Vertex 0: [{v0[0]:.4f}, {v0[1]:.4f}, {v0[2]:.4f}]")
+        print(f"Vertex 1: [{v1[0]:.4f}, {v1[1]:.4f}, {v1[2]:.4f}]")
+        print(f"Midpoint: [{midpoint[0]:.4f}, {midpoint[1]:.4f}, {midpoint[2]:.4f}]")
+        print(f"Length: {length:.4f}")
+        
+        # Try to trace back to tetrahedral mesh edges
+        if self._parting_surface_result_ref is not None and self._tet_result_ref is not None:
+            self._print_tet_edge_info(ps_edge, ps_vertices)
+        
+        if 'part_distances' in self._boundary_edges_data:
+            dist = self._boundary_edges_data['part_distances'][nearest_idx]
+            print(f"\n📏 DISTANCE TO PART MESH")
+            print(f"   Minimum distance: {dist:.4f}")
+            
+            if 'nearest_part_points' in self._boundary_edges_data:
+                nearest_pt = self._boundary_edges_data['nearest_part_points'][nearest_idx]
+                nearest_idx_part = self._boundary_edges_data['nearest_part_vertex_indices'][nearest_idx]
+                print(f"   Nearest part point: [{nearest_pt[0]:.4f}, {nearest_pt[1]:.4f}, {nearest_pt[2]:.4f}]")
+                print(f"   Nearest part vertex index: {nearest_idx_part}")
+                
+                # Check if edge should be connected (distance very small)
+                if dist < 0.1:
+                    print(f"   ✅ Edge is CLOSE to part (dist < 0.1)")
+                elif dist < 1.0:
+                    print(f"   ⚠️  Edge is NEAR part (0.1 < dist < 1.0)")
+                else:
+                    print(f"   ❌ Edge is FAR from part (dist >= 1.0)")
+        
+        # Additional analysis: check edge direction
+        edge_direction = v1 - v0
+        edge_direction_normalized = edge_direction / np.linalg.norm(edge_direction)
+        print(f"\n📐 EDGE GEOMETRY")
+        print(f"   Direction: [{edge_direction_normalized[0]:.4f}, {edge_direction_normalized[1]:.4f}, {edge_direction_normalized[2]:.4f}]")
+        
+        # Check if edge is mostly horizontal or vertical
+        z_component = abs(edge_direction_normalized[2])
+        if z_component > 0.9:
+            print(f"   Orientation: VERTICAL (Z-aligned)")
+        elif z_component < 0.1:
+            print(f"   Orientation: HORIZONTAL (XY-plane)")
+        else:
+            print(f"   Orientation: DIAGONAL (mixed)")
+        
+        print("="*70 + "\n")
+        
+        # Also log to the logger
+        logger.info(f"Selected edge {nearest_idx}: vertices {ps_edge}, length={length:.4f}, "
+                   f"part_dist={self._boundary_edges_data.get('part_distances', [0])[nearest_idx] if 'part_distances' in self._boundary_edges_data else 'N/A':.4f}")
+    
+    def _print_tet_edge_info(self, ps_edge, ps_vertices):
+        """Print tetrahedral mesh edge info for the parting surface edge vertices."""
+        ps_result = self._parting_surface_result_ref
+        tet_result = self._tet_result_ref
+        
+        # Check if vertex_to_edge is available
+        vertex_to_edge = getattr(ps_result, 'vertex_to_edge', None)
+        if vertex_to_edge is None:
+            print("\n⚠️  No vertex_to_edge mapping available (surface may have been repaired/smoothed)")
+            return
+        
+        print(f"\n🔬 TETRAHEDRAL MESH ANALYSIS")
+        
+        # Each parting surface vertex corresponds to the midpoint of a tet mesh edge
+        # vertex_to_edge[ps_vertex] = tet_edge_index
+        for i, ps_v_idx in enumerate(ps_edge):
+            if ps_v_idx < len(vertex_to_edge):
+                tet_edge_idx = vertex_to_edge[ps_v_idx]
+                tet_edge = tet_result.edges[tet_edge_idx]
+                tet_v0_idx, tet_v1_idx = int(tet_edge[0]), int(tet_edge[1])
+                
+                print(f"\n   PS Vertex {ps_v_idx} → Tet Edge {tet_edge_idx}: ({tet_v0_idx}, {tet_v1_idx})")
+                
+                # Get tet vertex positions
+                tet_verts = tet_result.vertices_original if tet_result.vertices_original is not None else tet_result.vertices
+                tv0 = tet_verts[tet_v0_idx]
+                tv1 = tet_verts[tet_v1_idx]
+                print(f"      Tet V{tet_v0_idx}: [{tv0[0]:.4f}, {tv0[1]:.4f}, {tv0[2]:.4f}]")
+                print(f"      Tet V{tet_v1_idx}: [{tv1[0]:.4f}, {tv1[1]:.4f}, {tv1[2]:.4f}]")
+                
+                # Get boundary labels for these vertices
+                if tet_result.boundary_labels is not None:
+                    bl0 = tet_result.boundary_labels[tet_v0_idx]
+                    bl1 = tet_result.boundary_labels[tet_v1_idx]
+                    label_names = {-1: "INNER_BOUNDARY (part)", 0: "INTERIOR", 1: "H1", 2: "H2"}
+                    print(f"      Boundary labels: V{tet_v0_idx}={label_names.get(bl0, bl0)}, V{tet_v1_idx}={label_names.get(bl1, bl1)}")
+                
+                # Get escape labels if available
+                if tet_result.seed_vertex_indices is not None and tet_result.seed_escape_labels is not None:
+                    seed_indices = tet_result.seed_vertex_indices
+                    escape_labels = tet_result.seed_escape_labels
+                    
+                    # Find if these vertices are in the seed list
+                    escape_names = {0: "UNREACHABLE", 1: "→H1", 2: "→H2"}
+                    
+                    for v_idx in [tet_v0_idx, tet_v1_idx]:
+                        if v_idx in seed_indices:
+                            seed_pos = np.where(seed_indices == v_idx)[0][0]
+                            el = escape_labels[seed_pos]
+                            print(f"      Escape label V{v_idx}: {escape_names.get(el, el)}")
+                        else:
+                            # Vertex not in seed list - it's on H1 or H2 boundary
+                            if tet_result.boundary_labels is not None:
+                                bl = tet_result.boundary_labels[v_idx]
+                                if bl == 1:
+                                    print(f"      Escape label V{v_idx}: ON_H1 (boundary)")
+                                elif bl == 2:
+                                    print(f"      Escape label V{v_idx}: ON_H2 (boundary)")
+                                else:
+                                    print(f"      Escape label V{v_idx}: NOT_IN_SEEDS (bl={bl})")
+            else:
+                print(f"\n   PS Vertex {ps_v_idx}: No mapping available")
+    
+    def _highlight_selected_edge(self, v0: np.ndarray, v1: np.ndarray):
+        """Highlight the selected edge in red."""
+        # Clear previous selection
+        if self._selected_edge_actor is not None:
+            try:
+                self.plotter.remove_actor(self._selected_edge_actor)
+            except Exception:
+                pass
+            self._selected_edge_actor = None
+        
+        # Create line for selected edge
+        points = np.array([v0, v1])
+        lines = np.array([2, 0, 1])  # 2 points, indices 0 and 1
+        selected_edge = pv.PolyData(points, lines=lines)
+        
+        self._selected_edge_actor = self.plotter.add_mesh(
+            selected_edge,
+            color='magenta',
+            line_width=8,
+            render_lines_as_tubes=True,
+        )
+        
+        self.plotter.update()
+    
+    def _clear_boundary_edges_visualization(self):
+        """Clear all boundary edge visualization."""
+        if self._boundary_edges_actor is not None:
+            try:
+                self.plotter.remove_actor(self._boundary_edges_actor)
+            except Exception:
+                pass
+            self._boundary_edges_actor = None
+        
+        if self._selected_edge_actor is not None:
+            try:
+                self.plotter.remove_actor(self._selected_edge_actor)
+            except Exception:
+                pass
+            self._selected_edge_actor = None
+        
+        self._boundary_edges_data = None
+        self.plotter.update()
+    
+    @property
+    def edge_debug_mode(self) -> bool:
+        """Check if edge debug mode is enabled."""
+        return self._edge_debug_mode

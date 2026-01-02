@@ -680,7 +680,8 @@ def smooth_membrane_with_boundary_reprojection(
     hull_mesh: Optional[trimesh.Trimesh],
     primary_mesh: Optional[trimesh.Trimesh] = None,
     iterations: int = 5,
-    damping_factor: float = 0.5
+    damping_factor: float = 0.5,
+    excluded_vertices: Optional[np.ndarray] = None
 ) -> SmoothingResult:
     """
     Smooth the membrane surface while preserving boundaries on the part mesh (M),
@@ -699,6 +700,8 @@ def smooth_membrane_with_boundary_reprojection(
         primary_mesh: The primary parting surface (for secondary surface smoothing)
         iterations: Number of alternating smooth/re-project iterations
         damping_factor: Smoothing damping factor (0.5 recommended)
+        excluded_vertices: Optional array of vertex indices to exclude from smoothing
+                          (e.g., gap-fill vertices that should remain fixed)
     
     Returns:
         SmoothingResult with smoothed mesh and statistics
@@ -747,14 +750,21 @@ def smooth_membrane_with_boundary_reprojection(
         boundary_verts.add(v0)
         boundary_verts.add(v1)
     
+    # Build set of excluded vertices (e.g., gap-fill vertices that shouldn't be smoothed)
+    excluded_set = set()
+    if excluded_vertices is not None and len(excluded_vertices) > 0:
+        excluded_set = set(excluded_vertices.tolist())
+        logger.info(f"Excluding {len(excluded_set)} vertices from smoothing (gap-fill vertices)")
+    
     boundary_verts = sorted(boundary_verts)
-    interior_verts = [v for v in range(n_verts) if v not in boundary_verts]
+    # Interior verts are those not on boundary AND not excluded
+    interior_verts = [v for v in range(n_verts) if v not in boundary_verts and v not in excluded_set]
     
     result.boundary_vertices = len(boundary_verts)
     result.interior_vertices = len(interior_verts)
     
     logger.info(f"Smoothing membrane: {n_verts} vertices "
-               f"({len(boundary_verts)} boundary, {len(interior_verts)} interior)")
+               f"({len(boundary_verts)} boundary, {len(interior_verts)} interior, {len(excluded_set)} excluded)")
     
     # Classify boundary vertices: which surface do they belong to?
     # We use TWO thresholds:
@@ -840,8 +850,8 @@ def smooth_membrane_with_boundary_reprojection(
         logger.info(f"Primary distances - min: {min(all_primary_dists):.4f}, max: {max(all_primary_dists):.4f}, "
                    f"mean: {np.mean(all_primary_dists):.4f}")
     logger.info(f"Tolerances: on-surface={on_surface_tolerance:.4f}, max-reproject={max_reproject_distance:.4f} (mesh scale: {mesh_scale:.4f})")
-    logger.info(f"Boundary classification: {part_count} to part, {hull_count} to hull, "
-               f"{primary_count} to primary, {patch_count} patch ({closest_count} gap-bridging)")
+    logger.info(f"Boundary classification: {part_count} to part, "
+               f"{hull_count} to hull, {primary_count} to primary, {patch_count} patch ({closest_count} gap-bridging)")
     
     # Build vertex adjacency (along boundary and overall)
     vertex_neighbors = [set() for _ in range(n_verts)]
@@ -863,6 +873,9 @@ def smooth_membrane_with_boundary_reprojection(
         new_vertices = vertices.copy()
         
         for vi in boundary_verts:
+            # Skip excluded vertices (gap-fill vertices)
+            if vi in excluded_set:
+                continue
             neighbors = list(boundary_neighbors[vi])
             if len(neighbors) >= 2:
                 # Average of neighbors along the boundary
@@ -873,7 +886,15 @@ def smooth_membrane_with_boundary_reprojection(
         vertices = new_vertices
         
         # === Step 2: Re-project boundary vertices onto target surfaces ===
+        # Per paper algorithm: after smoothing boundary polylines, re-project to M or ∂H
+        # - 'part': Boundary vertices near part mesh → re-project to part
+        # - 'hull': Boundary vertices near hull mesh → re-project to hull
+        # - 'primary': Boundary vertices near primary surface → re-project to primary
+        # - 'patch': Patch boundaries → NO re-projection
         for vi in boundary_verts:
+            # Skip excluded vertices (gap-fill vertices)
+            if vi in excluded_set:
+                continue
             surface_type = boundary_surface[vi]
             pos = vertices[vi]
             
@@ -886,9 +907,10 @@ def smooth_membrane_with_boundary_reprojection(
             elif surface_type in ('primary', 'closest_primary') and primary_proximity is not None:
                 closest_pts, _, _ = primary_proximity.on_surface([pos])
                 vertices[vi] = closest_pts[0]
-            # 'patch' vertices are not re-projected (they stay at patch boundaries)
+            # 'patch' vertices are not re-projected
         
         # === Step 3: Smooth interior vertices (boundary vertices fixed) ===
+        # Note: interior_verts already excludes excluded_set
         new_vertices = vertices.copy()
         
         for vi in interior_verts:

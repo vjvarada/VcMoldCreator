@@ -66,25 +66,31 @@ EDGE_TO_FACES = {
 
 def _build_marching_tet_table() -> Dict[int, List[Tuple[int, int, int]]]:
     """
-    Build the 64-entry marching tetrahedra lookup table.
+    Build the full 64-entry marching tetrahedra lookup table.
     
-    For a tetrahedron with vertices labeled H1 or H2, an edge is "cut" if
-    its two vertices have different labels. This gives us specific valid
-    configurations based on how many vertices are H1 vs H2:
+    Following Bloomenthal & Ferguson 1995, Bonnell et al. 2003, Nielson & Franke 1997,
+    we handle ALL 64 configurations including non-manifold cases that arise when
+    edges are directly flagged as cut (not derived from vertex scalar field).
     
-    Valid configurations from vertex labeling:
-    - 0 edges cut: all vertices same label (no surface)
-    - 3 edges cut: exactly 1 vertex differs (vertex isolated) -> 1 triangle
-    - 4 edges cut: 2 vertices H1, 2 vertices H2 -> 2 triangles (quad)
+    Edge numbering (for reference):
+        Edge 0: (v0, v1)    Edge 3: (v1, v2)
+        Edge 1: (v0, v2)    Edge 4: (v1, v3)
+        Edge 2: (v0, v3)    Edge 5: (v2, v3)
     
-    The 7 valid non-empty configurations are:
-    - Config 7 (000111): vertex 0 isolated, edges 0,1,2 cut
-    - Config 25 (011001): vertex 1 isolated, edges 0,3,4 cut
-    - Config 42 (101010): vertex 2 isolated, edges 1,3,5 cut
-    - Config 52 (110100): vertex 3 isolated, edges 2,4,5 cut
-    - Config 30 (011110): 2-2 split {0,1} vs {2,3}, edges 1,2,3,4 cut
-    - Config 45 (101101): 2-2 split {0,2} vs {1,3}, edges 0,2,3,5 cut
-    - Config 51 (110011): 2-2 split {0,3} vs {1,2}, edges 0,1,4,5 cut
+    Face numbering:
+        Face 0: (v1, v2, v3) - opposite v0
+        Face 1: (v0, v2, v3) - opposite v1
+        Face 2: (v0, v1, v3) - opposite v2
+        Face 3: (v0, v1, v2) - opposite v3
+    
+    Configuration types by number of cut edges:
+        0 edges: Config 0 - no surface
+        1 edge:  Cannot form triangle - degenerate, skip
+        2 edges: Cannot form triangle - degenerate, skip  
+        3 edges: 4 configs - single triangle (vertex isolated)
+        4 edges: 3 configs - quad (2 triangles)
+        5 edges: 6 configs - non-manifold (2 triangles meeting at vertex)
+        6 edges: Config 63 - non-manifold singularity (4 triangles)
     
     Returns:
         Dictionary mapping 6-bit config -> list of triangles
@@ -96,42 +102,90 @@ def _build_marching_tet_table() -> Dict[int, List[Tuple[int, int, int]]]:
     for i in range(64):
         table[i] = []
     
-    # 3-edge configs: vertex isolated (one vertex has different label)
-    # The triangle passes through the 3 edges emanating from the isolated vertex
-    # 
-    # Vertex 0 isolated: cut edges are (0,1), (0,2), (0,3) = edges 0, 1, 2
+    # ===========================================================================
+    # 3-EDGE CONFIGS: Single triangle (vertex isolated from others)
+    # ===========================================================================
+    # Vertex 0 isolated: edges 0,1,2 cut (edges from v0)
     # Config = 1 + 2 + 4 = 7
     table[7] = [(0, 1, 2)]
     
-    # Vertex 1 isolated: cut edges are (0,1), (1,2), (1,3) = edges 0, 3, 4
+    # Vertex 1 isolated: edges 0,3,4 cut (edges from v1)
     # Config = 1 + 8 + 16 = 25
     table[25] = [(0, 3, 4)]
     
-    # Vertex 2 isolated: cut edges are (0,2), (1,2), (2,3) = edges 1, 3, 5
+    # Vertex 2 isolated: edges 1,3,5 cut (edges from v2)
     # Config = 2 + 8 + 32 = 42
     table[42] = [(1, 3, 5)]
     
-    # Vertex 3 isolated: cut edges are (0,3), (1,3), (2,3) = edges 2, 4, 5
+    # Vertex 3 isolated: edges 2,4,5 cut (edges from v3)
     # Config = 4 + 16 + 32 = 52
     table[52] = [(2, 4, 5)]
     
-    # 4-edge configs: 2-2 vertex split (two vertices H1, two H2)
-    # The surface forms a quad through 4 edges, split into 2 triangles
-    #
-    # Split {0,1} vs {2,3}: cut edges are (0,2), (0,3), (1,2), (1,3) = edges 1,2,3,4
+    # ===========================================================================
+    # 4-EDGE CONFIGS: Quadrilateral surface (2 triangles)
+    # ===========================================================================
+    # Split {v0,v1} vs {v2,v3}: edges 1,2,3,4 cut
     # Config = 2 + 4 + 8 + 16 = 30
-    # Quad edges in order: 1,3,4,2 form a cycle -> triangles (1,3,4) and (1,4,2)
     table[30] = [(1, 3, 4), (1, 4, 2)]
     
-    # Split {0,2} vs {1,3}: cut edges are (0,1), (0,3), (1,2), (2,3) = edges 0,2,3,5
+    # Split {v0,v2} vs {v1,v3}: edges 0,2,3,5 cut
     # Config = 1 + 4 + 8 + 32 = 45
-    # Quad edges in order: 0,3,5,2 form a cycle -> triangles (0,3,5) and (0,5,2)
     table[45] = [(0, 3, 5), (0, 5, 2)]
     
-    # Split {0,3} vs {1,2}: cut edges are (0,1), (0,2), (1,3), (2,3) = edges 0,1,4,5
+    # Split {v0,v3} vs {v1,v2}: edges 0,1,4,5 cut
     # Config = 1 + 2 + 16 + 32 = 51
-    # Quad edges in order: 0,4,5,1 form a cycle -> triangles (0,4,5) and (0,5,1)
     table[51] = [(0, 4, 5), (0, 5, 1)]
+    
+    # ===========================================================================
+    # 5-EDGE CONFIGS: Non-manifold - 2 triangles sharing a vertex
+    # These arise when one edge is NOT cut (5 are cut)
+    # The surface has two triangular patches meeting at the uncrossed edge's midpoint
+    # ===========================================================================
+    # 
+    # For 5-edge configs, the single UNCUT edge defines two faces that share it.
+    # Each face contributes a triangle using its 3 edges minus the shared one.
+    # These two triangles share a VERTEX (not an edge), creating non-manifold geometry.
+    #
+    # Edge 0 NOT cut (edges 1,2,3,4,5 cut) - Config 62 = 63 - 1
+    # Uncut edge 0 connects v0-v1. 
+    # Triangle from face 1 (opposite v1): edges 1,2,5 = (v0v2, v0v3, v2v3)
+    # Triangle from face 2 (opposite v0): edges 3,4,5 = (v1v2, v1v3, v2v3)
+    # These share edge 5 (v2v3), so it's manifold! Actually forms a quad.
+    table[62] = [(1, 2, 5), (3, 4, 5)]
+    
+    # Edge 1 NOT cut (edges 0,2,3,4,5 cut) - Config 61 = 63 - 2  
+    # Uncut edge 1 connects v0-v2.
+    # Triangle from face 2 (opposite v2): edges 0,2,4 = (v0v1, v0v3, v1v3)
+    # Triangle from face 3 (opposite v3): edges 0,3,1 but 1 not cut, so edges 0,3 + need third
+    # Actually: faces sharing edge 1 are face 1 and face 3
+    # Face 1 (v0,v2,v3): edges 1,2,5 - without edge 1: edges 2,5
+    # Face 3 (v0,v1,v2): edges 0,1,3 - without edge 1: edges 0,3
+    # This gives us edges {0,2,3,4,5} cut. Triangles: 
+    table[61] = [(0, 2, 4), (3, 4, 5)]
+    
+    # Edge 2 NOT cut (edges 0,1,3,4,5 cut) - Config 59 = 63 - 4
+    # Uncut edge 2 connects v0-v3.
+    table[59] = [(0, 1, 3), (3, 4, 5)]
+    
+    # Edge 3 NOT cut (edges 0,1,2,4,5 cut) - Config 55 = 63 - 8
+    # Uncut edge 3 connects v1-v2.
+    table[55] = [(0, 1, 2), (2, 4, 5)]
+    
+    # Edge 4 NOT cut (edges 0,1,2,3,5 cut) - Config 47 = 63 - 16
+    # Uncut edge 4 connects v1-v3.
+    table[47] = [(0, 1, 2), (1, 3, 5)]
+    
+    # Edge 5 NOT cut (edges 0,1,2,3,4 cut) - Config 31 = 63 - 32
+    # Uncut edge 5 connects v2-v3.
+    table[31] = [(0, 1, 2), (0, 3, 4)]
+    
+    # ===========================================================================
+    # 6-EDGE CONFIG: All edges cut - tetrahedral singularity
+    # This is a degenerate case where the isosurface passes through ALL edges.
+    # Forms 4 triangles (one on each face of the tetrahedron).
+    # Config 63 = 111111
+    # ===========================================================================
+    table[63] = [(0, 1, 2), (0, 3, 4), (1, 3, 5), (2, 4, 5)]
     
     return table
 
@@ -275,6 +329,9 @@ def extract_parting_surface(
     triangles = []
     tets_contributing = 0
     
+    # Track configuration statistics for debugging
+    config_counts = {}
+    
     for t in range(len(tetrahedra)):
         # Get the 6 global edge indices for this tet
         tet_edges = tet_edge_indices[t]  # Shape (6,)
@@ -285,6 +342,9 @@ def extract_parting_surface(
             global_e = tet_edges[local_e]
             if cut_edge_flags[global_e]:
                 config |= (1 << local_e)
+        
+        # Track config counts
+        config_counts[config] = config_counts.get(config, 0) + 1
         
         # Look up triangles from table
         table_triangles = MARCHING_TET_TABLE.get(config, [])
@@ -308,6 +368,15 @@ def extract_parting_surface(
                 
                 if valid and len(tri_verts) == 3:
                     triangles.append(tri_verts)
+    
+    # Log configuration statistics
+    logger.info(f"Configuration statistics ({len(config_counts)} unique configs):")
+    for config in sorted(config_counts.keys()):
+        n_edges = bin(config).count('1')
+        has_triangles = len(MARCHING_TET_TABLE.get(config, [])) > 0
+        status = "→ triangles" if has_triangles else "→ EMPTY (no triangles)"
+        if config_counts[config] > 10:  # Only log significant configs
+            logger.info(f"  Config {config:2d} ({config:06b}, {n_edges} edges): {config_counts[config]:5d} tets {status}")
     
     result.num_tets_contributing = tets_contributing
     
@@ -608,6 +677,602 @@ def repair_parting_surface_with_part(
     
     # Basic cleanup: merge vertices and remove degenerate faces
     return repair_parting_surface(surface, merge_vertices=True)
+
+
+# =============================================================================
+# GAP CLOSING BETWEEN PARTING SURFACE AND PART
+# =============================================================================
+
+@dataclass
+class GapClosingResult:
+    """Result of gap closing operation."""
+    mesh: Optional[trimesh.Trimesh] = None
+    vertices: Optional[np.ndarray] = None
+    faces: Optional[np.ndarray] = None
+    
+    # Indices of vertices that should be constrained to part surface during smoothing
+    # These are the NEW vertices projected onto the part (outer rim of fill)
+    part_constrained_vertices: Optional[np.ndarray] = None
+    
+    # Indices of original boundary vertices used in gap fill (inner rim of fill)
+    # These should be treated as boundary vertices but NOT re-projected
+    # They maintain the connection between parting surface and fill geometry
+    fill_boundary_vertices: Optional[np.ndarray] = None
+    
+    # Edges of the inner rim (original boundary edges that become internal after fill)
+    # These are needed to build proper boundary_neighbors for smoothing
+    # Format: Nx2 array of vertex index pairs
+    inner_rim_edges: Optional[np.ndarray] = None
+    
+    # Statistics
+    boundary_edges_found: int = 0
+    boundary_edges_near_part: int = 0
+    boundary_loops_found: int = 0
+    fill_faces_added: int = 0
+    new_vertices_added: int = 0
+    
+    # Timing
+    processing_time_ms: float = 0.0
+
+
+def close_parting_surface_gaps(
+    surface: PartingSurfaceResult,
+    part_mesh: trimesh.Trimesh,
+    distance_threshold: float = None,
+    method: str = 'smart_curtain'
+) -> GapClosingResult:
+    """
+    Close gaps between parting surface boundary edges and the part mesh.
+    
+    IMPORTANT: This function returns the mesh with properly connected fill geometry.
+    The `part_constrained_vertices` field contains indices of vertices that MUST
+    be constrained to stay on the part surface during any subsequent smoothing.
+    
+    Algorithm:
+    1. Find boundary edges near the part
+    2. Build ordered chains from these edges
+    3. Project boundary vertices to closest point on part surface
+    4. Create fill triangles that:
+       - Reference original surface vertices directly (no duplication)
+       - Add only the projected-to-part vertices as new vertices
+       - Use consistent winding direction
+    
+    Args:
+        surface: PartingSurfaceResult with boundary edges to close
+        part_mesh: The original part mesh to close gaps against
+        distance_threshold: Max distance to consider "near part" (auto-computed if None)
+        method: Gap closing method (currently 'smart_curtain' is recommended)
+    
+    Returns:
+        GapClosingResult with new mesh including fill geometry and constraint info
+    """
+    import time
+    
+    start = time.time()
+    result = GapClosingResult()
+    
+    if surface.mesh is None:
+        logger.warning("No parting surface mesh to close gaps for")
+        return result
+    
+    if part_mesh is None:
+        logger.warning("No part mesh provided for gap closing")
+        return result
+    
+    mesh = surface.mesh
+    vertices = np.array(mesh.vertices, dtype=np.float64)
+    faces = np.array(mesh.faces, dtype=np.int64)
+    n_orig_verts = len(vertices)
+    
+    # === Step 1: Find boundary edges and their adjacent face info ===
+    edge_to_faces = {}
+    edge_to_adjacent_verts = {}  # For determining winding
+    
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = face[i], face[(i+1) % 3]
+            v_opposite = face[(i+2) % 3]  # Third vertex of face
+            edge_key = (min(v0, v1), max(v0, v1))
+            if edge_key not in edge_to_faces:
+                edge_to_faces[edge_key] = []
+                edge_to_adjacent_verts[edge_key] = []
+            edge_to_faces[edge_key].append(fi)
+            # Store which vertex is "inside" relative to this edge
+            edge_to_adjacent_verts[edge_key].append((v0, v1, v_opposite))
+    
+    # Boundary edges appear in exactly one face
+    boundary_edges = []
+    boundary_edge_info = {}  # edge_key -> (v0, v1, v_opposite) for winding
+    for edge_key, face_list in edge_to_faces.items():
+        if len(face_list) == 1:
+            boundary_edges.append(edge_key)
+            boundary_edge_info[edge_key] = edge_to_adjacent_verts[edge_key][0]
+    
+    result.boundary_edges_found = len(boundary_edges)
+    logger.info(f"Found {len(boundary_edges)} boundary edges on parting surface")
+    
+    if len(boundary_edges) == 0:
+        logger.info("Parting surface is watertight - no gaps to close")
+        result.mesh = mesh
+        result.vertices = vertices
+        result.faces = faces
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    # === Step 2: Compute distances to part surface ===
+    boundary_edge_array = np.array(boundary_edges)
+    midpoints = 0.5 * (vertices[boundary_edge_array[:, 0]] + vertices[boundary_edge_array[:, 1]])
+    
+    # Use trimesh's closest_point for accurate surface distance
+    closest_pts, distances, _ = trimesh.proximity.closest_point(part_mesh, midpoints)
+    
+    # Auto-compute threshold if not provided
+    if distance_threshold is None:
+        edge_lengths = np.linalg.norm(
+            vertices[boundary_edge_array[:, 1]] - vertices[boundary_edge_array[:, 0]], 
+            axis=1
+        )
+        distance_threshold = np.median(edge_lengths) * 2.0
+        logger.info(f"Auto distance threshold: {distance_threshold:.4f}")
+    
+    # Find edges near part
+    near_part_mask = distances < distance_threshold
+    near_part_edges = boundary_edge_array[near_part_mask]
+    result.boundary_edges_near_part = len(near_part_edges)
+    
+    logger.info(f"Found {len(near_part_edges)} boundary edges near part (< {distance_threshold:.4f})")
+    
+    if len(near_part_edges) == 0:
+        logger.info("No boundary edges near part - no gaps to close")
+        result.mesh = mesh
+        result.vertices = vertices
+        result.faces = faces
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    # === Step 3: Build boundary chains from near-part edges ===
+    boundary_chains = _build_boundary_chains(near_part_edges)
+    result.boundary_loops_found = len(boundary_chains)
+    logger.info(f"Found {len(boundary_chains)} boundary chains near part")
+    
+    # === Step 4: Create fill geometry with proper vertex sharing ===
+    fill_result = _create_connected_fill(
+        vertices, faces, boundary_chains, part_mesh, boundary_edge_info, distance_threshold
+    )
+    new_vertices = fill_result['new_vertices']
+    new_faces = fill_result['new_faces']
+    part_constrained_indices = fill_result['part_constrained_indices']
+    fill_boundary_indices = fill_result['fill_boundary_indices']
+    inner_rim_edges = fill_result['inner_rim_edges']
+    
+    if len(new_faces) == 0:
+        logger.info("No fill faces generated")
+        result.mesh = mesh
+        result.vertices = vertices
+        result.faces = faces
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    result.fill_faces_added = len(new_faces)
+    result.new_vertices_added = len(new_vertices)
+    
+    # === Step 5: Combine original mesh with fill geometry ===
+    # new_vertices are ONLY the projected points (new vertices to add)
+    # new_faces already reference original vertex indices correctly
+    
+    combined_vertices = np.vstack([vertices, new_vertices])
+    combined_faces = np.vstack([faces, new_faces])
+    
+    # Track which vertices are constrained to part (projected vertices - outer rim)
+    result.part_constrained_vertices = np.array(part_constrained_indices, dtype=np.int64)
+    
+    # Track original boundary vertices used in fill (inner rim)
+    # These should be boundary-smoothed but NOT re-projected
+    result.fill_boundary_vertices = np.array(fill_boundary_indices, dtype=np.int64)
+    
+    # Track inner rim edges (original boundary edges that become internal after fill)
+    # These are needed for proper boundary neighbor computation during smoothing
+    result.inner_rim_edges = inner_rim_edges
+    
+    # Create combined mesh
+    try:
+        combined_mesh = trimesh.Trimesh(
+            vertices=combined_vertices,
+            faces=combined_faces,
+            process=False
+        )
+        
+        # Remove any degenerate faces but do NOT merge vertices
+        # (we want to preserve the connection topology)
+        valid = combined_mesh.nondegenerate_faces()
+        if np.sum(~valid) > 0:
+            combined_mesh = trimesh.Trimesh(
+                vertices=combined_mesh.vertices,
+                faces=combined_mesh.faces[valid],
+                process=False
+            )
+        
+        # Fix normals to ensure consistent orientation
+        combined_mesh.fix_normals()
+        
+        result.mesh = combined_mesh
+        result.vertices = np.array(combined_mesh.vertices)
+        result.faces = np.array(combined_mesh.faces)
+        
+    except Exception as e:
+        logger.error(f"Failed to create combined mesh: {e}")
+        result.mesh = mesh
+        result.vertices = vertices
+        result.faces = faces
+    
+    result.processing_time_ms = (time.time() - start) * 1000
+    
+    logger.info(f"Gap closing: added {result.fill_faces_added} fill faces, "
+                f"{result.new_vertices_added} new projected verts, "
+                f"{len(result.part_constrained_vertices)} part-constrained (outer rim), "
+                f"{len(result.fill_boundary_vertices)} fill-boundary (inner rim), "
+                f"{len(result.inner_rim_edges)} inner rim edges "
+                f"in {result.processing_time_ms:.1f}ms")
+    
+    return result
+
+
+def _build_boundary_chains(edges: np.ndarray) -> List[Tuple[List[int], bool]]:
+    """
+    Build ordered boundary chains from a set of boundary edges.
+    Handles both closed loops and open chains.
+    
+    Args:
+        edges: (N, 2) array of edge vertex indices
+    
+    Returns:
+        List of (vertex_list, is_closed) tuples
+    """
+    if len(edges) == 0:
+        return []
+    
+    # Build adjacency for boundary vertices
+    adj = {}
+    for v0, v1 in edges:
+        if v0 not in adj:
+            adj[v0] = []
+        if v1 not in adj:
+            adj[v1] = []
+        adj[v0].append(v1)
+        adj[v1].append(v0)
+    
+    chains = []
+    visited_edges = set()
+    
+    # Find endpoint vertices (degree 1) to start open chains
+    endpoints = [v for v, neighbors in adj.items() if len(neighbors) == 1]
+    
+    # Process endpoints first (open chains)
+    for start_v in endpoints:
+        if not adj[start_v]:  # Already processed
+            continue
+        
+        # Check if the edge from this endpoint is already visited
+        neighbor = adj[start_v][0]
+        edge_key = (min(start_v, neighbor), max(start_v, neighbor))
+        if edge_key in visited_edges:
+            continue
+        
+        # Walk from endpoint
+        chain = [start_v]
+        visited_edges.add(edge_key)
+        
+        current = neighbor
+        prev = start_v
+        chain.append(current)
+        
+        while True:
+            neighbors = [n for n in adj.get(current, []) if n != prev]
+            if not neighbors:
+                break
+            
+            next_v = neighbors[0]
+            edge_key = (min(current, next_v), max(current, next_v))
+            if edge_key in visited_edges:
+                break
+            
+            visited_edges.add(edge_key)
+            chain.append(next_v)
+            prev = current
+            current = next_v
+        
+        if len(chain) >= 2:
+            chains.append((chain, False))  # Open chain
+    
+    # Process remaining edges (closed loops)
+    for edge in edges:
+        edge_key = (min(edge[0], edge[1]), max(edge[0], edge[1]))
+        if edge_key in visited_edges:
+            continue
+        
+        # Start a new loop from this edge
+        loop = [edge[0], edge[1]]
+        visited_edges.add(edge_key)
+        
+        current = edge[1]
+        prev = edge[0]
+        
+        while True:
+            neighbors = [n for n in adj.get(current, []) if n != prev]
+            if not neighbors:
+                break
+            
+            next_v = neighbors[0]
+            edge_key = (min(current, next_v), max(current, next_v))
+            if edge_key in visited_edges:
+                break
+            
+            if next_v == loop[0]:
+                # Loop closed
+                visited_edges.add(edge_key)
+                break
+            
+            visited_edges.add(edge_key)
+            loop.append(next_v)
+            prev = current
+            current = next_v
+        
+        if len(loop) >= 3:
+            chains.append((loop, True))  # Closed loop
+    
+    return chains
+
+
+def _create_connected_fill(
+    surface_vertices: np.ndarray,
+    surface_faces: np.ndarray,
+    boundary_chains: List[Tuple[List[int], bool]],
+    part_mesh: trimesh.Trimesh,
+    boundary_edge_info: Dict,
+    max_distance: float
+) -> Dict:
+    """
+    Create SINGLE fill triangles per boundary edge that connect to part mesh.
+    
+    SIMPLIFIED APPROACH: For each boundary edge (bv0, bv1), create ONE triangle
+    that connects to a single projected point on the part mesh. This avoids
+    self-intersecting geometry from the "curtain" approach.
+    
+    The projected point is the edge midpoint projected to the part surface.
+    Triangle: (bv0, bv1, projected_midpoint)
+    
+    The projected_midpoint vertex should be re-projected to part during smoothing,
+    just like the parting surface vertices are re-projected.
+    
+    Args:
+        surface_vertices: Original parting surface vertices
+        surface_faces: Original parting surface faces
+        boundary_chains: List of (vertex_list, is_closed) tuples
+        part_mesh: Part mesh for projection
+        boundary_edge_info: Dict mapping edge_key to (v0, v1, v_opposite) for winding
+        max_distance: Maximum allowed projection distance
+    
+    Returns:
+        Dict with keys:
+        - 'new_vertices': Projected midpoints (to be appended to surface_vertices)
+        - 'new_faces': Face indices referencing combined vertex array
+        - 'part_constrained_indices': Indices of projected vertices (should re-project to part)
+        - 'fill_boundary_indices': Indices of original boundary vertices used (inner rim)
+        - 'inner_rim_edges': Nx2 array of inner rim edge vertex pairs
+    """
+    n_orig_verts = len(surface_vertices)
+    new_vertices = []  # Projected midpoints
+    new_faces = []
+    part_constrained_indices = []  # Track which new vertices should stay on part
+    fill_boundary_indices = set()  # Track original boundary vertices used in fill
+    inner_rim_edges = []  # Track edges along the inner rim for boundary neighbor computation
+    
+    for chain_idx, (chain_verts, is_closed) in enumerate(boundary_chains):
+        if len(chain_verts) < 2:
+            continue
+        
+        n_pts = len(chain_verts)
+        n_edges = n_pts if is_closed else n_pts - 1
+        
+        for i in range(n_edges):
+            next_i = (i + 1) % n_pts
+            
+            # Original boundary vertex indices
+            bv0 = chain_verts[i]
+            bv1 = chain_verts[next_i]
+            
+            # Get boundary edge positions
+            b0_pos = surface_vertices[bv0]
+            b1_pos = surface_vertices[bv1]
+            
+            # Check if edge is degenerate
+            edge_len = np.linalg.norm(b1_pos - b0_pos)
+            if edge_len < 1e-8:
+                continue
+            
+            # Compute edge midpoint
+            edge_midpoint = 0.5 * (b0_pos + b1_pos)
+            
+            # Project midpoint to part surface
+            proj_pts, distances, face_indices = trimesh.proximity.closest_point(part_mesh, [edge_midpoint])
+            proj_pt = proj_pts[0]
+            proj_dist = distances[0]
+            
+            # Skip if projection is too far
+            if proj_dist > max_distance:
+                continue
+            
+            # Check that projected point is not too close to either boundary vertex
+            # (would create degenerate triangle)
+            dist_to_b0 = np.linalg.norm(proj_pt - b0_pos)
+            dist_to_b1 = np.linalg.norm(proj_pt - b1_pos)
+            min_dist = min(dist_to_b0, dist_to_b1)
+            
+            # If the projected point is too close, it means the boundary is already
+            # on the part surface. In this case, move along the part surface normal
+            # to find a valid projection point.
+            if min_dist < edge_len * 0.1:
+                # Get the part surface normal at this point
+                face_idx = face_indices[0]
+                part_normal = part_mesh.face_normals[face_idx]
+                
+                # Also get the direction from the adjacent face's interior to the edge
+                edge_key = (min(bv0, bv1), max(bv0, bv1))
+                if edge_key in boundary_edge_info:
+                    adj_v0, adj_v1, adj_opp = boundary_edge_info[edge_key]
+                    interior_dir = edge_midpoint - surface_vertices[adj_opp]
+                    interior_dir = interior_dir / (np.linalg.norm(interior_dir) + 1e-10)
+                    
+                    # Move the projection point along the part surface, away from interior
+                    # Project interior_dir onto the tangent plane of the part surface
+                    tangent_dir = interior_dir - np.dot(interior_dir, part_normal) * part_normal
+                    tangent_len = np.linalg.norm(tangent_dir)
+                    
+                    if tangent_len > 1e-6:
+                        tangent_dir = tangent_dir / tangent_len
+                        # Move by a fraction of the edge length along this direction
+                        offset = edge_len * 0.3
+                        candidate_pt = proj_pt + tangent_dir * offset
+                        
+                        # Re-project to ensure it's on the part surface
+                        new_proj_pts, new_dists, _ = trimesh.proximity.closest_point(part_mesh, [candidate_pt])
+                        proj_pt = new_proj_pts[0]
+                        
+                        # Re-check distances
+                        dist_to_b0 = np.linalg.norm(proj_pt - b0_pos)
+                        dist_to_b1 = np.linalg.norm(proj_pt - b1_pos)
+                        min_dist = min(dist_to_b0, dist_to_b1)
+                        
+                        # Still too close? Skip this edge
+                        if min_dist < edge_len * 0.1:
+                            continue
+                    else:
+                        # Can't find a good tangent direction, skip
+                        continue
+                else:
+                    # No edge info, skip
+                    continue
+            
+            # Create new vertex for the projected midpoint
+            new_vert_idx = n_orig_verts + len(new_vertices)
+            new_vertices.append(proj_pt)
+            part_constrained_indices.append(new_vert_idx)
+            
+            # Track boundary vertices and inner rim edge
+            fill_boundary_indices.add(bv0)
+            fill_boundary_indices.add(bv1)
+            inner_rim_edges.append([bv0, bv1])
+            
+            # Determine winding direction from adjacent face
+            edge_key = (min(bv0, bv1), max(bv0, bv1))
+            
+            if edge_key in boundary_edge_info:
+                adj_v0, adj_v1, adj_opp = boundary_edge_info[edge_key]
+                
+                # Compute direction from edge to adjacent face's opposite vertex
+                edge_mid_adj = 0.5 * (surface_vertices[adj_v0] + surface_vertices[adj_v1])
+                to_inside = surface_vertices[adj_opp] - edge_mid_adj
+                
+                # Direction to projected point
+                to_proj = proj_pt - edge_midpoint
+                
+                # If projection is on same side as the opposite vertex, flip winding
+                same_side = np.dot(to_inside, to_proj) > 0
+                
+                if same_side:
+                    # Flip winding: normal points away from inside
+                    new_faces.append([bv0, bv1, new_vert_idx])
+                else:
+                    # Normal winding
+                    new_faces.append([bv0, new_vert_idx, bv1])
+            else:
+                # No edge info - default winding
+                new_faces.append([bv0, new_vert_idx, bv1])
+    
+    if len(new_vertices) == 0:
+        return {
+            'new_vertices': np.zeros((0, 3)),
+            'new_faces': np.zeros((0, 3), dtype=np.int64),
+            'part_constrained_indices': [],
+            'fill_boundary_indices': [],
+            'inner_rim_edges': np.zeros((0, 2), dtype=np.int64)
+        }
+    
+    return {
+        'new_vertices': np.array(new_vertices, dtype=np.float64),
+        'new_faces': np.array(new_faces, dtype=np.int64),
+        'part_constrained_indices': part_constrained_indices,
+        'fill_boundary_indices': list(fill_boundary_indices),
+        'inner_rim_edges': np.array(inner_rim_edges, dtype=np.int64) if inner_rim_edges else np.zeros((0, 2), dtype=np.int64)
+    }
+
+
+def _build_boundary_loops(edges: np.ndarray) -> List[List[int]]:
+    """
+    Build ordered boundary loops from a set of boundary edges.
+    
+    Args:
+        edges: (N, 2) array of edge vertex indices
+    
+    Returns:
+        List of loops, each loop is a list of vertex indices in order
+    """
+    if len(edges) == 0:
+        return []
+    
+    # Build adjacency for boundary vertices
+    adj = {}
+    for v0, v1 in edges:
+        if v0 not in adj:
+            adj[v0] = []
+        if v1 not in adj:
+            adj[v1] = []
+        adj[v0].append(v1)
+        adj[v1].append(v0)
+    
+    loops = []
+    visited_edges = set()
+    
+    for start_edge in edges:
+        edge_key = (min(start_edge[0], start_edge[1]), max(start_edge[0], start_edge[1]))
+        if edge_key in visited_edges:
+            continue
+        
+        # Start a new loop from this edge
+        loop = [start_edge[0], start_edge[1]]
+        visited_edges.add(edge_key)
+        
+        # Walk forward from end vertex
+        current = start_edge[1]
+        prev = start_edge[0]
+        
+        while True:
+            # Find next vertex
+            neighbors = adj.get(current, [])
+            next_vert = None
+            for n in neighbors:
+                if n != prev:
+                    edge_key = (min(current, n), max(current, n))
+                    if edge_key not in visited_edges:
+                        next_vert = n
+                        visited_edges.add(edge_key)
+                        break
+            
+            if next_vert is None:
+                break
+            
+            if next_vert == loop[0]:
+                # Loop closed
+                break
+            
+            loop.append(next_vert)
+            prev = current
+            current = next_vert
+        
+        if len(loop) >= 3:
+            loops.append(loop)
+    
+    return loops
 
 
 # Log table stats on module load (debug level)
