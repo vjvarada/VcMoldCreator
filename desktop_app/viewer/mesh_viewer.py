@@ -3625,20 +3625,22 @@ class MeshViewer(QWidget):
     # SECONDARY PARTING SURFACE VISUALIZATION
     # =========================================================================
     
-    def set_secondary_parting_surface(self, parting_mesh: trimesh.Trimesh):
+    # Color for secondary surface gap-fill triangles (orange)
+    SECONDARY_GAP_FILL_COLOR = "#ff9900"  # Orange
+    SECONDARY_GAP_FILL_OPACITY = 0.8
+    
+    def set_secondary_parting_surface(self, parting_mesh: trimesh.Trimesh, fill_face_indices: np.ndarray = None):
         """
         Set and display the secondary parting surface mesh.
         
         Args:
             parting_mesh: The secondary parting surface mesh (from secondary cut edges)
+            fill_face_indices: Optional array of face indices that are gap-fill triangles (shown in orange)
         """
         if not PYVISTA_AVAILABLE:
             return
         
         self._secondary_parting_surface_mesh = parting_mesh
-        
-        # Convert to PyVista
-        pv_surface = self._trimesh_to_pyvista(parting_mesh)
         
         # Remove existing actor
         if self._secondary_parting_surface_actor is not None:
@@ -3648,18 +3650,75 @@ class MeshViewer(QWidget):
                 pass
             self._secondary_parting_surface_actor = None
         
-        # Add secondary parting surface mesh (semi-transparent red)
-        self._secondary_parting_surface_actor = self.plotter.add_mesh(
-            pv_surface,
-            color=self.SECONDARY_PARTING_SURFACE_COLOR,
-            opacity=self.SECONDARY_PARTING_SURFACE_OPACITY,
-            smooth_shading=True,
-            show_edges=True,
-            edge_color='#cc2222',  # Darker red for edges
-            line_width=1,
-            style='surface',
-            render_points_as_spheres=False,
-        )
+        # Remove existing secondary gap-fill actor if any
+        if hasattr(self, '_secondary_gap_fill_actor') and self._secondary_gap_fill_actor is not None:
+            try:
+                self.plotter.remove_actor(self._secondary_gap_fill_actor)
+            except Exception:
+                pass
+            self._secondary_gap_fill_actor = None
+        
+        # If we have fill face indices, split into two meshes
+        if fill_face_indices is not None and len(fill_face_indices) > 0:
+            # Create mask for main surface (non-fill faces)
+            all_faces = np.arange(len(parting_mesh.faces))
+            fill_set = set(fill_face_indices.tolist())
+            main_face_mask = np.array([i not in fill_set for i in all_faces])
+            fill_face_mask = np.array([i in fill_set for i in all_faces])
+            
+            # Main secondary surface (red)
+            if np.any(main_face_mask):
+                main_mesh = trimesh.Trimesh(
+                    vertices=parting_mesh.vertices,
+                    faces=parting_mesh.faces[main_face_mask],
+                    process=False
+                )
+                pv_main = self._trimesh_to_pyvista(main_mesh)
+                self._secondary_parting_surface_actor = self.plotter.add_mesh(
+                    pv_main,
+                    color=self.SECONDARY_PARTING_SURFACE_COLOR,
+                    opacity=self.SECONDARY_PARTING_SURFACE_OPACITY,
+                    smooth_shading=True,
+                    show_edges=True,
+                    edge_color='#cc2222',
+                    line_width=1,
+                    style='surface',
+                )
+            
+            # Gap-fill triangles (orange)
+            if np.any(fill_face_mask):
+                fill_mesh = trimesh.Trimesh(
+                    vertices=parting_mesh.vertices,
+                    faces=parting_mesh.faces[fill_face_mask],
+                    process=False
+                )
+                pv_fill = self._trimesh_to_pyvista(fill_mesh)
+                self._secondary_gap_fill_actor = self.plotter.add_mesh(
+                    pv_fill,
+                    color=self.SECONDARY_GAP_FILL_COLOR,
+                    opacity=self.SECONDARY_GAP_FILL_OPACITY,
+                    smooth_shading=True,
+                    show_edges=True,
+                    edge_color='#cc7700',  # Darker orange for edges
+                    line_width=1,
+                    style='surface',
+                )
+                logger.info(f"Secondary gap-fill triangles displayed in orange: {len(fill_face_indices)} faces")
+        else:
+            # No fill faces - show entire mesh in red
+            pv_surface = self._trimesh_to_pyvista(parting_mesh)
+            # Add secondary parting surface mesh (semi-transparent red)
+            self._secondary_parting_surface_actor = self.plotter.add_mesh(
+                pv_surface,
+                color=self.SECONDARY_PARTING_SURFACE_COLOR,
+                opacity=self.SECONDARY_PARTING_SURFACE_OPACITY,
+                smooth_shading=True,
+                show_edges=True,
+                edge_color='#cc2222',  # Darker red for edges
+                line_width=1,
+                style='surface',
+                render_points_as_spheres=False,
+            )
         
         # Set up rendering properties for better visibility
         if self._secondary_parting_surface_actor is not None:
@@ -3684,6 +3743,14 @@ class MeshViewer(QWidget):
                 pass
             self._secondary_parting_surface_actor = None
         
+        # Also clear secondary gap-fill actor
+        if hasattr(self, '_secondary_gap_fill_actor') and self._secondary_gap_fill_actor is not None:
+            try:
+                self.plotter.remove_actor(self._secondary_gap_fill_actor)
+            except Exception:
+                pass
+            self._secondary_gap_fill_actor = None
+        
         self._secondary_parting_surface_mesh = None
         self.plotter.update()
         logger.info("Secondary parting surface cleared")
@@ -3698,8 +3765,11 @@ class MeshViewer(QWidget):
         self._secondary_parting_surface_visible = visible
         if self._secondary_parting_surface_actor is not None:
             self._secondary_parting_surface_actor.SetVisibility(visible)
-            self.plotter.update()
-            logger.debug(f"Secondary parting surface visibility set to {visible}")
+        # Also set visibility for secondary gap-fill actor
+        if hasattr(self, '_secondary_gap_fill_actor') and self._secondary_gap_fill_actor is not None:
+            self._secondary_gap_fill_actor.SetVisibility(visible)
+        self.plotter.update()
+        logger.debug(f"Secondary parting surface visibility set to {visible}")
     
     def set_secondary_parting_surface_opacity(self, opacity: float):
         """
@@ -3712,7 +3782,12 @@ class MeshViewer(QWidget):
             prop = self._secondary_parting_surface_actor.GetProperty()
             if prop:
                 prop.SetOpacity(opacity)
-            self.plotter.update()
+        # Also set opacity for secondary gap-fill actor
+        if hasattr(self, '_secondary_gap_fill_actor') and self._secondary_gap_fill_actor is not None:
+            prop = self._secondary_gap_fill_actor.GetProperty()
+            if prop:
+                prop.SetOpacity(opacity)
+        self.plotter.update()
     
     @property
     def secondary_parting_surface_visible(self) -> bool:

@@ -1763,6 +1763,12 @@ class ComprehensiveSecondarySurfaceResult:
     boundary_vertices_extended: int = 0
     new_faces_added: int = 0
     
+    # From gap filling
+    gaps_detected: int = 0
+    gaps_filled: int = 0
+    fill_faces_added: int = 0
+    fill_face_indices: Optional[np.ndarray] = None
+    
     # From smoothing
     boundary_vertices: int = 0
     interior_vertices: int = 0
@@ -1772,6 +1778,7 @@ class ComprehensiveSecondarySurfaceResult:
     # Timing
     extraction_time_ms: float = 0.0
     propagation_time_ms: float = 0.0
+    gap_fill_time_ms: float = 0.0
     smoothing_time_ms: float = 0.0
     total_time_ms: float = 0.0
 
@@ -1820,7 +1827,8 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
         try:
             from core.parting_surface import (
                 extract_parting_surface_from_tet_result,
-                repair_parting_surface_with_part
+                repair_parting_surface_with_part,
+                close_parting_surface_gaps
             )
             from core.surface_propagation import (
                 propagate_secondary_surface,
@@ -1911,18 +1919,75 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
             self.progress.emit(f"Propagated: {propagation_result.final_faces:,} faces "
                              f"({result.islands_removed} islands removed)")
             
+            # Track current mesh and excluded vertices for gap fill
+            current_mesh = propagation_result.mesh
+            excluded_vertices = None
+            fill_face_start_idx = None
+            
+            # === Step 4.5: Close gaps between secondary surface and part mesh ===
+            # Similar to primary surface gap filling
+            if self.part_mesh is not None:
+                self.progress.emit("Closing gaps between secondary surface and part...")
+                gap_start = time.time()
+                
+                # Create a minimal PartingSurfaceResult-like object for close_parting_surface_gaps
+                from core.parting_surface import PartingSurfaceResult
+                temp_surface_result = PartingSurfaceResult(
+                    mesh=current_mesh,
+                    vertices=np.array(current_mesh.vertices),
+                    faces=np.array(current_mesh.faces),
+                    num_vertices=len(current_mesh.vertices),
+                    num_faces=len(current_mesh.faces)
+                )
+                
+                gap_result = close_parting_surface_gaps(
+                    temp_surface_result,
+                    self.part_mesh,
+                    distance_threshold=None,  # Auto-compute
+                    method='smart_curtain'
+                )
+                
+                result.gap_fill_time_ms = (time.time() - gap_start) * 1000
+                result.gaps_detected = gap_result.boundary_edges_near_part
+                result.gaps_filled = gap_result.boundary_loops_found
+                result.fill_faces_added = gap_result.fill_faces_added
+                
+                if gap_result.mesh is not None and gap_result.fill_faces_added > 0:
+                    # Record where fill faces start (for visualization)
+                    fill_face_start_idx = len(current_mesh.faces)
+                    result.fill_face_indices = np.arange(
+                        fill_face_start_idx,
+                        fill_face_start_idx + gap_result.fill_faces_added
+                    )
+                    current_mesh = gap_result.mesh
+                    
+                    # Collect vertices to exclude from smoothing (fill vertices)
+                    excluded_verts_set = set()
+                    if gap_result.part_constrained_vertices is not None:
+                        excluded_verts_set.update(gap_result.part_constrained_vertices.tolist())
+                    if gap_result.fill_boundary_vertices is not None:
+                        excluded_verts_set.update(gap_result.fill_boundary_vertices.tolist())
+                    if excluded_verts_set:
+                        excluded_vertices = np.array(list(excluded_verts_set), dtype=np.int64)
+                    
+                    self.progress.emit(f"Gap fill: {gap_result.fill_faces_added} faces added, "
+                                      f"{gap_result.boundary_loops_found} loops closed")
+                else:
+                    self.progress.emit("No gaps to fill (or already closed)")
+            
             # === Step 5: Smooth surface with boundary re-projection ===
             if self.smooth_iterations > 0:
                 self.progress.emit(f"Smoothing surface ({self.smooth_iterations} iterations, λ={self.damping_factor})...")
                 smoothing_start = time.time()
                 
                 smoothing_result = smooth_membrane_with_boundary_reprojection(
-                    propagation_result.mesh,
+                    current_mesh,
                     part_mesh=self.part_mesh,
                     hull_mesh=self.hull_mesh,
                     primary_mesh=self.primary_mesh,  # Re-project to primary surface too
                     iterations=self.smooth_iterations,
-                    damping_factor=self.damping_factor
+                    damping_factor=self.damping_factor,
+                    excluded_vertices=excluded_vertices  # Don't smooth gap-fill vertices
                 )
                 
                 result.smoothing_time_ms = (time.time() - smoothing_start) * 1000
@@ -1934,22 +1999,22 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
                     result.num_vertices = len(smoothing_result.mesh.vertices)
                     result.num_faces = len(smoothing_result.mesh.faces)
                 else:
-                    # Smoothing failed, use propagated mesh
-                    result.mesh = propagation_result.mesh
-                    result.num_vertices = propagation_result.final_vertices
-                    result.num_faces = propagation_result.final_faces
+                    # Smoothing failed, use current mesh (may include gap-fill)
+                    result.mesh = current_mesh
+                    result.num_vertices = len(current_mesh.vertices)
+                    result.num_faces = len(current_mesh.faces)
             else:
-                # No smoothing requested
-                result.mesh = propagation_result.mesh
-                result.num_vertices = propagation_result.final_vertices
-                result.num_faces = propagation_result.final_faces
+                # No smoothing requested, use current mesh (may include gap-fill)
+                result.mesh = current_mesh
+                result.num_vertices = len(current_mesh.vertices)
+                result.num_faces = len(current_mesh.faces)
             
             result.total_time_ms = (time.time() - total_start) * 1000
             
             self.progress.emit(
                 f"Complete: {result.num_vertices:,} verts, {result.num_faces:,} faces "
                 f"(extract: {result.extraction_time_ms:.0f}ms, propagate: {result.propagation_time_ms:.0f}ms, "
-                f"smooth: {result.smoothing_time_ms:.0f}ms)"
+                f"gap-fill: {result.gap_fill_time_ms:.0f}ms, smooth: {result.smoothing_time_ms:.0f}ms)"
             )
             
             self.complete.emit(result)
@@ -7730,6 +7795,11 @@ class MainWindow(QMainWindow):
                 self.secondary_surface_stats.add_row(f'   Islands removed: {result.islands_removed}')
                 self.secondary_surface_stats.add_row(f'   Vertices extended: {result.boundary_vertices_extended}')
                 
+                if result.fill_faces_added > 0:
+                    self.secondary_surface_stats.add_row(f'⏱ Gap fill: {result.gap_fill_time_ms:.0f}ms')
+                    self.secondary_surface_stats.add_row(f'   Fill faces: {result.fill_faces_added}')
+                    self.secondary_surface_stats.add_row(f'   Gaps closed: {result.gaps_filled}')
+                
                 if result.smooth_iterations > 0:
                     self.secondary_surface_stats.add_row(f'⏱ Smoothing ({result.smooth_iterations} iter): {result.smoothing_time_ms:.0f}ms')
                     self.secondary_surface_stats.add_row(f'   Boundary verts: {result.boundary_vertices:,}')
@@ -7743,13 +7813,16 @@ class MainWindow(QMainWindow):
         
         # Visualize the secondary surface
         try:
-            self.mesh_viewer.set_secondary_parting_surface(result.mesh)
+            # Pass fill_face_indices if available (to show in orange)
+            fill_face_indices = getattr(result, 'fill_face_indices', None)
+            self.mesh_viewer.set_secondary_parting_surface(result.mesh, fill_face_indices=fill_face_indices)
             
             # Ensure display options show secondary surface
             has_primary = self.mesh_viewer.has_parting_surface
             self.display_options.show_parting_surface_options(show_primary=has_primary, show_secondary=True)
             
-            logger.info(f"Secondary surface visualized: {result.num_vertices} vertices, {result.num_faces} faces")
+            logger.info(f"Secondary surface visualized: {result.num_vertices} vertices, {result.num_faces} faces"
+                       f"{f', {len(fill_face_indices)} fill faces in orange' if fill_face_indices is not None else ''}")
         except Exception as e:
             logger.exception(f"Error visualizing secondary surface: {e}")
         

@@ -782,51 +782,50 @@ def smooth_membrane_with_boundary_reprojection(
     # Any boundary vertex within this distance will be re-projected to closest surface
     max_reproject_distance = mesh_scale * 0.15  # 15% of mesh size - much more generous
     
-    # Track distances for debugging
-    all_part_dists = []
-    all_hull_dists = []
-    all_primary_dists = []
+    # OPTIMIZATION: Batch all distance queries instead of one-by-one
+    boundary_verts_array = np.array(boundary_verts, dtype=np.int64)
+    boundary_positions = vertices[boundary_verts_array]
+    n_boundary = len(boundary_verts_array)
     
-    for vi in boundary_verts:
-        pos = vertices[vi]
-        dist_to_part = np.inf
-        dist_to_hull = np.inf
-        dist_to_primary = np.inf
-        
-        if part_proximity is not None:
-            _, d, _ = part_proximity.on_surface([pos])
-            dist_to_part = d[0]
-            all_part_dists.append(dist_to_part)
-        
-        if hull_proximity is not None:
-            _, d, _ = hull_proximity.on_surface([pos])
-            dist_to_hull = d[0]
-            all_hull_dists.append(dist_to_hull)
-        
-        if primary_proximity is not None:
-            _, d, _ = primary_proximity.on_surface([pos])
-            dist_to_primary = d[0]
-            all_primary_dists.append(dist_to_primary)
+    # Compute distances to all surfaces in batch
+    dist_to_part = np.full(n_boundary, np.inf)
+    dist_to_hull = np.full(n_boundary, np.inf)
+    dist_to_primary = np.full(n_boundary, np.inf)
+    
+    if part_proximity is not None:
+        _, dist_to_part, _ = part_proximity.on_surface(boundary_positions)
+    
+    if hull_proximity is not None:
+        _, dist_to_hull, _ = hull_proximity.on_surface(boundary_positions)
+    
+    if primary_proximity is not None:
+        _, dist_to_primary, _ = primary_proximity.on_surface(boundary_positions)
+    
+    # Classify each boundary vertex based on distances
+    for i, vi in enumerate(boundary_verts):
+        d_part = dist_to_part[i]
+        d_hull = dist_to_hull[i]
+        d_primary = dist_to_primary[i]
         
         # First, check if vertex is clearly ON one surface (within tight tolerance)
         # Priority: primary > part > hull (for secondary surfaces touching primary)
         # For primary surfaces: part > hull
-        if primary_proximity is not None and dist_to_primary < on_surface_tolerance:
+        if primary_proximity is not None and d_primary < on_surface_tolerance:
             boundary_surface[vi] = 'primary'
-        elif dist_to_part < on_surface_tolerance:
+        elif d_part < on_surface_tolerance:
             boundary_surface[vi] = 'part'
-        elif dist_to_hull < on_surface_tolerance:
+        elif d_hull < on_surface_tolerance:
             boundary_surface[vi] = 'hull'
         else:
             # Not clearly ON any surface - find the CLOSEST surface within max distance
             # This handles corners and gap-bridging cases
-            min_dist = min(dist_to_part, dist_to_hull, dist_to_primary if primary_proximity else np.inf)
+            min_dist = min(d_part, d_hull, d_primary if primary_proximity else np.inf)
             
             if min_dist < max_reproject_distance:
                 # Re-project to closest surface to bridge the gap
-                if dist_to_part == min_dist:
+                if d_part == min_dist:
                     boundary_surface[vi] = 'closest_part'
-                elif dist_to_hull == min_dist:
+                elif d_hull == min_dist:
                     boundary_surface[vi] = 'closest_hull'
                 else:
                     boundary_surface[vi] = 'closest_primary'
@@ -841,15 +840,15 @@ def smooth_membrane_with_boundary_reprojection(
     closest_count = sum(1 for s in boundary_surface.values() if s.startswith('closest_'))
     
     # Log distance statistics for debugging
-    if all_part_dists:
-        logger.info(f"Part distances - min: {min(all_part_dists):.4f}, max: {max(all_part_dists):.4f}, "
-                   f"mean: {np.mean(all_part_dists):.4f}")
-    if all_hull_dists:
-        logger.info(f"Hull distances - min: {min(all_hull_dists):.4f}, max: {max(all_hull_dists):.4f}, "
-                   f"mean: {np.mean(all_hull_dists):.4f}")
-    if all_primary_dists:
-        logger.info(f"Primary distances - min: {min(all_primary_dists):.4f}, max: {max(all_primary_dists):.4f}, "
-                   f"mean: {np.mean(all_primary_dists):.4f}")
+    if part_proximity is not None:
+        logger.info(f"Part distances - min: {dist_to_part.min():.4f}, max: {dist_to_part.max():.4f}, "
+                   f"mean: {dist_to_part.mean():.4f}")
+    if hull_proximity is not None:
+        logger.info(f"Hull distances - min: {dist_to_hull.min():.4f}, max: {dist_to_hull.max():.4f}, "
+                   f"mean: {dist_to_hull.mean():.4f}")
+    if primary_proximity is not None:
+        logger.info(f"Primary distances - min: {dist_to_primary.min():.4f}, max: {dist_to_primary.max():.4f}, "
+                   f"mean: {dist_to_primary.mean():.4f}")
     logger.info(f"Tolerances: on-surface={on_surface_tolerance:.4f}, max-reproject={max_reproject_distance:.4f} (mesh scale: {mesh_scale:.4f})")
     logger.info(f"Boundary classification: {part_count} to part, "
                f"{hull_count} to hull, {primary_count} to primary, {patch_count} patch ({closest_count} gap-bridging)")
@@ -882,6 +881,29 @@ def smooth_membrane_with_boundary_reprojection(
         logger.info("Using fast C++ smoothing with OpenMP")
     else:
         logger.info("Using Python smoothing (rebuild C++ module for speedup)")
+    
+    # Pre-categorize boundary vertices for batched re-projection
+    part_boundary_indices = []
+    hull_boundary_indices = []
+    primary_boundary_indices = []
+    
+    for vi in boundary_verts:
+        if vi in excluded_set:
+            continue
+        surface_type = boundary_surface.get(vi, 'patch')
+        if surface_type in ('part', 'closest_part'):
+            part_boundary_indices.append(vi)
+        elif surface_type in ('hull', 'closest_hull'):
+            hull_boundary_indices.append(vi)
+        elif surface_type in ('primary', 'closest_primary'):
+            primary_boundary_indices.append(vi)
+    
+    part_boundary_indices = np.array(part_boundary_indices, dtype=np.int64)
+    hull_boundary_indices = np.array(hull_boundary_indices, dtype=np.int64)
+    primary_boundary_indices = np.array(primary_boundary_indices, dtype=np.int64)
+    
+    logger.info(f"Batched re-projection: {len(part_boundary_indices)} part, "
+               f"{len(hull_boundary_indices)} hull, {len(primary_boundary_indices)} primary")
     
     # Alternating smoothing iterations
     for iteration in range(iterations):
@@ -925,30 +947,27 @@ def smooth_membrane_with_boundary_reprojection(
             
             vertices = new_vertices
         
-        # === Step 2: Re-project boundary vertices onto target surfaces ===
+        # === Step 2: BATCHED Re-project boundary vertices onto target surfaces ===
         # Per paper algorithm: after smoothing boundary polylines, re-project to M or ∂H
-        # This must remain in Python to use trimesh.proximity
-        # - 'part': Boundary vertices near part mesh → re-project to part
-        # - 'hull': Boundary vertices near hull mesh → re-project to hull
-        # - 'primary': Boundary vertices near primary surface → re-project to primary
-        # - 'patch': Patch boundaries → NO re-projection
-        for vi in boundary_verts:
-            # Skip excluded vertices (gap-fill vertices)
-            if vi in excluded_set:
-                continue
-            surface_type = boundary_surface[vi]
-            pos = vertices[vi]
-            
-            if surface_type in ('part', 'closest_part') and part_proximity is not None:
-                closest_pts, _, _ = part_proximity.on_surface([pos])
-                vertices[vi] = closest_pts[0]
-            elif surface_type in ('hull', 'closest_hull') and hull_proximity is not None:
-                closest_pts, _, _ = hull_proximity.on_surface([pos])
-                vertices[vi] = closest_pts[0]
-            elif surface_type in ('primary', 'closest_primary') and primary_proximity is not None:
-                closest_pts, _, _ = primary_proximity.on_surface([pos])
-                vertices[vi] = closest_pts[0]
-            # 'patch' vertices are not re-projected
+        # OPTIMIZATION: Batch all queries by surface type instead of one-by-one
+        
+        # Re-project to part mesh (batched)
+        if len(part_boundary_indices) > 0 and part_proximity is not None:
+            part_positions = vertices[part_boundary_indices]
+            closest_pts, _, _ = part_proximity.on_surface(part_positions)
+            vertices[part_boundary_indices] = closest_pts
+        
+        # Re-project to hull mesh (batched)
+        if len(hull_boundary_indices) > 0 and hull_proximity is not None:
+            hull_positions = vertices[hull_boundary_indices]
+            closest_pts, _, _ = hull_proximity.on_surface(hull_positions)
+            vertices[hull_boundary_indices] = closest_pts
+        
+        # Re-project to primary mesh (batched)
+        if len(primary_boundary_indices) > 0 and primary_proximity is not None:
+            primary_positions = vertices[primary_boundary_indices]
+            closest_pts, _, _ = primary_proximity.on_surface(primary_positions)
+            vertices[primary_boundary_indices] = closest_pts
         
         if (iteration + 1) % 2 == 0:
             logger.debug(f"Smoothing iteration {iteration + 1}/{iterations} complete")
