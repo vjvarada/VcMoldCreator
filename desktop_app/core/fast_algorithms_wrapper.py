@@ -518,5 +518,265 @@ def get_implementation_info() -> dict:
         'edge_labels': 'C++' if CPP_AVAILABLE else 'Python',
         'secondary_cuts': 'C++ (OpenMP)' if CPP_AVAILABLE else 'Python/GPU',
         'mold_half_classification': 'C++ (OpenMP)' if CPP_AVAILABLE else 'Python/GPU',
+        'laplacian_smoothing': 'C++ (OpenMP)' if CPP_AVAILABLE else 'Python',
         'speedup_estimate': '10-50x' if CPP_AVAILABLE else 'N/A (using Python)',
     }
+
+
+# =============================================================================
+# FAST LAPLACIAN SMOOTHING
+# =============================================================================
+
+def run_fast_laplacian_smoothing(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    boundary_vertices: np.ndarray,
+    excluded_vertices: Optional[np.ndarray] = None,
+    iterations: int = 5,
+    lambda_factor: float = 0.5
+) -> Tuple[np.ndarray, float]:
+    """
+    Run fast Laplacian smoothing using C++ with OpenMP if available.
+    
+    This is useful for simple smoothing where all boundary/excluded vertices
+    are fixed throughout the operation.
+    
+    Args:
+        vertices: (N, 3) vertex positions
+        faces: (F, 3) face vertex indices
+        boundary_vertices: (B,) indices of boundary vertices to preserve
+        excluded_vertices: (E,) additional vertex indices to exclude from smoothing
+        iterations: Number of smoothing iterations
+        lambda_factor: Smoothing factor (0.0-1.0)
+    
+    Returns:
+        Tuple of (smoothed_vertices, elapsed_ms)
+    """
+    if excluded_vertices is None:
+        excluded_vertices = np.array([], dtype=np.int64)
+    
+    if CPP_AVAILABLE:
+        return _run_laplacian_smoothing_cpp(
+            vertices, faces, boundary_vertices, excluded_vertices,
+            iterations, lambda_factor
+        )
+    else:
+        return _run_laplacian_smoothing_python(
+            vertices, faces, boundary_vertices, excluded_vertices,
+            iterations, lambda_factor
+        )
+
+
+def _run_laplacian_smoothing_cpp(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    boundary_vertices: np.ndarray,
+    excluded_vertices: np.ndarray,
+    iterations: int,
+    lambda_factor: float
+) -> Tuple[np.ndarray, float]:
+    """C++ implementation of Laplacian smoothing."""
+    verts = np.ascontiguousarray(vertices, dtype=np.float64)
+    fcs = np.ascontiguousarray(faces, dtype=np.int64)
+    boundary = np.ascontiguousarray(boundary_vertices, dtype=np.int64)
+    excluded = np.ascontiguousarray(excluded_vertices, dtype=np.int64)
+    
+    result = _cpp.fast_laplacian_smoothing(
+        verts, fcs, boundary, excluded, iterations, lambda_factor
+    )
+    
+    logger.info(f"[C++] Laplacian smoothing: {result.iterations_performed} iterations "
+                f"in {result.elapsed_ms:.1f}ms")
+    
+    return np.asarray(result.vertices), result.elapsed_ms
+
+
+def _run_laplacian_smoothing_python(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    boundary_vertices: np.ndarray,
+    excluded_vertices: np.ndarray,
+    iterations: int,
+    lambda_factor: float
+) -> Tuple[np.ndarray, float]:
+    """Python fallback implementation of Laplacian smoothing."""
+    start_time = time.time()
+    
+    n_verts = len(vertices)
+    verts = vertices.copy()
+    
+    # Build set of fixed vertices
+    fixed_set = set(boundary_vertices.tolist())
+    fixed_set.update(excluded_vertices.tolist())
+    
+    # Build vertex adjacency
+    neighbors = [set() for _ in range(n_verts)]
+    for f in faces:
+        for i in range(3):
+            v = f[i]
+            neighbors[v].add(f[(i+1) % 3])
+            neighbors[v].add(f[(i+2) % 3])
+    
+    # Smoothing iterations
+    for _ in range(iterations):
+        new_verts = verts.copy()
+        
+        for v in range(n_verts):
+            if v in fixed_set:
+                continue
+            
+            if neighbors[v]:
+                neighbor_list = list(neighbors[v])
+                avg_pos = verts[neighbor_list].mean(axis=0)
+                new_verts[v] = verts[v] + lambda_factor * (avg_pos - verts[v])
+        
+        verts = new_verts
+    
+    elapsed_ms = (time.time() - start_time) * 1000
+    logger.info(f"[Python] Laplacian smoothing: {iterations} iterations in {elapsed_ms:.1f}ms")
+    
+    return verts, elapsed_ms
+
+
+def run_fast_boundary_interior_smoothing(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    boundary_vertex_indices: np.ndarray,
+    boundary_edges: list,  # List of (v0, v1) tuples
+    excluded_vertices: Optional[np.ndarray] = None,
+    lambda_factor: float = 0.5
+) -> np.ndarray:
+    """
+    Run one iteration of boundary + interior smoothing using C++ if available.
+    
+    This performs:
+    1. Smooth boundary vertices along boundary polylines
+    2. Smooth interior vertices (boundary fixed)
+    
+    Designed to be called in a loop with re-projection between iterations.
+    
+    Args:
+        vertices: (N, 3) current vertex positions
+        faces: (F, 3) face vertex indices
+        boundary_vertex_indices: (B,) indices of boundary vertices
+        boundary_edges: List of (v0, v1) tuples representing boundary edges
+        excluded_vertices: (E,) vertex indices to completely exclude
+        lambda_factor: Smoothing factor
+    
+    Returns:
+        Smoothed vertex positions (N, 3)
+    """
+    if excluded_vertices is None:
+        excluded_vertices = np.array([], dtype=np.int64)
+    
+    if CPP_AVAILABLE:
+        return _run_boundary_interior_smoothing_cpp(
+            vertices, faces, boundary_vertex_indices, boundary_edges,
+            excluded_vertices, lambda_factor
+        )
+    else:
+        return _run_boundary_interior_smoothing_python(
+            vertices, faces, boundary_vertex_indices, boundary_edges,
+            excluded_vertices, lambda_factor
+        )
+
+
+def _run_boundary_interior_smoothing_cpp(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    boundary_vertex_indices: np.ndarray,
+    boundary_edges: list,
+    excluded_vertices: np.ndarray,
+    lambda_factor: float
+) -> np.ndarray:
+    """C++ implementation of boundary + interior smoothing."""
+    # Build boundary neighbor data in CSR-like format
+    boundary_set = set(boundary_vertex_indices.tolist())
+    
+    # Build boundary adjacency
+    boundary_adj = {v: [] for v in boundary_vertex_indices}
+    for v0, v1 in boundary_edges:
+        if v0 in boundary_adj:
+            boundary_adj[v0].append(v1)
+        if v1 in boundary_adj:
+            boundary_adj[v1].append(v0)
+    
+    # Convert to flat arrays with offsets
+    boundary_neighbors_list = []
+    boundary_offsets = [0]
+    
+    for vi in boundary_vertex_indices:
+        neighbors = boundary_adj.get(vi, [])
+        boundary_neighbors_list.extend(neighbors)
+        boundary_offsets.append(len(boundary_neighbors_list))
+    
+    verts = np.ascontiguousarray(vertices, dtype=np.float64)
+    fcs = np.ascontiguousarray(faces, dtype=np.int64)
+    boundary_idx = np.ascontiguousarray(boundary_vertex_indices, dtype=np.int64)
+    boundary_nbrs = np.array(boundary_neighbors_list, dtype=np.int64)
+    boundary_offs = np.array(boundary_offsets, dtype=np.int64)
+    excluded = np.ascontiguousarray(excluded_vertices, dtype=np.int64)
+    
+    result = _cpp.fast_boundary_and_interior_smoothing(
+        verts, fcs, boundary_idx, boundary_nbrs, boundary_offs,
+        excluded, lambda_factor
+    )
+    
+    return np.asarray(result)
+
+
+def _run_boundary_interior_smoothing_python(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    boundary_vertex_indices: np.ndarray,
+    boundary_edges: list,
+    excluded_vertices: np.ndarray,
+    lambda_factor: float
+) -> np.ndarray:
+    """Python fallback for boundary + interior smoothing."""
+    n_verts = len(vertices)
+    verts = vertices.copy()
+    
+    boundary_set = set(boundary_vertex_indices.tolist())
+    excluded_set = set(excluded_vertices.tolist())
+    
+    # Build boundary adjacency
+    boundary_adj = {v: [] for v in boundary_vertex_indices}
+    for v0, v1 in boundary_edges:
+        if v0 in boundary_adj:
+            boundary_adj[v0].append(v1)
+        if v1 in boundary_adj:
+            boundary_adj[v1].append(v0)
+    
+    # Build full vertex adjacency
+    neighbors = [set() for _ in range(n_verts)]
+    for f in faces:
+        for i in range(3):
+            v = f[i]
+            neighbors[v].add(f[(i+1) % 3])
+            neighbors[v].add(f[(i+2) % 3])
+    
+    # Step 1: Smooth boundary vertices
+    new_verts = verts.copy()
+    for vi in boundary_vertex_indices:
+        if vi in excluded_set:
+            continue
+        nbrs = boundary_adj.get(vi, [])
+        if len(nbrs) >= 2:
+            avg_pos = verts[nbrs].mean(axis=0)
+            new_verts[vi] = verts[vi] + lambda_factor * (avg_pos - verts[vi])
+    
+    verts = new_verts
+    
+    # Step 2: Smooth interior vertices
+    new_verts = verts.copy()
+    for vi in range(n_verts):
+        if vi in boundary_set or vi in excluded_set:
+            continue
+        if neighbors[vi]:
+            neighbor_list = list(neighbors[vi])
+            avg_pos = verts[neighbor_list].mean(axis=0)
+            new_verts[vi] = verts[vi] + lambda_factor * (avg_pos - verts[vi])
+    
+    return new_verts
+

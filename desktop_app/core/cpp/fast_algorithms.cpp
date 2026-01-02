@@ -20,6 +20,7 @@
 #include <limits>
 #include <algorithm>
 #include <array>
+#include <chrono>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -1848,6 +1849,317 @@ MoldHalfClassificationResult classify_mold_halves_cpp(
 
 
 // ============================================================================
+// FAST LAPLACIAN SMOOTHING WITH OPENMP
+// ============================================================================
+
+/**
+ * Result structure for Laplacian smoothing.
+ */
+struct LaplacianSmoothingResult {
+    py::array_t<double> vertices;  // Smoothed vertex positions
+    int64_t iterations_performed;
+    double elapsed_ms;
+};
+
+/**
+ * Build vertex adjacency from faces.
+ * Returns vector of neighbor sets for each vertex.
+ */
+std::vector<std::vector<int64_t>> build_vertex_adjacency(
+    const py::array_t<int64_t>& faces,
+    int64_t n_vertices
+) {
+    auto faces_buf = faces.unchecked<2>();
+    int64_t n_faces = faces_buf.shape(0);
+    
+    std::vector<std::vector<int64_t>> adjacency(n_vertices);
+    
+    for (int64_t fi = 0; fi < n_faces; fi++) {
+        int64_t v0 = faces_buf(fi, 0);
+        int64_t v1 = faces_buf(fi, 1);
+        int64_t v2 = faces_buf(fi, 2);
+        
+        adjacency[v0].push_back(v1);
+        adjacency[v0].push_back(v2);
+        adjacency[v1].push_back(v0);
+        adjacency[v1].push_back(v2);
+        adjacency[v2].push_back(v0);
+        adjacency[v2].push_back(v1);
+    }
+    
+    // Remove duplicates
+    #pragma omp parallel for
+    for (int64_t vi = 0; vi < n_vertices; vi++) {
+        std::sort(adjacency[vi].begin(), adjacency[vi].end());
+        adjacency[vi].erase(
+            std::unique(adjacency[vi].begin(), adjacency[vi].end()),
+            adjacency[vi].end()
+        );
+    }
+    
+    return adjacency;
+}
+
+/**
+ * Fast Laplacian smoothing with OpenMP parallelization.
+ * 
+ * Performs iterative Laplacian smoothing where each vertex moves toward
+ * the centroid of its neighbors. Boundary and excluded vertices are preserved.
+ * 
+ * @param vertices (N, 3) array of vertex positions
+ * @param faces (F, 3) array of face vertex indices
+ * @param boundary_vertices 1D array of vertex indices to preserve (boundary)
+ * @param excluded_vertices 1D array of additional vertex indices to exclude from smoothing
+ * @param iterations Number of smoothing iterations
+ * @param lambda_factor Smoothing factor (0.0-1.0, typical 0.5)
+ * @return LaplacianSmoothingResult with smoothed vertices
+ */
+LaplacianSmoothingResult fast_laplacian_smoothing(
+    py::array_t<double> vertices,
+    py::array_t<int64_t> faces,
+    py::array_t<int64_t> boundary_vertices,
+    py::array_t<int64_t> excluded_vertices,
+    int iterations = 5,
+    double lambda_factor = 0.5
+) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
+    auto verts_buf = vertices.unchecked<2>();
+    const int64_t n_verts = verts_buf.shape(0);
+    
+    // Copy vertices to working array
+    std::vector<Vec3> current_verts(n_verts);
+    std::vector<Vec3> new_verts(n_verts);
+    
+    #pragma omp parallel for
+    for (int64_t i = 0; i < n_verts; i++) {
+        current_verts[i] = {verts_buf(i, 0), verts_buf(i, 1), verts_buf(i, 2)};
+        new_verts[i] = current_verts[i];
+    }
+    
+    // Build adjacency
+    auto adjacency = build_vertex_adjacency(faces, n_verts);
+    
+    // Build set of fixed vertices (boundary + excluded)
+    std::vector<bool> is_fixed(n_verts, false);
+    
+    auto boundary_buf = boundary_vertices.unchecked<1>();
+    int64_t n_boundary = boundary_buf.shape(0);
+    for (int64_t i = 0; i < n_boundary; i++) {
+        int64_t vi = boundary_buf(i);
+        if (vi >= 0 && vi < n_verts) {
+            is_fixed[vi] = true;
+        }
+    }
+    
+    auto excluded_buf = excluded_vertices.unchecked<1>();
+    int64_t n_excluded = excluded_buf.shape(0);
+    for (int64_t i = 0; i < n_excluded; i++) {
+        int64_t vi = excluded_buf(i);
+        if (vi >= 0 && vi < n_verts) {
+            is_fixed[vi] = true;
+        }
+    }
+    
+    // Smoothing iterations
+    for (int iter = 0; iter < iterations; iter++) {
+        #pragma omp parallel for schedule(dynamic, 1000)
+        for (int64_t vi = 0; vi < n_verts; vi++) {
+            if (is_fixed[vi]) {
+                new_verts[vi] = current_verts[vi];
+                continue;
+            }
+            
+            const auto& neighbors = adjacency[vi];
+            if (neighbors.empty()) {
+                new_verts[vi] = current_verts[vi];
+                continue;
+            }
+            
+            // Compute centroid of neighbors
+            Vec3 centroid = {0.0, 0.0, 0.0};
+            for (int64_t nj : neighbors) {
+                centroid[0] += current_verts[nj][0];
+                centroid[1] += current_verts[nj][1];
+                centroid[2] += current_verts[nj][2];
+            }
+            double inv_n = 1.0 / static_cast<double>(neighbors.size());
+            centroid[0] *= inv_n;
+            centroid[1] *= inv_n;
+            centroid[2] *= inv_n;
+            
+            // Move toward centroid
+            new_verts[vi][0] = current_verts[vi][0] + lambda_factor * (centroid[0] - current_verts[vi][0]);
+            new_verts[vi][1] = current_verts[vi][1] + lambda_factor * (centroid[1] - current_verts[vi][1]);
+            new_verts[vi][2] = current_verts[vi][2] + lambda_factor * (centroid[2] - current_verts[vi][2]);
+        }
+        
+        // Swap buffers
+        std::swap(current_verts, new_verts);
+    }
+    
+    // Build result array
+    auto result_vertices = py::array_t<double>({n_verts, static_cast<int64_t>(3)});
+    auto result_buf = result_vertices.mutable_unchecked<2>();
+    
+    #pragma omp parallel for
+    for (int64_t i = 0; i < n_verts; i++) {
+        result_buf(i, 0) = current_verts[i][0];
+        result_buf(i, 1) = current_verts[i][1];
+        result_buf(i, 2) = current_verts[i][2];
+    }
+    
+    auto end_time = std::chrono::high_resolution_clock::now();
+    double elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+    
+    LaplacianSmoothingResult result;
+    result.vertices = result_vertices;
+    result.iterations_performed = iterations;
+    result.elapsed_ms = elapsed_ms;
+    
+    return result;
+}
+
+/**
+ * Fast Laplacian smoothing with boundary re-projection for membrane surfaces.
+ * 
+ * Implements the paper's algorithm:
+ * 1. Smooth boundary vertices (polyline smoothing)
+ * 2. Re-project boundary vertices to target surfaces
+ * 3. Smooth interior vertices (boundary fixed)
+ * 4. Repeat
+ * 
+ * This version performs pure smoothing - Python handles re-projection to leverage trimesh.
+ * 
+ * @param vertices (N, 3) array of vertex positions
+ * @param faces (F, 3) array of face vertex indices
+ * @param boundary_vertex_indices 1D array of boundary vertex indices
+ * @param boundary_neighbors Flattened array of boundary neighbor indices
+ * @param boundary_neighbor_offsets (B+1,) array of offsets into boundary_neighbors
+ * @param excluded_vertices 1D array of vertex indices to completely exclude
+ * @param lambda_factor Smoothing factor
+ * @return Smoothed vertex positions
+ */
+py::array_t<double> fast_boundary_and_interior_smoothing(
+    py::array_t<double> vertices,
+    py::array_t<int64_t> faces,
+    py::array_t<int64_t> boundary_vertex_indices,
+    py::array_t<int64_t> boundary_neighbors,
+    py::array_t<int64_t> boundary_neighbor_offsets,
+    py::array_t<int64_t> excluded_vertices,
+    double lambda_factor = 0.5
+) {
+    auto verts_buf = vertices.unchecked<2>();
+    const int64_t n_verts = verts_buf.shape(0);
+    
+    auto boundary_idx_buf = boundary_vertex_indices.unchecked<1>();
+    auto boundary_nbr_buf = boundary_neighbors.unchecked<1>();
+    auto boundary_off_buf = boundary_neighbor_offsets.unchecked<1>();
+    const int64_t n_boundary = boundary_idx_buf.shape(0);
+    
+    // Copy vertices to working array
+    std::vector<Vec3> verts(n_verts);
+    #pragma omp parallel for
+    for (int64_t i = 0; i < n_verts; i++) {
+        verts[i] = {verts_buf(i, 0), verts_buf(i, 1), verts_buf(i, 2)};
+    }
+    
+    // Build set of excluded vertices
+    std::unordered_set<int64_t> excluded_set;
+    auto excluded_buf = excluded_vertices.unchecked<1>();
+    for (int64_t i = 0; i < excluded_buf.shape(0); i++) {
+        excluded_set.insert(excluded_buf(i));
+    }
+    
+    // Build set of boundary vertices
+    std::unordered_set<int64_t> boundary_set;
+    for (int64_t i = 0; i < n_boundary; i++) {
+        boundary_set.insert(boundary_idx_buf(i));
+    }
+    
+    // Build full vertex adjacency for interior smoothing
+    auto full_adjacency = build_vertex_adjacency(faces, n_verts);
+    
+    // === Step 1: Smooth boundary vertices (polyline smoothing) ===
+    std::vector<Vec3> new_verts = verts;
+    
+    #pragma omp parallel for
+    for (int64_t bi = 0; bi < n_boundary; bi++) {
+        int64_t vi = boundary_idx_buf(bi);
+        
+        // Skip excluded vertices
+        if (excluded_set.count(vi)) continue;
+        
+        int64_t start = boundary_off_buf(bi);
+        int64_t end = boundary_off_buf(bi + 1);
+        int64_t n_neighbors = end - start;
+        
+        if (n_neighbors < 2) continue;
+        
+        // Average of boundary neighbors
+        Vec3 avg = {0.0, 0.0, 0.0};
+        for (int64_t j = start; j < end; j++) {
+            int64_t nj = boundary_nbr_buf(j);
+            avg[0] += verts[nj][0];
+            avg[1] += verts[nj][1];
+            avg[2] += verts[nj][2];
+        }
+        double inv_n = 1.0 / static_cast<double>(n_neighbors);
+        avg[0] *= inv_n;
+        avg[1] *= inv_n;
+        avg[2] *= inv_n;
+        
+        // Move toward average
+        new_verts[vi][0] = verts[vi][0] + lambda_factor * (avg[0] - verts[vi][0]);
+        new_verts[vi][1] = verts[vi][1] + lambda_factor * (avg[1] - verts[vi][1]);
+        new_verts[vi][2] = verts[vi][2] + lambda_factor * (avg[2] - verts[vi][2]);
+    }
+    
+    verts = new_verts;
+    
+    // === Step 2: Smooth interior vertices (boundary fixed) ===
+    #pragma omp parallel for schedule(dynamic, 1000)
+    for (int64_t vi = 0; vi < n_verts; vi++) {
+        // Skip boundary vertices
+        if (boundary_set.count(vi)) continue;
+        // Skip excluded vertices
+        if (excluded_set.count(vi)) continue;
+        
+        const auto& neighbors = full_adjacency[vi];
+        if (neighbors.empty()) continue;
+        
+        Vec3 centroid = {0.0, 0.0, 0.0};
+        for (int64_t nj : neighbors) {
+            centroid[0] += verts[nj][0];
+            centroid[1] += verts[nj][1];
+            centroid[2] += verts[nj][2];
+        }
+        double inv_n = 1.0 / static_cast<double>(neighbors.size());
+        centroid[0] *= inv_n;
+        centroid[1] *= inv_n;
+        centroid[2] *= inv_n;
+        
+        new_verts[vi][0] = verts[vi][0] + lambda_factor * (centroid[0] - verts[vi][0]);
+        new_verts[vi][1] = verts[vi][1] + lambda_factor * (centroid[1] - verts[vi][1]);
+        new_verts[vi][2] = verts[vi][2] + lambda_factor * (centroid[2] - verts[vi][2]);
+    }
+    
+    // Build result array
+    auto result = py::array_t<double>({n_verts, static_cast<int64_t>(3)});
+    auto result_buf = result.mutable_unchecked<2>();
+    
+    #pragma omp parallel for
+    for (int64_t i = 0; i < n_verts; i++) {
+        result_buf(i, 0) = new_verts[i][0];
+        result_buf(i, 1) = new_verts[i][1];
+        result_buf(i, 2) = new_verts[i][2];
+    }
+    
+    return result;
+}
+
+
+// ============================================================================
 // PYBIND11 MODULE DEFINITION
 // ============================================================================
 
@@ -2135,5 +2447,87 @@ PYBIND11_MODULE(fast_algorithms, m) {
           -------
           CompleteMoldHalfResult
               Contains face_labels, face_colors, counts
+          )doc");
+    
+    // Laplacian smoothing result structure
+    py::class_<LaplacianSmoothingResult>(m, "LaplacianSmoothingResult")
+        .def_readonly("vertices", &LaplacianSmoothingResult::vertices)
+        .def_readonly("iterations_performed", &LaplacianSmoothingResult::iterations_performed)
+        .def_readonly("elapsed_ms", &LaplacianSmoothingResult::elapsed_ms);
+    
+    // Fast Laplacian smoothing
+    m.def("fast_laplacian_smoothing", &fast_laplacian_smoothing,
+          py::arg("vertices"),
+          py::arg("faces"),
+          py::arg("boundary_vertices"),
+          py::arg("excluded_vertices"),
+          py::arg("iterations") = 5,
+          py::arg("lambda_factor") = 0.5,
+          R"doc(
+          Fast Laplacian smoothing with OpenMP parallelization.
+          
+          Performs iterative Laplacian smoothing where each vertex moves toward
+          the centroid of its neighbors. Boundary and excluded vertices are preserved.
+          
+          Parameters
+          ----------
+          vertices : ndarray of shape (N, 3)
+              Vertex positions
+          faces : ndarray of shape (F, 3)
+              Face vertex indices
+          boundary_vertices : ndarray of shape (B,)
+              Indices of boundary vertices to preserve
+          excluded_vertices : ndarray of shape (E,)
+              Additional vertex indices to exclude from smoothing
+          iterations : int
+              Number of smoothing iterations (default: 5)
+          lambda_factor : float
+              Smoothing factor 0.0-1.0 (default: 0.5)
+              
+          Returns
+          -------
+          LaplacianSmoothingResult
+              Contains smoothed vertices, iterations performed, elapsed time in ms
+          )doc");
+    
+    // Fast boundary and interior smoothing (single iteration)
+    m.def("fast_boundary_and_interior_smoothing", &fast_boundary_and_interior_smoothing,
+          py::arg("vertices"),
+          py::arg("faces"),
+          py::arg("boundary_vertex_indices"),
+          py::arg("boundary_neighbors"),
+          py::arg("boundary_neighbor_offsets"),
+          py::arg("excluded_vertices"),
+          py::arg("lambda_factor") = 0.5,
+          R"doc(
+          Fast single iteration of boundary + interior smoothing.
+          
+          Performs one iteration of:
+          1. Smooth boundary vertices along boundary polylines
+          2. Smooth interior vertices (boundary fixed)
+          
+          Designed to be called in a loop with re-projection between iterations.
+          
+          Parameters
+          ----------
+          vertices : ndarray of shape (N, 3)
+              Current vertex positions
+          faces : ndarray of shape (F, 3)
+              Face vertex indices
+          boundary_vertex_indices : ndarray of shape (B,)
+              Indices of boundary vertices
+          boundary_neighbors : ndarray
+              Flattened array of boundary neighbor indices
+          boundary_neighbor_offsets : ndarray of shape (B+1,)
+              Offsets into boundary_neighbors for each boundary vertex
+          excluded_vertices : ndarray of shape (E,)
+              Vertex indices to completely exclude from smoothing
+          lambda_factor : float
+              Smoothing factor (default: 0.5)
+              
+          Returns
+          -------
+          ndarray of shape (N, 3)
+              Smoothed vertex positions
           )doc");
 }

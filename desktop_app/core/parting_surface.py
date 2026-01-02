@@ -4,15 +4,11 @@ Parting Surface Extraction using Marching Tetrahedra
 This module extracts a continuous parting surface mesh from a tetrahedral mesh
 where certain edges have been marked as "cut" (either primary or secondary cuts).
 
-Algorithm: Extended Marching Tetrahedra
+Algorithm: Marching Tetrahedra (paper-based vertex classification)
 - Each tetrahedron has 6 edges
-- Each edge can be either CUT (1) or NOT CUT (0)
-- This gives 2^6 = 64 possible configurations
-- For each configuration, we have a pre-computed lookup table that defines
-  which triangles to emit (using edge midpoints as vertices)
-
-The lookup table encodes surface triangles that pass through the cut edges,
-creating a manifold surface that separates the two mold halves.
+- Cut edges are derived from vertex labels (H1 vs H2)
+- Only 3-edge and 4-edge configurations generate triangles
+- 5-edge and 6-edge configs are skipped to avoid self-intersections
 
 Edge numbering within a tetrahedron (vertices 0,1,2,3):
     Edge 0: (0,1)
@@ -21,17 +17,11 @@ Edge numbering within a tetrahedron (vertices 0,1,2,3):
     Edge 3: (1,2)
     Edge 4: (1,3)
     Edge 5: (2,3)
-
-Face definitions (for understanding triangulation):
-    Face 0: vertices (1,2,3) - opposite vertex 0
-    Face 1: vertices (0,2,3) - opposite vertex 1
-    Face 2: vertices (0,1,3) - opposite vertex 2
-    Face 3: vertices (0,1,2) - opposite vertex 3
 """
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional
 import numpy as np
 import trimesh
 
@@ -52,45 +42,28 @@ TET_EDGES = [
     (2, 3),  # Edge 5
 ]
 
-# For each edge, which two faces share it
-# Useful for consistent triangle orientation
-EDGE_TO_FACES = {
-    0: (2, 3),  # Edge (0,1) shared by face 2 (0,1,3) and face 3 (0,1,2)
-    1: (1, 3),  # Edge (0,2) shared by face 1 (0,2,3) and face 3 (0,1,2)
-    2: (1, 2),  # Edge (0,3) shared by face 1 (0,2,3) and face 2 (0,1,3)
-    3: (0, 3),  # Edge (1,2) shared by face 0 (1,2,3) and face 3 (0,1,2)
-    4: (0, 2),  # Edge (1,3) shared by face 0 (1,2,3) and face 2 (0,1,3)
-    5: (0, 1),  # Edge (2,3) shared by face 0 (1,2,3) and face 1 (0,2,3)
-}
-
 
 def _build_marching_tet_table() -> Dict[int, List[Tuple[int, int, int]]]:
     """
-    Build the full 64-entry marching tetrahedra lookup table.
+    Build the marching tetrahedra lookup table.
     
-    Following Bloomenthal & Ferguson 1995, Bonnell et al. 2003, Nielson & Franke 1997,
-    we handle ALL 64 configurations including non-manifold cases that arise when
-    edges are directly flagged as cut (not derived from vertex scalar field).
+    Based on the paper's vertex-classification approach, we only generate
+    triangles for configurations that arise from clean vertex separation
+    (H1 vs H2 labels), which produces only 3-edge and 4-edge configurations.
     
     Edge numbering (for reference):
         Edge 0: (v0, v1)    Edge 3: (v1, v2)
         Edge 1: (v0, v2)    Edge 4: (v1, v3)
         Edge 2: (v0, v3)    Edge 5: (v2, v3)
     
-    Face numbering:
-        Face 0: (v1, v2, v3) - opposite v0
-        Face 1: (v0, v2, v3) - opposite v1
-        Face 2: (v0, v1, v3) - opposite v2
-        Face 3: (v0, v1, v2) - opposite v3
-    
-    Configuration types by number of cut edges:
+    Active configurations:
         0 edges: Config 0 - no surface
-        1 edge:  Cannot form triangle - degenerate, skip
-        2 edges: Cannot form triangle - degenerate, skip  
-        3 edges: 4 configs - single triangle (vertex isolated)
-        4 edges: 3 configs - quad (2 triangles)
-        5 edges: 6 configs - non-manifold (2 triangles meeting at vertex)
-        6 edges: Config 63 - non-manifold singularity (4 triangles)
+        3 edges: 4 configs (7, 25, 42, 52) - single triangle (vertex isolated)
+        4 edges: 3 configs (30, 45, 51) - quad (2 triangles)
+    
+    Disabled configurations (produce self-intersections):
+        5 edges: 6 configs - non-manifold geometry
+        6 edges: Config 63 - tetrahedral singularity
     
     Returns:
         Dictionary mapping 6-bit config -> list of triangles
@@ -137,93 +110,27 @@ def _build_marching_tet_table() -> Dict[int, List[Tuple[int, int, int]]]:
     table[51] = [(0, 4, 5), (0, 5, 1)]
     
     # ===========================================================================
-    # 5-EDGE CONFIGS: Non-manifold - 2 triangles sharing a vertex
-    # These arise when one edge is NOT cut (5 are cut)
-    # The surface has two triangular patches meeting at the uncrossed edge's midpoint
+    # 5-EDGE CONFIGS: DISABLED - These produce non-manifold/self-intersecting geometry
     # ===========================================================================
-    # 
-    # For 5-edge configs, the single UNCUT edge defines two faces that share it.
-    # Each face contributes a triangle using its 3 edges minus the shared one.
-    # These two triangles share a VERTEX (not an edge), creating non-manifold geometry.
+    # When 5 edges are cut, the resulting triangles share vertices in ways that
+    # create self-intersections. Following the original paper approach, we skip
+    # these configurations. Tetrahedra with 5 cut edges will not contribute triangles.
     #
-    # Edge 0 NOT cut (edges 1,2,3,4,5 cut) - Config 62 = 63 - 1
-    # Uncut edge 0 connects v0-v1. 
-    # Triangle from face 1 (opposite v1): edges 1,2,5 = (v0v2, v0v3, v2v3)
-    # Triangle from face 2 (opposite v0): edges 3,4,5 = (v1v2, v1v3, v2v3)
-    # These share edge 5 (v2v3), so it's manifold! Actually forms a quad.
-    table[62] = [(1, 2, 5), (3, 4, 5)]
-    
-    # Edge 1 NOT cut (edges 0,2,3,4,5 cut) - Config 61 = 63 - 2  
-    # Uncut edge 1 connects v0-v2.
-    # Triangle from face 2 (opposite v2): edges 0,2,4 = (v0v1, v0v3, v1v3)
-    # Triangle from face 3 (opposite v3): edges 0,3,1 but 1 not cut, so edges 0,3 + need third
-    # Actually: faces sharing edge 1 are face 1 and face 3
-    # Face 1 (v0,v2,v3): edges 1,2,5 - without edge 1: edges 2,5
-    # Face 3 (v0,v1,v2): edges 0,1,3 - without edge 1: edges 0,3
-    # This gives us edges {0,2,3,4,5} cut. Triangles: 
-    table[61] = [(0, 2, 4), (3, 4, 5)]
-    
-    # Edge 2 NOT cut (edges 0,1,3,4,5 cut) - Config 59 = 63 - 4
-    # Uncut edge 2 connects v0-v3.
-    table[59] = [(0, 1, 3), (3, 4, 5)]
-    
-    # Edge 3 NOT cut (edges 0,1,2,4,5 cut) - Config 55 = 63 - 8
-    # Uncut edge 3 connects v1-v2.
-    table[55] = [(0, 1, 2), (2, 4, 5)]
-    
-    # Edge 4 NOT cut (edges 0,1,2,3,5 cut) - Config 47 = 63 - 16
-    # Uncut edge 4 connects v1-v3.
-    table[47] = [(0, 1, 2), (1, 3, 5)]
-    
-    # Edge 5 NOT cut (edges 0,1,2,3,4 cut) - Config 31 = 63 - 32
-    # Uncut edge 5 connects v2-v3.
-    table[31] = [(0, 1, 2), (0, 3, 4)]
+    # Configs 62, 61, 59, 55, 47, 31 are left empty (no triangles).
     
     # ===========================================================================
-    # 6-EDGE CONFIG: All edges cut - tetrahedral singularity
-    # This is a degenerate case where the isosurface passes through ALL edges.
-    # Forms 4 triangles (one on each face of the tetrahedron).
-    # Config 63 = 111111
+    # 6-EDGE CONFIG: DISABLED - Tetrahedral singularity causes self-intersections
     # ===========================================================================
-    table[63] = [(0, 1, 2), (0, 3, 4), (1, 3, 5), (2, 4, 5)]
+    # When all 6 edges are cut, the 4 triangles (one per face) self-intersect.
+    # Following the original paper approach, we skip this configuration.
+    #
+    # Config 63 is left empty (no triangles).
     
     return table
 
 
-def _add_3_edge_configs_UNUSED(table: Dict[int, List[Tuple[int, int, int]]]):
-    """
-    DEPRECATED: Old implementation that used face-edge patterns.
-    Kept for reference only.
-    
-    The correct pattern is vertex-isolation, not face-edges.
-    Vertex isolation: 3 edges from an isolated vertex
-    Face edges: 3 edges forming a face (WRONG)
-    """
-    pass
-
-
-def _add_4_edge_configs_UNUSED(table: Dict[int, List[Tuple[int, int, int]]]):
-    """
-    DEPRECATED: Old implementation.
-    Kept for reference only.
-    """
-    pass
-
-
 # Pre-build the lookup table
 MARCHING_TET_TABLE = _build_marching_tet_table()
-
-
-def _log_table_stats():
-    """Log statistics about the lookup table."""
-    stats = {}
-    for config, triangles in MARCHING_TET_TABLE.items():
-        n_tris = len(triangles)
-        stats[n_tris] = stats.get(n_tris, 0) + 1
-    
-    logger.debug(f"Marching tet table: {sum(stats.values())} configs")
-    for n_tris, count in sorted(stats.items()):
-        logger.debug(f"  {count} configs with {n_tris} triangle(s)")
 
 
 # =============================================================================
@@ -371,12 +278,18 @@ def extract_parting_surface(
     
     # Log configuration statistics
     logger.info(f"Configuration statistics ({len(config_counts)} unique configs):")
+    high_config_tets = 0  # Count tets with 5+ edges cut
     for config in sorted(config_counts.keys()):
         n_edges = bin(config).count('1')
         has_triangles = len(MARCHING_TET_TABLE.get(config, [])) > 0
         status = "→ triangles" if has_triangles else "→ EMPTY (no triangles)"
         if config_counts[config] > 10:  # Only log significant configs
             logger.info(f"  Config {config:2d} ({config:06b}, {n_edges} edges): {config_counts[config]:5d} tets {status}")
+        if n_edges >= 5:
+            high_config_tets += config_counts[config]
+    
+    if high_config_tets > 0:
+        logger.warning(f"  {high_config_tets} tets with 5+ edges cut - potential self-intersections")
     
     result.num_tets_contributing = tets_contributing
     
@@ -604,6 +517,7 @@ def repair_parting_surface(
     This performs:
     1. Merge duplicate/close vertices
     2. Remove degenerate faces (zero area)
+    3. Remove small area triangles (< min_area)
     
     Args:
         surface: PartingSurfaceResult to clean
@@ -622,6 +536,7 @@ def repair_parting_surface(
     try:
         mesh = surface.mesh.copy()
         initial_verts = len(mesh.vertices)
+        initial_faces = len(mesh.faces)
         
         # Step 1: Merge close vertices
         if merge_vertices:
@@ -634,6 +549,22 @@ def repair_parting_surface(
                 vertices=mesh.vertices,
                 faces=mesh.faces[valid_faces]
             )
+        
+        # Step 3: Remove very small triangles (potential self-intersection sources)
+        # These often result from 5-edge configs where triangles nearly collapse
+        if len(mesh.faces) > 0:
+            areas = mesh.area_faces
+            median_area = np.median(areas)
+            min_area_threshold = median_area * 0.01  # 1% of median area
+            valid_area_mask = areas >= min_area_threshold
+            small_removed = np.sum(~valid_area_mask)
+            if small_removed > 0:
+                logger.info(f"Removing {small_removed} very small triangles (< {min_area_threshold:.6f} area)")
+                mesh = trimesh.Trimesh(
+                    vertices=mesh.vertices,
+                    faces=mesh.faces[valid_area_mask]
+                )
+                mesh.remove_unreferenced_vertices()
         
         result = PartingSurfaceResult(
             mesh=mesh,
@@ -649,7 +580,8 @@ def repair_parting_surface(
         
         elapsed = (time.time() - start) * 1000
         vert_diff = initial_verts - result.num_vertices
-        logger.info(f"Cleaned parting surface: merged {vert_diff} verts in {elapsed:.1f}ms")
+        face_diff = initial_faces - result.num_faces
+        logger.info(f"Cleaned parting surface: merged {vert_diff} verts, removed {face_diff} faces in {elapsed:.1f}ms")
         
         return result
         
@@ -1273,7 +1205,3 @@ def _build_boundary_loops(edges: np.ndarray) -> List[List[int]]:
             loops.append(loop)
     
     return loops
-
-
-# Log table stats on module load (debug level)
-_log_table_stats()

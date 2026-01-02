@@ -12,8 +12,8 @@ reach target surfaces.
 """
 
 import logging
-from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional, Set
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Set
 import numpy as np
 import trimesh
 
@@ -681,7 +681,8 @@ def smooth_membrane_with_boundary_reprojection(
     primary_mesh: Optional[trimesh.Trimesh] = None,
     iterations: int = 5,
     damping_factor: float = 0.5,
-    excluded_vertices: Optional[np.ndarray] = None
+    excluded_vertices: Optional[np.ndarray] = None,
+    use_fast_smoothing: bool = True
 ) -> SmoothingResult:
     """
     Smooth the membrane surface while preserving boundaries on the part mesh (M),
@@ -867,26 +868,66 @@ def smooth_membrane_with_boundary_reprojection(
         boundary_neighbors[v0].add(v1)
         boundary_neighbors[v1].add(v0)
     
+    # Try to use fast C++ smoothing if available
+    try:
+        from .fast_algorithms_wrapper import (
+            run_fast_boundary_interior_smoothing,
+            is_cpp_available
+        )
+        can_use_fast = use_fast_smoothing and is_cpp_available()
+    except ImportError:
+        can_use_fast = False
+    
+    if can_use_fast:
+        logger.info("Using fast C++ smoothing with OpenMP")
+    else:
+        logger.info("Using Python smoothing (rebuild C++ module for speedup)")
+    
     # Alternating smoothing iterations
     for iteration in range(iterations):
-        # === Step 1: Smooth boundary vertices (polyline smoothing) ===
-        new_vertices = vertices.copy()
-        
-        for vi in boundary_verts:
-            # Skip excluded vertices (gap-fill vertices)
-            if vi in excluded_set:
-                continue
-            neighbors = list(boundary_neighbors[vi])
-            if len(neighbors) >= 2:
-                # Average of neighbors along the boundary
-                neighbor_positions = vertices[neighbors]
-                avg_pos = neighbor_positions.mean(axis=0)
-                new_vertices[vi] = vertices[vi] + damping_factor * (avg_pos - vertices[vi])
-        
-        vertices = new_vertices
+        if can_use_fast:
+            # === Fast C++ smoothing (boundary + interior in one call) ===
+            vertices = run_fast_boundary_interior_smoothing(
+                vertices=vertices,
+                faces=faces,
+                boundary_vertex_indices=np.array(boundary_verts, dtype=np.int64),
+                boundary_edges=boundary_edges,
+                excluded_vertices=np.array(list(excluded_set), dtype=np.int64) if excluded_set else None,
+                lambda_factor=damping_factor
+            )
+        else:
+            # === Python fallback: Step 1 - Smooth boundary vertices (polyline smoothing) ===
+            new_vertices = vertices.copy()
+            
+            for vi in boundary_verts:
+                # Skip excluded vertices (gap-fill vertices)
+                if vi in excluded_set:
+                    continue
+                neighbors = list(boundary_neighbors[vi])
+                if len(neighbors) >= 2:
+                    # Average of neighbors along the boundary
+                    neighbor_positions = vertices[neighbors]
+                    avg_pos = neighbor_positions.mean(axis=0)
+                    new_vertices[vi] = vertices[vi] + damping_factor * (avg_pos - vertices[vi])
+            
+            vertices = new_vertices
+            
+            # === Python fallback: Step 3 - Smooth interior vertices (boundary vertices fixed) ===
+            # Note: interior_verts already excludes excluded_set
+            new_vertices = vertices.copy()
+            
+            for vi in interior_verts:
+                neighbors = list(vertex_neighbors[vi])
+                if neighbors:
+                    neighbor_positions = vertices[neighbors]
+                    avg_pos = neighbor_positions.mean(axis=0)
+                    new_vertices[vi] = vertices[vi] + damping_factor * (avg_pos - vertices[vi])
+            
+            vertices = new_vertices
         
         # === Step 2: Re-project boundary vertices onto target surfaces ===
         # Per paper algorithm: after smoothing boundary polylines, re-project to M or ∂H
+        # This must remain in Python to use trimesh.proximity
         # - 'part': Boundary vertices near part mesh → re-project to part
         # - 'hull': Boundary vertices near hull mesh → re-project to hull
         # - 'primary': Boundary vertices near primary surface → re-project to primary
@@ -908,19 +949,6 @@ def smooth_membrane_with_boundary_reprojection(
                 closest_pts, _, _ = primary_proximity.on_surface([pos])
                 vertices[vi] = closest_pts[0]
             # 'patch' vertices are not re-projected
-        
-        # === Step 3: Smooth interior vertices (boundary vertices fixed) ===
-        # Note: interior_verts already excludes excluded_set
-        new_vertices = vertices.copy()
-        
-        for vi in interior_verts:
-            neighbors = list(vertex_neighbors[vi])
-            if neighbors:
-                neighbor_positions = vertices[neighbors]
-                avg_pos = neighbor_positions.mean(axis=0)
-                new_vertices[vi] = vertices[vi] + damping_factor * (avg_pos - vertices[vi])
-        
-        vertices = new_vertices
         
         if (iteration + 1) % 2 == 0:
             logger.debug(f"Smoothing iteration {iteration + 1}/{iterations} complete")
