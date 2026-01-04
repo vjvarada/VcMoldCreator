@@ -2,7 +2,9 @@
 Tetrahedral Mesh Generation for Mold Volume
 
 This module generates a tetrahedral mesh of the mold cavity volume using fTetWild
-(via pytetwild). The tetrahedral mesh replaces the voxel grid approach for:
+via the pytetwild package.
+
+The tetrahedral mesh replaces the voxel grid approach for:
 - More accurate volume representation
 - Better boundary conforming
 - Edge-based weight assignment for parting surface computation
@@ -17,19 +19,12 @@ The edge weights are used for Dijkstra-based escape labeling to find the parting
 """
 
 import logging
-import os
-import multiprocessing
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Set, Optional
 import numpy as np
 import trimesh
 
-# Set OpenMP thread count BEFORE importing pytetwild
-# fTetWild uses OpenMP for parallelization internally
-_num_threads = os.environ.get('FTETWILD_NUM_THREADS', str(multiprocessing.cpu_count()))
-os.environ['OMP_NUM_THREADS'] = _num_threads
-os.environ['OMP_DYNAMIC'] = 'FALSE'  # Disable dynamic adjustment
-
+# Import pytetwild for tetrahedralization
 try:
     import pytetwild
     PYTETWILD_AVAILABLE = True
@@ -37,7 +32,12 @@ except ImportError:
     PYTETWILD_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
-logger.info(f"fTetWild configured with OMP_NUM_THREADS={_num_threads}")
+
+# Log pytetwild availability
+if PYTETWILD_AVAILABLE:
+    logger.info("pytetwild available for tetrahedralization")
+else:
+    logger.warning("pytetwild not available - tetrahedralization will fail. Install with: pip install pytetwild")
 
 # Check for GPU acceleration options
 try:
@@ -54,8 +54,6 @@ try:
     CPP_FAST_AVAILABLE = True
 except ImportError:
     CPP_FAST_AVAILABLE = False
-
-logger = logging.getLogger(__name__)
 
 if CPP_FAST_AVAILABLE:
     logger.info("C++ fast_algorithms available - using optimized Dijkstra and edge labeling")
@@ -195,9 +193,6 @@ def tetrahedralize_mesh(
         - vertices: (N, 3) float64 array of vertex positions
         - tetrahedra: (M, 4) int32 array of tetrahedron vertex indices
     """
-    if not PYTETWILD_AVAILABLE:
-        raise ImportError("pytetwild is not installed. Install with: pip install pytetwild")
-    
     import time
     start = time.time()
     
@@ -208,7 +203,12 @@ def tetrahedralize_mesh(
     logger.info(f"Tetrahedralizing mesh with {len(vertices)} vertices, {len(faces)} faces")
     logger.info(f"Parameters: edge_length_fac={edge_length_fac}, optimize={optimize}")
     
-    # Run fTetWild
+    if not PYTETWILD_AVAILABLE:
+        raise ImportError(
+            "pytetwild not available. Install with: pip install pytetwild"
+        )
+    
+    # Run fTetWild via pytetwild
     tet_vertices, tetrahedra = pytetwild.tetrahedralize(
         vertices, 
         faces,
