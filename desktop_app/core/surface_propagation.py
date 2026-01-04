@@ -21,6 +21,22 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# CONSTANTS
+# =============================================================================
+
+# Smoothing tolerance thresholds (as fraction of mesh bounding box diagonal)
+ON_SURFACE_TOLERANCE_FRACTION = 0.05      # 5% - for determining if vertex is ON a surface
+MAX_REPROJECT_DISTANCE_FRACTION = 0.15    # 15% - for allowing re-projection to nearby surfaces
+INNER_BOUNDARY_THRESHOLD_FRACTION = 0.02  # 2% - for classifying boundary vertices as inner
+
+# Edge weight computation
+EDGE_WEIGHT_EPSILON = 0.25  # Minimum edge weight to prevent division issues
+
+# Minimum triangle area threshold (as fraction of median area)
+MIN_TRIANGLE_AREA_FRACTION = 0.01  # Triangles with area < 1% of median are considered degenerate
+
+
+# =============================================================================
 # DATA CLASSES
 # =============================================================================
 
@@ -776,11 +792,11 @@ def smooth_membrane_with_boundary_reprojection(
     mesh_scale = np.linalg.norm(membrane_mesh.bounds[1] - membrane_mesh.bounds[0])
     
     # Tight tolerance for classification (which surface is this vertex ON)
-    on_surface_tolerance = mesh_scale * 0.05  # 5% of mesh size
+    on_surface_tolerance = mesh_scale * ON_SURFACE_TOLERANCE_FRACTION
     
     # Loose tolerance for re-projection (allow bridging gaps)
     # Any boundary vertex within this distance will be re-projected to closest surface
-    max_reproject_distance = mesh_scale * 0.15  # 15% of mesh size - much more generous
+    max_reproject_distance = mesh_scale * MAX_REPROJECT_DISTANCE_FRACTION
     
     # OPTIMIZATION: Batch all distance queries instead of one-by-one
     boundary_verts_array = np.array(boundary_verts, dtype=np.int64)

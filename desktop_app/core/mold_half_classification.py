@@ -22,7 +22,7 @@ Algorithm matches the React frontend implementation exactly.
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, Set, List, Optional, Tuple
+from typing import Dict, Set, List, Tuple
 
 import numpy as np
 import trimesh
@@ -44,6 +44,26 @@ except ImportError:
     CPP_FAST_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+# Classification thresholds
+STRONG_ALIGNMENT_THRESHOLD = 0.7      # Dot product threshold for strong directional alignment
+STRONG_ALIGNMENT_MARGIN = 0.3         # Required margin over competing direction
+OUTER_BOUNDARY_TOLERANCE_FRACTION = 0.001  # 0.1% of hull size for outer boundary detection
+TET_OUTER_BOUNDARY_TOLERANCE_FRACTION = 0.02  # 2% of hull size for tet-based detection
+
+# Boundary zone parameters
+DEFAULT_BOUNDARY_ZONE_THRESHOLD = 0.15  # Default threshold for boundary zone extent
+
+# Area-based filtering
+ORPHAN_REGION_AREA_THRESHOLD = 0.02   # 2% of total area - regions smaller are orphans
+
+# Minimum outer triangle fraction before warning
+MIN_OUTER_TRIANGLE_FRACTION = 0.1     # Warn if <10% of triangles are outer
 
 
 # ============================================================================
@@ -487,8 +507,8 @@ def _classify_mold_halves_complete_cuda(
             break
     
     # Re-apply strong directional constraints
-    strong_h1 = (dot1 > 0.7) & (dot1 > dot2 + 0.3)
-    strong_h2 = (dot2 > 0.7) & (dot2 > dot1 + 0.3)
+    strong_h1 = (dot1 > STRONG_ALIGNMENT_THRESHOLD) & (dot1 > dot2 + STRONG_ALIGNMENT_MARGIN)
+    strong_h2 = (dot2 > STRONG_ALIGNMENT_THRESHOLD) & (dot2 > dot1 + STRONG_ALIGNMENT_MARGIN)
     outer_labels[strong_h1] = 1
     outer_labels[strong_h2] = 2
     
@@ -953,7 +973,7 @@ def identify_outer_boundary_from_hull(
     bounds = hull_mesh.bounds
     hull_size = bounds[1] - bounds[0]
     max_dim = np.max(hull_size)
-    tolerance = max_dim * 0.001  # 0.1% of hull size
+    tolerance = max_dim * OUTER_BOUNDARY_TOLERANCE_FRACTION
     
     # Get hull face normals and compute plane constants
     face_normals = hull_mesh.face_normals  # Shape: (n_faces, 3)
@@ -1105,7 +1125,7 @@ def identify_outer_boundary_by_proximity(
     # Compute hull size for tolerance
     bounds = hull_mesh.bounds
     hull_size = np.linalg.norm(bounds[1] - bounds[0])
-    tolerance = hull_size * 0.02  # 2% of hull size - more generous for tet meshes
+    tolerance = hull_size * TET_OUTER_BOUNDARY_TOLERANCE_FRACTION
     
     # Use GPU for large meshes
     if use_gpu and CUDA_AVAILABLE and n_faces > 5000:
@@ -1403,9 +1423,8 @@ def classify_and_smooth(
         side_labels[i] = side.get(int(outer_array[i]), side_labels[i])
     
     # Step 5: Re-apply strong directional constraints (vectorized)
-    strong_threshold = 0.7
-    strong_h1 = (dot1 > strong_threshold) & (dot1 > dot2 + 0.3)
-    strong_h2 = (dot2 > strong_threshold) & (dot2 > dot1 + 0.3)
+    strong_h1 = (dot1 > STRONG_ALIGNMENT_THRESHOLD) & (dot1 > dot2 + STRONG_ALIGNMENT_MARGIN)
+    strong_h2 = (dot2 > STRONG_ALIGNMENT_THRESHOLD) & (dot2 > dot1 + STRONG_ALIGNMENT_MARGIN)
     side_labels[strong_h1] = 1
     side_labels[strong_h2] = 2
     
@@ -1492,7 +1511,7 @@ def remove_orphans_by_area(
     adjacency: Dict[int, List[int]],
     outer_triangles: Set[int],
     triangles: List[TriangleInfo],
-    area_threshold_ratio: float = 0.02
+    area_threshold_ratio: float = ORPHAN_REGION_AREA_THRESHOLD
 ) -> None:
     """
     Remove isolated regions based on total area rather than triangle count.
@@ -1567,7 +1586,7 @@ def classify_mold_halves(
     hull_mesh: trimesh.Trimesh,
     d1: np.ndarray,
     d2: np.ndarray,
-    boundary_zone_threshold: float = 0.15,
+    boundary_zone_threshold: float = DEFAULT_BOUNDARY_ZONE_THRESHOLD,
     part_mesh: trimesh.Trimesh = None,
     use_proximity_method: bool = False,
     use_fast_method: bool = True,
@@ -1659,7 +1678,7 @@ def classify_mold_halves(
     
     # If hull matching found very few outer triangles, treat ALL as outer
     effective_outer_triangles = outer_triangles
-    if len(outer_triangles) < n_triangles * 0.1:
+    if len(outer_triangles) < n_triangles * MIN_OUTER_TRIANGLE_FRACTION:
         logger.warning("Hull matching found too few triangles, using all triangles")
         effective_outer_triangles = set(range(n_triangles))
     

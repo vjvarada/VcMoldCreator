@@ -17,16 +17,27 @@ The edge weights are used for Dijkstra-based escape labeling to find the parting
 """
 
 import logging
+import os
+import multiprocessing
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Set, Optional
 import numpy as np
 import trimesh
+
+# Set OpenMP thread count BEFORE importing pytetwild
+# fTetWild uses OpenMP for parallelization internally
+_num_threads = os.environ.get('FTETWILD_NUM_THREADS', str(multiprocessing.cpu_count()))
+os.environ['OMP_NUM_THREADS'] = _num_threads
+os.environ['OMP_DYNAMIC'] = 'FALSE'  # Disable dynamic adjustment
 
 try:
     import pytetwild
     PYTETWILD_AVAILABLE = True
 except ImportError:
     PYTETWILD_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
+logger.info(f"fTetWild configured with OMP_NUM_THREADS={_num_threads}")
 
 # Check for GPU acceleration options
 try:

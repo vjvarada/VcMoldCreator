@@ -252,21 +252,40 @@ def compute_visibility_for_direction(
     return visible_indices, visible_area
 
 
-def compute_visibility_for_direction_worker(args) -> Tuple[int, List[int], float]:
+def compute_visibility_batch(
+    directions: np.ndarray,
+    direction_indices: List[int],
+    mesh: trimesh.Trimesh,
+    normals: np.ndarray,
+    centroids: np.ndarray,
+    areas: np.ndarray,
+    ray_offset: float
+) -> List[Tuple[int, List[int], float]]:
     """
-    Worker function for parallel visibility computation.
+    Compute visibility for a batch of directions.
+    
+    Processing multiple directions in one function reduces Python overhead.
     
     Args:
-        args: Tuple of (direction_idx, direction, mesh, normals, centroids, areas, ray_offset)
-    
+        directions: Array of directions to process (batch_size, 3)
+        direction_indices: Original indices of these directions
+        mesh: Trimesh mesh object
+        normals: Face normals (n_faces, 3)
+        centroids: Face centroids (n_faces, 3)
+        areas: Face areas (n_faces,)
+        ray_offset: Distance to offset ray origins
+        
     Returns:
-        Tuple of (direction_idx, visible_indices, visible_area)
+        List of (direction_idx, visible_indices, visible_area) tuples
     """
-    direction_idx, direction, mesh, normals, centroids, areas, ray_offset = args
-    visible_indices, visible_area = compute_visibility_for_direction(
-        direction, mesh, normals, centroids, areas, ray_offset
-    )
-    return direction_idx, visible_indices, visible_area
+    results = []
+    for i, idx in enumerate(direction_indices):
+        direction = directions[i]
+        visible_indices, visible_area = compute_visibility_for_direction(
+            direction, mesh, normals, centroids, areas, ray_offset
+        )
+        results.append((idx, visible_indices, visible_area))
+    return results
 
 
 def compute_all_visibility_parallel(
@@ -283,6 +302,7 @@ def compute_all_visibility_parallel(
     Compute visibility for all directions in parallel using thread pool.
     
     Embree is thread-safe, so we can run multiple ray queries in parallel.
+    Uses batched processing to reduce Python function call overhead.
     
     Args:
         directions: Array of shape (k, 3) with unit vectors
@@ -301,44 +321,79 @@ def compute_all_visibility_parallel(
     direction_scores: Dict[int, DirectionScore] = {}
     completed = 0
     
+    # For small k, process sequentially (threading overhead not worth it)
+    if k <= 8:
+        for i in range(k):
+            visible_indices, visible_area = compute_visibility_for_direction(
+                directions[i], mesh, normals, centroids, areas, ray_offset
+            )
+            direction_scores[i] = DirectionScore(
+                direction=directions[i].copy(),
+                visible_area=visible_area,
+                visible_triangles=set(visible_indices)
+            )
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, k)
+        return direction_scores
+    
+    # Create batches for parallel processing
+    # Larger batches = less overhead, but less granular progress
+    batch_size = max(2, k // (num_workers * 4))
+    batches = []
+    for start in range(0, k, batch_size):
+        end = min(start + batch_size, k)
+        batch_indices = list(range(start, end))
+        batch_directions = directions[start:end]
+        batches.append((batch_directions, batch_indices))
+    
     # Use ThreadPoolExecutor for parallel ray tracing
     # (Embree releases the GIL during ray tracing)
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        # Submit all tasks
+        # Submit batched tasks
         futures = {}
-        for i in range(k):
+        for batch_directions, batch_indices in batches:
             future = executor.submit(
-                compute_visibility_for_direction,
-                directions[i],
+                compute_visibility_batch,
+                batch_directions,
+                batch_indices,
                 mesh,
                 normals,
                 centroids,
                 areas,
                 ray_offset
             )
-            futures[future] = i
+            futures[future] = len(batch_indices)
         
-        # Collect results as they complete
+        # Collect results as batches complete
         for future in as_completed(futures):
-            i = futures[future]
+            batch_count = futures[future]
             try:
-                visible_indices, visible_area = future.result()
-                direction_scores[i] = DirectionScore(
-                    direction=directions[i].copy(),
-                    visible_area=visible_area,
-                    visible_triangles=set(visible_indices)
-                )
+                batch_results = future.result()
+                for idx, visible_indices, visible_area in batch_results:
+                    direction_scores[idx] = DirectionScore(
+                        direction=directions[idx].copy(),
+                        visible_area=visible_area,
+                        visible_triangles=set(visible_indices)
+                    )
+                    completed += 1
+                    if progress_callback and (completed % 5 == 0 or completed == k):
+                        progress_callback(completed, k)
             except Exception as e:
-                logger.warning(f"Direction {i} failed: {e}")
-                direction_scores[i] = DirectionScore(
-                    direction=directions[i].copy(),
-                    visible_area=0.0,
-                    visible_triangles=set()
-                )
-            
-            completed += 1
-            if progress_callback:
-                progress_callback(completed, k)
+                logger.warning(f"Batch failed: {e}")
+                # Mark all directions in failed batch as empty
+                completed += batch_count
+                if progress_callback:
+                    progress_callback(completed, k)
+    
+    # Fill in any missing directions with empty results
+    for i in range(k):
+        if i not in direction_scores:
+            direction_scores[i] = DirectionScore(
+                direction=directions[i].copy(),
+                visible_area=0.0,
+                visible_triangles=set()
+            )
     
     return direction_scores
 
@@ -359,6 +414,8 @@ def find_best_pair(
     1. Has angle > 135° between them
     2. Maximizes total coverage (D1 area + D2 unique area)
     
+    Uses vectorized NumPy operations for fast set difference calculations.
+    
     Args:
         direction_scores: Dict mapping direction index to DirectionScore
         areas: Triangle areas
@@ -377,34 +434,56 @@ def find_best_pair(
     if len(sorted_scores) < 2:
         return sorted_scores[0], sorted_scores[0]
     
+    n_scores = len(sorted_scores)
+    n_faces = len(areas)
+    
+    # Pre-compute visibility masks for all directions (vectorized representation)
+    # This replaces slow Python set operations with fast NumPy boolean operations
+    visibility_masks = np.zeros((n_scores, n_faces), dtype=bool)
+    directions_array = np.zeros((n_scores, 3), dtype=np.float64)
+    
+    for i, score in enumerate(sorted_scores):
+        for tri in score.visible_triangles:
+            visibility_masks[i, tri] = True
+        directions_array[i] = score.direction
+    
+    # Pre-compute all pairwise dot products (angles)
+    dot_products = directions_array @ directions_array.T
+    
+    # Pre-compute visible areas for each direction
+    visible_areas = np.array([s.visible_area for s in sorted_scores], dtype=np.float64)
+    
     best_d1 = sorted_scores[0]
     best_d2 = sorted_scores[1]
     best_coverage = 0.0
     best_dot = 1.0
     
-    n_scores = len(sorted_scores)
+    # Only check top candidates (prune search space)
+    # The best pair is likely among the top ~20 directions by visible area
+    top_k = min(n_scores, 30)
     
-    for i in range(n_scores):
+    for i in range(top_k):
         s1 = sorted_scores[i]
+        mask1 = visibility_masks[i]
         
         for j in range(i + 1, n_scores):
-            s2 = sorted_scores[j]
-            
-            # Check angle constraint
-            dot = np.dot(s1.direction, s2.direction)
+            # Check angle constraint using pre-computed dot products
+            dot = dot_products[i, j]
             if dot > MIN_ANGLE_COS:
                 continue  # Angle too narrow
             
             # Quick upper bound check
-            if s1.visible_area + s2.visible_area <= best_coverage:
+            if visible_areas[i] + visible_areas[j] <= best_coverage:
                 continue
             
-            # Try s1 as primary: compute s2's unique contribution
-            s2_unique_area = sum(
-                areas[tri] for tri in s2.visible_triangles
-                if tri not in s1.visible_triangles
-            )
-            coverage = s1.visible_area + s2_unique_area
+            s2 = sorted_scores[j]
+            mask2 = visibility_masks[j]
+            
+            # Vectorized set difference: s2 triangles not in s1
+            # s2_unique = mask2 & ~mask1
+            s2_unique_mask = mask2 & ~mask1
+            s2_unique_area = areas[s2_unique_mask].sum()
+            coverage = visible_areas[i] + s2_unique_area
             
             if coverage > best_coverage + 0.0001 or \
                (abs(coverage - best_coverage) < 0.0001 and dot < best_dot):
@@ -413,12 +492,10 @@ def find_best_pair(
                 best_d2 = s2
                 best_dot = dot
             
-            # Try s2 as primary: compute s1's unique contribution
-            s1_unique_area = sum(
-                areas[tri] for tri in s1.visible_triangles
-                if tri not in s2.visible_triangles
-            )
-            coverage = s2.visible_area + s1_unique_area
+            # Try s2 as primary: s1 triangles not in s2
+            s1_unique_mask = mask1 & ~mask2
+            s1_unique_area = areas[s1_unique_mask].sum()
+            coverage = visible_areas[j] + s1_unique_area
             
             if coverage > best_coverage + 0.0001 or \
                (abs(coverage - best_coverage) < 0.0001 and dot < best_dot):
@@ -566,35 +643,27 @@ def compute_visibility_paint(
     # Initialize classification (0 = neutral)
     triangle_classes = np.zeros(n_faces, dtype=np.int32)
     
-    # Check visibility for each direction
-    d1_visible = set()
-    d2_visible = set()
+    # Check visibility for each direction using boolean masks
+    d1_mask = np.zeros(n_faces, dtype=bool)
+    d2_mask = np.zeros(n_faces, dtype=bool)
     
     if show_d1:
         d1_indices, _ = compute_visibility_for_direction(
             d1, mesh, normals, centroids, areas, ray_offset
         )
-        d1_visible = set(d1_indices)
+        if d1_indices:
+            d1_mask[d1_indices] = True
     
     if show_d2:
         d2_indices, _ = compute_visibility_for_direction(
             d2, mesh, normals, centroids, areas, ray_offset
         )
-        d2_visible = set(d2_indices)
+        if d2_indices:
+            d2_mask[d2_indices] = True
     
-    # Classify triangles
-    # 0 = neutral, 1 = D1 only, 2 = D2 only, 3 = overlap
-    for i in range(n_faces):
-        is_d1 = i in d1_visible
-        is_d2 = i in d2_visible
-        
-        if is_d1 and is_d2:
-            triangle_classes[i] = 3  # Overlap
-        elif is_d1:
-            triangle_classes[i] = 1  # D1
-        elif is_d2:
-            triangle_classes[i] = 2  # D2
-        # else remains 0 (neutral)
+    # Vectorized classification: 0=neutral, 1=D1, 2=D2, 3=overlap
+    # Use bitwise encoding: D1 contributes 1, D2 contributes 2
+    triangle_classes = d1_mask.astype(np.int32) + 2 * d2_mask.astype(np.int32)
     
     elapsed_ms = (time.perf_counter() - start_time) * 1000
     
@@ -619,6 +688,8 @@ def get_face_colors(paint_data: VisibilityPaintData) -> np.ndarray:
     """
     Convert visibility classification to face colors.
     
+    Uses vectorized NumPy operations for speed.
+    
     Args:
         paint_data: VisibilityPaintData from compute_visibility_paint
         
@@ -629,16 +700,15 @@ def get_face_colors(paint_data: VisibilityPaintData) -> np.ndarray:
     colors = np.zeros((n_faces, 4), dtype=np.uint8)
     colors[:, 3] = 255  # Full opacity
     
-    # Map classes to colors
-    for i in range(n_faces):
-        cls = paint_data.triangle_classes[i]
-        if cls == 1:  # D1
-            colors[i, :3] = (PAINT_COLORS['D1'] * 255).astype(np.uint8)
-        elif cls == 2:  # D2
-            colors[i, :3] = (PAINT_COLORS['D2'] * 255).astype(np.uint8)
-        elif cls == 3:  # Overlap
-            colors[i, :3] = (PAINT_COLORS['OVERLAP'] * 255).astype(np.uint8)
-        else:  # Neutral
-            colors[i, :3] = (PAINT_COLORS['NEUTRAL'] * 255).astype(np.uint8)
+    # Pre-compute color lookup table (class 0-3 -> RGB)
+    color_lut = np.array([
+        PAINT_COLORS['NEUTRAL'] * 255,   # class 0 = neutral
+        PAINT_COLORS['D1'] * 255,        # class 1 = D1
+        PAINT_COLORS['D2'] * 255,        # class 2 = D2
+        PAINT_COLORS['OVERLAP'] * 255,   # class 3 = overlap
+    ], dtype=np.uint8)
+    
+    # Vectorized lookup - directly index into LUT
+    colors[:, :3] = color_lut[paint_data.triangle_classes]
     
     return colors

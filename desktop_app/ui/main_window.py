@@ -6,7 +6,7 @@ Designed to match the React frontend's UI/UX with Shards Dashboard theme.
 """
 
 import logging
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, List, Tuple
 from pathlib import Path
 from enum import Enum
 from datetime import datetime
@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QTextCharFormat, QColor, QFont
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 
 from core import (
     STLLoader, LoadResult,
@@ -32,8 +32,7 @@ from core import (
     MeshRepairer, MeshRepairResult
 )
 from core.mesh_decimation import (
-    MeshDecimator, DecimationQuality, DecimationResult,
-    get_decimation_recommendation, TRIANGLE_COUNT_THRESHOLDS
+    MeshDecimator, get_decimation_recommendation, TRIANGLE_COUNT_THRESHOLDS
 )
 from core.parting_direction import (
     find_parting_directions,
@@ -53,7 +52,6 @@ from core.mold_cavity import (
 )
 from core.mold_half_classification import (
     classify_mold_halves,
-    get_mold_half_face_colors,
     MoldHalfClassificationResult,
 )
 from core.tetrahedral_mesh import (
@@ -1924,10 +1922,11 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
             excluded_vertices = None
             fill_face_start_idx = None
             
-            # === Step 4.5: Close gaps between secondary surface and part mesh ===
-            # Similar to primary surface gap filling
+            # === Step 4.5: Close gaps between secondary surface and part/primary mesh ===
+            # For secondary surfaces, we fill gaps to BOTH the part mesh AND the primary surface
+            # to prevent fill triangles from intersecting the primary surface
             if self.part_mesh is not None:
-                self.progress.emit("Closing gaps between secondary surface and part...")
+                self.progress.emit("Closing gaps between secondary surface and part/primary...")
                 gap_start = time.time()
                 
                 # Create a minimal PartingSurfaceResult-like object for close_parting_surface_gaps
@@ -1944,7 +1943,8 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
                     temp_surface_result,
                     self.part_mesh,
                     distance_threshold=None,  # Auto-compute
-                    method='smart_curtain'
+                    method='smart_curtain',
+                    primary_surface_mesh=self.primary_mesh  # Include primary surface as fill target
                 )
                 
                 result.gap_fill_time_ms = (time.time() - gap_start) * 1000
