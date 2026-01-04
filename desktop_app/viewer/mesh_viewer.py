@@ -55,6 +55,11 @@ class MeshViewer(QWidget):
     PARTING_D1_COLOR = "#00ff00"  # Green - Primary direction
     PARTING_D2_COLOR = "#ff6600"  # Orange - Secondary direction
     
+    # Pouring direction colors (distinct from parting)
+    POURING_S1_COLOR = "#00dddd"  # Cyan - Silicone direction 1
+    POURING_S2_COLOR = "#dd44ff"  # Magenta - Silicone direction 2
+    POURING_RESIN_COLOR = "#ff6666"  # Red - Resin direction
+    
     # Inflated hull colors (matching React frontend)
     HULL_COLOR = "#9966ff"        # Purple - Inflated hull
     ORIGINAL_HULL_COLOR = "#666666"  # Gray - Original hull wireframe
@@ -90,6 +95,12 @@ class MeshViewer(QWidget):
         self._visibility_paint_showing = False  # Whether paint is currently displayed
         self._stored_face_colors: Optional[np.ndarray] = None  # Stored face colors for toggling
         self._original_scalars = None  # Store original mesh colors
+        
+        # Pouring direction visualization
+        self._pouring_arrow_actors: List = []  # List of pouring direction arrow actors
+        self._pouring_s1: Optional[np.ndarray] = None
+        self._pouring_s2: Optional[np.ndarray] = None
+        self._pouring_resin: Optional[np.ndarray] = None
         
         # Inflated hull visualization
         self._hull_mesh: Optional[trimesh.Trimesh] = None
@@ -670,6 +681,13 @@ class MeshViewer(QWidget):
             # Re-add arrows
             self.add_parting_direction_arrows(self._parting_d1, self._parting_d2)
         
+        # Re-add pouring direction arrows if they exist (they get cleared by plotter.clear())
+        if self._pouring_s1 is not None and self._pouring_s2 is not None and self._pouring_resin is not None:
+            # Clear the stale actor references
+            self._pouring_arrow_actors = []
+            # Re-add arrows
+            self.add_pouring_direction_arrows(self._pouring_s1, self._pouring_s2, self._pouring_resin)
+        
         # Re-add hull and cavity actors if they exist (they get cleared by plotter.clear())
         self._re_add_hull_and_cavity_actors()
         
@@ -926,6 +944,12 @@ class MeshViewer(QWidget):
         self._visibility_paint_showing = False
         self._stored_face_colors = None
         self._original_scalars = None
+        
+        # Reset pouring direction state
+        self._pouring_s1 = None
+        self._pouring_s2 = None
+        self._pouring_resin = None
+        self._pouring_arrow_actors = []
         
         # Reset hull state
         self._hull_mesh = None
@@ -1286,6 +1310,244 @@ class MeshViewer(QWidget):
             return
         
         for actor in self._arrow_actors:
+            try:
+                actor.SetVisibility(visible)
+            except Exception:
+                pass
+        
+        self.plotter.update()
+    
+    # ========================================================================
+    # POURING DIRECTION VISUALIZATION
+    # ========================================================================
+    
+    def add_pouring_direction_arrows(
+        self,
+        silicone_1: np.ndarray,
+        silicone_2: np.ndarray,
+        resin: np.ndarray,
+        arrow_length: Optional[float] = None
+    ):
+        """
+        Add pouring direction arrows to the viewer.
+        
+        Creates three arrows at the mesh center showing the optimal
+        pouring directions for silicone molds and resin casting.
+        Uses distinct colors from parting directions:
+        - Silicone 1: Cyan
+        - Silicone 2: Magenta
+        - Resin: Red
+        
+        Args:
+            silicone_1: First silicone pouring direction (3,) unit vector
+            silicone_2: Second silicone pouring direction (3,) unit vector
+            resin: Resin pouring direction (3,) unit vector
+            arrow_length: Optional arrow length (default: based on mesh size)
+        """
+        if not PYVISTA_AVAILABLE or self._pv_mesh is None:
+            return
+        
+        # Store directions for later use
+        self._pouring_s1 = silicone_1.copy()
+        self._pouring_s2 = silicone_2.copy()
+        self._pouring_resin = resin.copy()
+        
+        # Remove existing pouring arrows
+        self.remove_pouring_direction_arrows()
+        
+        # Calculate arrow dimensions based on mesh bounds
+        bounds = self._pv_mesh.bounds
+        center = np.array([
+            (bounds[0] + bounds[1]) / 2,
+            (bounds[2] + bounds[3]) / 2,
+            (bounds[4] + bounds[5]) / 2,
+        ])
+        
+        size = np.array([
+            bounds[1] - bounds[0],
+            bounds[3] - bounds[2],
+            bounds[5] - bounds[4],
+        ])
+        max_size = np.max(size)
+        
+        # Scale arrow proportionally to mesh size (slightly smaller than parting arrows)
+        if arrow_length is None:
+            arrow_length = max_size * 0.6
+        
+        # Scale arrow thickness based on bounding box
+        thickness_factor = max_size / 100.0
+        shaft_radius = max(0.004, min(0.012, thickness_factor * 0.4))
+        tip_radius = shaft_radius * 2.5
+        tip_length = 0.15
+        
+        # Offset arrows slightly from center to avoid overlap with parting arrows
+        offset = max_size * 0.05
+        
+        # Create Silicone 1 arrow (Cyan)
+        arrow1 = pv.Arrow(
+            start=center + np.array([offset, 0, 0]),
+            direction=silicone_1,
+            scale=arrow_length,
+            tip_length=tip_length,
+            tip_radius=tip_radius,
+            shaft_radius=shaft_radius,
+            tip_resolution=16,
+            shaft_resolution=16,
+        )
+        
+        actor1 = self.plotter.add_mesh(
+            arrow1,
+            color=self.POURING_S1_COLOR,
+            opacity=1.0,
+            smooth_shading=False,
+            show_edges=False,
+            ambient=0.4,
+            diffuse=0.6,
+            specular=0.0,
+        )
+        if actor1 is not None:
+            prop = actor1.GetProperty()
+            if prop:
+                prop.SetInterpolationToFlat()
+                prop.SetEdgeVisibility(True)
+                prop.SetEdgeColor(0.0, 0.6, 0.6)
+                prop.SetLineWidth(1.5)
+        self._pouring_arrow_actors.append(actor1)
+        
+        # Create Silicone 2 arrow (Magenta)
+        arrow2 = pv.Arrow(
+            start=center - np.array([offset, 0, 0]),
+            direction=silicone_2,
+            scale=arrow_length,
+            tip_length=tip_length,
+            tip_radius=tip_radius,
+            shaft_radius=shaft_radius,
+            tip_resolution=16,
+            shaft_resolution=16,
+        )
+        
+        actor2 = self.plotter.add_mesh(
+            arrow2,
+            color=self.POURING_S2_COLOR,
+            opacity=1.0,
+            smooth_shading=False,
+            show_edges=False,
+            ambient=0.4,
+            diffuse=0.6,
+            specular=0.0,
+        )
+        if actor2 is not None:
+            prop = actor2.GetProperty()
+            if prop:
+                prop.SetInterpolationToFlat()
+                prop.SetEdgeVisibility(True)
+                prop.SetEdgeColor(0.6, 0.2, 0.6)
+                prop.SetLineWidth(1.5)
+        self._pouring_arrow_actors.append(actor2)
+        
+        # Create Resin arrow (Red)
+        arrow3 = pv.Arrow(
+            start=center,
+            direction=resin,
+            scale=arrow_length,
+            tip_length=tip_length,
+            tip_radius=tip_radius,
+            shaft_radius=shaft_radius,
+            tip_resolution=16,
+            shaft_resolution=16,
+        )
+        
+        actor3 = self.plotter.add_mesh(
+            arrow3,
+            color=self.POURING_RESIN_COLOR,
+            opacity=1.0,
+            smooth_shading=False,
+            show_edges=False,
+            ambient=0.4,
+            diffuse=0.6,
+            specular=0.0,
+        )
+        if actor3 is not None:
+            prop = actor3.GetProperty()
+            if prop:
+                prop.SetInterpolationToFlat()
+                prop.SetEdgeVisibility(True)
+                prop.SetEdgeColor(0.6, 0.2, 0.2)
+                prop.SetLineWidth(1.5)
+        self._pouring_arrow_actors.append(actor3)
+        
+        # Add labels at arrow tips
+        s1_tip = center + np.array([offset, 0, 0]) + silicone_1 * arrow_length * 1.05
+        s2_tip = center - np.array([offset, 0, 0]) + silicone_2 * arrow_length * 1.05
+        resin_tip = center + resin * arrow_length * 1.05
+        
+        self.plotter.add_point_labels(
+            [s1_tip],
+            ['S1'],
+            font_size=10,
+            text_color=self.POURING_S1_COLOR,
+            font_family='arial',
+            bold=True,
+            show_points=False,
+            always_visible=True,
+            shape=None,
+            fill_shape=False,
+        )
+        
+        self.plotter.add_point_labels(
+            [s2_tip],
+            ['S2'],
+            font_size=10,
+            text_color=self.POURING_S2_COLOR,
+            font_family='arial',
+            bold=True,
+            show_points=False,
+            always_visible=True,
+            shape=None,
+            fill_shape=False,
+        )
+        
+        self.plotter.add_point_labels(
+            [resin_tip],
+            ['R'],
+            font_size=10,
+            text_color=self.POURING_RESIN_COLOR,
+            font_family='arial',
+            bold=True,
+            show_points=False,
+            always_visible=True,
+            shape=None,
+            fill_shape=False,
+        )
+        
+        self.plotter.update()
+        logger.info(f"Added pouring direction arrows: S1={silicone_1}, S2={silicone_2}, Resin={resin}")
+    
+    def remove_pouring_direction_arrows(self):
+        """Remove pouring direction arrows from the viewer."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        for actor in self._pouring_arrow_actors:
+            try:
+                self.plotter.remove_actor(actor)
+            except Exception as e:
+                logger.debug(f"Could not remove pouring arrow actor: {e}")
+        
+        self._pouring_arrow_actors = []
+        self.plotter.update()
+    
+    def set_pouring_arrows_visible(self, visible: bool):
+        """
+        Set visibility of pouring direction arrows.
+        
+        Args:
+            visible: True to show arrows, False to hide
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        for actor in self._pouring_arrow_actors:
             try:
                 actor.SetVisibility(visible)
             except Exception:
@@ -3798,6 +4060,168 @@ class MeshViewer(QWidget):
     def has_secondary_parting_surface(self) -> bool:
         """Check if secondary parting surface exists."""
         return self._secondary_parting_surface_mesh is not None
+
+    # =========================================================================
+    # SOLIDIFIED PARTING SURFACE VISUALIZATION
+    # =========================================================================
+    
+    # Color for solidified surfaces (cyan/teal to distinguish from flat surfaces)
+    SOLIDIFIED_SURFACE_COLOR = "#00bcd4"  # Cyan
+    SOLIDIFIED_SURFACE_OPACITY = 0.6
+    
+    # Mold half colors for solidified secondary membranes
+    SOLIDIFIED_H1_COLOR = "#4CAF50"  # Green - same as H1 in mold classification
+    SOLIDIFIED_H2_COLOR = "#FF9800"  # Orange - same as H2 in mold classification
+    SOLIDIFIED_UNKNOWN_COLOR = "#00bcd4"  # Cyan - for unknown/unclassified
+    
+    def set_solidified_parting_surface(self, solid_mesh: 'trimesh.Trimesh'):
+        """
+        Set and display the solidified parting surface mesh.
+        
+        The solidified surface is the parting surface with thickness added,
+        ready for CSG operations.
+        
+        Args:
+            solid_mesh: The solidified parting surface mesh (3D volume)
+        """
+        # Use the new multi-mesh method with a single mesh
+        self.set_solidified_parting_surfaces([solid_mesh])
+    
+    def set_solidified_parting_surfaces(self, solid_meshes: list, mold_halves: list = None):
+        """
+        Set and display multiple solidified parting surface meshes.
+        
+        Each mesh is displayed as a separate actor, colored by mold half if provided.
+        
+        Args:
+            solid_meshes: List of solidified parting surface meshes
+            mold_halves: Optional list of mold half classifications (1=H1, 2=H2, 0=unknown)
+                        If not provided, uses default cyan color for all
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        # Initialize storage for multiple actors
+        if not hasattr(self, '_solidified_parting_surface_meshes'):
+            self._solidified_parting_surface_meshes = []
+        if not hasattr(self, '_solidified_parting_surface_actors'):
+            self._solidified_parting_surface_actors = []
+        
+        # Clear existing actors
+        self.clear_solidified_parting_surface()
+        
+        # Store references
+        self._solidified_parting_surface_meshes = solid_meshes
+        
+        # Default mold_halves to all zeros if not provided
+        if mold_halves is None:
+            mold_halves = [0] * len(solid_meshes)
+        
+        total_verts = 0
+        total_faces = 0
+        h1_count = 0
+        h2_count = 0
+        
+        for i, solid_mesh in enumerate(solid_meshes):
+            if solid_mesh is None:
+                continue
+                
+            # Convert to pyvista
+            pv_surface = self._trimesh_to_pyvista(solid_mesh)
+            
+            # Get mold half classification
+            mold_half = mold_halves[i] if i < len(mold_halves) else 0
+            
+            # Choose color based on mold half
+            if mold_half == 1:
+                color = self.SOLIDIFIED_H1_COLOR
+                edge_color = '#388E3C'  # Darker green
+                h1_count += 1
+            elif mold_half == 2:
+                color = self.SOLIDIFIED_H2_COLOR
+                edge_color = '#F57C00'  # Darker orange
+                h2_count += 1
+            else:
+                color = self.SOLIDIFIED_UNKNOWN_COLOR
+                edge_color = '#008b9e'  # Darker cyan
+            
+            # Add solidified surface mesh
+            actor = self.plotter.add_mesh(
+                pv_surface,
+                color=color,
+                opacity=self.SOLIDIFIED_SURFACE_OPACITY,
+                smooth_shading=True,
+                show_edges=True,
+                edge_color=edge_color,
+                line_width=1,
+                style='surface',
+            )
+            
+            # Set up rendering properties
+            if actor is not None:
+                prop = actor.GetProperty()
+                if prop:
+                    prop.SetInterpolationToPhong()
+                    prop.SetAmbient(0.3)
+                    prop.SetDiffuse(0.7)
+                self._solidified_parting_surface_actors.append(actor)
+            
+            total_verts += len(solid_mesh.vertices)
+            total_faces += len(solid_mesh.faces)
+        
+        self.plotter.update()
+        
+        # Log with mold half info
+        if h1_count > 0 or h2_count > 0:
+            logger.info(f"Solidified parting surfaces displayed: {len(solid_meshes)} components "
+                       f"({h1_count} H1-green, {h2_count} H2-orange), "
+                       f"{total_verts} total vertices, {total_faces} total faces")
+        else:
+            logger.info(f"Solidified parting surfaces displayed: {len(solid_meshes)} components, "
+                       f"{total_verts} total vertices, {total_faces} total faces")
+    
+    def clear_solidified_parting_surface(self):
+        """Remove solidified parting surface visualization from the scene."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        # Handle multiple actors
+        if hasattr(self, '_solidified_parting_surface_actors'):
+            for actor in self._solidified_parting_surface_actors:
+                if actor is not None:
+                    try:
+                        self.plotter.remove_actor(actor)
+                    except Exception:
+                        pass
+            self._solidified_parting_surface_actors = []
+        
+        # Also handle legacy single actor (for backwards compatibility)
+        if hasattr(self, '_solidified_parting_surface_actor') and self._solidified_parting_surface_actor is not None:
+            try:
+                self.plotter.remove_actor(self._solidified_parting_surface_actor)
+            except Exception:
+                pass
+            self._solidified_parting_surface_actor = None
+        
+        if hasattr(self, '_solidified_parting_surface_meshes'):
+            self._solidified_parting_surface_meshes = []
+        if hasattr(self, '_solidified_parting_surface_mesh'):
+            self._solidified_parting_surface_mesh = None
+        
+        self.plotter.update()
+        logger.debug("Solidified parting surface cleared")
+    
+    def set_solidified_parting_surface_visible(self, visible: bool):
+        """Set visibility of solidified parting surface."""
+        if hasattr(self, '_solidified_parting_surface_actor') and self._solidified_parting_surface_actor is not None:
+            self._solidified_parting_surface_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Solidified parting surface visibility set to {visible}")
+    
+    @property
+    def has_solidified_parting_surface(self) -> bool:
+        """Check if solidified parting surface exists."""
+        return hasattr(self, '_solidified_parting_surface_mesh') and self._solidified_parting_surface_mesh is not None
 
     # =========================================================================
     # EDGE DEBUG MODE FOR PARTING SURFACE

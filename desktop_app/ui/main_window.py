@@ -41,6 +41,10 @@ from core.parting_direction import (
     PartingDirectionResult,
     VisibilityPaintData,
 )
+from core.pouring_direction import (
+    find_optimal_pouring_directions,
+    OptimalPouringDirections,
+)
 from core.inflated_hull import (
     generate_inflated_hull,
     compute_default_offset,
@@ -79,6 +83,7 @@ class Step(Enum):
     SECONDARY_CUTS = 'secondary-cuts'  # Secondary cutting edges detection
     PARTING_SURFACE = 'parting-surface'  # Primary parting surface: generation + repair + smoothing
     SECONDARY_SURFACE = 'secondary-surface'  # Secondary surface: generation + propagation + smoothing
+    SOLIDIFY_MEMBRANES = 'solidify-membranes'  # Solidify surfaces into 3D volumes for CSG
 
 
 STEPS = [
@@ -93,6 +98,7 @@ STEPS = [
     {'id': Step.SECONDARY_CUTS, 'icon': '✂️', 'title': 'Secondary Cuts', 'description': 'Detect secondary cutting edges where membrane intersects part'},
     {'id': Step.PARTING_SURFACE, 'icon': '🔲', 'title': 'Primary Surface', 'description': 'Generate, repair and smooth the primary parting surface'},
     {'id': Step.SECONDARY_SURFACE, 'icon': '🔴', 'title': 'Secondary Surface', 'description': 'Generate, propagate and smooth secondary parting surfaces'},
+    {'id': Step.SOLIDIFY_MEMBRANES, 'icon': '🧊', 'title': 'Solidify Membranes', 'description': 'Convert flat surfaces into solid 3D volumes for mold splitting'},
 ]
 
 
@@ -797,6 +803,81 @@ class HullWorker(QThread):
             
         except Exception as e:
             logger.exception(f"Error computing inflated hull: {e}")
+            self.error.emit(str(e))
+
+
+class PouringDirectionWorker(QThread):
+    """
+    Background worker for computing optimal pouring directions.
+    
+    IMPORTANT: This worker is intended to be used on silicone mold pieces (P1, P2),
+    NOT on the input part mesh. Pouring direction optimization should be performed
+    after the mold pieces have been generated via the splitting/cutting process.
+    
+    The algorithm uses persistence homology to identify potential air bubble traps
+    and finds directions that minimize trapped air during silicone and resin casting.
+    """
+    
+    progress = pyqtSignal(str)
+    progress_value = pyqtSignal(int, int)  # current, total
+    complete = pyqtSignal(object)  # OptimalPouringDirections
+    error = pyqtSignal(str)
+    
+    def __init__(
+        self,
+        mesh,
+        n_candidate_directions: int = 64,
+        tilt_angle_deg: float = 10.0,
+        area_threshold_mm2: float = 0.5,
+        alignment_angle_deg: float = 30.0,
+        resin_cone_angle_deg: float = 10.0
+    ):
+        """
+        Initialize pouring direction worker.
+        
+        Args:
+            mesh: The trimesh mesh to analyze
+            n_candidate_directions: Number of candidate directions to sample
+            tilt_angle_deg: Allowed mold tilt angle (reduces trapped area)
+            area_threshold_mm2: Minimum trapped area to consider (filters noise)
+            alignment_angle_deg: Max angle between silicone directions
+            resin_cone_angle_deg: Resin direction cone angle around bisector
+        """
+        super().__init__()
+        self.mesh = mesh
+        self.n_candidate_directions = n_candidate_directions
+        self.tilt_angle_deg = tilt_angle_deg
+        self.area_threshold_mm2 = area_threshold_mm2
+        self.alignment_angle_deg = alignment_angle_deg
+        self.resin_cone_angle_deg = resin_cone_angle_deg
+    
+    def run(self):
+        try:
+            from core.pouring_direction import find_optimal_pouring_directions
+            
+            logger.info(f"Computing pouring directions with {self.n_candidate_directions} candidates...")
+            self.progress.emit(f"Sampling {self.n_candidate_directions} candidate directions...")
+            
+            def progress_callback(current, total):
+                self.progress_value.emit(current, total)
+                if current % 10 == 0 or current == total:
+                    self.progress.emit(f"Evaluating direction {current}/{total}...")
+            
+            result = find_optimal_pouring_directions(
+                self.mesh,
+                n_candidate_directions=self.n_candidate_directions,
+                tilt_angle_deg=self.tilt_angle_deg,
+                area_threshold_mm2=self.area_threshold_mm2,
+                alignment_angle_deg=self.alignment_angle_deg,
+                resin_cone_angle_deg=self.resin_cone_angle_deg,
+                progress_callback=progress_callback
+            )
+            
+            self.progress.emit(f"Found optimal pouring directions in {result.computation_time_ms:.0f}ms")
+            self.complete.emit(result)
+            
+        except Exception as e:
+            logger.exception(f"Error computing pouring directions: {e}")
             self.error.emit(str(e))
 
 
@@ -3389,6 +3470,10 @@ class MainWindow(QMainWindow):
         self._parting_result: Optional[PartingDirectionResult] = None
         self._visibility_paint_data: Optional[VisibilityPaintData] = None
         
+        # Pouring direction state
+        self._pouring_worker: Optional[PouringDirectionWorker] = None
+        self._pouring_result: Optional[OptimalPouringDirections] = None
+        
         # Inflated hull state
         self._hull_worker: Optional[HullWorker] = None
         self._hull_result: Optional[InflatedHullResult] = None
@@ -3440,6 +3525,11 @@ class MainWindow(QMainWindow):
         # Comprehensive secondary surface state (combined gen + propagate + smooth)
         self._secondary_surface_worker = None
         self._secondary_surface_result = None
+        
+        # Membrane solidification state
+        self._solidify_membranes_worker = None
+        self._solidified_parting_surface = None
+        self._solidified_secondary_membranes = []
         
         logger.debug("MainWindow: Calling _setup_window...")
         self._setup_window()
@@ -3831,6 +3921,8 @@ class MainWindow(QMainWindow):
             self._setup_parting_surface_step()
         elif self._active_step == Step.SECONDARY_SURFACE:
             self._setup_secondary_surface_step()
+        elif self._active_step == Step.SOLIDIFY_MEMBRANES:
+            self._setup_solidify_membranes_step()
         
         self.context_layout.addStretch()
     
@@ -4015,6 +4107,10 @@ class MainWindow(QMainWindow):
         self.color_legend.hide()
         self.context_layout.addWidget(self.color_legend)
         
+        # NOTE: Pouring direction optimization will be added to a later step
+        # after silicone mold pieces (P1, P2) are created. The pouring directions
+        # must be calculated on the mold pieces, not on the input part mesh.
+        
         # Update UI with current state
         self._update_parting_step_ui()
     
@@ -4175,6 +4271,29 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'parting_progress_label'):
             self.parting_progress_label.setText(f"Error: {message}")
             self.parting_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+    
+    # =========================================================================
+    # POURING DIRECTION OPTIMIZATION
+    # =========================================================================
+    # NOTE: Pouring direction optimization is performed on the silicone mold pieces
+    # (P1, P2), NOT on the input part mesh. This functionality will be integrated
+    # into a later step in the workflow after the mold pieces have been generated.
+    # The PouringDirectionWorker class and these handler methods are preserved for
+    # future use. See core/pouring_direction.py for the algorithm implementation.
+    # 
+    # Relevant functions for mold piece pouring optimization:
+    # - find_optimal_pouring_for_mold_pieces(mold_piece_1, mold_piece_2, ...)
+    # - find_optimal_pouring_directions(mesh, ...) - for individual mold pieces
+    # =========================================================================
+    
+    # Handler methods preserved for future use when mold piece step is implemented:
+    # - _on_calculate_pouring()
+    # - _on_pouring_progress()
+    # - _on_pouring_progress_value()
+    # - _on_pouring_complete()
+    # - _update_pouring_stats()
+    # - _on_pouring_error()
+    # - _on_pouring_worker_finished()
     
     # =========================================================================
     # HULL STEP
@@ -4476,6 +4595,9 @@ class MainWindow(QMainWindow):
         # Clear parting results
         self._parting_result = None
         self._visibility_paint_data = None
+        
+        # Clear pouring results
+        self._pouring_result = None
         
         # Clear hull results
         self._hull_result = None
@@ -7843,6 +7965,363 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             pass
         QMessageBox.critical(self, "Error", f"Secondary surface generation failed:\n{error_msg}")
+
+    # =========================================================================
+    # SOLIDIFY MEMBRANES STEP
+    # =========================================================================
+    
+    def _setup_solidify_membranes_step(self):
+        """Setup the solidify secondary membranes step UI."""
+        # Check prerequisites - need secondary surface
+        has_secondary = (self._secondary_surface_result is not None and 
+                        self._secondary_surface_result.mesh is not None)
+        
+        if not has_secondary:
+            # Check if there were any secondary cuts detected
+            has_secondary_cuts = (self._tet_result is not None and 
+                                 self._tet_result.secondary_cut_edges is not None and
+                                 len(self._tet_result.secondary_cut_edges) > 0)
+            
+            if not has_secondary_cuts:
+                no_cuts_label = QLabel("ℹ️ No secondary membranes detected.\n\nThis part does not require secondary membrane solidification.")
+                no_cuts_label.setStyleSheet(f"""
+                    color: {Colors.INFO};
+                    font-size: 13px;
+                    padding: 12px;
+                    background-color: rgba(0, 184, 216, 0.1);
+                    border: 1px solid {Colors.INFO};
+                    border-radius: 6px;
+                """)
+                no_cuts_label.setWordWrap(True)
+                self.context_layout.addWidget(no_cuts_label)
+                
+                # Mark as complete since no secondary membranes needed
+                if Step.SOLIDIFY_MEMBRANES in self.step_buttons:
+                    self.step_buttons[Step.SOLIDIFY_MEMBRANES].set_status('completed')
+                return
+            else:
+                no_secondary_label = QLabel("⚠️ Please complete Secondary Surface generation first.")
+                no_secondary_label.setStyleSheet(f"""
+                    color: {Colors.WARNING};
+                    font-size: 13px;
+                    padding: 12px;
+                    background-color: rgba(255, 180, 0, 0.1);
+                    border: 1px solid {Colors.WARNING};
+                    border-radius: 6px;
+                """)
+                no_secondary_label.setWordWrap(True)
+                self.context_layout.addWidget(no_secondary_label)
+                return
+        
+        # Get the secondary membrane mesh
+        secondary_mesh = self._secondary_surface_result.mesh
+        
+        # Description section
+        info_group = QGroupBox("Solidify Secondary Membranes")
+        info_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        info_layout = QVBoxLayout(info_group)
+        
+        info_text = QLabel(
+            "Convert flat secondary membrane surfaces into solid 3D volumes.\n\n"
+            "This step prepares membranes for mold piece splitting:\n"
+            "• Offset surface in both directions by thickness/2\n"
+            "• Create side faces connecting boundaries\n"
+            "• Ensure manifold (watertight) output for CSG operations"
+        )
+        info_text.setWordWrap(True)
+        info_text.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px; line-height: 1.4;')
+        info_layout.addWidget(info_text)
+        
+        self.context_layout.addWidget(info_group)
+        
+        # Current state info
+        state_info = StatsBox()
+        state_info.add_header('Current State', Colors.INFO)
+        state_info.add_row(f'Secondary surface: {len(secondary_mesh.faces):,} faces')
+        state_info.add_row(f'Secondary vertices: {len(secondary_mesh.vertices):,}')
+        
+        # Show if previously solidified
+        if self._solidified_secondary_membranes:
+            state_info.add_row('')
+            state_info.add_row('✅ Previously solidified')
+        
+        self.context_layout.addWidget(state_info)
+        
+        # Parameters group
+        params_group = QGroupBox("Solidification Parameters")
+        params_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+                color: {Colors.DARK};
+                background-color: {Colors.LIGHT};
+            }}
+            QGroupBox QLabel {{
+                color: {Colors.DARK};
+                font-size: 12px;
+            }}
+        """)
+        params_layout = QFormLayout(params_group)
+        params_layout.setContentsMargins(12, 12, 12, 12)
+        params_layout.setSpacing(10)
+        
+        # Thickness parameter
+        self.solidify_thickness_spin = QDoubleSpinBox()
+        self.solidify_thickness_spin.setRange(0.1, 20.0)
+        self.solidify_thickness_spin.setValue(0.4)
+        self.solidify_thickness_spin.setSingleStep(0.1)
+        self.solidify_thickness_spin.setSuffix(" mm")
+        self.solidify_thickness_spin.setToolTip("Total thickness of the solidified membrane")
+        params_layout.addRow("Thickness:", self.solidify_thickness_spin)
+        
+        # Auto-reduce thickness checkbox
+        self.solidify_auto_reduce_check = QCheckBox("Auto-reduce for high curvature")
+        self.solidify_auto_reduce_check.setChecked(True)
+        self.solidify_auto_reduce_check.setToolTip("Automatically reduce thickness in areas of high curvature to prevent self-intersection")
+        self.solidify_auto_reduce_check.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
+        params_layout.addRow("", self.solidify_auto_reduce_check)
+        
+        # Manifold repair checkbox
+        self.solidify_manifold_repair_check = QCheckBox("Use manifold repair")
+        self.solidify_manifold_repair_check.setChecked(True)
+        self.solidify_manifold_repair_check.setToolTip("Use manifold3d to repair non-manifold geometry")
+        self.solidify_manifold_repair_check.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
+        params_layout.addRow("", self.solidify_manifold_repair_check)
+        
+        self.context_layout.addWidget(params_group)
+        
+        # Solidify button
+        self.solidify_btn = QPushButton("🧊 Solidify Secondary Membrane")
+        self.solidify_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.solidify_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #17a2b8;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: #138496;
+            }}
+            QPushButton:disabled {{
+                background-color: {Colors.GRAY_LIGHT};
+                color: {Colors.GRAY};
+            }}
+        """)
+        self.solidify_btn.clicked.connect(self._run_solidify_membranes)
+        self.context_layout.addWidget(self.solidify_btn)
+        
+        # Progress bar
+        self.solidify_progress = QProgressBar()
+        self.solidify_progress.setStyleSheet(f"""
+            QProgressBar {{
+                border: none;
+                border-radius: 4px;
+                background-color: {Colors.LIGHT};
+                height: 8px;
+            }}
+            QProgressBar::chunk {{
+                background-color: #17a2b8;
+                border-radius: 4px;
+            }}
+        """)
+        self.solidify_progress.setTextVisible(False)
+        self.solidify_progress.setRange(0, 0)
+        self.solidify_progress.hide()
+        self.context_layout.addWidget(self.solidify_progress)
+        
+        # Progress label
+        self.solidify_progress_label = QLabel("")
+        self.solidify_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.solidify_progress_label.hide()
+        self.context_layout.addWidget(self.solidify_progress_label)
+        
+        # Stats box for results
+        self.solidify_stats = StatsBox()
+        self.solidify_stats.hide()
+        self.context_layout.addWidget(self.solidify_stats)
+        
+        # Show previous results if available
+        if self._solidified_secondary_membranes:
+            self._show_solidify_results()
+    
+    def _run_solidify_membranes(self):
+        """Run the secondary membrane solidification process."""
+        from core.membrane_solidifier import solidify_membrane_components, SolidificationResult
+        
+        # Get parameters
+        thickness = self.solidify_thickness_spin.value()
+        auto_reduce = self.solidify_auto_reduce_check.isChecked()
+        use_manifold = self.solidify_manifold_repair_check.isChecked()
+        
+        # Get the secondary membrane mesh
+        secondary_mesh = None
+        if self._secondary_surface_result is not None and self._secondary_surface_result.mesh is not None:
+            secondary_mesh = self._secondary_surface_result.mesh
+        
+        if secondary_mesh is None:
+            QMessageBox.warning(self, "Error", "No secondary surface available to solidify.")
+            return
+        
+        # Update UI
+        self.solidify_btn.setEnabled(False)
+        self.solidify_progress.show()
+        self.solidify_progress_label.show()
+        self.solidify_progress_label.setText("Splitting into components and solidifying...")
+        self.solidify_stats.hide()
+        
+        # Process in a try block (synchronous for now - these are fast operations)
+        try:
+            import time
+            start_time = time.time()
+            
+            # Solidify each component of the secondary membrane separately
+            self.solidify_progress_label.setText("Splitting surface into components...")
+            
+            # Gather classification data from tet_result if available
+            secondary_cut_edges = None
+            tet_vertices = None
+            seed_escape_labels = None
+            seed_vertex_indices = None
+            
+            if self._tet_result is not None:
+                secondary_cut_edges = self._tet_result.secondary_cut_edges
+                tet_vertices = self._tet_result.vertices
+                seed_escape_labels = self._tet_result.seed_escape_labels
+                seed_vertex_indices = self._tet_result.seed_vertex_indices
+            
+            # Use the component-based solidification which handles disconnected surfaces
+            results = solidify_membrane_components(
+                surface_mesh=secondary_mesh,
+                thickness=thickness,
+                auto_reduce_thickness=auto_reduce,
+                use_manifold_repair=use_manifold,
+                secondary_cut_edges=secondary_cut_edges,
+                tet_vertices=tet_vertices,
+                seed_escape_labels=seed_escape_labels,
+                seed_vertex_indices=seed_vertex_indices
+            )
+            
+            # Store results
+            self._solidified_secondary_membranes = results
+            
+            total_time = (time.time() - start_time) * 1000
+            
+            # Show results
+            self._show_solidify_results(total_time)
+            
+            # Mark step complete
+            if Step.SOLIDIFY_MEMBRANES in self.step_buttons:
+                self.step_buttons[Step.SOLIDIFY_MEMBRANES].set_status('completed')
+            
+            logger.info(f"Secondary membrane solidification complete in {total_time:.0f}ms")
+            
+        except Exception as e:
+            logger.exception(f"Error during solidification: {e}")
+            self.solidify_progress_label.setText(f"Error: {str(e)}")
+            self.solidify_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+            QMessageBox.critical(self, "Error", f"Solidification failed:\n{str(e)}")
+        finally:
+            self.solidify_btn.setEnabled(True)
+            self.solidify_progress.hide()
+    
+    def _show_solidify_results(self, total_time_ms: float = 0):
+        """Display solidification results."""
+        self.solidify_stats.clear()
+        self.solidify_stats.add_header('Solidification Results', Colors.SUCCESS)
+        
+        # Collect all solid meshes and mold halves for visualization
+        solid_meshes = []
+        mold_halves = []
+        
+        # Secondary surface results
+        if self._solidified_secondary_membranes:
+            for i, result in enumerate(self._solidified_secondary_membranes):
+                # Get mold half classification
+                mold_half = getattr(result, 'mold_half', 0)
+                mold_half_str = f"H{mold_half}" if mold_half > 0 else "—"
+                mold_half_color = "🟢" if mold_half == 1 else ("🟠" if mold_half == 2 else "🔵")
+                
+                if len(self._solidified_secondary_membranes) > 1:
+                    self.solidify_stats.add_row(f'Component {i+1} {mold_half_color}:')
+                else:
+                    self.solidify_stats.add_row(f'Solidified Membrane {mold_half_color}:')
+                self.solidify_stats.add_row(f'  Mold Half: {mold_half_str}')
+                self.solidify_stats.add_row(f'  Vertices: {len(result.solid_mesh.vertices):,}')
+                self.solidify_stats.add_row(f'  Faces: {len(result.solid_mesh.faces):,}')
+                self.solidify_stats.add_row(f'  Thickness: {result.thickness_used:.2f} mm')
+                self.solidify_stats.add_row(f'  Watertight: {"✅" if result.is_watertight else "❌"}')
+                self.solidify_stats.add_row(f'  Manifold: {"✅" if result.is_manifold else "❌"}')
+                
+                if result.has_self_intersections:
+                    self.solidify_stats.add_row(f'  ⚠️ Self-intersections detected')
+                
+                if result.warnings:
+                    for w in result.warnings[:2]:  # Show first 2 warnings
+                        w_text = f'  ⚠️ {w[:40]}...' if len(w) > 40 else f'  ⚠️ {w}'
+                        self.solidify_stats.add_row(w_text)
+                
+                # Collect mesh and mold_half for visualization
+                solid_meshes.append(result.solid_mesh)
+                mold_halves.append(mold_half)
+            
+            # Show summary with mold half breakdown
+            total_verts = sum(len(r.solid_mesh.vertices) for r in self._solidified_secondary_membranes)
+            total_faces = sum(len(r.solid_mesh.faces) for r in self._solidified_secondary_membranes)
+            watertight_count = sum(1 for r in self._solidified_secondary_membranes if r.is_watertight)
+            h1_count = sum(1 for r in self._solidified_secondary_membranes if getattr(r, 'mold_half', 0) == 1)
+            h2_count = sum(1 for r in self._solidified_secondary_membranes if getattr(r, 'mold_half', 0) == 2)
+            
+            self.solidify_stats.add_row('')
+            self.solidify_stats.add_row(f'Summary: {len(self._solidified_secondary_membranes)} components')
+            if h1_count > 0 or h2_count > 0:
+                self.solidify_stats.add_row(f'  🟢 H1: {h1_count}  |  🟠 H2: {h2_count}')
+            self.solidify_stats.add_row(f'Total: {total_verts:,} verts, {total_faces:,} faces')
+            self.solidify_stats.add_row(f'Watertight: {watertight_count}/{len(self._solidified_secondary_membranes)}')
+        
+        # Visualize all solidified surfaces at once with mold half colors
+        if solid_meshes:
+            try:
+                self.mesh_viewer.set_solidified_parting_surfaces(solid_meshes, mold_halves)
+            except Exception as e:
+                logger.warning(f"Could not visualize solidified surfaces: {e}")
+        
+        if total_time_ms > 0:
+            self.solidify_stats.add_row('')
+            self.solidify_stats.add_row(f'Total time: {total_time_ms:.0f}ms')
+        
+        self.solidify_stats.show()
+        self.solidify_progress_label.setText("Solidification complete!")
+        self.solidify_progress_label.setStyleSheet(f'color: {Colors.SUCCESS}; font-size: 12px;')
+        self.solidify_progress_label.show()
 
     def _load_mesh(self, file_path: str, scale_factor: float = 1.0):
         """Load and process a mesh file."""

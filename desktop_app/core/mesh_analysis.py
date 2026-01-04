@@ -11,10 +11,13 @@ Analyzes:
 - Volume and surface area
 - Bounding box dimensions
 - Mesh quality issues
+- Height fields for direction analysis
+- Vertex/face adjacency structures
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Dict, Set, Tuple
+from collections import defaultdict
 import numpy as np
 import trimesh
 
@@ -304,3 +307,89 @@ def analyze_mesh(mesh: trimesh.Trimesh) -> MeshDiagnostics:
     """
     analyzer = MeshAnalyzer(mesh)
     return analyzer.analyze()
+
+
+# ============================================================================
+# HEIGHT FIELD AND ADJACENCY FUNCTIONS
+# ============================================================================
+
+def compute_height_field(
+    mesh: trimesh.Trimesh, 
+    direction: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute height function h(v) = dot(v, direction) for all vertices.
+    
+    The height function projects each vertex position onto a direction vector,
+    creating a scalar field used for persistence homology analysis.
+    
+    Args:
+        mesh: Input trimesh mesh
+        direction: Unit vector representing the "up" direction (pouring direction)
+        
+    Returns:
+        vertex_heights: (N,) array of vertex height values
+        face_heights: (M,) array of face height values (average of vertex heights)
+    """
+    # Normalize direction
+    direction = np.asarray(direction, dtype=np.float64)
+    direction = direction / np.linalg.norm(direction)
+    
+    # Compute vertex heights via dot product
+    vertex_heights = mesh.vertices @ direction
+    
+    # Compute face heights as average of vertex heights
+    face_vertex_heights = vertex_heights[mesh.faces]  # (M, 3)
+    face_heights = face_vertex_heights.mean(axis=1)   # (M,)
+    
+    return vertex_heights, face_heights
+
+
+def build_vertex_neighbors(mesh: trimesh.Trimesh) -> Dict[int, Set[int]]:
+    """
+    Build vertex adjacency map: vertex_index -> set of neighboring vertex indices.
+    
+    Two vertices are neighbors if they share an edge in the mesh.
+    Uses edge connectivity from trimesh for efficient O(E) construction.
+    
+    Args:
+        mesh: Input trimesh mesh
+        
+    Returns:
+        Dictionary mapping each vertex index to a set of its neighbor vertex indices
+    """
+    neighbors: Dict[int, Set[int]] = defaultdict(set)
+    
+    for edge in mesh.edges:
+        neighbors[edge[0]].add(edge[1])
+        neighbors[edge[1]].add(edge[0])
+    
+    return dict(neighbors)
+
+
+def build_face_neighbors(mesh: trimesh.Trimesh) -> Dict[int, List[int]]:
+    """
+    Build face adjacency map: face_index -> list of neighboring face indices.
+    
+    Two faces are neighbors if they share an edge. Uses trimesh's optimized
+    face_adjacency computation which is O(F) using half-edge structure.
+    
+    Args:
+        mesh: Input trimesh mesh
+        
+    Returns:
+        Dictionary mapping each face index to a list of its neighbor face indices
+    """
+    n_faces = len(mesh.faces)
+    neighbors: Dict[int, List[int]] = {i: [] for i in range(n_faces)}
+    
+    # trimesh.face_adjacency is an (n, 2) array of pairs of adjacent face indices
+    face_adj = mesh.face_adjacency
+    
+    for i in range(len(face_adj)):
+        a, b = face_adj[i]
+        neighbors[a].append(b)
+        neighbors[b].append(a)
+    
+    return neighbors
+

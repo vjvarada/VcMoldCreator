@@ -1,6 +1,12 @@
 # Core module for mesh operations
 from core.stl_loader import STLLoader, load_stl_file, LoadResult
-from core.mesh_analysis import MeshAnalyzer, MeshDiagnostics
+from core.mesh_analysis import (
+    MeshAnalyzer,
+    MeshDiagnostics,
+    compute_height_field,
+    build_vertex_neighbors,
+    build_face_neighbors,
+)
 from core.mesh_repair import MeshRepairer, MeshRepairResult
 from core.parting_direction import (
     find_parting_directions,
@@ -9,6 +15,17 @@ from core.parting_direction import (
     PartingDirectionResult,
     VisibilityPaintData,
     PartingColors,
+)
+from core.pouring_direction import (
+    find_optimal_pouring_directions,
+    find_optimal_pouring_for_mold_pieces,
+    OptimalPouringDirections,
+    PouringDirectionResult as PouringDirResult,
+    PersistencePair,
+    CriticalPoint,
+    evaluate_candidate_directions,
+    score_pouring_direction,
+    compute_persistence_pairs,
 )
 from core.inflated_hull import (
     generate_inflated_hull,
@@ -69,6 +86,10 @@ __all__ = [
     'MeshDiagnostics',
     'MeshRepairer',
     'MeshRepairResult',
+    # Mesh analysis utilities
+    'compute_height_field',
+    'build_vertex_neighbors',
+    'build_face_neighbors',
     # Parting direction
     'find_parting_directions',
     'compute_visibility_paint',
@@ -76,6 +97,15 @@ __all__ = [
     'PartingDirectionResult',
     'VisibilityPaintData',
     'PartingColors',
+    # Pouring direction
+    'find_optimal_pouring_directions',
+    'OptimalPouringDirections',
+    'PouringDirResult',
+    'PersistencePair',
+    'CriticalPoint',
+    'evaluate_candidate_directions',
+    'score_pouring_direction',
+    'compute_persistence_pairs',
     # Inflated hull
     'generate_inflated_hull',
     'compute_default_offset',
