@@ -17,15 +17,14 @@ from core.parting_direction import (
     PartingColors,
 )
 from core.pouring_direction import (
-    find_optimal_pouring_directions,
-    find_optimal_pouring_for_mold_pieces,
-    OptimalPouringDirections,
     PouringDirectionResult as PouringDirResult,
     PersistencePair,
     CriticalPoint,
     evaluate_candidate_directions,
     score_pouring_direction,
     compute_persistence_pairs,
+    find_mold_aware_pouring_directions,
+    MoldAwarePouringDirections,
 )
 from core.inflated_hull import (
     generate_inflated_hull,
@@ -98,8 +97,8 @@ __all__ = [
     'VisibilityPaintData',
     'PartingColors',
     # Pouring direction
-    'find_optimal_pouring_directions',
-    'OptimalPouringDirections',
+    'find_mold_aware_pouring_directions',
+    'MoldAwarePouringDirections',
     'PouringDirResult',
     'PersistencePair',
     'CriticalPoint',

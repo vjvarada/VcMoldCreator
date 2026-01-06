@@ -41,10 +41,6 @@ from core.parting_direction import (
     PartingDirectionResult,
     VisibilityPaintData,
 )
-from core.pouring_direction import (
-    find_optimal_pouring_directions,
-    OptimalPouringDirections,
-)
 from core.inflated_hull import (
     generate_inflated_hull,
     compute_default_offset,
@@ -83,7 +79,7 @@ class Step(Enum):
     SECONDARY_CUTS = 'secondary-cuts'  # Secondary cutting edges detection
     PARTING_SURFACE = 'parting-surface'  # Primary parting surface: generation + repair + smoothing
     SECONDARY_SURFACE = 'secondary-surface'  # Secondary surface: generation + propagation + smoothing
-    SOLIDIFY_MEMBRANES = 'solidify-membranes'  # Solidify surfaces into 3D volumes for CSG
+    POURING = 'pouring'                # Pouring direction optimization (final step)
 
 
 STEPS = [
@@ -98,7 +94,7 @@ STEPS = [
     {'id': Step.SECONDARY_CUTS, 'icon': '✂️', 'title': 'Secondary Cuts', 'description': 'Detect secondary cutting edges where membrane intersects part'},
     {'id': Step.PARTING_SURFACE, 'icon': '🔲', 'title': 'Primary Surface', 'description': 'Generate, repair and smooth the primary parting surface'},
     {'id': Step.SECONDARY_SURFACE, 'icon': '🔴', 'title': 'Secondary Surface', 'description': 'Generate, propagate and smooth secondary parting surfaces'},
-    {'id': Step.SOLIDIFY_MEMBRANES, 'icon': '🧊', 'title': 'Solidify Membranes', 'description': 'Convert flat surfaces into solid 3D volumes for mold splitting'},
+    {'id': Step.POURING, 'icon': '🧪', 'title': 'Pouring Directions', 'description': 'Optimize silicone/resin pouring directions for each mold half'},
 ]
 
 
@@ -806,78 +802,72 @@ class HullWorker(QThread):
             self.error.emit(str(e))
 
 
-class PouringDirectionWorker(QThread):
-    """
-    Background worker for computing optimal pouring directions.
-    
-    IMPORTANT: This worker is intended to be used on silicone mold pieces (P1, P2),
-    NOT on the input part mesh. Pouring direction optimization should be performed
-    after the mold pieces have been generated via the splitting/cutting process.
-    
-    The algorithm uses persistence homology to identify potential air bubble traps
-    and finds directions that minimize trapped air during silicone and resin casting.
-    """
+class MoldAwarePouringDirectionWorker(QThread):
+    """Background worker for computing mold-aware pouring directions (one per mold half)."""
     
     progress = pyqtSignal(str)
     progress_value = pyqtSignal(int, int)  # current, total
-    complete = pyqtSignal(object)  # OptimalPouringDirections
+    complete = pyqtSignal(object)  # MoldAwarePouringDirections
     error = pyqtSignal(str)
     
     def __init__(
         self,
-        mesh,
+        part_mesh,
+        tet_result,  # TetrahedralMeshResult with escape labels
         n_candidate_directions: int = 64,
         tilt_angle_deg: float = 10.0,
         area_threshold_mm2: float = 0.5,
-        alignment_angle_deg: float = 30.0,
-        resin_cone_angle_deg: float = 10.0
+        parting_direction: np.ndarray = None
     ):
         """
-        Initialize pouring direction worker.
+        Initialize mold-aware pouring direction worker.
         
         Args:
-            mesh: The trimesh mesh to analyze
+            part_mesh: The original part mesh
+            tet_result: TetrahedralMeshResult with seed_escape_labels computed
             n_candidate_directions: Number of candidate directions to sample
             tilt_angle_deg: Allowed mold tilt angle (reduces trapped area)
             area_threshold_mm2: Minimum trapped area to consider (filters noise)
-            alignment_angle_deg: Max angle between silicone directions
-            resin_cone_angle_deg: Resin direction cone angle around bisector
+            parting_direction: Parting direction for diagnostic logging
         """
         super().__init__()
-        self.mesh = mesh
+        self.part_mesh = part_mesh
+        self.tet_result = tet_result
         self.n_candidate_directions = n_candidate_directions
         self.tilt_angle_deg = tilt_angle_deg
         self.area_threshold_mm2 = area_threshold_mm2
-        self.alignment_angle_deg = alignment_angle_deg
-        self.resin_cone_angle_deg = resin_cone_angle_deg
+        self.parting_direction = parting_direction
     
     def run(self):
         try:
-            from core.pouring_direction import find_optimal_pouring_directions
+            from core.pouring_direction import find_mold_aware_pouring_directions
             
-            logger.info(f"Computing pouring directions with {self.n_candidate_directions} candidates...")
-            self.progress.emit(f"Sampling {self.n_candidate_directions} candidate directions...")
+            logger.info(f"Computing mold-aware pouring directions with {self.n_candidate_directions} candidates...")
+            self.progress.emit(f"Classifying faces by mold half...")
             
             def progress_callback(current, total):
                 self.progress_value.emit(current, total)
-                if current % 10 == 0 or current == total:
-                    self.progress.emit(f"Evaluating direction {current}/{total}...")
+                half_total = total // 2
+                if current <= half_total:
+                    self.progress.emit(f"Evaluating H1 direction {current}/{half_total}...")
+                else:
+                    self.progress.emit(f"Evaluating H2 direction {current - half_total}/{half_total}...")
             
-            result = find_optimal_pouring_directions(
-                self.mesh,
+            result = find_mold_aware_pouring_directions(
+                self.part_mesh,
+                self.tet_result,
                 n_candidate_directions=self.n_candidate_directions,
                 tilt_angle_deg=self.tilt_angle_deg,
                 area_threshold_mm2=self.area_threshold_mm2,
-                alignment_angle_deg=self.alignment_angle_deg,
-                resin_cone_angle_deg=self.resin_cone_angle_deg,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                parting_direction=self.parting_direction
             )
             
-            self.progress.emit(f"Found optimal pouring directions in {result.computation_time_ms:.0f}ms")
+            self.progress.emit(f"Found mold-aware pouring directions in {result.computation_time_ms:.0f}ms")
             self.complete.emit(result)
             
         except Exception as e:
-            logger.exception(f"Error computing pouring directions: {e}")
+            logger.exception(f"Error computing mold-aware pouring directions: {e}")
             self.error.emit(str(e))
 
 
@@ -3471,8 +3461,8 @@ class MainWindow(QMainWindow):
         self._visibility_paint_data: Optional[VisibilityPaintData] = None
         
         # Pouring direction state
-        self._pouring_worker: Optional[PouringDirectionWorker] = None
-        self._pouring_result: Optional[OptimalPouringDirections] = None
+        self._pouring_worker: Optional[MoldAwarePouringDirectionWorker] = None
+        self._mold_aware_pouring_result = None  # MoldAwarePouringDirections
         
         # Inflated hull state
         self._hull_worker: Optional[HullWorker] = None
@@ -3525,11 +3515,6 @@ class MainWindow(QMainWindow):
         # Comprehensive secondary surface state (combined gen + propagate + smooth)
         self._secondary_surface_worker = None
         self._secondary_surface_result = None
-        
-        # Membrane solidification state
-        self._solidify_membranes_worker = None
-        self._solidified_parting_surface = None
-        self._solidified_secondary_membranes = []
         
         logger.debug("MainWindow: Calling _setup_window...")
         self._setup_window()
@@ -3921,8 +3906,8 @@ class MainWindow(QMainWindow):
             self._setup_parting_surface_step()
         elif self._active_step == Step.SECONDARY_SURFACE:
             self._setup_secondary_surface_step()
-        elif self._active_step == Step.SOLIDIFY_MEMBRANES:
-            self._setup_solidify_membranes_step()
+        elif self._active_step == Step.POURING:
+            self._setup_pouring_step()
         
         self.context_layout.addStretch()
     
@@ -4107,10 +4092,6 @@ class MainWindow(QMainWindow):
         self.color_legend.hide()
         self.context_layout.addWidget(self.color_legend)
         
-        # NOTE: Pouring direction optimization will be added to a later step
-        # after silicone mold pieces (P1, P2) are created. The pouring directions
-        # must be calculated on the mold pieces, not on the input part mesh.
-        
         # Update UI with current state
         self._update_parting_step_ui()
     
@@ -4275,25 +4256,205 @@ class MainWindow(QMainWindow):
     # =========================================================================
     # POURING DIRECTION OPTIMIZATION
     # =========================================================================
-    # NOTE: Pouring direction optimization is performed on the silicone mold pieces
-    # (P1, P2), NOT on the input part mesh. This functionality will be integrated
-    # into a later step in the workflow after the mold pieces have been generated.
-    # The PouringDirectionWorker class and these handler methods are preserved for
-    # future use. See core/pouring_direction.py for the algorithm implementation.
-    # 
-    # Relevant functions for mold piece pouring optimization:
-    # - find_optimal_pouring_for_mold_pieces(mold_piece_1, mold_piece_2, ...)
-    # - find_optimal_pouring_directions(mesh, ...) - for individual mold pieces
-    # =========================================================================
     
-    # Handler methods preserved for future use when mold piece step is implemented:
-    # - _on_calculate_pouring()
-    # - _on_pouring_progress()
-    # - _on_pouring_progress_value()
-    # - _on_pouring_complete()
-    # - _update_pouring_stats()
-    # - _on_pouring_error()
-    # - _on_pouring_worker_finished()
+    def _on_calculate_pouring(self):
+        """Start pouring direction optimization."""
+        if self._current_mesh is None:
+            return
+        
+        # Check if we have tet_result with escape labels - REQUIRED for pouring calculation
+        has_mold_half_data = (
+            self._tet_result is not None and
+            hasattr(self._tet_result, 'seed_escape_labels') and
+            self._tet_result.seed_escape_labels is not None and
+            hasattr(self._tet_result, 'seed_vertex_indices') and
+            self._tet_result.seed_vertex_indices is not None
+        )
+        
+        if not has_mold_half_data:
+            QMessageBox.warning(
+                self,
+                "Missing Data",
+                "Pouring direction calculation requires mold half classification data.\n\n"
+                "Please complete the Dijkstra escape labeling step first to classify "
+                "which parts of the mesh belong to each mold half (H1/H2)."
+            )
+            return
+        
+        # Get parameters from UI
+        n_candidates = self.pouring_candidates_spinbox.value()
+        tilt_angle = self.pouring_tilt_spinbox.value()
+        threshold = self.pouring_threshold_spinbox.value()
+        
+        # Disable button during computation
+        self.pouring_calc_btn.setEnabled(False)
+        self.pouring_progress.setRange(0, n_candidates)
+        self.pouring_progress.setValue(0)
+        self.pouring_progress.show()
+        self.pouring_progress_label.setText("Starting mold-aware computation...")
+        self.pouring_progress_label.show()
+        
+        # Clear previous pouring results
+        self._mold_aware_pouring_result = None
+        self.mesh_viewer.remove_pouring_direction_arrows()
+        self.mesh_viewer.remove_split_meshes_for_pouring()
+        
+        # Hide display options pouring toggle
+        if hasattr(self.display_options, 'show_pouring_option'):
+            self.display_options.show_pouring_option(False)
+        
+        # Use mold-aware pouring direction calculation (separate direction per mold half)
+        logger.info("Using mold-aware pouring direction calculation (separate for H1/H2)")
+        
+        # Get parting direction for diagnostic logging
+        parting_dir = None
+        if self._parting_result is not None:
+            parting_dir = self._parting_result.d1
+        
+        self._pouring_worker = MoldAwarePouringDirectionWorker(
+            self._current_mesh,
+            self._tet_result,
+            n_candidate_directions=n_candidates,
+            tilt_angle_deg=tilt_angle,
+            area_threshold_mm2=threshold,
+            parting_direction=parting_dir
+        )
+        self._pouring_worker.progress.connect(self._on_pouring_progress)
+        self._pouring_worker.progress_value.connect(self._on_pouring_progress_value)
+        self._pouring_worker.complete.connect(self._on_mold_aware_pouring_complete)
+        self._pouring_worker.error.connect(self._on_pouring_error)
+        self._pouring_worker.finished.connect(self._on_pouring_worker_finished)
+        self._pouring_worker.start()
+    
+    def _on_pouring_progress(self, message: str):
+        """Handle pouring progress updates."""
+        if hasattr(self, 'pouring_progress_label'):
+            self.pouring_progress_label.setText(message)
+    
+    def _on_pouring_progress_value(self, current: int, total: int):
+        """Handle pouring progress value updates."""
+        if hasattr(self, 'pouring_progress'):
+            self.pouring_progress.setRange(0, total)
+            self.pouring_progress.setValue(current)
+    
+    def _on_mold_aware_pouring_complete(self, result):
+        """Handle mold-aware pouring direction optimization complete."""
+        from core.pouring_direction import MoldAwarePouringDirections
+        
+        self._mold_aware_pouring_result = result
+        
+        # Show the H1/H2 split meshes for visualization
+        # This helps verify that the mesh is correctly partitioned by mold half
+        self.mesh_viewer.show_split_meshes_for_pouring(
+            result.h1_mesh,
+            result.h2_mesh
+        )
+        
+        # Add arrows to viewer - use H1 and H2 silicone directions
+        self.mesh_viewer.add_pouring_direction_arrows(
+            result.h1_silicone_direction,
+            result.h2_silicone_direction,
+            result.resin_direction
+        )
+        
+        # Update stats display (mold-aware version)
+        self._update_mold_aware_pouring_stats()
+        
+        # Show the pouring toggle in display options
+        if hasattr(self.display_options, 'show_pouring_option'):
+            self.display_options.show_pouring_option(True)
+        
+        # Update step status
+        self.step_buttons[Step.POURING].set_status('completed')
+        
+        logger.info(f"Mold-aware pouring directions computed in {result.computation_time_ms:.0f}ms")
+        logger.info(f"  H1 Silicone: score={result.h1_silicone_score:.2f}, direction={result.h1_silicone_direction}, faces={result.h1_face_count}")
+        logger.info(f"  H2 Silicone: score={result.h2_silicone_score:.2f}, direction={result.h2_silicone_direction}, faces={result.h2_face_count}")
+        logger.info(f"  Resin: score={result.resin_score:.2f}, direction={result.resin_direction}")
+    
+    def _update_mold_aware_pouring_stats(self):
+        """Update pouring direction stats display (mold-aware mode)."""
+        if not hasattr(self, 'pouring_stats') or self._mold_aware_pouring_result is None:
+            return
+        
+        result = self._mold_aware_pouring_result
+        self.pouring_stats.clear()
+        self.pouring_stats.show()
+        
+        self.pouring_stats.add_header('✅ Mold-Aware Pouring Directions', Colors.SUCCESS)
+        
+        # Compute angles from parting surface if parting direction is available
+        h1_surface_angle = None
+        h2_surface_angle = None
+        resin_surface_angle = None
+        if self._parting_result is not None:
+            parting_dir = np.asarray(self._parting_result.d1, dtype=np.float64)
+            parting_dir = parting_dir / np.linalg.norm(parting_dir)
+            
+            # Angle from parting direction (normal to parting surface)
+            h1_dot = np.abs(np.dot(result.h1_silicone_direction, parting_dir))
+            h2_dot = np.abs(np.dot(result.h2_silicone_direction, parting_dir))
+            resin_dot = np.abs(np.dot(result.resin_direction, parting_dir))
+            
+            h1_angle_from_parting = np.degrees(np.arccos(np.clip(h1_dot, 0, 1)))
+            h2_angle_from_parting = np.degrees(np.arccos(np.clip(h2_dot, 0, 1)))
+            resin_angle_from_parting = np.degrees(np.arccos(np.clip(resin_dot, 0, 1)))
+            
+            # Angle from parting SURFACE (complementary angle)
+            h1_surface_angle = 90.0 - h1_angle_from_parting
+            h2_surface_angle = 90.0 - h2_angle_from_parting
+            resin_surface_angle = 90.0 - resin_angle_from_parting
+        
+        # H1 mold half silicone direction
+        h1_str = f"[{result.h1_silicone_direction[0]:.3f}, {result.h1_silicone_direction[1]:.3f}, {result.h1_silicone_direction[2]:.3f}]"
+        self.pouring_stats.add_row(f'H1 Silicone: {h1_str}', '#00dddd')
+        h1_angle_str = f", Surface angle: {h1_surface_angle:.1f}°" if h1_surface_angle is not None else ""
+        self.pouring_stats.add_row(f'  Faces: {result.h1_face_count}, Trapped: {result.h1_silicone_score:.2f} mm²{h1_angle_str}')
+        
+        # H2 mold half silicone direction
+        h2_str = f"[{result.h2_silicone_direction[0]:.3f}, {result.h2_silicone_direction[1]:.3f}, {result.h2_silicone_direction[2]:.3f}]"
+        self.pouring_stats.add_row(f'H2 Silicone: {h2_str}', '#dd44ff')
+        h2_angle_str = f", Surface angle: {h2_surface_angle:.1f}deg" if h2_surface_angle is not None else ""
+        self.pouring_stats.add_row(f'  Faces: {result.h2_face_count}, Trapped: {result.h2_silicone_score:.2f} mm2{h2_angle_str}')
+        
+        # Resin direction
+        r_str = f"[{result.resin_direction[0]:.3f}, {result.resin_direction[1]:.3f}, {result.resin_direction[2]:.3f}]"
+        self.pouring_stats.add_row(f'Resin: {r_str}', '#ff6666')
+        resin_angle_str = f", Surface angle: {resin_surface_angle:.1f}deg" if resin_surface_angle is not None else ""
+        self.pouring_stats.add_row(f'  Trapped: {result.resin_score:.2f} mm2{resin_angle_str}')
+        
+        # Show alignment info between H1 and H2 directions
+        alignment_type = "Anti-aligned" if getattr(result, 'is_anti_aligned', False) else "Aligned"
+        self.pouring_stats.add_row(f'H1-H2: {alignment_type} ({result.silicone_alignment_angle_deg:.1f}deg)')
+        
+        self.pouring_stats.add_row(f'Time: {result.computation_time_ms:.0f}ms')
+        
+        # Show the split mesh toggle checkbox
+        if hasattr(self, 'show_split_mesh_checkbox'):
+            self.show_split_mesh_checkbox.show()
+            self.show_split_mesh_checkbox.setChecked(True)  # Default to showing split meshes
+        
+        # Update button text
+        self.pouring_calc_btn.setText("Recalculate")
+    
+    def _on_toggle_split_mesh_view(self, checked: bool):
+        """Toggle visibility of the H1/H2 split mesh visualization."""
+        self.mesh_viewer.set_split_meshes_visible(checked)
+    
+    def _on_pouring_error(self, message: str):
+        """Handle pouring computation error."""
+        if hasattr(self, 'pouring_progress_label'):
+            self.pouring_progress_label.setText(f"Error: {message}")
+            self.pouring_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+        QMessageBox.critical(self, "Error", f"Pouring direction computation failed:\n{message}")
+    
+    def _on_pouring_worker_finished(self):
+        """Handle pouring worker finished."""
+        if hasattr(self, 'pouring_calc_btn'):
+            self.pouring_calc_btn.setEnabled(True)
+        if hasattr(self, 'pouring_progress'):
+            self.pouring_progress.hide()
+        self._pouring_worker = None
     
     # =========================================================================
     # HULL STEP
@@ -4597,7 +4758,7 @@ class MainWindow(QMainWindow):
         self._visibility_paint_data = None
         
         # Clear pouring results
-        self._pouring_result = None
+        self._mold_aware_pouring_result = None
         
         # Clear hull results
         self._hull_result = None
@@ -6810,6 +6971,283 @@ class MainWindow(QMainWindow):
         self._dijkstra_worker = None
 
     # =========================================================================
+    # POURING DIRECTION STEP
+    # =========================================================================
+    
+    def _setup_pouring_step(self):
+        """Setup the pouring direction optimization step UI."""
+        # Check prerequisites - need Dijkstra results (mold half classification)
+        has_mold_half_data = (
+            self._tet_result is not None and
+            hasattr(self._tet_result, 'seed_escape_labels') and
+            self._tet_result.seed_escape_labels is not None and
+            hasattr(self._tet_result, 'seed_vertex_indices') and
+            self._tet_result.seed_vertex_indices is not None
+        )
+        
+        if not has_mold_half_data:
+            no_data_label = QLabel("⚠️ Please run Dijkstra escape labeling first to classify mold halves.")
+            no_data_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_data_label.setWordWrap(True)
+            self.context_layout.addWidget(no_data_label)
+            return
+        
+        # Header
+        header = QLabel("🧪 Pouring Direction Optimization")
+        header.setStyleSheet(f"""
+            font-size: 14px;
+            font-weight: 500;
+            color: {Colors.DARK};
+        """)
+        self.context_layout.addWidget(header)
+        
+        # Description
+        desc = QLabel(
+            "Compute optimal silicone pouring directions for each mold half (H1, H2) and "
+            "resin pouring direction for the final part. Uses persistence homology to "
+            "minimize air bubble trapping."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"""
+            font-size: 12px;
+            color: {Colors.GRAY};
+            margin-bottom: 8px;
+        """)
+        self.context_layout.addWidget(desc)
+        
+        # Show current mold half stats
+        n_h1 = np.sum(self._tet_result.seed_escape_labels == 1)
+        n_h2 = np.sum(self._tet_result.seed_escape_labels == 2)
+        
+        mold_info = StatsBox()
+        mold_info.add_header('Mold Half Classification', Colors.INFO)
+        mold_info.add_row(f'H1 interior vertices: {n_h1}', Colors.PARTING_D1)
+        mold_info.add_row(f'H2 interior vertices: {n_h2}', Colors.PARTING_D2)
+        self.context_layout.addWidget(mold_info)
+        
+        # Parameters group
+        pouring_params_group = QGroupBox("Parameters")
+        pouring_params_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 12px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 8px;
+                padding-top: 8px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+            QLabel {{
+                color: {Colors.DARK};
+                font-size: 12px;
+            }}
+        """)
+        pouring_params_layout = QFormLayout(pouring_params_group)
+        pouring_params_layout.setContentsMargins(12, 16, 12, 12)
+        pouring_params_layout.setSpacing(8)
+        
+        # Tilt angle spinbox
+        self.pouring_tilt_spinbox = QDoubleSpinBox()
+        self.pouring_tilt_spinbox.setRange(0.0, 45.0)
+        self.pouring_tilt_spinbox.setValue(10.0)
+        self.pouring_tilt_spinbox.setSingleStep(1.0)
+        self.pouring_tilt_spinbox.setSuffix("°")
+        self.pouring_tilt_spinbox.setToolTip("Maximum angle the mold can be tilted during pouring to help air escape")
+        self.pouring_tilt_spinbox.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                background-color: {Colors.WHITE};
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 12px;
+                min-width: 80px;
+            }}
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+                background-color: {Colors.LIGHT};
+                border: none;
+                width: 16px;
+            }}
+        """)
+        pouring_params_layout.addRow("Tilt angle:", self.pouring_tilt_spinbox)
+        
+        # Area threshold spinbox
+        self.pouring_threshold_spinbox = QDoubleSpinBox()
+        self.pouring_threshold_spinbox.setRange(0.01, 100.0)
+        self.pouring_threshold_spinbox.setValue(0.5)
+        self.pouring_threshold_spinbox.setSingleStep(0.1)
+        self.pouring_threshold_spinbox.setSuffix(" mm²")
+        self.pouring_threshold_spinbox.setToolTip("Minimum trapped air area to consider (filters noise)")
+        self.pouring_threshold_spinbox.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                background-color: {Colors.WHITE};
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 12px;
+                min-width: 80px;
+            }}
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+                background-color: {Colors.LIGHT};
+                border: none;
+                width: 16px;
+            }}
+        """)
+        pouring_params_layout.addRow("Min trapped area:", self.pouring_threshold_spinbox)
+        
+        # Number of candidate directions
+        self.pouring_candidates_spinbox = QSpinBox()
+        self.pouring_candidates_spinbox.setRange(16, 256)
+        self.pouring_candidates_spinbox.setValue(64)
+        self.pouring_candidates_spinbox.setSingleStep(16)
+        self.pouring_candidates_spinbox.setToolTip("Number of directions to sample (more = slower but more accurate)")
+        self.pouring_candidates_spinbox.setStyleSheet(f"""
+            QSpinBox {{
+                background-color: {Colors.WHITE};
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 12px;
+                min-width: 80px;
+            }}
+            QSpinBox::up-button, QSpinBox::down-button {{
+                background-color: {Colors.LIGHT};
+                border: none;
+                width: 16px;
+            }}
+        """)
+        pouring_params_layout.addRow("Candidates:", self.pouring_candidates_spinbox)
+        
+        self.context_layout.addWidget(pouring_params_group)
+        
+        # Calculate pouring button
+        self.pouring_calc_btn = QPushButton("🧪 Calculate Pouring Directions")
+        self.pouring_calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.pouring_calc_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #9966ff;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: #7744dd;
+            }}
+            QPushButton:disabled {{
+                background-color: {Colors.GRAY_LIGHT};
+                color: {Colors.GRAY};
+            }}
+        """)
+        self.pouring_calc_btn.clicked.connect(self._on_calculate_pouring)
+        self.context_layout.addWidget(self.pouring_calc_btn)
+        
+        # Pouring progress bar
+        self.pouring_progress = QProgressBar()
+        self.pouring_progress.setStyleSheet(f"""
+            QProgressBar {{
+                border: none;
+                border-radius: 4px;
+                background-color: {Colors.LIGHT};
+                height: 8px;
+            }}
+            QProgressBar::chunk {{
+                background-color: #9966ff;
+                border-radius: 4px;
+            }}
+        """)
+        self.pouring_progress.setTextVisible(False)
+        self.pouring_progress.hide()
+        self.context_layout.addWidget(self.pouring_progress)
+        
+        # Pouring progress label
+        self.pouring_progress_label = QLabel("")
+        self.pouring_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.pouring_progress_label.hide()
+        self.context_layout.addWidget(self.pouring_progress_label)
+        
+        # Pouring results stats box
+        self.pouring_stats = StatsBox()
+        self.pouring_stats.hide()
+        self.context_layout.addWidget(self.pouring_stats)
+        
+        # Checkbox to toggle H1/H2 split mesh visualization
+        self.show_split_mesh_checkbox = QCheckBox("Show H1/H2 Split Meshes")
+        self.show_split_mesh_checkbox.setStyleSheet(f"""
+            QCheckBox {{
+                color: {Colors.DARK};
+                font-size: 12px;
+                padding: 8px 0;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+                border-radius: 3px;
+                border: 1px solid {Colors.GRAY};
+                background-color: {Colors.WHITE};
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: #9966ff;
+                border: 1px solid #7744dd;
+            }}
+        """)
+        self.show_split_mesh_checkbox.setChecked(True)  # Default to showing split meshes
+        self.show_split_mesh_checkbox.toggled.connect(self._on_toggle_split_mesh_view)
+        self.show_split_mesh_checkbox.hide()  # Hidden until results are available
+        self.context_layout.addWidget(self.show_split_mesh_checkbox)
+        
+        # Update UI if we already have results
+        self._update_pouring_step_ui()
+    
+    def _update_pouring_step_ui(self):
+        """Update pouring step UI based on current state."""
+        if not hasattr(self, 'pouring_stats'):
+            return
+        
+        if self._mold_aware_pouring_result is not None:
+            # Show mold-aware results
+            result = self._mold_aware_pouring_result
+            self.pouring_stats.clear()
+            self.pouring_stats.show()
+            
+            self.pouring_stats.add_header('✅ Mold-Aware Pouring Directions', Colors.SUCCESS)
+            
+            # H1 silicone direction
+            h1_str = f"[{result.h1_silicone_direction[0]:.3f}, {result.h1_silicone_direction[1]:.3f}, {result.h1_silicone_direction[2]:.3f}]"
+            self.pouring_stats.add_row(f'H1 Silicone: {h1_str}', '#00dddd')
+            self.pouring_stats.add_row(f'  Faces: {result.h1_face_count}, Trapped: {result.h1_silicone_score:.2f} mm²')
+            
+            # H2 silicone direction
+            h2_str = f"[{result.h2_silicone_direction[0]:.3f}, {result.h2_silicone_direction[1]:.3f}, {result.h2_silicone_direction[2]:.3f}]"
+            self.pouring_stats.add_row(f'H2 Silicone: {h2_str}', '#dd44ff')
+            self.pouring_stats.add_row(f'  Faces: {result.h2_face_count}, Trapped: {result.h2_silicone_score:.2f} mm²')
+            
+            # Resin direction
+            r_str = f"[{result.resin_direction[0]:.3f}, {result.resin_direction[1]:.3f}, {result.resin_direction[2]:.3f}]"
+            self.pouring_stats.add_row(f'Resin: {r_str}', '#ff6666')
+            self.pouring_stats.add_row(f'  Trapped: {result.resin_score:.2f} mm²')
+            
+            self.pouring_stats.add_row(f'Time: {result.computation_time_ms:.0f}ms')
+            
+            self.pouring_calc_btn.setText("🔄 Recalculate")
+
+    # =========================================================================
     # SECONDARY CUTS STEP
     # =========================================================================
     
@@ -7651,6 +8089,9 @@ class MainWindow(QMainWindow):
             # Mark as complete since no secondary surface needed
             if Step.SECONDARY_SURFACE in self.step_buttons:
                 self.step_buttons[Step.SECONDARY_SURFACE].set_status('completed')
+            # Unlock pouring step
+            if Step.POURING in self.step_buttons:
+                self.step_buttons[Step.POURING].set_status('ready')
             return
         
         # Description section
@@ -7951,6 +8392,9 @@ class MainWindow(QMainWindow):
         # Mark step complete
         if Step.SECONDARY_SURFACE in self.step_buttons:
             self.step_buttons[Step.SECONDARY_SURFACE].set_status('completed')
+        # Unlock pouring step
+        if Step.POURING in self.step_buttons:
+            self.step_buttons[Step.POURING].set_status('ready')
     
     def _on_secondary_surface_error(self, error_msg: str):
         """Handle secondary surface generation error."""
@@ -7965,363 +8409,6 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             pass
         QMessageBox.critical(self, "Error", f"Secondary surface generation failed:\n{error_msg}")
-
-    # =========================================================================
-    # SOLIDIFY MEMBRANES STEP
-    # =========================================================================
-    
-    def _setup_solidify_membranes_step(self):
-        """Setup the solidify secondary membranes step UI."""
-        # Check prerequisites - need secondary surface
-        has_secondary = (self._secondary_surface_result is not None and 
-                        self._secondary_surface_result.mesh is not None)
-        
-        if not has_secondary:
-            # Check if there were any secondary cuts detected
-            has_secondary_cuts = (self._tet_result is not None and 
-                                 self._tet_result.secondary_cut_edges is not None and
-                                 len(self._tet_result.secondary_cut_edges) > 0)
-            
-            if not has_secondary_cuts:
-                no_cuts_label = QLabel("ℹ️ No secondary membranes detected.\n\nThis part does not require secondary membrane solidification.")
-                no_cuts_label.setStyleSheet(f"""
-                    color: {Colors.INFO};
-                    font-size: 13px;
-                    padding: 12px;
-                    background-color: rgba(0, 184, 216, 0.1);
-                    border: 1px solid {Colors.INFO};
-                    border-radius: 6px;
-                """)
-                no_cuts_label.setWordWrap(True)
-                self.context_layout.addWidget(no_cuts_label)
-                
-                # Mark as complete since no secondary membranes needed
-                if Step.SOLIDIFY_MEMBRANES in self.step_buttons:
-                    self.step_buttons[Step.SOLIDIFY_MEMBRANES].set_status('completed')
-                return
-            else:
-                no_secondary_label = QLabel("⚠️ Please complete Secondary Surface generation first.")
-                no_secondary_label.setStyleSheet(f"""
-                    color: {Colors.WARNING};
-                    font-size: 13px;
-                    padding: 12px;
-                    background-color: rgba(255, 180, 0, 0.1);
-                    border: 1px solid {Colors.WARNING};
-                    border-radius: 6px;
-                """)
-                no_secondary_label.setWordWrap(True)
-                self.context_layout.addWidget(no_secondary_label)
-                return
-        
-        # Get the secondary membrane mesh
-        secondary_mesh = self._secondary_surface_result.mesh
-        
-        # Description section
-        info_group = QGroupBox("Solidify Secondary Membranes")
-        info_group.setStyleSheet(f"""
-            QGroupBox {{
-                font-size: 13px;
-                font-weight: 500;
-                color: {Colors.DARK};
-                border: 1px solid {Colors.BORDER};
-                border-radius: 6px;
-                margin-top: 10px;
-                padding-top: 10px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-            }}
-        """)
-        info_layout = QVBoxLayout(info_group)
-        
-        info_text = QLabel(
-            "Convert flat secondary membrane surfaces into solid 3D volumes.\n\n"
-            "This step prepares membranes for mold piece splitting:\n"
-            "• Offset surface in both directions by thickness/2\n"
-            "• Create side faces connecting boundaries\n"
-            "• Ensure manifold (watertight) output for CSG operations"
-        )
-        info_text.setWordWrap(True)
-        info_text.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px; line-height: 1.4;')
-        info_layout.addWidget(info_text)
-        
-        self.context_layout.addWidget(info_group)
-        
-        # Current state info
-        state_info = StatsBox()
-        state_info.add_header('Current State', Colors.INFO)
-        state_info.add_row(f'Secondary surface: {len(secondary_mesh.faces):,} faces')
-        state_info.add_row(f'Secondary vertices: {len(secondary_mesh.vertices):,}')
-        
-        # Show if previously solidified
-        if self._solidified_secondary_membranes:
-            state_info.add_row('')
-            state_info.add_row('✅ Previously solidified')
-        
-        self.context_layout.addWidget(state_info)
-        
-        # Parameters group
-        params_group = QGroupBox("Solidification Parameters")
-        params_group.setStyleSheet(f"""
-            QGroupBox {{
-                font-size: 13px;
-                font-weight: 500;
-                color: {Colors.DARK};
-                border: 1px solid {Colors.BORDER};
-                border-radius: 6px;
-                margin-top: 10px;
-                padding-top: 10px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-                color: {Colors.DARK};
-                background-color: {Colors.LIGHT};
-            }}
-            QGroupBox QLabel {{
-                color: {Colors.DARK};
-                font-size: 12px;
-            }}
-        """)
-        params_layout = QFormLayout(params_group)
-        params_layout.setContentsMargins(12, 12, 12, 12)
-        params_layout.setSpacing(10)
-        
-        # Thickness parameter
-        self.solidify_thickness_spin = QDoubleSpinBox()
-        self.solidify_thickness_spin.setRange(0.1, 20.0)
-        self.solidify_thickness_spin.setValue(0.4)
-        self.solidify_thickness_spin.setSingleStep(0.1)
-        self.solidify_thickness_spin.setSuffix(" mm")
-        self.solidify_thickness_spin.setToolTip("Total thickness of the solidified membrane")
-        params_layout.addRow("Thickness:", self.solidify_thickness_spin)
-        
-        # Auto-reduce thickness checkbox
-        self.solidify_auto_reduce_check = QCheckBox("Auto-reduce for high curvature")
-        self.solidify_auto_reduce_check.setChecked(True)
-        self.solidify_auto_reduce_check.setToolTip("Automatically reduce thickness in areas of high curvature to prevent self-intersection")
-        self.solidify_auto_reduce_check.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
-        params_layout.addRow("", self.solidify_auto_reduce_check)
-        
-        # Manifold repair checkbox
-        self.solidify_manifold_repair_check = QCheckBox("Use manifold repair")
-        self.solidify_manifold_repair_check.setChecked(True)
-        self.solidify_manifold_repair_check.setToolTip("Use manifold3d to repair non-manifold geometry")
-        self.solidify_manifold_repair_check.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
-        params_layout.addRow("", self.solidify_manifold_repair_check)
-        
-        self.context_layout.addWidget(params_group)
-        
-        # Solidify button
-        self.solidify_btn = QPushButton("🧊 Solidify Secondary Membrane")
-        self.solidify_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.solidify_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: #17a2b8;
-                color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 12px 16px;
-                font-size: 13px;
-                font-weight: 500;
-            }}
-            QPushButton:hover {{
-                background-color: #138496;
-            }}
-            QPushButton:disabled {{
-                background-color: {Colors.GRAY_LIGHT};
-                color: {Colors.GRAY};
-            }}
-        """)
-        self.solidify_btn.clicked.connect(self._run_solidify_membranes)
-        self.context_layout.addWidget(self.solidify_btn)
-        
-        # Progress bar
-        self.solidify_progress = QProgressBar()
-        self.solidify_progress.setStyleSheet(f"""
-            QProgressBar {{
-                border: none;
-                border-radius: 4px;
-                background-color: {Colors.LIGHT};
-                height: 8px;
-            }}
-            QProgressBar::chunk {{
-                background-color: #17a2b8;
-                border-radius: 4px;
-            }}
-        """)
-        self.solidify_progress.setTextVisible(False)
-        self.solidify_progress.setRange(0, 0)
-        self.solidify_progress.hide()
-        self.context_layout.addWidget(self.solidify_progress)
-        
-        # Progress label
-        self.solidify_progress_label = QLabel("")
-        self.solidify_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
-        self.solidify_progress_label.hide()
-        self.context_layout.addWidget(self.solidify_progress_label)
-        
-        # Stats box for results
-        self.solidify_stats = StatsBox()
-        self.solidify_stats.hide()
-        self.context_layout.addWidget(self.solidify_stats)
-        
-        # Show previous results if available
-        if self._solidified_secondary_membranes:
-            self._show_solidify_results()
-    
-    def _run_solidify_membranes(self):
-        """Run the secondary membrane solidification process."""
-        from core.membrane_solidifier import solidify_membrane_components, SolidificationResult
-        
-        # Get parameters
-        thickness = self.solidify_thickness_spin.value()
-        auto_reduce = self.solidify_auto_reduce_check.isChecked()
-        use_manifold = self.solidify_manifold_repair_check.isChecked()
-        
-        # Get the secondary membrane mesh
-        secondary_mesh = None
-        if self._secondary_surface_result is not None and self._secondary_surface_result.mesh is not None:
-            secondary_mesh = self._secondary_surface_result.mesh
-        
-        if secondary_mesh is None:
-            QMessageBox.warning(self, "Error", "No secondary surface available to solidify.")
-            return
-        
-        # Update UI
-        self.solidify_btn.setEnabled(False)
-        self.solidify_progress.show()
-        self.solidify_progress_label.show()
-        self.solidify_progress_label.setText("Splitting into components and solidifying...")
-        self.solidify_stats.hide()
-        
-        # Process in a try block (synchronous for now - these are fast operations)
-        try:
-            import time
-            start_time = time.time()
-            
-            # Solidify each component of the secondary membrane separately
-            self.solidify_progress_label.setText("Splitting surface into components...")
-            
-            # Gather classification data from tet_result if available
-            secondary_cut_edges = None
-            tet_vertices = None
-            seed_escape_labels = None
-            seed_vertex_indices = None
-            
-            if self._tet_result is not None:
-                secondary_cut_edges = self._tet_result.secondary_cut_edges
-                tet_vertices = self._tet_result.vertices
-                seed_escape_labels = self._tet_result.seed_escape_labels
-                seed_vertex_indices = self._tet_result.seed_vertex_indices
-            
-            # Use the component-based solidification which handles disconnected surfaces
-            results = solidify_membrane_components(
-                surface_mesh=secondary_mesh,
-                thickness=thickness,
-                auto_reduce_thickness=auto_reduce,
-                use_manifold_repair=use_manifold,
-                secondary_cut_edges=secondary_cut_edges,
-                tet_vertices=tet_vertices,
-                seed_escape_labels=seed_escape_labels,
-                seed_vertex_indices=seed_vertex_indices
-            )
-            
-            # Store results
-            self._solidified_secondary_membranes = results
-            
-            total_time = (time.time() - start_time) * 1000
-            
-            # Show results
-            self._show_solidify_results(total_time)
-            
-            # Mark step complete
-            if Step.SOLIDIFY_MEMBRANES in self.step_buttons:
-                self.step_buttons[Step.SOLIDIFY_MEMBRANES].set_status('completed')
-            
-            logger.info(f"Secondary membrane solidification complete in {total_time:.0f}ms")
-            
-        except Exception as e:
-            logger.exception(f"Error during solidification: {e}")
-            self.solidify_progress_label.setText(f"Error: {str(e)}")
-            self.solidify_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
-            QMessageBox.critical(self, "Error", f"Solidification failed:\n{str(e)}")
-        finally:
-            self.solidify_btn.setEnabled(True)
-            self.solidify_progress.hide()
-    
-    def _show_solidify_results(self, total_time_ms: float = 0):
-        """Display solidification results."""
-        self.solidify_stats.clear()
-        self.solidify_stats.add_header('Solidification Results', Colors.SUCCESS)
-        
-        # Collect all solid meshes and mold halves for visualization
-        solid_meshes = []
-        mold_halves = []
-        
-        # Secondary surface results
-        if self._solidified_secondary_membranes:
-            for i, result in enumerate(self._solidified_secondary_membranes):
-                # Get mold half classification
-                mold_half = getattr(result, 'mold_half', 0)
-                mold_half_str = f"H{mold_half}" if mold_half > 0 else "—"
-                mold_half_color = "🟢" if mold_half == 1 else ("🟠" if mold_half == 2 else "🔵")
-                
-                if len(self._solidified_secondary_membranes) > 1:
-                    self.solidify_stats.add_row(f'Component {i+1} {mold_half_color}:')
-                else:
-                    self.solidify_stats.add_row(f'Solidified Membrane {mold_half_color}:')
-                self.solidify_stats.add_row(f'  Mold Half: {mold_half_str}')
-                self.solidify_stats.add_row(f'  Vertices: {len(result.solid_mesh.vertices):,}')
-                self.solidify_stats.add_row(f'  Faces: {len(result.solid_mesh.faces):,}')
-                self.solidify_stats.add_row(f'  Thickness: {result.thickness_used:.2f} mm')
-                self.solidify_stats.add_row(f'  Watertight: {"✅" if result.is_watertight else "❌"}')
-                self.solidify_stats.add_row(f'  Manifold: {"✅" if result.is_manifold else "❌"}')
-                
-                if result.has_self_intersections:
-                    self.solidify_stats.add_row(f'  ⚠️ Self-intersections detected')
-                
-                if result.warnings:
-                    for w in result.warnings[:2]:  # Show first 2 warnings
-                        w_text = f'  ⚠️ {w[:40]}...' if len(w) > 40 else f'  ⚠️ {w}'
-                        self.solidify_stats.add_row(w_text)
-                
-                # Collect mesh and mold_half for visualization
-                solid_meshes.append(result.solid_mesh)
-                mold_halves.append(mold_half)
-            
-            # Show summary with mold half breakdown
-            total_verts = sum(len(r.solid_mesh.vertices) for r in self._solidified_secondary_membranes)
-            total_faces = sum(len(r.solid_mesh.faces) for r in self._solidified_secondary_membranes)
-            watertight_count = sum(1 for r in self._solidified_secondary_membranes if r.is_watertight)
-            h1_count = sum(1 for r in self._solidified_secondary_membranes if getattr(r, 'mold_half', 0) == 1)
-            h2_count = sum(1 for r in self._solidified_secondary_membranes if getattr(r, 'mold_half', 0) == 2)
-            
-            self.solidify_stats.add_row('')
-            self.solidify_stats.add_row(f'Summary: {len(self._solidified_secondary_membranes)} components')
-            if h1_count > 0 or h2_count > 0:
-                self.solidify_stats.add_row(f'  🟢 H1: {h1_count}  |  🟠 H2: {h2_count}')
-            self.solidify_stats.add_row(f'Total: {total_verts:,} verts, {total_faces:,} faces')
-            self.solidify_stats.add_row(f'Watertight: {watertight_count}/{len(self._solidified_secondary_membranes)}')
-        
-        # Visualize all solidified surfaces at once with mold half colors
-        if solid_meshes:
-            try:
-                self.mesh_viewer.set_solidified_parting_surfaces(solid_meshes, mold_halves)
-            except Exception as e:
-                logger.warning(f"Could not visualize solidified surfaces: {e}")
-        
-        if total_time_ms > 0:
-            self.solidify_stats.add_row('')
-            self.solidify_stats.add_row(f'Total time: {total_time_ms:.0f}ms')
-        
-        self.solidify_stats.show()
-        self.solidify_progress_label.setText("Solidification complete!")
-        self.solidify_progress_label.setStyleSheet(f'color: {Colors.SUCCESS}; font-size: 12px;')
-        self.solidify_progress_label.show()
 
     def _load_mesh(self, file_path: str, scale_factor: float = 1.0):
         """Load and process a mesh file."""

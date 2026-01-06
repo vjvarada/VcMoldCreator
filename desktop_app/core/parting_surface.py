@@ -605,6 +605,199 @@ def repair_parting_surface(
         return surface
 
 
+def fill_internal_holes(
+    surface: PartingSurfaceResult,
+    max_hole_edges: int = 8
+) -> PartingSurfaceResult:
+    """
+    Fill small internal holes in the parting surface mesh.
+    
+    These holes typically form due to:
+    - 5-edge or 6-edge tetrahedron configurations that are skipped
+    - Small gaps between marching tetrahedra triangles
+    
+    This function finds boundary loops (holes) in the mesh and fills them
+    with a simple fan triangulation if they have <= max_hole_edges.
+    
+    The new triangles become part of the mesh and will be smoothed along
+    with the rest of the surface.
+    
+    Args:
+        surface: PartingSurfaceResult with potential internal holes
+        max_hole_edges: Maximum number of edges in a hole to fill (default 8)
+                       Holes with more edges are likely intentional boundaries
+    
+    Returns:
+        PartingSurfaceResult with internal holes filled
+    """
+    if surface.mesh is None or surface.faces is None:
+        return surface
+    
+    import time
+    start = time.time()
+    
+    vertices = np.array(surface.mesh.vertices, dtype=np.float64)
+    faces = np.array(surface.mesh.faces, dtype=np.int64)
+    n_verts = len(vertices)
+    n_faces_original = len(faces)
+    
+    # Build edge-to-face map to find boundary edges
+    edge_face_count = {}  # edge_key -> count
+    edge_to_faces = {}    # edge_key -> list of (face_idx, v0, v1, v_opposite)
+    
+    for face_idx, face in enumerate(faces):
+        v0, v1, v2 = face
+        edges = [(v0, v1, v2), (v1, v2, v0), (v2, v0, v1)]
+        for va, vb, v_opp in edges:
+            edge_key = (min(va, vb), max(va, vb))
+            edge_face_count[edge_key] = edge_face_count.get(edge_key, 0) + 1
+            if edge_key not in edge_to_faces:
+                edge_to_faces[edge_key] = []
+            edge_to_faces[edge_key].append((face_idx, va, vb, v_opp))
+    
+    # Find boundary edges (appear in exactly 1 face)
+    boundary_edges = []
+    boundary_edge_winding = {}  # edge_key -> (v0, v1) with correct winding for fill
+    
+    for edge_key, count in edge_face_count.items():
+        if count == 1:
+            boundary_edges.append(edge_key)
+            # Get winding from the face - we need reverse winding for fill triangles
+            face_idx, va, vb, v_opp = edge_to_faces[edge_key][0]
+            # The boundary edge goes va->vb in the original face
+            # For a hole-filling face, we need the opposite direction
+            boundary_edge_winding[edge_key] = (vb, va)  # Reversed for fill
+    
+    if not boundary_edges:
+        logger.info("No internal holes found (no boundary edges)")
+        return surface
+    
+    logger.info(f"Found {len(boundary_edges)} boundary edges, looking for hole loops...")
+    
+    # Build adjacency for boundary edges
+    boundary_vertex_edges = {}  # vertex -> list of edge_keys
+    for edge_key in boundary_edges:
+        v0, v1 = edge_key
+        if v0 not in boundary_vertex_edges:
+            boundary_vertex_edges[v0] = []
+        if v1 not in boundary_vertex_edges:
+            boundary_vertex_edges[v1] = []
+        boundary_vertex_edges[v0].append(edge_key)
+        boundary_vertex_edges[v1].append(edge_key)
+    
+    # Find boundary loops using edge traversal
+    used_edges = set()
+    loops = []
+    
+    for start_edge in boundary_edges:
+        if start_edge in used_edges:
+            continue
+        
+        # Try to form a loop starting from this edge
+        v0, v1 = boundary_edge_winding[start_edge]
+        loop = [v0]
+        current = v1
+        current_edge = start_edge
+        used_edges.add(start_edge)
+        
+        max_loop_len = len(boundary_edges) + 1
+        while current != v0 and len(loop) < max_loop_len:
+            loop.append(current)
+            
+            # Find next edge from current vertex
+            next_edge = None
+            for edge_key in boundary_vertex_edges.get(current, []):
+                if edge_key not in used_edges:
+                    next_edge = edge_key
+                    break
+            
+            if next_edge is None:
+                # Dead end - not a closed loop
+                break
+            
+            used_edges.add(next_edge)
+            # Determine which vertex is "next"
+            e0, e1 = next_edge
+            if boundary_edge_winding[next_edge][0] == current:
+                current = boundary_edge_winding[next_edge][1]
+            else:
+                current = boundary_edge_winding[next_edge][0]
+        
+        # Check if we closed the loop
+        if current == v0 and len(loop) >= 3:
+            loops.append(loop)
+    
+    logger.info(f"Found {len(loops)} boundary loops")
+    
+    # Fill holes with simple fan triangulation
+    new_faces = []
+    holes_filled = 0
+    
+    for loop in loops:
+        n_edges = len(loop)
+        
+        if n_edges > max_hole_edges:
+            logger.debug(f"Skipping large loop with {n_edges} edges (> {max_hole_edges})")
+            continue
+        
+        # Use fan triangulation from centroid
+        # Create a new vertex at the centroid of the loop
+        loop_verts = vertices[loop]
+        centroid = np.mean(loop_verts, axis=0)
+        centroid_idx = len(vertices)
+        vertices = np.vstack([vertices, centroid.reshape(1, 3)])
+        
+        # Create triangles fanning from centroid
+        for i in range(n_edges):
+            v0 = loop[i]
+            v1 = loop[(i + 1) % n_edges]
+            # Triangle: centroid, v0, v1 (correct winding for inward-facing hole)
+            new_faces.append([centroid_idx, v0, v1])
+        
+        holes_filled += 1
+        logger.debug(f"Filled hole with {n_edges} edges using {n_edges} triangles")
+    
+    if holes_filled == 0:
+        logger.info("No internal holes filled (all loops too large)")
+        return surface
+    
+    # Combine original and new faces
+    new_faces_array = np.array(new_faces, dtype=np.int64)
+    all_faces = np.vstack([faces, new_faces_array])
+    
+    # Create new mesh
+    try:
+        new_mesh = trimesh.Trimesh(
+            vertices=vertices,
+            faces=all_faces,
+            process=False
+        )
+        new_mesh.fix_normals()
+    except Exception as e:
+        logger.error(f"Failed to create mesh after hole filling: {e}")
+        return surface
+    
+    # Create result
+    result = PartingSurfaceResult(
+        mesh=new_mesh,
+        vertices=vertices,
+        faces=all_faces,
+        vertex_to_edge=None,  # Invalidated by adding vertices
+        num_vertices=len(vertices),
+        num_faces=len(all_faces),
+        num_tets_processed=surface.num_tets_processed,
+        num_tets_contributing=surface.num_tets_contributing,
+        extraction_time_ms=surface.extraction_time_ms
+    )
+    
+    elapsed = (time.time() - start) * 1000
+    n_new_faces = len(all_faces) - n_faces_original
+    n_new_verts = len(vertices) - n_verts
+    logger.info(f"Filled {holes_filled} internal holes: added {n_new_verts} vertices, {n_new_faces} faces in {elapsed:.1f}ms")
+    
+    return result
+
+
 def repair_parting_surface_with_part(
     surface: PartingSurfaceResult,
     part_mesh: trimesh.Trimesh

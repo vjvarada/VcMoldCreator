@@ -102,6 +102,11 @@ class MeshViewer(QWidget):
         self._pouring_s2: Optional[np.ndarray] = None
         self._pouring_resin: Optional[np.ndarray] = None
         
+        # H1/H2 split mesh visualization for pouring direction analysis
+        self._h1_split_mesh_actor = None
+        self._h2_split_mesh_actor = None
+        self._split_mesh_visible = True
+        
         # Inflated hull visualization
         self._hull_mesh: Optional[trimesh.Trimesh] = None
         self._hull_actor = None
@@ -1555,6 +1560,118 @@ class MeshViewer(QWidget):
         
         self.plotter.update()
     
+    def show_split_meshes_for_pouring(
+        self,
+        h1_mesh: Optional[trimesh.Trimesh],
+        h2_mesh: Optional[trimesh.Trimesh]
+    ):
+        """
+        Display the H1 and H2 split meshes used for pouring direction analysis.
+        
+        This visualization helps verify that the mesh is correctly split by mold half
+        before computing silicone pouring directions.
+        
+        Args:
+            h1_mesh: The H1 mold half portion of the part surface (cyan)
+            h2_mesh: The H2 mold half portion of the part surface (magenta)
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        # Remove existing split mesh actors
+        self.remove_split_meshes_for_pouring()
+        
+        # Hide the main mesh to show split meshes clearly
+        if self._actor is not None:
+            self._actor.SetVisibility(False)
+        
+        # Add H1 mesh (cyan - same as S1 arrow color)
+        if h1_mesh is not None and len(h1_mesh.faces) > 0:
+            h1_pv = self._trimesh_to_pyvista(h1_mesh)
+            self._h1_split_mesh_actor = self.plotter.add_mesh(
+                h1_pv,
+                color=self.POURING_S1_COLOR,  # Cyan
+                opacity=0.9,
+                smooth_shading=False,
+                show_edges=True,
+                edge_color='#006666',
+                line_width=0.5,
+                ambient=0.4,
+                diffuse=0.6,
+                specular=0.0,
+            )
+            logger.info(f"Added H1 split mesh: {len(h1_mesh.faces)} faces (cyan)")
+        
+        # Add H2 mesh (magenta - same as S2 arrow color)
+        if h2_mesh is not None and len(h2_mesh.faces) > 0:
+            h2_pv = self._trimesh_to_pyvista(h2_mesh)
+            self._h2_split_mesh_actor = self.plotter.add_mesh(
+                h2_pv,
+                color=self.POURING_S2_COLOR,  # Magenta
+                opacity=0.9,
+                smooth_shading=False,
+                show_edges=True,
+                edge_color='#660066',
+                line_width=0.5,
+                ambient=0.4,
+                diffuse=0.6,
+                specular=0.0,
+            )
+            logger.info(f"Added H2 split mesh: {len(h2_mesh.faces)} faces (magenta)")
+        
+        self._split_mesh_visible = True
+        self.plotter.update()
+    
+    def remove_split_meshes_for_pouring(self):
+        """Remove the H1/H2 split mesh visualization."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        if self._h1_split_mesh_actor is not None:
+            try:
+                self.plotter.remove_actor(self._h1_split_mesh_actor)
+            except Exception:
+                pass
+            self._h1_split_mesh_actor = None
+        
+        if self._h2_split_mesh_actor is not None:
+            try:
+                self.plotter.remove_actor(self._h2_split_mesh_actor)
+            except Exception:
+                pass
+            self._h2_split_mesh_actor = None
+        
+        # Restore main mesh visibility
+        if self._actor is not None:
+            self._actor.SetVisibility(True)
+        
+        self._split_mesh_visible = False
+        self.plotter.update()
+    
+    def set_split_meshes_visible(self, visible: bool):
+        """
+        Toggle visibility of the H1/H2 split meshes.
+        
+        Args:
+            visible: True to show split meshes (hides main mesh), 
+                    False to hide split meshes (shows main mesh)
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        self._split_mesh_visible = visible
+        
+        if self._h1_split_mesh_actor is not None:
+            self._h1_split_mesh_actor.SetVisibility(visible)
+        if self._h2_split_mesh_actor is not None:
+            self._h2_split_mesh_actor.SetVisibility(visible)
+        
+        # Toggle main mesh visibility opposite to split meshes
+        if self._actor is not None:
+            self._actor.SetVisibility(not visible)
+        
+        self.plotter.update()
+
     def apply_visibility_paint(
         self,
         face_colors: np.ndarray,
@@ -4060,168 +4177,6 @@ class MeshViewer(QWidget):
     def has_secondary_parting_surface(self) -> bool:
         """Check if secondary parting surface exists."""
         return self._secondary_parting_surface_mesh is not None
-
-    # =========================================================================
-    # SOLIDIFIED PARTING SURFACE VISUALIZATION
-    # =========================================================================
-    
-    # Color for solidified surfaces (cyan/teal to distinguish from flat surfaces)
-    SOLIDIFIED_SURFACE_COLOR = "#00bcd4"  # Cyan
-    SOLIDIFIED_SURFACE_OPACITY = 0.6
-    
-    # Mold half colors for solidified secondary membranes
-    SOLIDIFIED_H1_COLOR = "#4CAF50"  # Green - same as H1 in mold classification
-    SOLIDIFIED_H2_COLOR = "#FF9800"  # Orange - same as H2 in mold classification
-    SOLIDIFIED_UNKNOWN_COLOR = "#00bcd4"  # Cyan - for unknown/unclassified
-    
-    def set_solidified_parting_surface(self, solid_mesh: 'trimesh.Trimesh'):
-        """
-        Set and display the solidified parting surface mesh.
-        
-        The solidified surface is the parting surface with thickness added,
-        ready for CSG operations.
-        
-        Args:
-            solid_mesh: The solidified parting surface mesh (3D volume)
-        """
-        # Use the new multi-mesh method with a single mesh
-        self.set_solidified_parting_surfaces([solid_mesh])
-    
-    def set_solidified_parting_surfaces(self, solid_meshes: list, mold_halves: list = None):
-        """
-        Set and display multiple solidified parting surface meshes.
-        
-        Each mesh is displayed as a separate actor, colored by mold half if provided.
-        
-        Args:
-            solid_meshes: List of solidified parting surface meshes
-            mold_halves: Optional list of mold half classifications (1=H1, 2=H2, 0=unknown)
-                        If not provided, uses default cyan color for all
-        """
-        if not PYVISTA_AVAILABLE:
-            return
-        
-        # Initialize storage for multiple actors
-        if not hasattr(self, '_solidified_parting_surface_meshes'):
-            self._solidified_parting_surface_meshes = []
-        if not hasattr(self, '_solidified_parting_surface_actors'):
-            self._solidified_parting_surface_actors = []
-        
-        # Clear existing actors
-        self.clear_solidified_parting_surface()
-        
-        # Store references
-        self._solidified_parting_surface_meshes = solid_meshes
-        
-        # Default mold_halves to all zeros if not provided
-        if mold_halves is None:
-            mold_halves = [0] * len(solid_meshes)
-        
-        total_verts = 0
-        total_faces = 0
-        h1_count = 0
-        h2_count = 0
-        
-        for i, solid_mesh in enumerate(solid_meshes):
-            if solid_mesh is None:
-                continue
-                
-            # Convert to pyvista
-            pv_surface = self._trimesh_to_pyvista(solid_mesh)
-            
-            # Get mold half classification
-            mold_half = mold_halves[i] if i < len(mold_halves) else 0
-            
-            # Choose color based on mold half
-            if mold_half == 1:
-                color = self.SOLIDIFIED_H1_COLOR
-                edge_color = '#388E3C'  # Darker green
-                h1_count += 1
-            elif mold_half == 2:
-                color = self.SOLIDIFIED_H2_COLOR
-                edge_color = '#F57C00'  # Darker orange
-                h2_count += 1
-            else:
-                color = self.SOLIDIFIED_UNKNOWN_COLOR
-                edge_color = '#008b9e'  # Darker cyan
-            
-            # Add solidified surface mesh
-            actor = self.plotter.add_mesh(
-                pv_surface,
-                color=color,
-                opacity=self.SOLIDIFIED_SURFACE_OPACITY,
-                smooth_shading=True,
-                show_edges=True,
-                edge_color=edge_color,
-                line_width=1,
-                style='surface',
-            )
-            
-            # Set up rendering properties
-            if actor is not None:
-                prop = actor.GetProperty()
-                if prop:
-                    prop.SetInterpolationToPhong()
-                    prop.SetAmbient(0.3)
-                    prop.SetDiffuse(0.7)
-                self._solidified_parting_surface_actors.append(actor)
-            
-            total_verts += len(solid_mesh.vertices)
-            total_faces += len(solid_mesh.faces)
-        
-        self.plotter.update()
-        
-        # Log with mold half info
-        if h1_count > 0 or h2_count > 0:
-            logger.info(f"Solidified parting surfaces displayed: {len(solid_meshes)} components "
-                       f"({h1_count} H1-green, {h2_count} H2-orange), "
-                       f"{total_verts} total vertices, {total_faces} total faces")
-        else:
-            logger.info(f"Solidified parting surfaces displayed: {len(solid_meshes)} components, "
-                       f"{total_verts} total vertices, {total_faces} total faces")
-    
-    def clear_solidified_parting_surface(self):
-        """Remove solidified parting surface visualization from the scene."""
-        if not PYVISTA_AVAILABLE:
-            return
-        
-        # Handle multiple actors
-        if hasattr(self, '_solidified_parting_surface_actors'):
-            for actor in self._solidified_parting_surface_actors:
-                if actor is not None:
-                    try:
-                        self.plotter.remove_actor(actor)
-                    except Exception:
-                        pass
-            self._solidified_parting_surface_actors = []
-        
-        # Also handle legacy single actor (for backwards compatibility)
-        if hasattr(self, '_solidified_parting_surface_actor') and self._solidified_parting_surface_actor is not None:
-            try:
-                self.plotter.remove_actor(self._solidified_parting_surface_actor)
-            except Exception:
-                pass
-            self._solidified_parting_surface_actor = None
-        
-        if hasattr(self, '_solidified_parting_surface_meshes'):
-            self._solidified_parting_surface_meshes = []
-        if hasattr(self, '_solidified_parting_surface_mesh'):
-            self._solidified_parting_surface_mesh = None
-        
-        self.plotter.update()
-        logger.debug("Solidified parting surface cleared")
-    
-    def set_solidified_parting_surface_visible(self, visible: bool):
-        """Set visibility of solidified parting surface."""
-        if hasattr(self, '_solidified_parting_surface_actor') and self._solidified_parting_surface_actor is not None:
-            self._solidified_parting_surface_actor.SetVisibility(visible)
-            self.plotter.update()
-            logger.debug(f"Solidified parting surface visibility set to {visible}")
-    
-    @property
-    def has_solidified_parting_surface(self) -> bool:
-        """Check if solidified parting surface exists."""
-        return hasattr(self, '_solidified_parting_surface_mesh') and self._solidified_parting_surface_mesh is not None
 
     # =========================================================================
     # EDGE DEBUG MODE FOR PARTING SURFACE

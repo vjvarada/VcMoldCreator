@@ -2383,8 +2383,31 @@ def find_secondary_cutting_edges(
     
     logger.info(f"Secondary cuts: min_intersection_count={min_intersection_count}, avg_edge_length={avg_edge_length:.4f}")
     
+    # OPTIMIZATION: Pre-filter edges and cache boundary paths
+    # Group edges by their boundary destination pairs to reuse path computations
+    boundary_path_cache = {}  # (wi_boundary, wj_boundary) -> path
+    
+    # Pre-compute boundary mappings for all unique destinations
+    unique_destinations = set()
+    for vi, vj, idx_i, idx_j in candidate_edges:
+        wi = interior_escape_destinations[idx_i]
+        wj = interior_escape_destinations[idx_j]
+        if wi >= 0:
+            unique_destinations.add(wi)
+        if wj >= 0:
+            unique_destinations.add(wj)
+    
+    # Pre-compute tet vertex -> boundary vertex mapping for all destinations
+    dest_to_boundary = {}
+    for dest in unique_destinations:
+        dest_to_boundary[dest] = _find_nearest_boundary_vertex(vertices[dest], boundary_verts)
+    
+    logger.info(f"Secondary cuts: {len(unique_destinations)} unique boundary destinations")
+    
     # Gather all membrane data first
     edge_membrane_data = []
+    skipped_same_dest = 0
+    skipped_no_path = 0
     
     for vi, vj, idx_i, idx_j in candidate_edges:
         # Get escape paths
@@ -2392,33 +2415,42 @@ def find_secondary_cutting_edges(
         path_j = interior_escape_paths[idx_j]  # vj → wj
         
         if len(path_i) < 1 or len(path_j) < 1:
+            skipped_no_path += 1
             continue
         
         wi = interior_escape_destinations[idx_i]
         wj = interior_escape_destinations[idx_j]
         
         if wi < 0 or wj < 0:
+            skipped_no_path += 1
             continue
         
-        # Verify that path ends at the boundary destination
-        # The path should be [start_vertex, ..., boundary_vertex]
-        if path_i[-1] != wi:
-            logger.warning(f"Path {idx_i} does not end at destination: path[-1]={path_i[-1]}, wi={wi}")
-        if path_j[-1] != wj:
-            logger.warning(f"Path {idx_j} does not end at destination: path[-1]={path_j[-1]}, wj={wj}")
+        # Use pre-computed boundary mappings
+        wi_boundary = dest_to_boundary[wi]
+        wj_boundary = dest_to_boundary[wj]
         
-        # Map wi, wj to boundary mesh vertex indices
-        wi_boundary = _find_nearest_boundary_vertex(vertices[wi], boundary_verts)
-        wj_boundary = _find_nearest_boundary_vertex(vertices[wj], boundary_verts)
+        # OPTIMIZATION: Skip if destinations are the same (no membrane possible)
+        if wi_boundary == wj_boundary:
+            skipped_same_dest += 1
+            continue
         
-        # Compute shortest path wi → wj on boundary mesh
-        boundary_path = _shortest_path_on_boundary(
-            wi_boundary, wj_boundary, boundary_mesh, boundary_adjacency
-        )
+        # Use cached boundary path or compute new one
+        cache_key = (min(wi_boundary, wj_boundary), max(wi_boundary, wj_boundary))
+        if cache_key not in boundary_path_cache:
+            boundary_path_cache[cache_key] = _shortest_path_on_boundary(
+                wi_boundary, wj_boundary, boundary_mesh, boundary_adjacency
+            )
+        
+        boundary_path = boundary_path_cache[cache_key]
+        # Reverse if needed based on direction
+        if wi_boundary > wj_boundary:
+            boundary_path = boundary_path[::-1]
         
         edge_membrane_data.append((vi, vj, path_i, path_j, boundary_path))
     
-    logger.info(f"Secondary cuts: built {len(edge_membrane_data)} membranes to check")
+    logger.info(f"Secondary cuts: built {len(edge_membrane_data)} membranes to check "
+               f"(skipped: {skipped_same_dest} same-dest, {skipped_no_path} no-path, "
+               f"{len(boundary_path_cache)} unique boundary paths cached)")
     logger.info(f"Secondary cuts: min_membrane_thickness={min_membrane_thickness:.4f}")
     
     if len(edge_membrane_data) == 0:

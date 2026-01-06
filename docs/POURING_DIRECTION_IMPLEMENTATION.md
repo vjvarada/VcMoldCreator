@@ -4,12 +4,6 @@
 
 This document outlines the implementation plan for determining optimal silicone and resin pouring directions that minimize air bubble trapping during mold casting. The algorithm uses **persistence homology** to identify and score local maxima where air bubbles could become trapped.
 
-> **IMPORTANT**: Pouring direction optimization is performed on the **silicone mold pieces (P1, P2)**, NOT on the input part mesh. The mold pieces are generated at the end of the mold creation pipeline, and only then can we calculate optimal pouring directions for:
-> 1. **Silicone pouring**: Each mold piece (P1, P2) gets its own optimal direction (f1, f2)
-> 2. **Resin pouring**: Direction is chosen in a small cone around the bisector of f1 and f2
->
-> This ensures the silicone has a good surface to level out while casting, and air bubbles are minimized in the actual mold cavity geometry.
-
 ### Problem Statement
 
 Air bubbles may get trapped at local maxima relative to the pouring direction. While slight tilting during casting can help some bubbles escape, others remain trapped depending on the local geometry. We need a criterion to select pouring directions that minimize the presence of relevant (bubble-trapping) local maxima.
@@ -1251,23 +1245,6 @@ desktop_app/
 - [x] Phase 5: Direction scoring and selection
 - [x] Phase 6: Silicone and resin direction selection
 - [x] Phase 7: Main API
-- [x] Phase 8: UI integration (ready, pending mold piece step)
-- [x] Phase 9: Visualization (ready, pending mold piece step)
+- [x] Phase 8: UI integration
+- [x] Phase 9: Visualization
 - [ ] Phase 10: Testing
-
-### Implementation Notes
-
-**Current Status**: The core algorithm (Phases 1-7) is fully implemented and tested. The UI integration (Phase 8) and visualization (Phase 9) code is implemented but not yet active in the application because:
-
-1. Pouring directions must be calculated on the **silicone mold pieces (P1, P2)**, not the input part mesh
-2. The mold piece generation step has not yet been implemented in the pipeline
-3. When mold pieces become available, the `find_optimal_pouring_for_mold_pieces()` function should be used
-
-**Key APIs**:
-- `find_optimal_pouring_directions(mesh, ...)` - For a single mold piece
-- `find_optimal_pouring_for_mold_pieces(mold_piece_1, mold_piece_2, ...)` - For both mold pieces together
-
-**Visualization**: The `MeshViewer` class has methods ready for displaying pouring direction arrows:
-- `add_pouring_direction_arrows(s1_dir, s2_dir, resin_dir)`
-- `remove_pouring_direction_arrows()`
-- `set_pouring_arrows_visible(visible)`
