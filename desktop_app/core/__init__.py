@@ -19,7 +19,6 @@ from core.parting_direction import (
 from core.pouring_direction import (
     PouringDirectionResult as PouringDirResult,
     PersistencePair,
-    CriticalPoint,
     evaluate_candidate_directions,
     score_pouring_direction,
     compute_persistence_pairs,
@@ -101,7 +100,6 @@ __all__ = [
     'MoldAwarePouringDirections',
     'PouringDirResult',
     'PersistencePair',
-    'CriticalPoint',
     'evaluate_candidate_directions',
     'score_pouring_direction',
     'compute_persistence_pairs',

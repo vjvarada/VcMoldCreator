@@ -114,6 +114,8 @@ class MoldAwarePouringDirections:
     # Resin direction (for the complete part)
     resin_direction: np.ndarray
     resin_score: float
+    resin_maxima_positions: Optional[np.ndarray] = None  # (N, 3) positions of bubble-trapping maxima
+    resin_global_maximum_position: Optional[np.ndarray] = None  # (3,) position of the highest maximum
     
     # Alignment metrics
     silicone_alignment_angle_deg: float = 0.0  # Angle between h1 and h2 directions (or negated h2)
@@ -1659,6 +1661,26 @@ def find_mold_aware_pouring_directions(
         area_threshold_mm2=area_threshold_mm2
     )
     
+    # Extract maxima positions for visualization
+    # These are the bubble-trapping local maxima on the mold cavity ceiling
+    # Note: We use the ORIGINAL part_mesh vertices (not inverted) since
+    # the vertex indices from the inverted mesh map to the same positions
+    resin_maxima_positions = None
+    if resin_result.pairs:
+        maxima_indices = [pair.maximum_idx for pair in resin_result.pairs]
+        # Get unique indices
+        unique_indices = list(set(maxima_indices))
+        resin_maxima_positions = part_mesh.vertices[unique_indices].copy()
+        logger.info(f"Found {len(unique_indices)} bubble-trapping maxima for resin direction")
+    
+    # Find the TRUE global maximum (highest point of the ENTIRE mesh in resin direction)
+    # This is the absolute highest point when the part is oriented with resin direction up
+    resin_dir = resin_result.direction
+    all_heights = part_mesh.vertices @ resin_dir
+    global_max_vertex_idx = np.argmax(all_heights)
+    resin_global_maximum_position = part_mesh.vertices[global_max_vertex_idx].copy()
+    logger.info(f"Global maximum vertex {global_max_vertex_idx} at height {all_heights[global_max_vertex_idx]:.2f}: {resin_global_maximum_position}")
+    
     elapsed = (time.time() - start_time) * 1000
     logger.info(f"Mold-aware pouring direction optimization complete in {elapsed:.1f} ms")
     logger.info(f"  H1: direction={h1_direction}, score={h1_score:.2f}, faces={len(h1_faces)}")
@@ -1708,6 +1730,8 @@ def find_mold_aware_pouring_directions(
         h2_all_directions=h2_all_directions,
         resin_direction=resin_result.direction,
         resin_score=resin_result.total_score,
+        resin_maxima_positions=resin_maxima_positions,
+        resin_global_maximum_position=resin_global_maximum_position,
         silicone_alignment_angle_deg=alignment_angle_deg,
         directions_well_aligned=well_aligned,
         is_anti_aligned=is_anti_aligned,

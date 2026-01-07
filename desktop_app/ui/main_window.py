@@ -4357,6 +4357,14 @@ class MainWindow(QMainWindow):
             result.resin_direction
         )
         
+        # Add yellow dots at bubble-trapping maxima for resin direction
+        if result.resin_maxima_positions is not None:
+            self.mesh_viewer.add_resin_maxima_points(result.resin_maxima_positions)
+        
+        # Add red dot at the global maximum (highest bubble trap)
+        if result.resin_global_maximum_position is not None:
+            self.mesh_viewer.add_resin_global_maximum_point(result.resin_global_maximum_position)
+        
         # Update stats display (mold-aware version)
         self._update_mold_aware_pouring_stats()
         
@@ -4420,8 +4428,9 @@ class MainWindow(QMainWindow):
         # Resin direction
         r_str = f"[{result.resin_direction[0]:.3f}, {result.resin_direction[1]:.3f}, {result.resin_direction[2]:.3f}]"
         self.pouring_stats.add_row(f'Resin: {r_str}', '#ff6666')
+        n_maxima = len(result.resin_maxima_positions) if result.resin_maxima_positions is not None else 0
         resin_angle_str = f", Surface angle: {resin_surface_angle:.1f}deg" if resin_surface_angle is not None else ""
-        self.pouring_stats.add_row(f'  Trapped: {result.resin_score:.2f} mm2{resin_angle_str}')
+        self.pouring_stats.add_row(f'  Trapped: {result.resin_score:.2f} mm², Maxima: {n_maxima}{resin_angle_str}')
         
         # Show alignment info between H1 and H2 directions
         alignment_type = "Anti-aligned" if getattr(result, 'is_anti_aligned', False) else "Aligned"

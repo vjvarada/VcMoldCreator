@@ -101,6 +101,10 @@ class MeshViewer(QWidget):
         self._pouring_s1: Optional[np.ndarray] = None
         self._pouring_s2: Optional[np.ndarray] = None
         self._pouring_resin: Optional[np.ndarray] = None
+        self._resin_maxima_actor = None  # Spheres at bubble-trapping maxima (yellow)
+        self._resin_maxima_visible = True
+        self._resin_global_max_actor = None  # Sphere at global maximum (red)
+        self._resin_global_max_visible = True
         
         # H1/H2 split mesh visualization for pouring direction analysis
         self._h1_split_mesh_actor = None
@@ -1540,6 +1544,191 @@ class MeshViewer(QWidget):
                 logger.debug(f"Could not remove pouring arrow actor: {e}")
         
         self._pouring_arrow_actors = []
+        self.plotter.update()
+    
+    def add_resin_maxima_points(
+        self,
+        positions: np.ndarray,
+        sphere_radius: Optional[float] = None
+    ):
+        """
+        Add yellow spheres at the bubble-trapping maxima positions.
+        
+        These are the local maxima from the persistence analysis that
+        identify where air bubbles would accumulate during resin casting.
+        
+        Args:
+            positions: (N, 3) array of 3D positions of maxima
+            sphere_radius: Optional radius for spheres (default: based on mesh size)
+        """
+        if not PYVISTA_AVAILABLE or self._pv_mesh is None:
+            return
+        
+        if positions is None or len(positions) == 0:
+            logger.info("No resin maxima positions to display")
+            return
+        
+        # Remove existing maxima visualization
+        self.remove_resin_maxima_points()
+        
+        # Calculate sphere radius based on mesh bounds
+        bounds = self._pv_mesh.bounds
+        size = np.array([
+            bounds[1] - bounds[0],
+            bounds[3] - bounds[2],
+            bounds[5] - bounds[4],
+        ])
+        max_size = np.max(size)
+        
+        if sphere_radius is None:
+            # Scale sphere radius to be visible but not too large
+            sphere_radius = max_size * 0.015  # 1.5% of mesh size
+        
+        # Create spheres at each maximum position
+        spheres = pv.PolyData()
+        for pos in positions:
+            sphere = pv.Sphere(radius=sphere_radius, center=pos)
+            spheres = spheres.merge(sphere)
+        
+        # Add to plotter with yellow color
+        actor = self.plotter.add_mesh(
+            spheres,
+            color='yellow',
+            opacity=1.0,
+            smooth_shading=True,
+            show_edges=False,
+            ambient=0.3,
+            diffuse=0.7,
+            specular=0.3,
+        )
+        
+        self._resin_maxima_actor = actor
+        self._resin_maxima_visible = True
+        self.plotter.update()
+        
+        logger.info(f"Added {len(positions)} yellow spheres at resin bubble-trapping maxima")
+    
+    def remove_resin_maxima_points(self):
+        """Remove resin maxima spheres from the viewer."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        if self._resin_maxima_actor is not None:
+            try:
+                self.plotter.remove_actor(self._resin_maxima_actor)
+            except Exception as e:
+                logger.debug(f"Could not remove resin maxima actor: {e}")
+            self._resin_maxima_actor = None
+        
+        self.plotter.update()
+    
+    def set_resin_maxima_visible(self, visible: bool):
+        """
+        Set visibility of resin maxima spheres.
+        
+        Args:
+            visible: True to show spheres, False to hide
+        """
+        if not PYVISTA_AVAILABLE or self._resin_maxima_actor is None:
+            return
+        
+        try:
+            self._resin_maxima_actor.SetVisibility(visible)
+            self._resin_maxima_visible = visible
+        except Exception:
+            pass
+        
+        self.plotter.update()
+    
+    def add_resin_global_maximum_point(
+        self,
+        position: np.ndarray,
+        sphere_radius: Optional[float] = None
+    ):
+        """
+        Add a red sphere at the global maximum position.
+        
+        The global maximum is the highest local maximum in the resin
+        pouring direction - the most critical bubble trap location.
+        
+        Args:
+            position: (3,) array of 3D position of the global maximum
+            sphere_radius: Optional radius for sphere (default: based on mesh size)
+        """
+        if not PYVISTA_AVAILABLE or self._pv_mesh is None:
+            return
+        
+        if position is None:
+            logger.info("No global maximum position to display")
+            return
+        
+        # Remove existing global max visualization
+        self.remove_resin_global_maximum_point()
+        
+        # Calculate sphere radius based on mesh bounds
+        bounds = self._pv_mesh.bounds
+        size = np.array([
+            bounds[1] - bounds[0],
+            bounds[3] - bounds[2],
+            bounds[5] - bounds[4],
+        ])
+        max_size = np.max(size)
+        
+        if sphere_radius is None:
+            # Slightly larger than local maxima spheres for emphasis
+            sphere_radius = max_size * 0.022  # 2.2% of mesh size
+        
+        # Create sphere at global maximum position
+        sphere = pv.Sphere(radius=sphere_radius, center=position)
+        
+        # Add to plotter with red color
+        actor = self.plotter.add_mesh(
+            sphere,
+            color='red',
+            opacity=1.0,
+            smooth_shading=True,
+            show_edges=False,
+            ambient=0.3,
+            diffuse=0.7,
+            specular=0.5,
+        )
+        
+        self._resin_global_max_actor = actor
+        self._resin_global_max_visible = True
+        self.plotter.update()
+        
+        logger.info(f"Added red sphere at resin global maximum: {position}")
+    
+    def remove_resin_global_maximum_point(self):
+        """Remove resin global maximum sphere from the viewer."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        if self._resin_global_max_actor is not None:
+            try:
+                self.plotter.remove_actor(self._resin_global_max_actor)
+            except Exception as e:
+                logger.debug(f"Could not remove resin global max actor: {e}")
+            self._resin_global_max_actor = None
+        
+        self.plotter.update()
+    
+    def set_resin_global_maximum_visible(self, visible: bool):
+        """
+        Set visibility of resin global maximum sphere.
+        
+        Args:
+            visible: True to show sphere, False to hide
+        """
+        if not PYVISTA_AVAILABLE or self._resin_global_max_actor is None:
+            return
+        
+        try:
+            self._resin_global_max_actor.SetVisibility(visible)
+            self._resin_global_max_visible = visible
+        except Exception:
+            pass
+        
         self.plotter.update()
     
     def set_pouring_arrows_visible(self, visible: bool):
