@@ -43,6 +43,9 @@ MIN_TRIANGLE_AREA_FRACTION = 0.01        # 1% of median area considered degenera
 # Higher value = more aggressive gap filling (catches edges farther from target surfaces)
 DISTANCE_THRESHOLD_EDGE_MULTIPLIER = 3.0  # threshold = median_edge_length * this value
 
+# Small polyline removal thresholds
+DEFAULT_MIN_LOOP_PERIMETER = 4.0  # Default minimum perimeter in mm for closed loops to keep
+
 
 # =============================================================================
 # MARCHING TETRAHEDRA LOOKUP TABLES
@@ -968,6 +971,272 @@ def close_parting_surface_gaps(
                 f"in {result.processing_time_ms:.1f}ms")
     
     return result
+
+
+# =============================================================================
+# SMALL POLYLINE REMOVAL AND HOLE FILLING
+# =============================================================================
+
+@dataclass
+class SmallHoleRemovalResult:
+    """Result of small polyline/hole removal operation."""
+    mesh: Optional[trimesh.Trimesh] = None
+    vertices: Optional[np.ndarray] = None
+    faces: Optional[np.ndarray] = None
+    
+    # Statistics
+    loops_found: int = 0
+    loops_removed: int = 0
+    holes_filled: int = 0
+    fill_faces_added: int = 0
+    
+    # Perimeter info for removed loops
+    removed_loop_perimeters: List[float] = None
+    
+    # Timing
+    processing_time_ms: float = 0.0
+
+
+def remove_small_boundary_loops(
+    surface: PartingSurfaceResult,
+    min_perimeter: float = DEFAULT_MIN_LOOP_PERIMETER,
+    fill_holes: bool = True,
+    smooth_fill: bool = True,
+    smooth_iterations: int = 2
+) -> SmallHoleRemovalResult:
+    """
+    Remove small closed boundary loops (holes) from the parting surface.
+    
+    This function identifies closed boundary loops with perimeter less than
+    min_perimeter, removes them, fills the resulting holes, and optionally
+    smooths the fill region.
+    
+    Per the paper Section 4.4: After extracting the membrane mesh, small holes
+    or artifacts should be cleaned up to create a smooth parting surface.
+    
+    Algorithm:
+    1. Find all boundary edges (edges with only one adjacent face)
+    2. Build closed loops from boundary edges
+    3. Calculate perimeter of each loop
+    4. For loops with perimeter < min_perimeter:
+       a. Compute centroid of loop vertices
+       b. Create fan triangulation from centroid to loop edges
+       c. Apply local Laplacian smoothing to fill region
+    
+    Args:
+        surface: PartingSurfaceResult with the parting surface mesh
+        min_perimeter: Minimum perimeter (in mesh units) for loops to keep.
+                      Loops smaller than this will be filled. Default 4.0mm
+        fill_holes: If True, fill the holes after identifying small loops
+        smooth_fill: If True, apply local smoothing to filled regions
+        smooth_iterations: Number of smoothing iterations for fill regions
+    
+    Returns:
+        SmallHoleRemovalResult with cleaned mesh and statistics
+    """
+    import time
+    start = time.time()
+    
+    result = SmallHoleRemovalResult(removed_loop_perimeters=[])
+    
+    if surface.mesh is None:
+        logger.warning("No mesh provided for small loop removal")
+        return result
+    
+    mesh = surface.mesh
+    vertices = np.array(mesh.vertices, dtype=np.float64)
+    faces = np.array(mesh.faces, dtype=np.int64)
+    
+    # === Step 1: Find all boundary edges ===
+    edge_to_faces = {}
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            if edge_key not in edge_to_faces:
+                edge_to_faces[edge_key] = []
+            edge_to_faces[edge_key].append(fi)
+    
+    boundary_edges = [(v0, v1) for (v0, v1), flist in edge_to_faces.items() if len(flist) == 1]
+    
+    if not boundary_edges:
+        logger.info("No boundary edges found - mesh is watertight")
+        result.mesh = mesh
+        result.vertices = vertices
+        result.faces = faces
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    # === Step 2: Build closed loops from boundary edges ===
+    boundary_chains = _build_boundary_chains(np.array(boundary_edges, dtype=np.int64))
+    
+    # Filter to only closed loops
+    closed_loops = [(chain, is_closed) for chain, is_closed in boundary_chains if is_closed]
+    result.loops_found = len(closed_loops)
+    
+    logger.info(f"Found {len(closed_loops)} closed boundary loops")
+    
+    if len(closed_loops) == 0:
+        result.mesh = mesh
+        result.vertices = vertices
+        result.faces = faces
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    # === Step 3: Calculate perimeter and identify small loops ===
+    small_loops = []
+    for chain_verts, is_closed in closed_loops:
+        perimeter = 0.0
+        n_verts = len(chain_verts)
+        for i in range(n_verts):
+            v0 = chain_verts[i]
+            v1 = chain_verts[(i + 1) % n_verts]
+            edge_len = np.linalg.norm(vertices[v1] - vertices[v0])
+            perimeter += edge_len
+        
+        if perimeter < min_perimeter:
+            small_loops.append((chain_verts, perimeter))
+            logger.info(f"Small loop found: {len(chain_verts)} vertices, perimeter={perimeter:.3f}mm")
+    
+    if not small_loops:
+        logger.info(f"No loops with perimeter < {min_perimeter}mm found")
+        result.mesh = mesh
+        result.vertices = vertices
+        result.faces = faces
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    logger.info(f"Found {len(small_loops)} small loops to fill (perimeter < {min_perimeter}mm)")
+    
+    if not fill_holes:
+        # Just report statistics without filling
+        result.loops_removed = len(small_loops)
+        result.removed_loop_perimeters = [p for _, p in small_loops]
+        result.mesh = mesh
+        result.vertices = vertices
+        result.faces = faces
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    # === Step 4: Fill small holes ===
+    new_faces_list = list(faces)  # Start with existing faces
+    new_vertices_list = list(vertices)  # Start with existing vertices
+    fill_vertex_indices = []  # Track centroid vertices for smoothing
+    
+    for chain_verts, perimeter in small_loops:
+        result.removed_loop_perimeters.append(perimeter)
+        
+        # Compute centroid of loop
+        loop_positions = vertices[chain_verts]
+        centroid = np.mean(loop_positions, axis=0)
+        
+        # Add centroid as new vertex
+        centroid_idx = len(new_vertices_list)
+        new_vertices_list.append(centroid)
+        fill_vertex_indices.append(centroid_idx)
+        
+        # Create fan triangulation from centroid to loop edges
+        n_loop = len(chain_verts)
+        for i in range(n_loop):
+            v0 = chain_verts[i]
+            v1 = chain_verts[(i + 1) % n_loop]
+            # Triangle: v0, v1, centroid (consistent winding)
+            new_faces_list.append([v0, v1, centroid_idx])
+            result.fill_faces_added += 1
+        
+        result.holes_filled += 1
+    
+    result.loops_removed = len(small_loops)
+    
+    # Convert to arrays
+    filled_vertices = np.array(new_vertices_list, dtype=np.float64)
+    filled_faces = np.array(new_faces_list, dtype=np.int64)
+    
+    # === Step 5: Optional local smoothing of fill regions ===
+    if smooth_fill and fill_vertex_indices:
+        filled_vertices = _smooth_fill_vertices(
+            filled_vertices, 
+            filled_faces, 
+            fill_vertex_indices, 
+            iterations=smooth_iterations
+        )
+    
+    # === Step 6: Create result mesh ===
+    try:
+        result_mesh = trimesh.Trimesh(
+            vertices=filled_vertices,
+            faces=filled_faces,
+            process=False
+        )
+        result_mesh.fix_normals()
+        
+        result.mesh = result_mesh
+        result.vertices = np.array(result_mesh.vertices)
+        result.faces = np.array(result_mesh.faces)
+        
+    except Exception as e:
+        logger.error(f"Failed to create filled mesh: {e}")
+        result.mesh = mesh
+        result.vertices = vertices
+        result.faces = faces
+    
+    result.processing_time_ms = (time.time() - start) * 1000
+    
+    logger.info(f"Small loop removal: filled {result.holes_filled} holes, "
+                f"added {result.fill_faces_added} faces "
+                f"in {result.processing_time_ms:.1f}ms")
+    
+    return result
+
+
+def _smooth_fill_vertices(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    fill_vertex_indices: List[int],
+    iterations: int = 2,
+    lambda_factor: float = 0.5
+) -> np.ndarray:
+    """
+    Apply local Laplacian smoothing to fill vertices (centroids).
+    
+    Only the centroid vertices are moved; boundary loop vertices stay fixed.
+    
+    Args:
+        vertices: All mesh vertices
+        faces: All mesh faces
+        fill_vertex_indices: Indices of fill centroid vertices to smooth
+        iterations: Number of smoothing iterations
+        lambda_factor: Smoothing factor (0-1)
+    
+    Returns:
+        Updated vertex array
+    """
+    vertices = vertices.copy()
+    fill_set = set(fill_vertex_indices)
+    
+    # Build vertex adjacency from faces
+    n_verts = len(vertices)
+    neighbors = [set() for _ in range(n_verts)]
+    
+    for f in faces:
+        for i in range(3):
+            v = int(f[i])
+            neighbors[v].add(int(f[(i + 1) % 3]))
+            neighbors[v].add(int(f[(i + 2) % 3]))
+    
+    # Smooth only fill vertices
+    for _ in range(iterations):
+        new_positions = vertices.copy()
+        
+        for v in fill_vertex_indices:
+            if neighbors[v]:
+                neighbor_list = list(neighbors[v])
+                centroid = np.mean(vertices[neighbor_list], axis=0)
+                new_positions[v] = vertices[v] + lambda_factor * (centroid - vertices[v])
+        
+        vertices = new_positions
+    
+    return vertices
 
 
 def _build_boundary_chains(edges: np.ndarray) -> List[Tuple[List[int], bool]]:

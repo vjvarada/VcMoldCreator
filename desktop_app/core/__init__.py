@@ -65,7 +65,11 @@ from core.parting_surface import (
     extract_parting_surface_from_tet_result,
     smooth_parting_surface,
     repair_parting_surface,
+    remove_small_boundary_loops,
+    close_parting_surface_gaps,
     PartingSurfaceResult,
+    SmallHoleRemovalResult,
+    GapClosingResult,
     MARCHING_TET_TABLE,
     TET_EDGES,
 )
@@ -131,7 +135,11 @@ __all__ = [
     'extract_parting_surface_from_tet_result',
     'smooth_parting_surface',
     'repair_parting_surface',
+    'remove_small_boundary_loops',
+    'close_parting_surface_gaps',
     'PartingSurfaceResult',
+    'SmallHoleRemovalResult',
+    'GapClosingResult',
     'MARCHING_TET_TABLE',
     'TET_EDGES',
 ]

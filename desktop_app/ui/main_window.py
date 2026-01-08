@@ -1802,6 +1802,37 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             # Current mesh after cleaning
             current_mesh = repaired_result.mesh
             
+            # === Step 3.5: Remove small boundary loops (holes < 4mm perimeter) ===
+            from core.parting_surface import remove_small_boundary_loops, PartingSurfaceResult
+            
+            self.progress.emit("Removing small holes (< 4mm perimeter)...")
+            hole_removal_start = time.time()
+            
+            # Wrap current mesh in PartingSurfaceResult for the function
+            temp_surface = PartingSurfaceResult(
+                mesh=current_mesh,
+                vertices=np.array(current_mesh.vertices),
+                faces=np.array(current_mesh.faces),
+                num_vertices=len(current_mesh.vertices),
+                num_faces=len(current_mesh.faces)
+            )
+            
+            hole_result = remove_small_boundary_loops(
+                temp_surface,
+                min_perimeter=4.0,  # 4mm minimum perimeter
+                fill_holes=True,
+                smooth_fill=True,
+                smooth_iterations=2
+            )
+            
+            hole_removal_time_ms = (time.time() - hole_removal_start) * 1000
+            
+            if hole_result.holes_filled > 0:
+                self.progress.emit(f"Filled {hole_result.holes_filled} small holes ({hole_removal_time_ms:.0f}ms)")
+                current_mesh = hole_result.mesh
+            else:
+                self.progress.emit(f"No small holes found ({hole_removal_time_ms:.0f}ms)")
+            
             # === Step 4: Smooth surface with boundary re-projection ===
             # Per paper Section 4.4: "The triangulated surface C encoding the cut layout 
             # is composed using a set of patches that are interconnected by chains of 
@@ -2019,6 +2050,32 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
             )
             
             secondary_mesh = repair_result.mesh if repair_result.mesh is not None else extraction_result.mesh
+            
+            # === Step 3.5: Remove small boundary loops (holes < 4mm perimeter) ===
+            from core.parting_surface import remove_small_boundary_loops
+            
+            self.progress.emit("Removing small holes (< 4mm perimeter)...")
+            
+            # Wrap current mesh in PartingSurfaceResult for the function
+            temp_surface = PartingSurfaceResult(
+                mesh=secondary_mesh,
+                vertices=np.array(secondary_mesh.vertices),
+                faces=np.array(secondary_mesh.faces),
+                num_vertices=len(secondary_mesh.vertices),
+                num_faces=len(secondary_mesh.faces)
+            )
+            
+            hole_result = remove_small_boundary_loops(
+                temp_surface,
+                min_perimeter=4.0,  # 4mm minimum perimeter
+                fill_holes=True,
+                smooth_fill=True,
+                smooth_iterations=2
+            )
+            
+            if hole_result.holes_filled > 0:
+                self.progress.emit(f"Filled {hole_result.holes_filled} small holes")
+                secondary_mesh = hole_result.mesh
             
             # === Step 4: Propagate - remove islands and extend boundaries ===
             self.progress.emit("Propagating surface (removing islands, extending boundaries)...")
