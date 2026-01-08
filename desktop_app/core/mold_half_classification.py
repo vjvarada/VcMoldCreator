@@ -1078,12 +1078,14 @@ def identify_outer_boundary_by_distance(
     tolerance_fraction: float = 0.02
 ) -> Tuple[Set[int], Set[int]]:
     """
-    Fast outer boundary detection using vertex distance to part mesh.
+    Fast outer boundary detection using vertex distance to part mesh SURFACE.
     
     A face is "inner" (from part surface) if ALL its vertices are within 
-    tolerance of the part mesh. Otherwise it's "outer" (from hull surface).
+    tolerance of the part mesh surface. Otherwise it's "outer" (from hull surface).
     
-    This is O(n) using KD-tree queries, much faster than the plane-based method.
+    Uses trimesh's nearest.on_surface() for accurate surface distance computation,
+    which is more reliable than vertex-to-vertex KD-tree distance when the
+    tetrahedral boundary mesh has finer resolution than the part mesh.
     
     Args:
         boundary_mesh: The boundary mesh to classify
@@ -1093,7 +1095,6 @@ def identify_outer_boundary_by_distance(
     Returns:
         Tuple of (outer_triangles, inner_triangles) sets
     """
-    from scipy.spatial import cKDTree
     import time
     start = time.time()
     
@@ -1102,17 +1103,20 @@ def identify_outer_boundary_by_distance(
     mesh_size = np.linalg.norm(bounds[1] - bounds[0])
     tolerance = mesh_size * tolerance_fraction
     
-    # Build KD-tree for part mesh vertices
-    part_tree = cKDTree(part_mesh.vertices)
-    
-    # Query distances for all boundary mesh vertices
+    # Query distances from boundary vertices to part mesh SURFACE
+    # This is more accurate than vertex-to-vertex KD-tree distance
     boundary_verts = boundary_mesh.vertices
-    distances, _ = part_tree.query(boundary_verts, k=1)
+    _, distances, _ = part_mesh.nearest.on_surface(boundary_verts)
     
-    # Mark vertices as "near part" if within tolerance
+    # Mark vertices as "near part surface" if within tolerance
     near_part = distances < tolerance  # (n_verts,)
     
-    # A face is inner if ALL its vertices are near part
+    # Log distance statistics for debugging
+    logger.debug(f"Distance to part surface: min={distances.min():.4f}, max={distances.max():.4f}, "
+                f"tolerance={tolerance:.4f}")
+    logger.debug(f"Vertices near part: {np.sum(near_part)} / {len(boundary_verts)}")
+    
+    # A face is inner if ALL its vertices are near part surface
     faces = boundary_mesh.faces  # (n_faces, 3)
     face_near_part = near_part[faces]  # (n_faces, 3)
     all_near_part = np.all(face_near_part, axis=1)  # (n_faces,)
@@ -1121,7 +1125,7 @@ def identify_outer_boundary_by_distance(
     outer_triangles = set(np.where(~all_near_part)[0])
     
     elapsed = (time.time() - start) * 1000
-    logger.debug(f"Distance-based outer detection: {len(outer_triangles)} outer, "
+    logger.debug(f"Surface distance-based outer detection: {len(outer_triangles)} outer, "
                 f"{len(inner_triangles)} inner in {elapsed:.0f}ms")
     
     return outer_triangles, inner_triangles

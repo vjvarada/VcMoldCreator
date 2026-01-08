@@ -2246,17 +2246,19 @@ class MeshViewer(QWidget):
         seed_distance_threshold: float = None
     ):
         """
-        Apply mold half classification to tetrahedral mesh with seed vertices.
+        Apply mold half classification to the OUTER HULL boundary of the tetrahedral mesh.
         
-        This method:
-        1. Colors boundary mesh edges by H1/H2/boundary classification
-        2. Identifies and highlights seed vertices (close to part surface) in blue
+        This method visualizes ONLY the outer hull boundary (H1/H2/boundary zone),
+        excluding the inner boundary (part surface). This ensures the classification
+        visualization accurately represents the mold half partition of the hull.
         
         Colors:
-        - H₁ (Green): Edges on H1 triangles
-        - H₂ (Orange): Edges on H2 triangles  
-        - Boundary Zone (Gray): Interface between H₁ and H₂
-        - Seed (Blue): Tetrahedral vertices close to part surface
+        - H₁ (Green): Edges on H1 outer hull triangles
+        - H₂ (Orange): Edges on H2 outer hull triangles  
+        - Boundary Zone (Gray): Interface between H₁ and H₂ on the hull
+        
+        Inner boundary (part surface) edges are NOT displayed, as they are not
+        part of the mold half classification.
         
         Args:
             tet_vertices: Full tetrahedral mesh vertices (N x 3)
@@ -2273,7 +2275,7 @@ class MeshViewer(QWidget):
         
         logger.info("Applying tet mesh classification with seed vertices")
         
-        # Remove existing actors
+        # Remove existing mold halves actors
         if self._mold_halves_actor is not None:
             try:
                 self.plotter.remove_actor(self._mold_halves_actor)
@@ -2295,6 +2297,10 @@ class MeshViewer(QWidget):
             except Exception:
                 pass
             self._part_surface_actor = None
+        
+        # Hide the tetrahedral mesh visualization from the tetrahedralize step
+        # (don't remove it - user can toggle it back on via display options)
+        self.set_tetrahedral_mesh_visible(False)
         
         # =====================================================================
         # STEP 1: Identify seed vertices (tetrahedral vertices close to part)
@@ -2319,7 +2325,9 @@ class MeshViewer(QWidget):
         logger.info(f"  Distance to part: min={tet_to_part_distances.min():.4f}, max={tet_to_part_distances.max():.4f}")
         
         # =====================================================================
-        # STEP 2: Classify boundary mesh for H1/H2/boundary visualization
+        # STEP 2: Classify OUTER hull boundary for H1/H2/boundary visualization
+        # Only include faces that are on the outer hull (H1, H2, or boundary zone)
+        # Exclude inner boundary faces (part surface)
         # =====================================================================
         
         boundary_vertices = np.asarray(boundary_mesh.vertices)
@@ -2330,13 +2338,36 @@ class MeshViewer(QWidget):
         h1_set = classification_result.h1_triangles
         h2_set = classification_result.h2_triangles
         boundary_set = classification_result.boundary_zone_triangles
+        inner_set = classification_result.inner_boundary_triangles
         
-        # Assign vertex labels based on adjacent triangles
+        # Log detailed classification stats
+        logger.info(f"Classification result sets: H1={len(h1_set)}, H2={len(h2_set)}, "
+                   f"boundary_zone={len(boundary_set)}, inner={len(inner_set)}")
+        logger.info(f"Total boundary faces: {len(boundary_faces)}")
+        
+        # Outer hull faces = H1 + H2 + boundary zone (excludes inner boundary)
+        outer_hull_faces = h1_set | h2_set | boundary_set
+        n_outer_faces = len(outer_hull_faces)
+        n_inner_faces = len(inner_set)
+        
+        # Verify sets don't overlap and cover all faces
+        all_classified = h1_set | h2_set | boundary_set | inner_set
+        n_unclassified = len(boundary_faces) - len(all_classified)
+        if n_unclassified > 0:
+            logger.warning(f"WARNING: {n_unclassified} boundary faces are not classified!")
+        
+        logger.info(f"Outer hull faces: {n_outer_faces}, Inner boundary faces: {n_inner_faces}")
+        
+        # Assign vertex labels based on adjacent OUTER triangles only
         vertex_h1_count = np.zeros(n_boundary_verts, dtype=np.int32)
         vertex_h2_count = np.zeros(n_boundary_verts, dtype=np.int32)
         vertex_boundary_count = np.zeros(n_boundary_verts, dtype=np.int32)
         
         for face_idx, face in enumerate(boundary_faces):
+            # Skip inner boundary faces (part surface)
+            if face_idx in inner_set:
+                continue
+            
             v0, v1, v2 = face
             if face_idx in h1_set:
                 vertex_h1_count[v0] += 1
@@ -2359,25 +2390,33 @@ class MeshViewer(QWidget):
             elif vertex_h2_count[i] > vertex_h1_count[i] and vertex_h2_count[i] > vertex_boundary_count[i]:
                 boundary_vertex_labels[i] = 2  # H2
             elif vertex_boundary_count[i] > 0:
-                boundary_vertex_labels[i] = 3  # Boundary
+                boundary_vertex_labels[i] = 3  # Boundary zone
             elif vertex_h1_count[i] > 0:
                 boundary_vertex_labels[i] = 1
             elif vertex_h2_count[i] > 0:
                 boundary_vertex_labels[i] = 2
+            # Vertices with no outer hull face adjacency stay at 0 (inner/unclassified)
         
-        # Build boundary edges
-        boundary_edge_set = set()
-        for face in boundary_faces:
+        # Build edges ONLY from outer hull faces (H1, H2, boundary zone)
+        # This excludes edges from the inner boundary (part surface)
+        outer_edge_set = set()
+        for face_idx, face in enumerate(boundary_faces):
+            # Only include edges from outer hull faces
+            if face_idx not in outer_hull_faces:
+                continue
+            
             v0, v1, v2 = face
-            boundary_edge_set.add((min(v0, v1), max(v0, v1)))
-            boundary_edge_set.add((min(v1, v2), max(v1, v2)))
-            boundary_edge_set.add((min(v2, v0), max(v2, v0)))
+            outer_edge_set.add((min(v0, v1), max(v0, v1)))
+            outer_edge_set.add((min(v1, v2), max(v1, v2)))
+            outer_edge_set.add((min(v2, v0), max(v2, v0)))
         
-        boundary_edges = np.array(list(boundary_edge_set))
+        boundary_edges = np.array(list(outer_edge_set)) if outer_edge_set else np.empty((0, 2), dtype=np.int64)
         n_boundary_edges = len(boundary_edges)
         
+        logger.info(f"Outer hull edges: {n_boundary_edges}")
+        
         # =====================================================================
-        # STEP 2b: Assign colors to ALL boundary edges (outer boundary)
+        # STEP 2b: Assign colors to outer hull boundary edges only
         # =====================================================================
         
         # Assign edge colors based on endpoint labels
@@ -2390,7 +2429,7 @@ class MeshViewer(QWidget):
             elif l0 == 2 and l1 == 2:
                 edge_colors[i] = [255, 152, 0]  # Orange for H2
             elif l0 == 3 and l1 == 3:
-                edge_colors[i] = [158, 158, 158]  # Gray for boundary
+                edge_colors[i] = [158, 158, 158]  # Gray for boundary zone
             elif l0 in [1, 2] and l1 in [1, 2]:
                 edge_colors[i] = [158, 158, 158]  # Gray for H1-H2 interface
             elif l0 == 1 or l1 == 1:
@@ -2403,7 +2442,7 @@ class MeshViewer(QWidget):
         n_h1_verts = np.sum(boundary_vertex_labels == 1)
         n_h2_verts = np.sum(boundary_vertex_labels == 2)
         n_boundary_zone_verts = np.sum(boundary_vertex_labels == 3)
-        logger.info(f"Boundary vertex labels: H1={n_h1_verts}, H2={n_h2_verts}, boundary={n_boundary_zone_verts}")
+        logger.info(f"Outer hull vertex labels: H1={n_h1_verts}, H2={n_h2_verts}, boundary_zone={n_boundary_zone_verts}")
         
         # =====================================================================
         # STEP 3: Create visualization
@@ -2436,7 +2475,7 @@ class MeshViewer(QWidget):
             self._mold_halves_edges_actor.SetVisibility(self._outer_boundary_visible)
         
         self.plotter.update()
-        logger.info(f"Applied tet classification: {n_boundary_edges} boundary edges")
+        logger.info(f"Applied tet classification: {n_boundary_edges} outer hull boundary edges (excluded {n_inner_faces} inner faces)")
     
     def show_part_surface_reference(self, part_mesh: 'trimesh.Trimesh'):
         """
