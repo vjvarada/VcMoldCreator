@@ -1,7 +1,7 @@
 """
 Tetrahedral Mesh Generation for Mold Volume
 
-This module generates a tetrahedral mesh of the mold cavity volume using fTetWild
+This module generates a tetrahedral mesh of the mold bounding volume using fTetWild
 via the pytetwild package.
 
 The tetrahedral mesh replaces the voxel grid approach for:
@@ -10,12 +10,14 @@ The tetrahedral mesh replaces the voxel grid approach for:
 - Edge-based weight assignment for parting surface computation
 
 Algorithm:
-1. Take the cavity mesh (Hull - Part CSG result)
-2. Tetrahedralize the interior volume using fTetWild
-3. Build edge connectivity for weight assignment
-4. Compute distances from tet vertices/edges to part surface and shell boundary
+1. Tetrahedralize the complete bounding hull mesh
+2. Classify tetrahedra as inside or outside the part mesh (using centroid test)
+3. Filter to keep only tetrahedra in the mold cavity (outside the part)
+4. Build edge connectivity (walk graph) from the filtered tetrahedra
+5. Compute distances from tet vertices/edges to part surface and shell boundary
 
-The edge weights are used for Dijkstra-based escape labeling to find the parting surface.
+The walk graph (edges from outside-part tetrahedra) is used for Dijkstra-based 
+escape labeling to find the parting surface.
 """
 
 import logging
@@ -172,7 +174,7 @@ class TetrahedralMeshResult:
 
 
 def tetrahedralize_mesh(
-    cavity_mesh: trimesh.Trimesh,
+    surface_mesh: trimesh.Trimesh,
     edge_length_fac: float = 0.05,
     optimize: bool = True
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -183,7 +185,7 @@ def tetrahedralize_mesh(
     and defective meshes gracefully.
     
     Args:
-        cavity_mesh: The cavity surface mesh (should be watertight)
+        surface_mesh: The surface mesh to tetrahedralize (e.g., hull mesh)
         edge_length_fac: Target edge length as fraction of bounding box diagonal
                         Default 0.05 = bbox/20. Smaller = finer mesh.
         optimize: Whether to optimize mesh quality (slower but better quality)
@@ -197,8 +199,8 @@ def tetrahedralize_mesh(
     start = time.time()
     
     # Get vertices and faces from trimesh
-    vertices = np.asarray(cavity_mesh.vertices, dtype=np.float64)
-    faces = np.asarray(cavity_mesh.faces, dtype=np.int32)
+    vertices = np.asarray(surface_mesh.vertices, dtype=np.float64)
+    faces = np.asarray(surface_mesh.faces, dtype=np.int32)
     
     logger.info(f"Tetrahedralizing mesh with {len(vertices)} vertices, {len(faces)} faces")
     logger.info(f"Parameters: edge_length_fac={edge_length_fac}, optimize={optimize}")
@@ -223,7 +225,7 @@ def tetrahedralize_mesh(
 
 
 def _tetrahedralize_ftetwild(
-    cavity_mesh: trimesh.Trimesh,
+    surface_mesh: trimesh.Trimesh,
     edge_length_fac: float = 0.05,
     optimize: bool = True
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -237,8 +239,8 @@ def _tetrahedralize_ftetwild(
     start = time.time()
     
     # Get vertices and faces from trimesh
-    vertices = np.asarray(cavity_mesh.vertices, dtype=np.float64)
-    faces = np.asarray(cavity_mesh.faces, dtype=np.int32)
+    vertices = np.asarray(surface_mesh.vertices, dtype=np.float64)
+    faces = np.asarray(surface_mesh.faces, dtype=np.int32)
     
     logger.info(f"[fTetWild] Tetrahedralizing mesh with {len(vertices)} vertices, {len(faces)} faces")
     logger.info(f"Parameters: edge_length_fac={edge_length_fac}, optimize={optimize}")
@@ -255,8 +257,156 @@ def _tetrahedralize_ftetwild(
     logger.info(f"[fTetWild] Generated {len(tet_vertices)} vertices, {len(tetrahedra)} tetrahedra in {elapsed:.0f}ms")
     
     return tet_vertices, tetrahedra
+
+
+def tetrahedralize_csg_difference(
+    hull_mesh: trimesh.Trimesh,
+    part_mesh: trimesh.Trimesh,
+    edge_length_fac: float = 0.05,
+    epsilon: float = 1e-3,
+    stop_energy: float = 10.0,
+    coarsen: bool = True,
+    num_threads: int = 0
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Generate tetrahedral mesh of mold cavity using CSG difference: hull - part.
     
-    return tet_vertices, tetrahedra
+    This uses fTetWild's CSG capabilities to tetrahedralize the volume between
+    the hull and part meshes, where both surfaces become constraints in the
+    resulting tetrahedral mesh.
+    
+    Args:
+        hull_mesh: The outer bounding hull mesh
+        part_mesh: The inner part mesh (to subtract from hull)
+        edge_length_fac: Target edge length as fraction of bbox diagonal (default 0.05)
+        epsilon: Envelope size for surface approximation (default 1e-3)
+        stop_energy: Energy threshold for mesh optimization (default 10.0)
+        coarsen: Whether to coarsen output mesh (default True)
+        num_threads: Number of threads (0 = all cores)
+    
+    Returns:
+        Tuple of (vertices, tetrahedra, markers):
+        - vertices: (N, 3) float array of vertex positions
+        - tetrahedra: (M, 4) int array of tetrahedron vertex indices
+        - markers: (M,) int array indicating which surface each tet is from
+                   (1=hull/left, 2=part/right)
+    """
+    import time
+    import tempfile
+    import os
+    import json
+    
+    start = time.time()
+    
+    if not PYTETWILD_AVAILABLE:
+        raise ImportError("pytetwild not available. Install with: pip install pytetwild")
+    
+    logger.info(f"[CSG] Hull mesh: {len(hull_mesh.vertices)} vertices, {len(hull_mesh.faces)} faces")
+    logger.info(f"[CSG] Part mesh: {len(part_mesh.vertices)} vertices, {len(part_mesh.faces)} faces")
+    logger.info(f"[CSG] Parameters: edge_length_fac={edge_length_fac}, epsilon={epsilon}")
+    
+    # Create temporary directory for mesh files
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Export meshes to STL files
+        hull_path = os.path.join(tmpdir, "hull.stl")
+        part_path = os.path.join(tmpdir, "part.stl")
+        csg_path = os.path.join(tmpdir, "csg_tree.json")
+        
+        logger.info(f"[CSG] Exporting meshes to temporary files...")
+        hull_mesh.export(hull_path)
+        part_mesh.export(part_path)
+        
+        # Create CSG tree JSON for difference operation (hull - part)
+        csg_tree = {
+            "operation": "difference",  # hull - part = mold cavity
+            "left": hull_path,
+            "right": part_path
+        }
+        
+        with open(csg_path, 'w') as f:
+            json.dump(csg_tree, f)
+        
+        logger.info(f"[CSG] Running fTetWild CSG difference...")
+        
+        # Run CSG tetrahedralization
+        result_grid = pytetwild.tetrahedralize_csg(
+            csg_path,
+            epsilon=epsilon,
+            edge_length_r=edge_length_fac,
+            stop_energy=stop_energy,
+            coarsen=coarsen,
+            num_threads=num_threads,
+            loglevel=3  # moderate logging
+        )
+        
+        # Extract vertices, tetrahedra, and markers from PyVista UnstructuredGrid
+        vertices = np.asarray(result_grid.points, dtype=np.float64)
+        
+        # Extract tetrahedra from cells
+        # PyVista stores cells as [n_pts, p1, p2, p3, p4, n_pts, p1, ...]
+        cells = result_grid.cells.reshape(-1, 5)[:, 1:5]  # Skip the count, get 4 vertices
+        tetrahedra = np.asarray(cells, dtype=np.int32)
+        
+        # Get markers (which input surface each tet belongs to)
+        markers = np.asarray(result_grid["marker"], dtype=np.int32)
+    
+    elapsed = (time.time() - start) * 1000
+    
+    # Count tetrahedra by marker
+    n_hull_tets = np.sum(markers == 1)
+    n_part_tets = np.sum(markers == 2)
+    
+    logger.info(f"[CSG] Generated {len(vertices)} vertices, {len(tetrahedra)} tetrahedra in {elapsed:.0f}ms")
+    logger.info(f"[CSG] Tetrahedra by marker: hull={n_hull_tets}, part={n_part_tets}")
+    
+    return vertices, tetrahedra, markers
+
+
+def classify_tetrahedra(
+    tet_vertices: np.ndarray,
+    tetrahedra: np.ndarray,
+    part_mesh: trimesh.Trimesh,
+    tolerance: float = 0.0
+) -> np.ndarray:
+    """
+    Classify each tetrahedron as inside or outside the part mesh.
+    
+    Uses the centroid of each tetrahedron to determine if it's inside the part.
+    Tetrahedra in the mold cavity (outside the part) are marked as True,
+    tetrahedra inside the part are marked as False.
+    
+    Args:
+        tet_vertices: (N, 3) tetrahedral mesh vertices
+        tetrahedra: (M, 4) tetrahedron vertex indices
+        part_mesh: The original part mesh to check against
+        tolerance: Small positive value - centroids within this distance
+                   inside the part are also considered inside (default 0.0)
+    
+    Returns:
+        (M,) boolean array - True = outside part (mold cavity), False = inside part
+    """
+    logger.info(f"Classifying {len(tetrahedra)} tetrahedra...")
+    
+    # Compute tetrahedra centroids
+    centroids = tet_vertices[tetrahedra].mean(axis=1)  # (M, 3)
+    
+    # Check which centroids are inside the part mesh
+    # trimesh.contains returns True for points inside the mesh
+    inside_part = part_mesh.contains(centroids)
+    
+    # If tolerance > 0, also check distance to surface for points just outside
+    if tolerance > 0:
+        _, distances, _ = part_mesh.nearest.on_surface(centroids)
+        inside_part = inside_part & (distances > tolerance)
+    
+    # Outside part = mold cavity
+    outside_part = ~inside_part
+    
+    n_inside = np.sum(inside_part)
+    n_outside = np.sum(outside_part)
+    logger.info(f"Classification: {n_inside} tetrahedra inside part, {n_outside} outside part (mold cavity)")
+    
+    return outside_part
 
 
 def filter_tetrahedra_outside_part(
@@ -268,8 +418,8 @@ def filter_tetrahedra_outside_part(
     """
     Filter out tetrahedra that are inside the part mesh.
     
-    This removes tetrahedra whose centroids are inside the part mesh,
-    which can happen due to imperfect CSG operations or mesh issues.
+    Returns only the tetrahedra in the mold cavity (outside the part),
+    which form the walk graph for the mold half algorithm.
     
     Args:
         tet_vertices: (N, 3) tetrahedral mesh vertices
@@ -282,35 +432,19 @@ def filter_tetrahedra_outside_part(
         Tuple of (filtered_vertices, filtered_tetrahedra)
         Note: vertices are reindexed to remove unused ones
     """
-    logger.info(f"Filtering tetrahedra inside part mesh (tolerance={tolerance})...")
+    logger.info(f"Filtering tetrahedra to build walk graph from mold cavity (tolerance={tolerance})...")
     
-    # Compute tetrahedra centroids
-    centroids = tet_vertices[tetrahedra].mean(axis=1)  # (M, 3)
+    # Use classify_tetrahedra to get the outside/inside mask
+    outside_mask = classify_tetrahedra(tet_vertices, tetrahedra, part_mesh, tolerance)
     
-    # Check which centroids are inside the part mesh
-    # trimesh.contains returns True for points inside the mesh
-    inside_part = part_mesh.contains(centroids)
-    
-    # If tolerance > 0, also check distance to surface for points just outside
-    if tolerance > 0:
-        # For points just outside, check if they're very close to the surface
-        _, distances, _ = part_mesh.nearest.on_surface(centroids)
-        # Points very close to the surface (but outside) are kept
-        # Only truly inside points are removed
-        inside_part = inside_part & (distances > tolerance)
-    
-    # Keep tetrahedra whose centroids are OUTSIDE the part
-    outside_mask = ~inside_part
-    n_inside = np.sum(inside_part)
     n_outside = np.sum(outside_mask)
-    
-    logger.info(f"Tetrahedra inside part: {n_inside}, outside part: {n_outside}")
+    n_inside = len(tetrahedra) - n_outside
     
     if n_inside == 0:
         logger.info("No tetrahedra inside part mesh - no filtering needed")
         return tet_vertices, tetrahedra
     
-    # Filter tetrahedra
+    # Filter to keep only tetrahedra outside the part (mold cavity)
     filtered_tetrahedra = tetrahedra[outside_mask]
     
     # Reindex vertices to remove unused ones
@@ -321,7 +455,7 @@ def filter_tetrahedra_outside_part(
     filtered_vertices = tet_vertices[used_vertices]
     filtered_tetrahedra = vertex_remap[filtered_tetrahedra]
     
-    logger.info(f"After filtering: {len(filtered_vertices)} vertices, {len(filtered_tetrahedra)} tetrahedra")
+    logger.info(f"Walk graph built from {len(filtered_tetrahedra)} tetrahedra ({len(filtered_vertices)} vertices)")
     
     return filtered_vertices, filtered_tetrahedra
 
@@ -1582,18 +1716,18 @@ def compute_distances_to_mesh(
 
 def identify_boundary_vertices(
     tet_vertices: np.ndarray,
-    cavity_mesh: trimesh.Trimesh,
+    boundary_mesh: trimesh.Trimesh,
     tolerance: float = None
 ) -> np.ndarray:
     """
-    Identify which tet vertices lie on the cavity boundary surface.
+    Identify which tet vertices lie on the boundary surface.
     
     Uses trimesh's fast proximity query (CPU only, but efficient for this task)
     since we just need a boolean mask, not exact distances.
     
     Args:
         tet_vertices: (N, 3) tetrahedral mesh vertices
-        cavity_mesh: Original cavity surface mesh
+        boundary_mesh: The boundary surface mesh (e.g., tetrahedral boundary)
         tolerance: Distance tolerance for boundary detection.
                    If None, uses 0.1% of bounding box diagonal.
     
@@ -1601,13 +1735,13 @@ def identify_boundary_vertices(
         (N,) boolean array - True if vertex is on boundary
     """
     if tolerance is None:
-        bbox_diag = np.linalg.norm(cavity_mesh.bounds[1] - cavity_mesh.bounds[0])
+        bbox_diag = np.linalg.norm(boundary_mesh.bounds[1] - boundary_mesh.bounds[0])
         tolerance = bbox_diag * 0.001
     
     # Use trimesh's fast proximity query directly (CPU, but efficient for boundary check)
     # This is faster than our GPU implementation for this specific use case
     # because we're checking ALL vertices against the surface they came from
-    closest_points, distances, triangle_ids = cavity_mesh.nearest.on_surface(tet_vertices)
+    closest_points, distances, triangle_ids = boundary_mesh.nearest.on_surface(tet_vertices)
     
     # Vertices within tolerance are on boundary
     boundary_mask = distances < tolerance
@@ -1726,9 +1860,8 @@ def label_boundary_from_classification(
 
 
 def generate_tetrahedral_mesh(
-    cavity_mesh: trimesh.Trimesh,
-    part_mesh: trimesh.Trimesh,
     hull_mesh: trimesh.Trimesh,
+    part_mesh: trimesh.Trimesh,
     classification_result=None,  # MoldHalfClassificationResult
     edge_length_fac: float = 0.05,
     optimize: bool = True,
@@ -1745,9 +1878,8 @@ def generate_tetrahedral_mesh(
     3. weighted_edge_length = edge_length * edge_weight
     
     Args:
-        cavity_mesh: The cavity mesh (Hull - Part CSG result)
-        part_mesh: Original part mesh (for distance computation)
-        hull_mesh: Original hull mesh (not used currently, kept for API compatibility)
+        hull_mesh: The inflated hull mesh (bounding volume to tetrahedralize)
+        part_mesh: Original part mesh (for distance computation and filtering)
         classification_result: Mold half classification result (for boundary labeling)
         edge_length_fac: Target edge length as fraction of bbox diagonal
         optimize: Whether to optimize tet quality
@@ -1762,7 +1894,7 @@ def generate_tetrahedral_mesh(
     # Step 1: Tetrahedralize
     tet_start = time.time()
     tet_vertices, tetrahedra = tetrahedralize_mesh(
-        cavity_mesh, 
+        hull_mesh, 
         edge_length_fac=edge_length_fac,
         optimize=optimize
     )

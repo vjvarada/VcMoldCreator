@@ -46,10 +46,6 @@ from core.inflated_hull import (
     compute_default_offset,
     InflatedHullResult,
 )
-from core.mold_cavity import (
-    create_mold_cavity,
-    MoldCavityResult,
-)
 from core.mold_half_classification import (
     classify_mold_halves,
     MoldHalfClassificationResult,
@@ -71,8 +67,7 @@ class Step(Enum):
     IMPORT = 'import'
     PARTING = 'parting'
     HULL = 'hull'
-    CAVITY = 'cavity'
-    TETRAHEDRALIZE = 'tetrahedralize'  # Now comes before mold halves
+    TETRAHEDRALIZE = 'tetrahedralize'  # Tetrahedralize bounding hull
     MOLD_HALVES = 'mold-halves'        # Now operates on tet boundary
     EDGE_WEIGHTS = 'edge-weights'
     DIJKSTRA = 'dijkstra'              # Dijkstra walk to find parting surface
@@ -85,9 +80,8 @@ class Step(Enum):
 STEPS = [
     {'id': Step.IMPORT, 'icon': '📁', 'title': 'Import STL', 'description': 'Load a 3D model file in STL format for mold analysis'},
     {'id': Step.PARTING, 'icon': '🔀', 'title': 'Parting Direction', 'description': 'Compute optimal parting directions for mold separation'},
-    {'id': Step.HULL, 'icon': '📦', 'title': 'Bounding Hull', 'description': 'Generate inflated convex hull for mold cavity creation'},
-    {'id': Step.CAVITY, 'icon': '🕳️', 'title': 'Mold Cavity', 'description': 'Create mold cavity by subtracting the original mesh from the hull'},
-    {'id': Step.TETRAHEDRALIZE, 'icon': '🔷', 'title': 'Tetrahedralize', 'description': 'Generate tetrahedral mesh of mold cavity volume'},
+    {'id': Step.HULL, 'icon': '📦', 'title': 'Bounding Hull', 'description': 'Generate inflated convex hull for mold bounding volume'},
+    {'id': Step.TETRAHEDRALIZE, 'icon': '🔷', 'title': 'Tetrahedralize', 'description': 'Generate tetrahedral mesh of bounding volume'},
     {'id': Step.MOLD_HALVES, 'icon': '🎨', 'title': 'Mold Halves', 'description': 'Classify tetrahedral boundary into H₁ and H₂ mold halves'},
     {'id': Step.EDGE_WEIGHTS, 'icon': '⚖️', 'title': 'Edge Weights', 'description': 'Compute edge weights based on distance to part surface'},
     {'id': Step.DIJKSTRA, 'icon': '🛤️', 'title': 'Dijkstra Walk', 'description': 'Find shortest paths from part surface to mold halves'},
@@ -871,48 +865,8 @@ class MoldAwarePouringDirectionWorker(QThread):
             self.error.emit(str(e))
 
 
-class CavityWorker(QThread):
-    """Background worker for computing mold cavity (CSG subtraction)."""
-    
-    progress = pyqtSignal(str)
-    complete = pyqtSignal(object)  # MoldCavityResult
-    error = pyqtSignal(str)
-    
-    def __init__(self, hull_mesh, original_mesh):
-        """
-        Initialize cavity worker.
-        
-        Args:
-            hull_mesh: The inflated hull mesh
-            original_mesh: The original mesh to subtract from hull
-        """
-        super().__init__()
-        self.hull_mesh = hull_mesh
-        self.original_mesh = original_mesh
-    
-    def run(self):
-        try:
-            logger.info("Computing mold cavity (CSG subtraction)...")
-            self.progress.emit("Performing CSG subtraction (hull - original)...")
-            
-            result = create_mold_cavity(
-                self.hull_mesh,
-                self.original_mesh
-            )
-            
-            if result.success:
-                self.progress.emit(f"Cavity created: {result.validation.vertex_count} vertices, {result.validation.face_count} faces")
-                self.complete.emit(result)
-            else:
-                self.error.emit(result.error_message or "CSG subtraction failed")
-            
-        except Exception as e:
-            logger.exception(f"Error computing mold cavity: {e}")
-            self.error.emit(str(e))
-
-
 class MoldHalvesWorker(QThread):
-    """Background worker for classifying mold halves (H₁ and H₂)."""
+    """Background worker for classifying mold halves (H₁ and H₂) on the tetrahedral boundary mesh."""
     
     progress = pyqtSignal(str)
     complete = pyqtSignal(object)  # MoldHalfClassificationResult
@@ -920,7 +874,7 @@ class MoldHalvesWorker(QThread):
     
     def __init__(
         self,
-        cavity_mesh,
+        boundary_mesh,
         hull_mesh,
         d1: np.ndarray,
         d2: np.ndarray,
@@ -934,7 +888,7 @@ class MoldHalvesWorker(QThread):
         Initialize mold halves classification worker.
         
         Args:
-            cavity_mesh: The mold cavity mesh (or tetrahedral boundary mesh)
+            boundary_mesh: The tetrahedral boundary mesh (surface of filtered tetrahedra)
             hull_mesh: The hull mesh (used to identify outer boundary)
             d1: Primary parting direction
             d2: Secondary parting direction
@@ -945,7 +899,7 @@ class MoldHalvesWorker(QThread):
             tet_boundary_labels: (N,) boundary labels from tet mesh
         """
         super().__init__()
-        self.cavity_mesh = cavity_mesh
+        self.boundary_mesh = boundary_mesh
         self.hull_mesh = hull_mesh
         self.d1 = d1
         self.d2 = d2
@@ -961,7 +915,7 @@ class MoldHalvesWorker(QThread):
             self.progress.emit("Classifying mold halves...")
             
             result = classify_mold_halves(
-                self.cavity_mesh,
+                self.boundary_mesh,
                 self.hull_mesh,
                 self.d1,
                 self.d2,
@@ -999,11 +953,82 @@ def _run_tetrahedralization_subprocess(vertices, faces, edge_length_fac, optimiz
     return tet_vertices, tetrahedra
 
 
+def _run_csg_tetrahedralization_subprocess(
+    hull_vertices, hull_faces, 
+    part_vertices, part_faces,
+    edge_length_fac, epsilon, stop_energy, coarsen
+):
+    """
+    Run CSG difference tetrahedralization in a subprocess.
+    
+    Uses fTetWild's CSG capabilities to compute hull - part = mold cavity.
+    Returns tuple of (tet_vertices, tetrahedra, markers).
+    """
+    import pytetwild
+    import tempfile
+    import os
+    import json
+    import numpy as np
+    import trimesh
+    
+    # Reconstruct meshes from vertices/faces
+    hull_mesh = trimesh.Trimesh(vertices=hull_vertices, faces=hull_faces)
+    part_mesh = trimesh.Trimesh(vertices=part_vertices, faces=part_faces)
+    
+    # Create temporary directory for mesh files
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Export meshes to STL files
+        hull_path = os.path.join(tmpdir, "hull.stl")
+        part_path = os.path.join(tmpdir, "part.stl")
+        csg_path = os.path.join(tmpdir, "csg_tree.json")
+        
+        hull_mesh.export(hull_path)
+        part_mesh.export(part_path)
+        
+        # Create CSG tree JSON for difference operation (hull - part)
+        csg_tree = {
+            "operation": "difference",  # hull - part = mold cavity
+            "left": hull_path,
+            "right": part_path
+        }
+        
+        with open(csg_path, 'w') as f:
+            json.dump(csg_tree, f)
+        
+        # Run CSG tetrahedralization
+        result_grid = pytetwild.tetrahedralize_csg(
+            csg_path,
+            epsilon=epsilon,
+            edge_length_r=edge_length_fac,
+            stop_energy=stop_energy,
+            coarsen=coarsen,
+            num_threads=0,  # Use all cores
+            loglevel=3
+        )
+        
+        # Extract vertices, tetrahedra, and markers from PyVista UnstructuredGrid
+        vertices = np.asarray(result_grid.points, dtype=np.float64)
+        
+        # Extract tetrahedra from cells
+        cells = result_grid.cells.reshape(-1, 5)[:, 1:5]
+        tetrahedra = np.asarray(cells, dtype=np.int32)
+        
+        # Get markers
+        markers = np.asarray(result_grid["marker"], dtype=np.int32)
+    
+    return vertices, tetrahedra, markers
+
+
 class TetrahedralizeWorker(QThread):
     """Background worker for generating tetrahedral mesh of mold volume.
     
     Runs pytetwild in a separate PROCESS (not just thread) to avoid GIL blocking.
     This keeps the UI fully responsive during tetrahedralization.
+    
+    Supports two modes:
+    1. Standard: Tetrahedralize hull only, then filter tetrahedra inside part
+    2. CSG: Use CSG difference (hull - part) for tetrahedralization where both
+            surfaces become constraints in the tet mesh
     """
     
     progress = pyqtSignal(str)
@@ -1012,25 +1037,37 @@ class TetrahedralizeWorker(QThread):
     
     def __init__(
         self, 
-        cavity_mesh, 
+        hull_mesh, 
         part_mesh=None,
         edge_length_fac: float = 0.05,
-        optimize: bool = True
+        optimize: bool = True,
+        use_csg: bool = False,
+        csg_epsilon: float = 1e-3,
+        csg_stop_energy: float = 10.0,
+        csg_coarsen: bool = True
     ):
         """
         Initialize tetrahedralization worker.
         
         Args:
-            cavity_mesh: The mold cavity mesh
-            part_mesh: The original part mesh (for filtering tetrahedra inside part)
+            hull_mesh: The inflated hull mesh (bounding volume to tetrahedralize)
+            part_mesh: The original part mesh (for filtering or CSG)
             edge_length_fac: Target edge length as fraction of bbox diagonal
-            optimize: Whether to optimize tet quality
+            optimize: Whether to optimize tet quality (standard mode only)
+            use_csg: If True, use CSG difference (hull - part) for tetrahedralization
+            csg_epsilon: CSG envelope size (default 1e-3)
+            csg_stop_energy: CSG optimization energy threshold (default 10.0)
+            csg_coarsen: Whether to coarsen CSG output (default True)
         """
         super().__init__()
-        self.cavity_mesh = cavity_mesh
+        self.hull_mesh = hull_mesh
         self.part_mesh = part_mesh
         self.edge_length_fac = edge_length_fac
         self.optimize = optimize
+        self.use_csg = use_csg
+        self.csg_epsilon = csg_epsilon
+        self.csg_stop_energy = csg_stop_energy
+        self.csg_coarsen = csg_coarsen
         self._cancelled = False
         self._process = None
     
@@ -1052,71 +1089,128 @@ class TetrahedralizeWorker(QThread):
                 self.error.emit("pytetwild is not installed. Install with: pip install pytetwild")
                 return
             
-            logger.info("Generating tetrahedral mesh in subprocess...")
-            self.progress.emit("Starting tetrahedralization (subprocess)...")
-            
-            # Get mesh data as numpy arrays
-            vertices = np.asarray(self.cavity_mesh.vertices, dtype=np.float64)
-            faces = np.asarray(self.cavity_mesh.faces, dtype=np.int32)
-            
             start_time = time.time()
             
-            self.progress.emit(f"Tetrahedralizing {len(vertices)} vertices, {len(faces)} faces...")
-            
-            # Run tetrahedralization in a separate process to avoid GIL blocking
             # Use spawn context to ensure clean process on Windows
             ctx = mp.get_context('spawn')
             
-            with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
-                future = executor.submit(
-                    _run_tetrahedralization_subprocess,
-                    vertices, faces,
-                    self.edge_length_fac, self.optimize
+            if self.use_csg and self.part_mesh is not None:
+                # CSG MODE: hull - part = mold cavity
+                logger.info("Generating tetrahedral mesh using CSG difference (hull - part)...")
+                self.progress.emit("Starting CSG tetrahedralization (hull - part)...")
+                
+                # Get mesh data
+                hull_vertices = np.asarray(self.hull_mesh.vertices, dtype=np.float64)
+                hull_faces = np.asarray(self.hull_mesh.faces, dtype=np.int32)
+                part_vertices = np.asarray(self.part_mesh.vertices, dtype=np.float64)
+                part_faces = np.asarray(self.part_mesh.faces, dtype=np.int32)
+                
+                self.progress.emit(
+                    f"CSG: hull ({len(hull_vertices)} verts, {len(hull_faces)} faces) - "
+                    f"part ({len(part_vertices)} verts, {len(part_faces)} faces)..."
                 )
                 
-                # Poll for completion while checking for cancellation
-                while not future.done():
-                    if self._cancelled:
-                        future.cancel()
-                        self.error.emit("Cancelled by user")
-                        return
-                    
-                    # Update progress with elapsed time
-                    elapsed = time.time() - start_time
-                    self.progress.emit(f"Tetrahedralizing... ({elapsed:.1f}s elapsed)")
-                    
-                    # Sleep briefly to allow UI updates
-                    time.sleep(0.5)
-                
-                # Get result - handle BrokenProcessPool specifically
-                try:
-                    tet_vertices, tetrahedra = future.result()
-                except concurrent.futures.process.BrokenProcessPool as e:
-                    logger.error(f"TetGen process crashed: {e}")
-                    self.error.emit(
-                        "Tetrahedralization failed: TetGen process crashed.\n"
-                        "This may be caused by problematic mesh geometry.\n"
-                        "Try: 1) Repair mesh, 2) Simplify mesh, 3) Adjust edge length factor."
+                with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
+                    future = executor.submit(
+                        _run_csg_tetrahedralization_subprocess,
+                        hull_vertices, hull_faces,
+                        part_vertices, part_faces,
+                        self.edge_length_fac, 
+                        self.csg_epsilon,
+                        self.csg_stop_energy,
+                        self.csg_coarsen
                     )
+                    
+                    # Poll for completion
+                    while not future.done():
+                        if self._cancelled:
+                            future.cancel()
+                            self.error.emit("Cancelled by user")
+                            return
+                        
+                        elapsed = time.time() - start_time
+                        self.progress.emit(f"CSG tetrahedralizing... ({elapsed:.1f}s elapsed)")
+                        time.sleep(0.5)
+                    
+                    try:
+                        tet_vertices, tetrahedra, markers = future.result()
+                    except concurrent.futures.process.BrokenProcessPool as e:
+                        logger.error(f"CSG process crashed: {e}")
+                        self.error.emit(
+                            "CSG tetrahedralization failed: process crashed.\n"
+                            "This may be caused by problematic mesh geometry.\n"
+                            "Try: 1) Repair mesh, 2) Use standard mode instead."
+                        )
+                        return
+                
+                tet_time = (time.time() - start_time) * 1000
+                
+                # Log CSG statistics
+                n_hull_tets = np.sum(markers == 1)
+                n_part_tets = np.sum(markers == 2)
+                logger.info(f"CSG result: {len(tetrahedra)} tets (hull={n_hull_tets}, part={n_part_tets})")
+                
+                # No additional filtering needed - CSG already gives us the cavity
+                
+            else:
+                # STANDARD MODE: Tetrahedralize hull, then filter
+                logger.info("Generating tetrahedral mesh in subprocess...")
+                self.progress.emit("Starting tetrahedralization (subprocess)...")
+                
+                vertices = np.asarray(self.hull_mesh.vertices, dtype=np.float64)
+                faces = np.asarray(self.hull_mesh.faces, dtype=np.int32)
+                
+                self.progress.emit(f"Tetrahedralizing {len(vertices)} vertices, {len(faces)} faces...")
+                
+                with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
+                    future = executor.submit(
+                        _run_tetrahedralization_subprocess,
+                        vertices, faces,
+                        self.edge_length_fac, self.optimize
+                    )
+                    
+                    while not future.done():
+                        if self._cancelled:
+                            future.cancel()
+                            self.error.emit("Cancelled by user")
+                            return
+                        
+                        elapsed = time.time() - start_time
+                        self.progress.emit(f"Tetrahedralizing... ({elapsed:.1f}s elapsed)")
+                        time.sleep(0.5)
+                    
+                    try:
+                        tet_vertices, tetrahedra = future.result()
+                    except concurrent.futures.process.BrokenProcessPool as e:
+                        logger.error(f"TetGen process crashed: {e}")
+                        self.error.emit(
+                            "Tetrahedralization failed: TetGen process crashed.\n"
+                            "This may be caused by problematic mesh geometry.\n"
+                            "Try: 1) Repair mesh, 2) Simplify mesh, 3) Adjust edge length factor."
+                        )
+                        return
+                
+                tet_time = (time.time() - start_time) * 1000
+                
+                if self._cancelled:
+                    self.error.emit("Cancelled by user")
                     return
-            
-            tet_time = (time.time() - start_time) * 1000
+                
+                # Filter out tetrahedra that are inside the part mesh
+                if self.part_mesh is not None:
+                    self.progress.emit("Filtering tetrahedra inside part mesh...")
+                    from core.tetrahedral_mesh import filter_tetrahedra_outside_part
+                    tet_vertices, tetrahedra = filter_tetrahedra_outside_part(
+                        tet_vertices, tetrahedra, self.part_mesh
+                    )
+                    
+                    if len(tetrahedra) == 0:
+                        self.error.emit("All tetrahedra were inside the part mesh. Check mesh quality.")
+                        return
             
             if self._cancelled:
                 self.error.emit("Cancelled by user")
                 return
-            
-            # Filter out tetrahedra that are inside the part mesh
-            if self.part_mesh is not None:
-                self.progress.emit("Filtering tetrahedra inside part mesh...")
-                from core.tetrahedral_mesh import filter_tetrahedra_outside_part
-                tet_vertices, tetrahedra = filter_tetrahedra_outside_part(
-                    tet_vertices, tetrahedra, self.part_mesh
-                )
-                
-                if len(tetrahedra) == 0:
-                    self.error.emit("All tetrahedra were inside the part mesh. Check mesh quality.")
-                    return
             
             self.progress.emit("Extracting edges...")
             
@@ -1143,8 +1237,9 @@ class TetrahedralizeWorker(QThread):
                 tetrahedralize_time_ms=tet_time
             )
             
+            mode_str = "CSG" if self.use_csg else "Standard"
             self.progress.emit(
-                f"Complete: {result.num_vertices} vertices, "
+                f"Complete ({mode_str}): {result.num_vertices} vertices, "
                 f"{result.num_tetrahedra} tetrahedra, {result.num_edges} edges"
             )
             self.complete.emit(result)
@@ -1168,7 +1263,6 @@ class EdgeWeightsWorker(QThread):
         self, 
         tet_result,  # TetrahedralMeshResult from previous step
         part_mesh,
-        cavity_mesh,
         hull_mesh,
         classification_result,
         d1=None,  # Parting direction 1 (for classifying tet boundary mesh)
@@ -1180,7 +1274,6 @@ class EdgeWeightsWorker(QThread):
         Args:
             tet_result: TetrahedralMeshResult from tetrahedralization step
             part_mesh: Original part mesh (for distance computation)
-            cavity_mesh: Cavity mesh (for proximity-based boundary detection)
             hull_mesh: Hull mesh (for outer boundary identification)
             classification_result: Mold half classification result (used for d1/d2 if not provided)
             d1: Parting direction 1 (optional, will use default if not provided)
@@ -1189,7 +1282,6 @@ class EdgeWeightsWorker(QThread):
         super().__init__()
         self.tet_result = tet_result
         self.part_mesh = part_mesh
-        self.cavity_mesh = cavity_mesh
         self.hull_mesh = hull_mesh
         self.classification_result = classification_result
         self.d1 = d1
@@ -1455,9 +1547,15 @@ class DijkstraWorker(QThread):
         interior_escape_labels: np.ndarray
     ) -> List[Tuple[int, int]]:
         """
-        Compute primary cut edges - edges where one vertex escapes to H1 and other to H2.
+        Compute primary cut edges - edges where vertices on opposite sides of the membrane.
         
-        These are the edges the parting surface passes through.
+        Per the paper, a cut edge separates H1 from H2. This includes:
+        1. Interior vertex → H1 adjacent to Interior vertex → H2
+        2. H1 boundary vertex adjacent to Interior vertex → H2  
+        3. H2 boundary vertex adjacent to Interior vertex → H1
+        
+        The parting surface passes through the midpoints of these cut edges,
+        ensuring it flows from the hull boundary (∂H) to the part surface (M).
         
         Args:
             edges: (E, 2) all tetrahedral mesh edges
@@ -1467,24 +1565,45 @@ class DijkstraWorker(QThread):
         Returns:
             List of (vi, vj) tuples for primary cut edges
         """
-        # Build vertex -> escape label mapping
+        # Build vertex -> effective label mapping
+        # This combines boundary labels (for H1/H2 boundary vertices) with escape labels
         n_verts = np.max(edges) + 1 if len(edges) > 0 else 0
-        vertex_labels = np.full(n_verts, -1, dtype=np.int8)  # -1 = boundary or not interior
         
+        # Start with boundary labels: 0=interior, 1=H1, 2=H2, -1=inner boundary (part)
+        boundary_labels = self.tet_result.boundary_labels
+        
+        # Initialize: -1 means "not classified" (neither H1 nor H2)
+        # 1 = H1 side, 2 = H2 side
+        vertex_labels = np.full(n_verts, -1, dtype=np.int8)
+        
+        # First, assign H1/H2 boundary vertices their boundary labels
+        if boundary_labels is not None:
+            h1_mask = boundary_labels == 1
+            h2_mask = boundary_labels == 2
+            vertex_labels[h1_mask] = 1  # H1 boundary vertices
+            vertex_labels[h2_mask] = 2  # H2 boundary vertices
+        
+        # Then, assign interior vertices their escape labels
         for i, vert_idx in enumerate(interior_vertex_indices):
-            vertex_labels[vert_idx] = interior_escape_labels[i]
+            escape_label = interior_escape_labels[i]
+            if escape_label in (1, 2):
+                vertex_labels[vert_idx] = escape_label
         
-        # Find edges where one endpoint → H1 and other → H2
+        # Find edges where one endpoint is on H1 side and other is on H2 side
+        # This includes:
+        # - Interior → H1 adjacent to Interior → H2 (original)
+        # - H1 boundary adjacent to Interior → H2 (NEW: reaches hull)
+        # - H2 boundary adjacent to Interior → H1 (NEW: reaches hull)
         primary_cuts = []
         for v0, v1 in edges:
             l0 = vertex_labels[v0]
             l1 = vertex_labels[v1]
             
-            # Primary cut: one goes to H1 (1), other goes to H2 (2)
+            # Primary cut: one is on H1 side (1), other is on H2 side (2)
             if (l0 == 1 and l1 == 2) or (l0 == 2 and l1 == 1):
                 primary_cuts.append((int(v0), int(v1)))
         
-        logger.info(f"Found {len(primary_cuts)} primary cut edges")
+        logger.info(f"Found {len(primary_cuts)} primary cut edges (including hull boundary edges)")
         return primary_cuts
 
 
@@ -1544,7 +1663,14 @@ class SecondaryCutsWorker(QThread):
 
 @dataclass
 class ComprehensiveSurfaceResult:
-    """Result of comprehensive primary surface processing (generation + repair + gap fill + smoothing)."""
+    """
+    Result of comprehensive primary surface processing (extraction + repair + smoothing).
+    
+    Per paper Section 4.3-4.4:
+    - Membrane meshing: Marching tetrahedra extracts surface at cut edge midpoints
+    - Membrane smoothing: Laplacian smoothing with boundary reprojection to M and ∂H
+    - No gap filling needed - surface is "bounded by construction" by M and ∂H
+    """
     # From extraction
     mesh: Optional[trimesh.Trimesh] = None
     num_vertices: int = 0
@@ -1554,14 +1680,6 @@ class ComprehensiveSurfaceResult:
     
     # Mapping from surface vertex index to tet mesh edge index (for debugging)
     vertex_to_edge: Optional[np.ndarray] = None
-    
-    # From gap filling
-    gaps_detected: int = 0
-    gaps_filled: int = 0
-    fill_faces_added: int = 0
-    gap_fill_time_ms: float = 0.0
-    # Indices of gap-fill faces (for visualization in different color)
-    fill_face_indices: Optional[np.ndarray] = None
     
     # From smoothing
     boundary_vertices: int = 0
@@ -1580,10 +1698,12 @@ class ComprehensivePrimarySurfaceWorker(QThread):
     """
     Background worker for primary surface processing.
     
-    Performs:
-    1. Extract surface using Marching Tetrahedra
+    Performs per paper Section 4.3-4.4:
+    1. Extract surface using Marching Tetrahedra (membrane meshing)
     2. Clean surface (merge vertices, remove degenerates)
-    3. Smooth surface with boundary re-projection
+    3. Smooth surface with boundary re-projection to M and ∂H (membrane smoothing)
+    
+    The surface is "bounded by construction" by M and ∂H - no gap filling needed.
     """
     
     progress = pyqtSignal(str)
@@ -1597,10 +1717,10 @@ class ComprehensivePrimarySurfaceWorker(QThread):
         
         Args:
             tet_result: TetrahedralMeshResult with primary cut edges
-            part_mesh: Original part mesh for boundary re-projection
-            hull_mesh: Hull mesh for boundary re-projection
+            part_mesh: Original part mesh for boundary re-projection (M)
+            hull_mesh: Hull mesh for boundary re-projection (∂H)
             smooth_iterations: Number of smoothing iterations
-            damping_factor: Smoothing damping factor
+            damping_factor: Smoothing damping factor (0.5 per paper)
         """
         super().__init__()
         self.tet_result = tet_result
@@ -1613,8 +1733,7 @@ class ComprehensivePrimarySurfaceWorker(QThread):
         try:
             from core.parting_surface import (
                 extract_parting_surface_from_tet_result,
-                repair_parting_surface_with_part,
-                close_parting_surface_gaps
+                repair_parting_surface_with_part
             )
             from core.surface_propagation import smooth_membrane_with_boundary_reprojection
             from core.tetrahedral_mesh import prepare_parting_surface_data
@@ -1683,64 +1802,32 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             # Current mesh after cleaning
             current_mesh = repaired_result.mesh
             
-            # Track gap-fill info for smoothing exclusion
-            excluded_vertices = None
-            fill_face_start_idx = None
+            # === Step 4: Smooth surface with boundary re-projection ===
+            # Per paper Section 4.4: "The triangulated surface C encoding the cut layout 
+            # is composed using a set of patches that are interconnected by chains of 
+            # non-manifold edges that are bounded by construction by the object surface 
+            # mesh M and the external boundary ∂H."
+            #
+            # The parting surface is NATURALLY bounded by M and ∂H because:
+            # - Cut edges between part surface vertices (with different escape labels) have 
+            #   midpoints ON the part surface M
+            # - Cut edges between hull boundary vertices and interior vertices have midpoints
+            #   near the hull ∂H
+            #
+            # Smoothing reprojects boundary vertices to M or ∂H to ensure proper connection.
+            # No gap filling is needed - this matches the paper's approach.
             
-            # === Step 3.5: Close gaps between parting surface and part (BEFORE smoothing) ===
-            # Gap-fill adds triangles to connect parting surface boundary to the part mesh.
-            # These fill triangles will NOT be smoothed - only the original parting surface is.
-            if self.part_mesh is not None:
-                self.progress.emit("Closing gaps between parting surface and part...")
-                gap_start = time.time()
-                
-                gap_result = close_parting_surface_gaps(
-                    repaired_result,
-                    self.part_mesh,
-                    distance_threshold=None,  # Auto-compute
-                    method='smart_curtain'
-                )
-                
-                result.gap_fill_time_ms = (time.time() - gap_start) * 1000
-                result.gaps_detected = gap_result.boundary_edges_near_part
-                result.gaps_filled = gap_result.boundary_loops_found
-                result.fill_faces_added = gap_result.fill_faces_added
-                
-                if gap_result.mesh is not None and gap_result.fill_faces_added > 0:
-                    # Record where fill faces start (for visualization)
-                    fill_face_start_idx = len(current_mesh.faces)
-                    result.fill_face_indices = np.arange(
-                        fill_face_start_idx,
-                        fill_face_start_idx + gap_result.fill_faces_added
-                    )
-                    current_mesh = gap_result.mesh
-                    
-                    # Collect vertices to exclude from smoothing (fill vertices)
-                    # part_constrained_vertices are the new projected vertices
-                    # fill_boundary_vertices are the original boundary used in fill
-                    excluded_verts_set = set()
-                    if gap_result.part_constrained_vertices is not None:
-                        excluded_verts_set.update(gap_result.part_constrained_vertices.tolist())
-                    if gap_result.fill_boundary_vertices is not None:
-                        excluded_verts_set.update(gap_result.fill_boundary_vertices.tolist())
-                    if excluded_verts_set:
-                        excluded_vertices = np.array(list(excluded_verts_set), dtype=np.int64)
-                    
-                    self.progress.emit(f"Gap fill: {gap_result.fill_faces_added} faces added, "
-                                      f"{gap_result.boundary_loops_found} loops closed")
-                else:
-                    self.progress.emit("No gaps to fill (or already closed)")
-            
-            # === Step 4: Smooth surface with boundary re-projection (AFTER gap fill) ===
-            # Smooth only the original parting surface, NOT the gap-fill triangles.
             if self.smooth_iterations > 0:
                 self.progress.emit(f"Smoothing surface ({self.smooth_iterations} iterations, λ={self.damping_factor})...")
                 
-                # Log which meshes are available
+                # Log which meshes are available for boundary reprojection
                 if self.hull_mesh is not None:
-                    self.progress.emit(f"Hull mesh available: {len(self.hull_mesh.faces)} faces")
+                    self.progress.emit(f"Hull mesh for ∂H reprojection: {len(self.hull_mesh.faces)} faces")
                 else:
                     self.progress.emit("WARNING: No hull mesh for boundary re-projection!")
+                
+                if self.part_mesh is not None:
+                    self.progress.emit(f"Part mesh for M reprojection: {len(self.part_mesh.faces)} faces")
                 
                 smoothing_start = time.time()
                 
@@ -1751,7 +1838,7 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                     primary_mesh=None,  # No primary for primary surface smoothing
                     iterations=self.smooth_iterations,
                     damping_factor=self.damping_factor,
-                    excluded_vertices=excluded_vertices  # Don't smooth gap-fill vertices
+                    excluded_vertices=None  # No excluded vertices - smooth everything
                 )
                 
                 result.smoothing_time_ms = (time.time() - smoothing_start) * 1000
@@ -1763,29 +1850,6 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                 else:
                     self.progress.emit("Smoothing returned no mesh, using unsmoothed")
             
-            # === Step 5: Weld gap-fill triangles to smoothed parting surface ===
-            # After smoothing, merge vertices at the boundary between gap-fill and parting surface
-            if result.fill_face_indices is not None and len(result.fill_face_indices) > 0:
-                self.progress.emit("Welding gap-fill triangles to parting surface...")
-                try:
-                    # Use trimesh's merge_vertices to weld close vertices
-                    pre_weld_verts = len(current_mesh.vertices)
-                    current_mesh.merge_vertices(merge_tex=False, merge_norm=False)
-                    post_weld_verts = len(current_mesh.vertices)
-                    merged_count = pre_weld_verts - post_weld_verts
-                    
-                    if merged_count > 0:
-                        self.progress.emit(f"Welded {merged_count} vertices")
-                        # Update fill_face_indices since faces may have been renumbered
-                        # After merge, we can't reliably track fill faces, so clear the indices
-                        # (They're already welded into the mesh now)
-                        result.fill_face_indices = None
-                    else:
-                        self.progress.emit("No vertices needed welding")
-                except Exception as e:
-                    logger.warning(f"Weld step failed: {e}")
-                    self.progress.emit(f"Weld warning: {e}")
-            
             # Set final result
             result.mesh = current_mesh
             result.num_vertices = len(current_mesh.vertices)
@@ -1796,8 +1860,6 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             # Build timing summary
             timing_parts = [f"extract: {result.extraction_time_ms:.0f}ms"]
             timing_parts.append(f"repair: {result.repair_time_ms:.0f}ms")
-            if result.gap_fill_time_ms > 0:
-                timing_parts.append(f"gap-fill: {result.gap_fill_time_ms:.0f}ms")
             if self.smooth_iterations > 0:
                 timing_parts.append(f"smooth: {result.smoothing_time_ms:.0f}ms")
             
@@ -3072,11 +3134,10 @@ class DisplayOptionsPanel(QFrame):
     hide_mesh_changed = pyqtSignal(bool)
     hide_parting_changed = pyqtSignal(bool)  # Toggle visibility paint + arrows
     hide_hull_changed = pyqtSignal(bool)  # Toggle bounding hull visibility
-    hide_cavity_changed = pyqtSignal(bool)  # Toggle mold cavity visibility
     hide_tet_mesh_changed = pyqtSignal(bool)  # Toggle tetrahedral mesh visibility
     hide_mold_halves_changed = pyqtSignal(bool)  # Toggle mold halves visibility (both)
     hide_outer_boundary_changed = pyqtSignal(bool)  # Toggle outer boundary (H1/H2/boundary zone)
-    hide_inner_boundary_changed = pyqtSignal(bool)  # Toggle inner boundary (seed edges)
+
     
     # Edge weight visualization signals
     show_edge_weights_changed = pyqtSignal(bool)  # Toggle edge weight visualization
@@ -3179,13 +3240,6 @@ class DisplayOptionsPanel(QFrame):
         self.hide_hull_cb.hide()  # Hidden until hull is computed
         layout.addWidget(self.hide_hull_cb)
         
-        # Hide mold cavity checkbox
-        self.hide_cavity_cb = QCheckBox('Hide Mold Cavity')
-        self.hide_cavity_cb.setChecked(False)  # Not hidden by default (cavity is shown)
-        self.hide_cavity_cb.stateChanged.connect(lambda s: self.hide_cavity_changed.emit(s == Qt.CheckState.Checked.value))
-        self.hide_cavity_cb.hide()  # Hidden until cavity is computed
-        layout.addWidget(self.hide_cavity_cb)
-        
         # Hide tetrahedral mesh checkbox
         self.hide_tet_mesh_cb = QCheckBox('Hide Tet Mesh')
         self.hide_tet_mesh_cb.setChecked(False)  # Not hidden by default (tet mesh is shown)
@@ -3206,12 +3260,7 @@ class DisplayOptionsPanel(QFrame):
         self.hide_outer_boundary_cb.hide()
         layout.addWidget(self.hide_outer_boundary_cb)
         
-        # Hide inner boundary checkbox (seed edges close to part)
-        self.hide_inner_boundary_cb = QCheckBox('  Inner Boundary')
-        self.hide_inner_boundary_cb.setChecked(False)  # Not hidden by default
-        self.hide_inner_boundary_cb.stateChanged.connect(lambda s: self.hide_inner_boundary_changed.emit(s == Qt.CheckState.Checked.value))
-        self.hide_inner_boundary_cb.hide()
-        layout.addWidget(self.hide_inner_boundary_cb)
+
         
         # Separator for edge weight options
         self.edge_weight_separator = QFrame()
@@ -3330,15 +3379,6 @@ class DisplayOptionsPanel(QFrame):
             self.hide_hull_cb.hide()
         self.adjustSize()
     
-    def show_cavity_option(self, show: bool = True):
-        """Show or hide the cavity visibility checkbox."""
-        if show:
-            self.hide_cavity_cb.show()
-            self.hide_cavity_cb.setChecked(False)  # Reset to showing cavity
-        else:
-            self.hide_cavity_cb.hide()
-        self.adjustSize()
-    
     def show_tet_mesh_option(self, show: bool = True):
         """Show or hide the tetrahedral mesh visibility checkbox."""
         if show:
@@ -3353,14 +3393,11 @@ class DisplayOptionsPanel(QFrame):
         if show:
             self.mold_boundary_label.show()
             self.hide_outer_boundary_cb.show()
-            self.hide_inner_boundary_cb.show()
-            # Reset to showing both boundaries
+            # Reset to showing outer boundary
             self.hide_outer_boundary_cb.setChecked(False)
-            self.hide_inner_boundary_cb.setChecked(False)
         else:
             self.mold_boundary_label.hide()
             self.hide_outer_boundary_cb.hide()
-            self.hide_inner_boundary_cb.hide()
         self.adjustSize()
     
     def show_edge_weight_options(self, show: bool = True):
@@ -3467,10 +3504,6 @@ class MainWindow(QMainWindow):
         # Inflated hull state
         self._hull_worker: Optional[HullWorker] = None
         self._hull_result: Optional[InflatedHullResult] = None
-        
-        # Mold cavity state
-        self._cavity_worker: Optional[CavityWorker] = None
-        self._cavity_result: Optional[MoldCavityResult] = None
         
         # Mold halves classification state
         self._mold_halves_worker = None
@@ -3809,11 +3842,9 @@ class MainWindow(QMainWindow):
         self.display_options.hide_mesh_changed.connect(self._on_hide_mesh_changed)
         self.display_options.hide_parting_changed.connect(self._on_hide_parting_changed)
         self.display_options.hide_hull_changed.connect(self._on_hide_hull_changed)
-        self.display_options.hide_cavity_changed.connect(self._on_hide_cavity_changed)
         self.display_options.hide_tet_mesh_changed.connect(self._on_hide_tet_mesh_changed)
         self.display_options.hide_mold_halves_changed.connect(self._on_hide_mold_halves_changed)
         self.display_options.hide_outer_boundary_changed.connect(self._on_hide_outer_boundary_changed)
-        self.display_options.hide_inner_boundary_changed.connect(self._on_hide_inner_boundary_changed)
         
         # Edge weight visibility signals
         self.display_options.show_edge_weights_changed.connect(
@@ -3890,8 +3921,6 @@ class MainWindow(QMainWindow):
             self._setup_parting_step()
         elif self._active_step == Step.HULL:
             self._setup_hull_step()
-        elif self._active_step == Step.CAVITY:
-            self._setup_cavity_step()
         elif self._active_step == Step.MOLD_HALVES:
             self._setup_mold_halves_step()
         elif self._active_step == Step.TETRAHEDRALIZE:
@@ -4715,9 +4744,9 @@ class MainWindow(QMainWindow):
         # Update step status
         self.step_buttons[Step.HULL].set_status('completed')
         
-        # Unlock the CAVITY step now that hull is computed
-        if Step.CAVITY in self.step_buttons:
-            self.step_buttons[Step.CAVITY].set_status('available')
+        # Unlock the TETRAHEDRALIZE step now that hull is computed
+        if Step.TETRAHEDRALIZE in self.step_buttons:
+            self.step_buttons[Step.TETRAHEDRALIZE].set_status('available')
         
         logger.info(f"Hull generated: {result.vertex_count} vertices, {result.face_count} faces")
     
@@ -4760,7 +4789,6 @@ class MainWindow(QMainWindow):
         # Clear mesh viewer
         self.mesh_viewer.clear()
         self.mesh_viewer.clear_hull()
-        self.mesh_viewer.clear_cavity()
         
         # Clear parting results
         self._parting_result = None
@@ -4771,9 +4799,6 @@ class MainWindow(QMainWindow):
         
         # Clear hull results
         self._hull_result = None
-        
-        # Clear cavity results
-        self._cavity_result = None
         
         # Clear mold halves results
         self._mold_halves_result = None
@@ -4794,8 +4819,6 @@ class MainWindow(QMainWindow):
             self.step_buttons[Step.PARTING].set_status('locked')
         if Step.HULL in self.step_buttons:
             self.step_buttons[Step.HULL].set_status('locked')
-        if Step.CAVITY in self.step_buttons:
-            self.step_buttons[Step.CAVITY].set_status('locked')
         if Step.MOLD_HALVES in self.step_buttons:
             self.step_buttons[Step.MOLD_HALVES].set_status('locked')
         if Step.TETRAHEDRALIZE in self.step_buttons:
@@ -4811,7 +4834,6 @@ class MainWindow(QMainWindow):
         self.display_options.hide()
         self.display_options.show_parting_option(False)
         self.display_options.show_hull_option(False)
-        self.display_options.show_cavity_option(False)
         self.display_options.show_tet_mesh_option(False)
         self.display_options.show_mold_halves_option(False)
         
@@ -4980,9 +5002,6 @@ class MainWindow(QMainWindow):
             # Hull
             'hull_result': result_to_dict(self._hull_result),
             
-            # Cavity
-            'cavity_result': result_to_dict(self._cavity_result),
-            
             # Mold halves
             'mold_halves_result': result_to_dict(self._mold_halves_result),
             'boundary_zone_threshold': self._boundary_zone_threshold,
@@ -5099,14 +5118,6 @@ class MainWindow(QMainWindow):
             if self._hull_result and hasattr(self._hull_result, 'mesh') and self._hull_result.mesh:
                 self.mesh_viewer.set_hull_mesh(self._hull_result.mesh)
                 self.display_options.show_hull_option(True)
-        
-        # Restore cavity result
-        if session.get('cavity_result'):
-            from core.mold_cavity import MoldCavityResult
-            self._cavity_result = dict_to_result(session['cavity_result'], MoldCavityResult)
-            if self._cavity_result and hasattr(self._cavity_result, 'cavity_mesh') and self._cavity_result.cavity_mesh:
-                self.mesh_viewer.set_cavity_mesh(self._cavity_result.cavity_mesh)
-                self.display_options.show_cavity_option(True)
         
         # Restore mold halves result
         if session.get('mold_halves_result'):
@@ -5256,12 +5267,6 @@ class MainWindow(QMainWindow):
             self.mesh_viewer.set_hull_visible(not hide)
             logger.debug(f"Hull visibility changed: hide={hide}")
     
-    def _on_hide_cavity_changed(self, hide: bool):
-        """Handle hide mold cavity checkbox change."""
-        if self.mesh_viewer:
-            self.mesh_viewer.set_cavity_visible(not hide)
-            logger.debug(f"Cavity visibility changed: hide={hide}")
-    
     def _on_hide_tet_mesh_changed(self, hide: bool):
         """Handle hide tetrahedral mesh checkbox change."""
         if self.mesh_viewer:
@@ -5280,253 +5285,6 @@ class MainWindow(QMainWindow):
             self.mesh_viewer.set_outer_boundary_visible(not hide)
             logger.debug(f"Outer boundary visibility changed: hide={hide}")
     
-    def _on_hide_inner_boundary_changed(self, hide: bool):
-        """Handle hide inner boundary checkbox change (seed edges)."""
-        if self.mesh_viewer:
-            self.mesh_viewer.set_inner_boundary_visible(not hide)
-            logger.debug(f"Inner boundary visibility changed: hide={hide}")
-    
-    # =========================================================================
-    # CAVITY STEP
-    # =========================================================================
-    
-    def _setup_cavity_step(self):
-        """Setup the mold cavity step UI."""
-        # Check if mesh is loaded
-        if self._current_mesh is None:
-            no_mesh_label = QLabel("⚠️ No mesh loaded. Please import an STL file first.")
-            no_mesh_label.setStyleSheet(f"""
-                color: {Colors.WARNING};
-                font-size: 13px;
-                padding: 12px;
-                background-color: rgba(255, 180, 0, 0.1);
-                border: 1px solid {Colors.WARNING};
-                border-radius: 6px;
-            """)
-            no_mesh_label.setWordWrap(True)
-            self.context_layout.addWidget(no_mesh_label)
-            return
-        
-        # Check if hull is computed
-        if self._hull_result is None:
-            no_hull_label = QLabel("⚠️ Please generate bounding hull first.")
-            no_hull_label.setStyleSheet(f"""
-                color: {Colors.WARNING};
-                font-size: 13px;
-                padding: 12px;
-                background-color: rgba(255, 180, 0, 0.1);
-                border: 1px solid {Colors.WARNING};
-                border-radius: 6px;
-            """)
-            no_hull_label.setWordWrap(True)
-            self.context_layout.addWidget(no_hull_label)
-            return
-        
-        # Description section
-        info_group = QGroupBox("Mold Cavity Creation")
-        info_group.setStyleSheet(f"""
-            QGroupBox {{
-                font-size: 13px;
-                font-weight: 500;
-                color: {Colors.DARK};
-                border: 1px solid {Colors.BORDER};
-                border-radius: 6px;
-                margin-top: 10px;
-                padding-top: 10px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-            }}
-        """)
-        info_layout = QVBoxLayout(info_group)
-        
-        info_text = QLabel(
-            "Creates the mold cavity by performing CSG (Constructive Solid Geometry) "
-            "subtraction: Hull - Original Mesh = Cavity. The cavity represents the "
-            "hollow space between the hull and the original mesh."
-        )
-        info_text.setWordWrap(True)
-        info_text.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px; line-height: 1.4;')
-        info_layout.addWidget(info_text)
-        
-        self.context_layout.addWidget(info_group)
-        
-        # Calculate button
-        self.cavity_calc_btn = QPushButton("🕳️ Create Mold Cavity")
-        self.cavity_calc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.cavity_calc_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {Colors.PRIMARY};
-                color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 12px 16px;
-                font-size: 13px;
-                font-weight: 500;
-            }}
-            QPushButton:hover {{
-                background-color: #0056b3;
-            }}
-            QPushButton:disabled {{
-                background-color: {Colors.GRAY_LIGHT};
-                color: {Colors.GRAY};
-            }}
-        """)
-        self.cavity_calc_btn.clicked.connect(self._on_calculate_cavity)
-        self.context_layout.addWidget(self.cavity_calc_btn)
-        
-        # Progress bar
-        self.cavity_progress = QProgressBar()
-        self.cavity_progress.setStyleSheet(f"""
-            QProgressBar {{
-                border: none;
-                border-radius: 4px;
-                background-color: {Colors.LIGHT};
-                height: 8px;
-            }}
-            QProgressBar::chunk {{
-                background-color: {Colors.INFO};
-                border-radius: 4px;
-            }}
-        """)
-        self.cavity_progress.setTextVisible(False)
-        self.cavity_progress.setRange(0, 0)  # Indeterminate
-        self.cavity_progress.hide()
-        self.context_layout.addWidget(self.cavity_progress)
-        
-        # Progress label
-        self.cavity_progress_label = QLabel("")
-        self.cavity_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
-        self.cavity_progress_label.hide()
-        self.context_layout.addWidget(self.cavity_progress_label)
-        
-        # Cavity stats (show if computed)
-        self.cavity_stats = StatsBox()
-        self.cavity_stats.hide()
-        self.context_layout.addWidget(self.cavity_stats)
-        
-        # Update UI with current state
-        self._update_cavity_step_ui()
-    
-    def _update_cavity_step_ui(self):
-        """Update cavity step UI based on current state."""
-        if not hasattr(self, 'cavity_stats'):
-            return
-        
-        if self._cavity_result is not None:
-            # Show stats
-            self.cavity_stats.clear()
-            self.cavity_stats.show()
-            
-            result = self._cavity_result
-            
-            self.cavity_stats.add_header('✅ Cavity Created', Colors.SUCCESS)
-            self.cavity_stats.add_row(f'Vertices: {result.validation.vertex_count:,}')
-            self.cavity_stats.add_row(f'Faces: {result.validation.face_count:,}')
-            
-            # Validation info
-            if result.validation.is_closed:
-                self.cavity_stats.add_row('Manifold: ✅ Closed', Colors.SUCCESS)
-            else:
-                self.cavity_stats.add_row('Manifold: ⚠️ Open', Colors.WARNING)
-            
-            if result.validation.volume is not None:
-                self.cavity_stats.add_row(f'Volume: {result.validation.volume:.2f} cubic units')
-            
-            if result.used_fallback:
-                self.cavity_stats.add_row('⚠️ Used fallback engine', Colors.WARNING)
-            
-            # Update button text
-            self.cavity_calc_btn.setText("🔄 Regenerate Cavity")
-        else:
-            self.cavity_stats.hide()
-    
-    def _on_calculate_cavity(self):
-        """Start cavity computation."""
-        if self._current_mesh is None or self._hull_result is None:
-            return
-        
-        # Disable button during computation
-        self.cavity_calc_btn.setEnabled(False)
-        self.cavity_progress.show()
-        self.cavity_progress_label.setText("Computing mold cavity (CSG subtraction)...")
-        self.cavity_progress_label.show()
-        
-        # Clear previous cavity
-        self.mesh_viewer.clear_cavity()
-        self._cavity_result = None
-        
-        # Start worker
-        self._cavity_worker = CavityWorker(self._hull_result.mesh, self._current_mesh)
-        self._cavity_worker.progress.connect(self._on_cavity_progress)
-        self._cavity_worker.complete.connect(self._on_cavity_complete)
-        self._cavity_worker.error.connect(self._on_cavity_error)
-        self._cavity_worker.finished.connect(self._on_cavity_worker_finished)
-        self._cavity_worker.start()
-    
-    def _on_cavity_progress(self, message: str):
-        """Handle cavity progress updates."""
-        # Check if widget still exists (user may have navigated away)
-        if hasattr(self, 'cavity_progress_label') and self.cavity_progress_label is not None:
-            try:
-                self.cavity_progress_label.setText(message)
-            except RuntimeError:
-                pass  # Widget was deleted
-    
-    def _on_cavity_complete(self, result: MoldCavityResult):
-        """Handle cavity computation complete."""
-        self._cavity_result = result
-        
-        # Add cavity to viewer
-        self.mesh_viewer.set_cavity_mesh(result.mesh)
-        
-        # Update UI only if widgets still exist
-        if hasattr(self, 'cavity_stats') and self.cavity_stats is not None:
-            try:
-                self._update_cavity_step_ui()
-            except RuntimeError:
-                pass  # Widget was deleted
-        
-        # Show cavity option in display options panel
-        self.display_options.show_cavity_option(True)
-        
-        # Update step status
-        self.step_buttons[Step.CAVITY].set_status('completed')
-        
-        # Unlock tetrahedralize step (now comes before mold halves)
-        if Step.TETRAHEDRALIZE in self.step_buttons:
-            self.step_buttons[Step.TETRAHEDRALIZE].set_status('available')
-        
-        logger.info(f"Cavity created: {result.validation.vertex_count} vertices, {result.validation.face_count} faces")
-    
-    def _on_cavity_error(self, message: str):
-        """Handle cavity computation error."""
-        # Check if widget still exists
-        if hasattr(self, 'cavity_progress_label') and self.cavity_progress_label is not None:
-            try:
-                self.cavity_progress_label.setText(f"Error: {message}")
-                self.cavity_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
-            except RuntimeError:
-                pass  # Widget was deleted
-        QMessageBox.critical(self, "Error", f"Cavity creation failed:\n{message}")
-    
-    def _on_cavity_worker_finished(self):
-        """Handle cavity worker finished."""
-        # Check if widgets still exist
-        if hasattr(self, 'cavity_calc_btn') and self.cavity_calc_btn is not None:
-            try:
-                self.cavity_calc_btn.setEnabled(True)
-            except RuntimeError:
-                pass  # Widget was deleted
-        if hasattr(self, 'cavity_progress') and self.cavity_progress is not None:
-            try:
-                self.cavity_progress.hide()
-            except RuntimeError:
-                pass  # Widget was deleted
-        self._cavity_worker = None
-
     # =========================================================================
     # MOLD HALVES STEP
     # =========================================================================
@@ -5749,7 +5507,6 @@ class MainWindow(QMainWindow):
             self.mold_halves_stats.add_row(f'H₁ (Green): {len(result.h1_triangles):,} ({h1_pct:.1f}%)', Colors.SUCCESS)
             self.mold_halves_stats.add_row(f'H₂ (Orange): {len(result.h2_triangles):,} ({h2_pct:.1f}%)', Colors.WARNING)
             self.mold_halves_stats.add_row(f'Boundary Zone: {len(result.boundary_zone_triangles):,}')
-            self.mold_halves_stats.add_row(f'Inner (part): {len(result.inner_boundary_triangles):,}')
             self.mold_halves_stats.add_row(f'Total: {result.total_triangles:,}')
             
             # Update button text
@@ -5817,9 +5574,6 @@ class MainWindow(QMainWindow):
         
         # Get the tetrahedral boundary mesh
         boundary_mesh = self._tet_result.boundary_mesh
-        
-        # Set up cavity mesh for visualization
-        self.mesh_viewer.set_cavity_mesh(boundary_mesh)
         
         # Apply classification colors AND seed vertex identification
         # Seeds are identified by distance to part mesh (not boundary mesh classification)
@@ -5898,9 +5652,9 @@ class MainWindow(QMainWindow):
             self.context_layout.addWidget(no_mesh_label)
             return
         
-        if self._cavity_result is None:
-            no_cavity_label = QLabel("⚠️ Please create mold cavity first.")
-            no_cavity_label.setStyleSheet(f"""
+        if self._hull_result is None:
+            no_hull_label = QLabel("⚠️ Please generate bounding hull first.")
+            no_hull_label.setStyleSheet(f"""
                 color: {Colors.WARNING};
                 font-size: 13px;
                 padding: 12px;
@@ -5908,8 +5662,8 @@ class MainWindow(QMainWindow):
                 border: 1px solid {Colors.WARNING};
                 border-radius: 6px;
             """)
-            no_cavity_label.setWordWrap(True)
-            self.context_layout.addWidget(no_cavity_label)
+            no_hull_label.setWordWrap(True)
+            self.context_layout.addWidget(no_hull_label)
             return
         
         if not PYTETWILD_AVAILABLE:
@@ -5947,8 +5701,8 @@ class MainWindow(QMainWindow):
         info_layout = QVBoxLayout(info_group)
         
         info_text = QLabel(
-            "Generates a tetrahedral mesh of the mold cavity volume using fTetWild. "
-            "This replaces the voxel grid with a more accurate mesh representation. "
+            "Generates a tetrahedral mesh of the complete bounding volume using fTetWild. "
+            "Tetrahedra inside the part mesh will be filtered out. "
             "Edge weights are computed for the parting surface algorithm."
         )
         info_text.setWordWrap(True)
@@ -6132,23 +5886,23 @@ class MainWindow(QMainWindow):
         """Update the estimated time and complexity display for tetrahedralization."""
         if not hasattr(self, 'tet_complexity_label') or self.tet_complexity_label is None:
             return
-        if self._cavity_result is None:
+        if self._hull_result is None:
             return
         
         try:
-            cavity_mesh = self._cavity_result.mesh
-            n_verts = len(cavity_mesh.vertices)
-            n_faces = len(cavity_mesh.faces)
+            hull_mesh = self._hull_result.mesh
+            n_verts = len(hull_mesh.vertices)
+            n_faces = len(hull_mesh.faces)
             
             # Calculate bounding box diagonal
-            bounds = cavity_mesh.bounds
+            bounds = hull_mesh.bounds
             bbox_diag = np.linalg.norm(bounds[1] - bounds[0])
             
             # Estimate target edge length
             target_edge = bbox_diag * self._tet_edge_length_fac
             
             # Estimate mesh volume (approximate)
-            volume = cavity_mesh.volume if cavity_mesh.is_watertight else bbox_diag ** 3 * 0.1
+            volume = hull_mesh.volume if hull_mesh.is_watertight else bbox_diag ** 3 * 0.1
             
             # Estimate number of tetrahedra based on volume and edge length
             # Rough formula: n_tets ≈ volume / (edge^3 * 0.1)
@@ -6243,9 +5997,9 @@ class MainWindow(QMainWindow):
         self.tet_progress_label.setText("Initializing tetrahedralization...")
         self.tet_stats.hide()
         
-        # Log cavity mesh stats (quick - no distance computation)
-        cavity_mesh = self._cavity_result.mesh
-        logger.info(f"Cavity mesh for tetrahedralization: {len(cavity_mesh.vertices)} verts, {len(cavity_mesh.faces)} faces")
+        # Log hull mesh stats
+        hull_mesh = self._hull_result.mesh
+        logger.info(f"Hull mesh for tetrahedralization: {len(hull_mesh.vertices)} verts, {len(hull_mesh.faces)} faces")
         
         # Process events to update UI before blocking operation
         from PyQt6.QtWidgets import QApplication
@@ -6254,12 +6008,17 @@ class MainWindow(QMainWindow):
         # Clear previous result
         self._tet_result = None
         
-        # Start worker - tetrahedralize and filter out tetrahedra inside part
+        # Start worker - use CSG difference (hull - part) for tetrahedralization
+        # This makes both hull and part surfaces constraints in the tet mesh
         self._tet_worker = TetrahedralizeWorker(
-            self._cavity_result.mesh,
-            part_mesh=self._current_mesh,  # Pass part mesh for filtering
+            self._hull_result.mesh,
+            part_mesh=self._current_mesh,
             edge_length_fac=self._tet_edge_length_fac,
-            optimize=self._tet_optimize
+            optimize=self._tet_optimize,
+            use_csg=True,  # Enable CSG mode: hull - part = mold cavity
+            csg_epsilon=1e-3,
+            csg_stop_energy=10.0,
+            csg_coarsen=False  # Don't coarsen - respect edge_length_fac for density control
         )
         self._tet_worker.progress.connect(self._on_tet_progress)
         self._tet_worker.complete.connect(self._on_tet_complete)
@@ -6291,10 +6050,6 @@ class MainWindow(QMainWindow):
             result.vertices,
             result.edges
         )
-        
-        # Also set the boundary mesh as the cavity for visualization
-        if result.boundary_mesh is not None:
-            self.mesh_viewer.set_cavity_mesh(result.boundary_mesh)
         
         # Show tet mesh display option
         self.display_options.show_tet_mesh_option(True)
@@ -6502,7 +6257,6 @@ class MainWindow(QMainWindow):
         self._edge_weights_worker = EdgeWeightsWorker(
             self._tet_result,
             self._current_mesh,
-            self._cavity_result.mesh,
             self._hull_result.mesh,
             self._mold_halves_result,
             d1=d1,
@@ -6579,7 +6333,6 @@ class MainWindow(QMainWindow):
                 self.edge_weights_stats.add_header('🏷️ Boundary Classified', Colors.INFO)
                 self.edge_weights_stats.add_row(f'H₁ faces: {len(classification_result.h1_triangles):,}')
                 self.edge_weights_stats.add_row(f'H₂ faces: {len(classification_result.h2_triangles):,}')
-                self.edge_weights_stats.add_row(f'Inner boundary: {len(classification_result.inner_boundary_triangles):,}')
                 self.edge_weights_stats.add_row(f'Boundary zone: {len(classification_result.boundary_zone_triangles):,}')
             except RuntimeError:
                 pass
@@ -7892,15 +7645,7 @@ class MainWindow(QMainWindow):
         self.parting_surface_stats.add_row(f'⏱ Extraction: {result.extraction_time_ms:.0f}ms')
         self.parting_surface_stats.add_row(f'⏱ Cleanup: {result.repair_time_ms:.0f}ms')
         
-        # Show gap filling stats if gaps were detected
-        if result.gaps_detected > 0:
-            self.parting_surface_stats.add_row(f'⏱ Gap filling: {result.gap_fill_time_ms:.0f}ms')
-            self.parting_surface_stats.add_row(f'   Gaps detected: {result.gaps_detected:,}')
-            self.parting_surface_stats.add_row(f'   Gaps filled: {result.gaps_filled:,}')
-            self.parting_surface_stats.add_row(f'   Faces added: {result.fill_faces_added:,}')
-        elif result.gap_fill_time_ms > 0:
-            self.parting_surface_stats.add_row(f'⏱ Gap filling: {result.gap_fill_time_ms:.0f}ms (no gaps)')
-        
+        # Show smoothing stats if smoothing was performed
         if result.smooth_iterations > 0:
             self.parting_surface_stats.add_row(f'⏱ Smoothing ({result.smooth_iterations} iter): {result.smoothing_time_ms:.0f}ms')
             self.parting_surface_stats.add_row(f'   Boundary verts: {result.boundary_vertices:,}')

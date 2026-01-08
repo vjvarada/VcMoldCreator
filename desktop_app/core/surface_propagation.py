@@ -281,93 +281,6 @@ def get_ordered_boundary_loops(mesh: trimesh.Trimesh) -> List[List[int]]:
 
 
 # =============================================================================
-# HOLE FILLING
-# =============================================================================
-
-def _fill_small_holes(mesh: trimesh.Trimesh, max_hole_edges: int = 6) -> trimesh.Trimesh:
-    """
-    Fill small holes in the mesh (holes with up to max_hole_edges boundary edges).
-    
-    Uses ear-clipping triangulation for small polygon holes.
-    
-    Args:
-        mesh: Input mesh with holes
-        max_hole_edges: Maximum number of edges in a hole to fill
-    
-    Returns:
-        Mesh with small holes filled
-    """
-    boundary_loops = get_ordered_boundary_loops(mesh)
-    
-    if not boundary_loops:
-        return mesh
-    
-    # Filter to small holes only
-    small_holes = [loop for loop in boundary_loops if len(loop) <= max_hole_edges]
-    
-    if not small_holes:
-        return mesh
-    
-    logger.debug(f"Filling {len(small_holes)} small holes (max {max_hole_edges} edges)")
-    
-    all_vertices = list(mesh.vertices)
-    all_faces = list(mesh.faces)
-    holes_filled = 0
-    
-    for loop in small_holes:
-        n = len(loop)
-        if n < 3:
-            continue
-        
-        # Get vertex positions for the hole
-        positions = np.array([mesh.vertices[vi] for vi in loop])
-        
-        # Compute hole normal (average of edge cross products)
-        center = positions.mean(axis=0)
-        normal = np.zeros(3)
-        for i in range(n):
-            v0 = positions[i] - center
-            v1 = positions[(i + 1) % n] - center
-            normal += np.cross(v0, v1)
-        normal_len = np.linalg.norm(normal)
-        if normal_len > 1e-10:
-            normal /= normal_len
-        
-        # Simple triangulation: fan from first vertex for small holes
-        if n == 3:
-            # Triangle - just add it
-            all_faces.append([loop[0], loop[1], loop[2]])
-            holes_filled += 1
-        elif n == 4:
-            # Quad - split into two triangles
-            all_faces.append([loop[0], loop[1], loop[2]])
-            all_faces.append([loop[0], loop[2], loop[3]])
-            holes_filled += 1
-        else:
-            # Fan triangulation for 5-6 sided holes
-            for i in range(1, n - 1):
-                all_faces.append([loop[0], loop[i], loop[i + 1]])
-            holes_filled += 1
-    
-    if holes_filled > 0:
-        logger.info(f"Filled {holes_filled} small holes")
-        filled_mesh = trimesh.Trimesh(
-            vertices=np.array(all_vertices),
-            faces=np.array(all_faces)
-        )
-        # Clean up
-        valid_faces = filled_mesh.nondegenerate_faces()
-        if np.sum(~valid_faces) > 0:
-            filled_mesh = trimesh.Trimesh(
-                vertices=filled_mesh.vertices,
-                faces=filled_mesh.faces[valid_faces]
-            )
-        return filled_mesh
-    
-    return mesh
-
-
-# =============================================================================
 # SURFACE PROPAGATION
 # =============================================================================
 
@@ -611,12 +524,10 @@ def propagate_to_target_surfaces(
         
         extended_mesh.remove_unreferenced_vertices()
         
-        # Check for remaining holes and try to fill small ones
+        # Check for remaining holes (informational only - don't fill per paper)
         remaining_boundaries = find_boundary_edges(extended_mesh)
         if remaining_boundaries:
             logger.debug(f"Extended mesh has {len(remaining_boundaries)} remaining boundary edges")
-            # Try to fill small holes (triangular or quad holes)
-            extended_mesh = _fill_small_holes(extended_mesh, max_hole_edges=6)
         
         
         logger.info(f"Extension complete: {total_connected} vertices connected to target surfaces, "
@@ -701,22 +612,25 @@ def smooth_membrane_with_boundary_reprojection(
     use_fast_smoothing: bool = True
 ) -> SmoothingResult:
     """
-    Smooth the membrane surface while preserving boundaries on the part mesh (M),
-    hull boundary (∂H), and optionally the primary parting surface.
+    Smooth the membrane surface following the algorithm from Section 4.4 of the paper.
     
-    Implements the algorithm from the paper:
-    1. Smooth boundary vertices (polylines)
-    2. Re-project boundary vertices onto their original surfaces (M, ∂H, or primary)
-    3. Smooth interior vertices while keeping boundary vertices fixed
-    4. Repeat for specified iterations
+    Per paper: "The smoothing is performed by alternating two main steps:
+    1. First we smooth the polyline that includes the boundary vertices only.
+       After this smooth step, we re-project those vertices onto the original
+       surface of M or the external boundary ∂H, depending on which of the two
+       surfaces they belonged to originally.
+    2. Then, we smooth all the interior vertices, keeping the ones on the
+       boundary fixed (the ones smoothed in the previous step).
+    Each smoothing step is performed using a damping factor (0.5 in our experiments)
+    to ensure a proper convergence to the final solution."
     
     Args:
         membrane_mesh: The triangulated cut surface C to smooth
         part_mesh: The part/object surface mesh M (boundary constraint)
         hull_mesh: The external boundary mesh ∂H (boundary constraint)
         primary_mesh: The primary parting surface (for secondary surface smoothing)
-        iterations: Number of alternating smooth/re-project iterations
-        damping_factor: Smoothing damping factor (0.5 recommended)
+        iterations: Number of alternating smooth iterations
+        damping_factor: Smoothing damping factor (0.5 per paper)
         excluded_vertices: Optional array of vertex indices to exclude from smoothing
                           (e.g., gap-fill vertices that should remain fixed)
     
@@ -921,10 +835,17 @@ def smooth_membrane_with_boundary_reprojection(
     logger.info(f"Batched re-projection: {len(part_boundary_indices)} part, "
                f"{len(hull_boundary_indices)} hull, {len(primary_boundary_indices)} primary")
     
-    # Alternating smoothing iterations
+    # Alternating smoothing iterations per paper Section 4.4:
+    # "The smoothing is performed by alternating two main steps:
+    #  1. First we smooth the polyline that includes the boundary vertices only.
+    #     After this smooth step, we re-project those vertices onto the original 
+    #     surface of M or the external boundary ∂H.
+    #  2. Then, we smooth all the interior vertices, keeping the ones on the 
+    #     boundary fixed (the ones smoothed in the previous step)."
     for iteration in range(iterations):
         if can_use_fast:
-            # === Fast C++ smoothing (boundary + interior in one call) ===
+            # === Fast C++ smoothing: Step 1 - Smooth boundary vertices (polyline smoothing) ===
+            # Note: C++ function only does boundary smoothing, not interior
             vertices = run_fast_boundary_interior_smoothing(
                 vertices=vertices,
                 faces=faces,
@@ -943,47 +864,48 @@ def smooth_membrane_with_boundary_reprojection(
                     continue
                 neighbors = list(boundary_neighbors[vi])
                 if len(neighbors) >= 2:
-                    # Average of neighbors along the boundary
-                    neighbor_positions = vertices[neighbors]
-                    avg_pos = neighbor_positions.mean(axis=0)
-                    new_vertices[vi] = vertices[vi] + damping_factor * (avg_pos - vertices[vi])
-            
-            vertices = new_vertices
-            
-            # === Python fallback: Step 3 - Smooth interior vertices (boundary vertices fixed) ===
-            # Note: interior_verts already excludes excluded_set
-            new_vertices = vertices.copy()
-            
-            for vi in interior_verts:
-                neighbors = list(vertex_neighbors[vi])
-                if neighbors:
+                    # Average of neighbors along the boundary polyline
                     neighbor_positions = vertices[neighbors]
                     avg_pos = neighbor_positions.mean(axis=0)
                     new_vertices[vi] = vertices[vi] + damping_factor * (avg_pos - vertices[vi])
             
             vertices = new_vertices
         
-        # === Step 2: BATCHED Re-project boundary vertices onto target surfaces ===
-        # Per paper algorithm: after smoothing boundary polylines, re-project to M or ∂H
-        # OPTIMIZATION: Batch all queries by surface type instead of one-by-one
+        # === Step 2: Re-project boundary vertices onto target surfaces ===
+        # Per paper: "After this smooth step, we re-project those vertices onto the 
+        # original surface of M or the external boundary ∂H"
         
-        # Re-project to part mesh (batched)
+        # Re-project to part mesh M (batched)
         if len(part_boundary_indices) > 0 and part_proximity is not None:
             part_positions = vertices[part_boundary_indices]
             closest_pts, _, _ = part_proximity.on_surface(part_positions)
             vertices[part_boundary_indices] = closest_pts
         
-        # Re-project to hull mesh (batched)
+        # Re-project to hull mesh ∂H (batched)
         if len(hull_boundary_indices) > 0 and hull_proximity is not None:
             hull_positions = vertices[hull_boundary_indices]
             closest_pts, _, _ = hull_proximity.on_surface(hull_positions)
             vertices[hull_boundary_indices] = closest_pts
         
-        # Re-project to primary mesh (batched)
+        # Re-project to primary mesh (for secondary surfaces)
         if len(primary_boundary_indices) > 0 and primary_proximity is not None:
             primary_positions = vertices[primary_boundary_indices]
             closest_pts, _, _ = primary_proximity.on_surface(primary_positions)
             vertices[primary_boundary_indices] = closest_pts
+        
+        # === Step 3: Smooth interior vertices (boundary vertices now fixed) ===
+        # Per paper: "Then, we smooth all the interior vertices, keeping the ones 
+        # on the boundary fixed"
+        new_vertices = vertices.copy()
+        
+        for vi in interior_verts:
+            neighbors = list(vertex_neighbors[vi])
+            if neighbors:
+                neighbor_positions = vertices[neighbors]
+                avg_pos = neighbor_positions.mean(axis=0)
+                new_vertices[vi] = vertices[vi] + damping_factor * (avg_pos - vertices[vi])
+        
+        vertices = new_vertices
         
         if (iteration + 1) % 2 == 0:
             logger.debug(f"Smoothing iteration {iteration + 1}/{iterations} complete")

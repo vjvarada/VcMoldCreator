@@ -40,7 +40,8 @@ PROJECTION_OFFSET_FRACTION = 0.3         # Offset distance when adjusting too-cl
 MIN_TRIANGLE_AREA_FRACTION = 0.01        # 1% of median area considered degenerate
 
 # Distance threshold multiplier for auto-computing gap fill threshold
-DISTANCE_THRESHOLD_EDGE_MULTIPLIER = 2.0  # threshold = median_edge_length * this value
+# Higher value = more aggressive gap filling (catches edges farther from target surfaces)
+DISTANCE_THRESHOLD_EDGE_MULTIPLIER = 3.0  # threshold = median_edge_length * this value
 
 
 # =============================================================================
@@ -186,16 +187,27 @@ def extract_parting_surface(
     cut_edge_flags: np.ndarray,
     tet_edge_indices: np.ndarray,
     use_original_vertices: bool = True,
-    vertices_original: Optional[np.ndarray] = None
+    vertices_original: Optional[np.ndarray] = None,
+    boundary_labels: Optional[np.ndarray] = None
 ) -> PartingSurfaceResult:
     """
     Extract the parting surface mesh using Marching Tetrahedra.
+    
+    Per paper Section 4.3: "The triangulated surface C encoding the cut layout 
+    is composed using a set of patches that are interconnected by chains of 
+    non-manifold edges that are bounded by construction by the object surface 
+    mesh M and the external boundary ∂H."
     
     For each tetrahedron:
     1. Look up which of its 6 edges are cut (using cut_edge_flags)
     2. Build a 6-bit configuration index
     3. Look up triangles from MARCHING_TET_TABLE
-    4. Emit triangles using edge midpoints as vertices
+    4. Emit triangles using boundary-aware cut point placement:
+       - If edge touches part surface M (boundary_label == -1): use M vertex position
+       - If edge touches hull boundary ∂H (boundary_label == 1 or 2): use ∂H vertex position
+       - Otherwise: use edge midpoint
+    
+    This ensures the parting surface is "bounded by construction" by M and ∂H.
     
     Args:
         vertices: (N, 3) vertex positions (inflated mesh)
@@ -205,6 +217,7 @@ def extract_parting_surface(
         tet_edge_indices: (M, 6) tet-to-edge mapping
         use_original_vertices: If True, use vertices_original for surface construction
         vertices_original: (N, 3) original (non-inflated) vertex positions
+        boundary_labels: (N,) vertex boundary labels: 0=interior, 1=H1, 2=H2, -1=part surface
     
     Returns:
         PartingSurfaceResult with the extracted surface mesh
@@ -232,18 +245,61 @@ def extract_parting_surface(
         result.extraction_time_ms = (time.time() - start) * 1000
         return result
     
-    # Step 1: Compute edge midpoints for all cut edges
-    # We'll create vertices only for cut edges
+    # Step 1: Compute cut point positions for all cut edges
+    # Per paper: surface is "bounded by construction" by M and ∂H
+    # For edges touching a boundary surface, place vertex ON that surface (not at midpoint)
     cut_edge_indices = np.where(cut_edge_flags)[0]
     
     # Map from global edge index to surface vertex index
     edge_to_surface_vertex = {int(e): i for i, e in enumerate(cut_edge_indices)}
     
-    # Compute midpoints
+    # Compute cut point positions with boundary-aware placement
     surface_vertices = np.zeros((len(cut_edge_indices), 3), dtype=np.float64)
+    
+    # Track statistics for logging
+    n_part_boundary = 0   # Cut points placed on part surface M
+    n_hull_boundary = 0   # Cut points placed on hull boundary ∂H
+    n_midpoint = 0        # Cut points at edge midpoints (interior)
+    
     for i, e_idx in enumerate(cut_edge_indices):
         v0, v1 = edges[e_idx]
-        surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
+        
+        # Determine cut point placement based on boundary labels
+        if boundary_labels is not None:
+            bl0 = boundary_labels[v0]
+            bl1 = boundary_labels[v1]
+            
+            # Check if either vertex is on part surface M (boundary_label == -1)
+            # If so, place cut point at that vertex to ensure surface is bounded by M
+            if bl0 == -1 and bl1 != -1:
+                # v0 is on part surface, v1 is not → place at v0
+                surface_vertices[i] = verts[v0]
+                n_part_boundary += 1
+            elif bl1 == -1 and bl0 != -1:
+                # v1 is on part surface, v0 is not → place at v1
+                surface_vertices[i] = verts[v1]
+                n_part_boundary += 1
+            # Check if either vertex is on hull boundary ∂H (boundary_label == 1 or 2)
+            # If so, place cut point at that vertex to ensure surface is bounded by ∂H
+            elif bl0 in (1, 2) and bl1 not in (1, 2, -1):
+                # v0 is on hull boundary, v1 is interior → place at v0
+                surface_vertices[i] = verts[v0]
+                n_hull_boundary += 1
+            elif bl1 in (1, 2) and bl0 not in (1, 2, -1):
+                # v1 is on hull boundary, v0 is interior → place at v1
+                surface_vertices[i] = verts[v1]
+                n_hull_boundary += 1
+            else:
+                # Both interior, or both on same boundary type → use midpoint
+                surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
+                n_midpoint += 1
+        else:
+            # No boundary labels available → use midpoint (fallback)
+            surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
+            n_midpoint += 1
+    
+    logger.info(f"Cut point placement: {n_part_boundary} on part M, "
+                f"{n_hull_boundary} on hull ∂H, {n_midpoint} midpoints")
     
     result.vertex_to_edge = cut_edge_indices.copy()
     
@@ -435,7 +491,8 @@ def extract_parting_surface_from_tet_result(
         cut_edge_flags=cut_flags,
         tet_edge_indices=tet_result.tet_edge_indices,
         use_original_vertices=use_original_vertices,
-        vertices_original=tet_result.vertices_original
+        vertices_original=tet_result.vertices_original,
+        boundary_labels=tet_result.boundary_labels  # Pass for boundary-aware cut point placement
     )
 
 
@@ -605,199 +662,6 @@ def repair_parting_surface(
         return surface
 
 
-def fill_internal_holes(
-    surface: PartingSurfaceResult,
-    max_hole_edges: int = 8
-) -> PartingSurfaceResult:
-    """
-    Fill small internal holes in the parting surface mesh.
-    
-    These holes typically form due to:
-    - 5-edge or 6-edge tetrahedron configurations that are skipped
-    - Small gaps between marching tetrahedra triangles
-    
-    This function finds boundary loops (holes) in the mesh and fills them
-    with a simple fan triangulation if they have <= max_hole_edges.
-    
-    The new triangles become part of the mesh and will be smoothed along
-    with the rest of the surface.
-    
-    Args:
-        surface: PartingSurfaceResult with potential internal holes
-        max_hole_edges: Maximum number of edges in a hole to fill (default 8)
-                       Holes with more edges are likely intentional boundaries
-    
-    Returns:
-        PartingSurfaceResult with internal holes filled
-    """
-    if surface.mesh is None or surface.faces is None:
-        return surface
-    
-    import time
-    start = time.time()
-    
-    vertices = np.array(surface.mesh.vertices, dtype=np.float64)
-    faces = np.array(surface.mesh.faces, dtype=np.int64)
-    n_verts = len(vertices)
-    n_faces_original = len(faces)
-    
-    # Build edge-to-face map to find boundary edges
-    edge_face_count = {}  # edge_key -> count
-    edge_to_faces = {}    # edge_key -> list of (face_idx, v0, v1, v_opposite)
-    
-    for face_idx, face in enumerate(faces):
-        v0, v1, v2 = face
-        edges = [(v0, v1, v2), (v1, v2, v0), (v2, v0, v1)]
-        for va, vb, v_opp in edges:
-            edge_key = (min(va, vb), max(va, vb))
-            edge_face_count[edge_key] = edge_face_count.get(edge_key, 0) + 1
-            if edge_key not in edge_to_faces:
-                edge_to_faces[edge_key] = []
-            edge_to_faces[edge_key].append((face_idx, va, vb, v_opp))
-    
-    # Find boundary edges (appear in exactly 1 face)
-    boundary_edges = []
-    boundary_edge_winding = {}  # edge_key -> (v0, v1) with correct winding for fill
-    
-    for edge_key, count in edge_face_count.items():
-        if count == 1:
-            boundary_edges.append(edge_key)
-            # Get winding from the face - we need reverse winding for fill triangles
-            face_idx, va, vb, v_opp = edge_to_faces[edge_key][0]
-            # The boundary edge goes va->vb in the original face
-            # For a hole-filling face, we need the opposite direction
-            boundary_edge_winding[edge_key] = (vb, va)  # Reversed for fill
-    
-    if not boundary_edges:
-        logger.info("No internal holes found (no boundary edges)")
-        return surface
-    
-    logger.info(f"Found {len(boundary_edges)} boundary edges, looking for hole loops...")
-    
-    # Build adjacency for boundary edges
-    boundary_vertex_edges = {}  # vertex -> list of edge_keys
-    for edge_key in boundary_edges:
-        v0, v1 = edge_key
-        if v0 not in boundary_vertex_edges:
-            boundary_vertex_edges[v0] = []
-        if v1 not in boundary_vertex_edges:
-            boundary_vertex_edges[v1] = []
-        boundary_vertex_edges[v0].append(edge_key)
-        boundary_vertex_edges[v1].append(edge_key)
-    
-    # Find boundary loops using edge traversal
-    used_edges = set()
-    loops = []
-    
-    for start_edge in boundary_edges:
-        if start_edge in used_edges:
-            continue
-        
-        # Try to form a loop starting from this edge
-        v0, v1 = boundary_edge_winding[start_edge]
-        loop = [v0]
-        current = v1
-        current_edge = start_edge
-        used_edges.add(start_edge)
-        
-        max_loop_len = len(boundary_edges) + 1
-        while current != v0 and len(loop) < max_loop_len:
-            loop.append(current)
-            
-            # Find next edge from current vertex
-            next_edge = None
-            for edge_key in boundary_vertex_edges.get(current, []):
-                if edge_key not in used_edges:
-                    next_edge = edge_key
-                    break
-            
-            if next_edge is None:
-                # Dead end - not a closed loop
-                break
-            
-            used_edges.add(next_edge)
-            # Determine which vertex is "next"
-            e0, e1 = next_edge
-            if boundary_edge_winding[next_edge][0] == current:
-                current = boundary_edge_winding[next_edge][1]
-            else:
-                current = boundary_edge_winding[next_edge][0]
-        
-        # Check if we closed the loop
-        if current == v0 and len(loop) >= 3:
-            loops.append(loop)
-    
-    logger.info(f"Found {len(loops)} boundary loops")
-    
-    # Fill holes with simple fan triangulation
-    new_faces = []
-    holes_filled = 0
-    
-    for loop in loops:
-        n_edges = len(loop)
-        
-        if n_edges > max_hole_edges:
-            logger.debug(f"Skipping large loop with {n_edges} edges (> {max_hole_edges})")
-            continue
-        
-        # Use fan triangulation from centroid
-        # Create a new vertex at the centroid of the loop
-        loop_verts = vertices[loop]
-        centroid = np.mean(loop_verts, axis=0)
-        centroid_idx = len(vertices)
-        vertices = np.vstack([vertices, centroid.reshape(1, 3)])
-        
-        # Create triangles fanning from centroid
-        for i in range(n_edges):
-            v0 = loop[i]
-            v1 = loop[(i + 1) % n_edges]
-            # Triangle: centroid, v0, v1 (correct winding for inward-facing hole)
-            new_faces.append([centroid_idx, v0, v1])
-        
-        holes_filled += 1
-        logger.debug(f"Filled hole with {n_edges} edges using {n_edges} triangles")
-    
-    if holes_filled == 0:
-        logger.info("No internal holes filled (all loops too large)")
-        return surface
-    
-    # Combine original and new faces
-    new_faces_array = np.array(new_faces, dtype=np.int64)
-    all_faces = np.vstack([faces, new_faces_array])
-    
-    # Create new mesh
-    try:
-        new_mesh = trimesh.Trimesh(
-            vertices=vertices,
-            faces=all_faces,
-            process=False
-        )
-        new_mesh.fix_normals()
-    except Exception as e:
-        logger.error(f"Failed to create mesh after hole filling: {e}")
-        return surface
-    
-    # Create result
-    result = PartingSurfaceResult(
-        mesh=new_mesh,
-        vertices=vertices,
-        faces=all_faces,
-        vertex_to_edge=None,  # Invalidated by adding vertices
-        num_vertices=len(vertices),
-        num_faces=len(all_faces),
-        num_tets_processed=surface.num_tets_processed,
-        num_tets_contributing=surface.num_tets_contributing,
-        extraction_time_ms=surface.extraction_time_ms
-    )
-    
-    elapsed = (time.time() - start) * 1000
-    n_new_faces = len(all_faces) - n_faces_original
-    n_new_verts = len(vertices) - n_verts
-    logger.info(f"Filled {holes_filled} internal holes: added {n_new_verts} vertices, {n_new_faces} faces in {elapsed:.1f}ms")
-    
-    return result
-
-
 def repair_parting_surface_with_part(
     surface: PartingSurfaceResult,
     part_mesh: trimesh.Trimesh
@@ -860,23 +724,28 @@ def close_parting_surface_gaps(
     part_mesh: trimesh.Trimesh,
     distance_threshold: float = None,
     method: str = 'smart_curtain',
-    primary_surface_mesh: trimesh.Trimesh = None
+    primary_surface_mesh: trimesh.Trimesh = None,
+    hull_mesh: trimesh.Trimesh = None
 ) -> GapClosingResult:
     """
-    Close gaps between parting surface boundary edges and the part mesh (and optionally primary surface).
+    Close gaps between parting surface boundary edges and target surfaces.
+    
+    Per the paper Section 4.3: "The triangulated surface C is bounded by 
+    construction by the object surface mesh M and the external boundary ∂H."
+    
+    This function connects parting surface boundary edges to:
+    1. The part mesh M (inner boundary)
+    2. The hull mesh ∂H (outer boundary) - NEW
+    3. The primary surface (for secondary surfaces)
     
     IMPORTANT: This function returns the mesh with properly connected fill geometry.
     The `part_constrained_vertices` field contains indices of vertices that MUST
-    be constrained to stay on the part surface during any subsequent smoothing.
-    
-    For secondary surfaces, the primary_surface_mesh parameter allows gap filling to
-    connect to EITHER the part mesh OR the primary surface, whichever is closer.
-    This prevents fill triangles from intersecting the primary surface.
+    be constrained to stay on the part/hull surface during any subsequent smoothing.
     
     Algorithm:
-    1. Find boundary edges near the part (or primary surface)
+    1. Find boundary edges near target surfaces (part, hull, or primary)
     2. Build ordered chains from these edges
-    3. Project boundary vertices to closest point on part/primary surface
+    3. Project boundary vertices to closest point on nearest target surface
     4. Create fill triangles that:
        - Reference original surface vertices directly (no duplication)
        - Add only the projected-to-target vertices as new vertices
@@ -884,10 +753,11 @@ def close_parting_surface_gaps(
     
     Args:
         surface: PartingSurfaceResult with boundary edges to close
-        part_mesh: The original part mesh to close gaps against
-        distance_threshold: Max distance to consider "near part" (auto-computed if None)
+        part_mesh: The original part mesh to close gaps against (inner boundary M)
+        distance_threshold: Max distance to consider "near target" (auto-computed if None)
         method: Gap closing method (currently 'smart_curtain' is recommended)
         primary_surface_mesh: Optional primary parting surface mesh (for secondary surface gap filling)
+        hull_mesh: Optional hull mesh to close gaps against (outer boundary ∂H)
     
     Returns:
         GapClosingResult with new mesh including fill geometry and constraint info
@@ -945,21 +815,39 @@ def close_parting_surface_gaps(
         result.processing_time_ms = (time.time() - start) * 1000
         return result
     
-    # === Step 2: Compute distances to part surface (and optionally primary surface) ===
+    # === Step 2: Compute distances to target surfaces (part, hull, primary) ===
+    # Use MINIMUM distance from EITHER edge vertex to target surface
+    # This is more robust than using midpoint distance - if either vertex is near the target,
+    # we should create a fill triangle to ensure proper connection.
     boundary_edge_array = np.array(boundary_edges)
-    midpoints = 0.5 * (vertices[boundary_edge_array[:, 0]] + vertices[boundary_edge_array[:, 1]])
     
-    # Use trimesh's closest_point for accurate surface distance
-    closest_pts_part, distances_part, _ = trimesh.proximity.closest_point(part_mesh, midpoints)
+    # Get positions of both vertices for each edge
+    v0_positions = vertices[boundary_edge_array[:, 0]]
+    v1_positions = vertices[boundary_edge_array[:, 1]]
+    
+    # Compute distances from both vertices to part mesh
+    _, dist_v0_part, _ = trimesh.proximity.closest_point(part_mesh, v0_positions)
+    _, dist_v1_part, _ = trimesh.proximity.closest_point(part_mesh, v1_positions)
+    distances_part = np.minimum(dist_v0_part, dist_v1_part)
+    distances = distances_part.copy()
+    
+    # Also compute distances to hull mesh (outer boundary ∂H) 
+    distances_hull = None
+    if hull_mesh is not None:
+        _, dist_v0_hull, _ = trimesh.proximity.closest_point(hull_mesh, v0_positions)
+        _, dist_v1_hull, _ = trimesh.proximity.closest_point(hull_mesh, v1_positions)
+        distances_hull = np.minimum(dist_v0_hull, dist_v1_hull)
+        distances = np.minimum(distances, distances_hull)
+        logger.info(f"Computing distances to part AND hull mesh")
     
     # If primary surface provided, also compute distances to it
+    distances_primary = None
     if primary_surface_mesh is not None:
-        closest_pts_primary, distances_primary, _ = trimesh.proximity.closest_point(primary_surface_mesh, midpoints)
-        # Use minimum distance to either target
-        distances = np.minimum(distances_part, distances_primary)
-        logger.info(f"Computing distances to both part and primary surface")
-    else:
-        distances = distances_part
+        _, dist_v0_primary, _ = trimesh.proximity.closest_point(primary_surface_mesh, v0_positions)
+        _, dist_v1_primary, _ = trimesh.proximity.closest_point(primary_surface_mesh, v1_positions)
+        distances_primary = np.minimum(dist_v0_primary, dist_v1_primary)
+        distances = np.minimum(distances, distances_primary)
+        logger.info(f"Computing distances to primary surface")
     
     # Auto-compute threshold if not provided
     if distance_threshold is None:
@@ -971,14 +859,21 @@ def close_parting_surface_gaps(
         logger.info(f"Auto distance threshold: {distance_threshold:.4f}")
     
     # Find edges near target surfaces
-    near_part_mask = distances < distance_threshold
-    near_part_edges = boundary_edge_array[near_part_mask]
-    result.boundary_edges_near_part = len(near_part_edges)
+    near_target_mask = distances < distance_threshold
+    near_target_edges = boundary_edge_array[near_target_mask]
+    result.boundary_edges_near_part = len(near_target_edges)
     
-    target_desc = "part/primary" if primary_surface_mesh is not None else "part"
-    logger.info(f"Found {len(near_part_edges)} boundary edges near {target_desc} (< {distance_threshold:.4f})")
+    # Build target description for logging
+    targets = ["part"]
+    if hull_mesh is not None:
+        targets.append("hull")
+    if primary_surface_mesh is not None:
+        targets.append("primary")
+    target_desc = "/".join(targets)
     
-    if len(near_part_edges) == 0:
+    logger.info(f"Found {len(near_target_edges)} boundary edges near {target_desc} (< {distance_threshold:.4f})")
+    
+    if len(near_target_edges) == 0:
         logger.info(f"No boundary edges near {target_desc} - no gaps to close")
         result.mesh = mesh
         result.vertices = vertices
@@ -987,14 +882,15 @@ def close_parting_surface_gaps(
         return result
     
     # === Step 3: Build boundary chains from near-target edges ===
-    boundary_chains = _build_boundary_chains(near_part_edges)
+    boundary_chains = _build_boundary_chains(near_target_edges)
     result.boundary_loops_found = len(boundary_chains)
     logger.info(f"Found {len(boundary_chains)} boundary chains near {target_desc}")
     
     # === Step 4: Create fill geometry with proper vertex sharing ===
     fill_result = _create_connected_fill(
         vertices, faces, boundary_chains, part_mesh, boundary_edge_info, distance_threshold,
-        primary_surface_mesh=primary_surface_mesh
+        primary_surface_mesh=primary_surface_mesh,
+        hull_mesh=hull_mesh
     )
     new_vertices = fill_result['new_vertices']
     new_faces = fill_result['new_faces']
@@ -1187,179 +1083,165 @@ def _create_connected_fill(
     part_mesh: trimesh.Trimesh,
     boundary_edge_info: Dict,
     max_distance: float,
-    primary_surface_mesh: trimesh.Trimesh = None
+    primary_surface_mesh: trimesh.Trimesh = None,
+    hull_mesh: trimesh.Trimesh = None
 ) -> Dict:
     """
-    Create SINGLE fill triangles per boundary edge that connect to part mesh or primary surface.
+    Create fill geometry that connects parting surface boundary to target surfaces.
     
-    SIMPLIFIED APPROACH: For each boundary edge (bv0, bv1), create ONE triangle
-    that connects to a single projected point on the closest target surface.
+    Per the paper Section 4.3: "The triangulated surface C is bounded by 
+    construction by the object surface mesh M and the external boundary ∂H."
     
-    For secondary surface gap filling, we project to EITHER the part mesh OR the
-    primary surface, whichever is closer. This prevents fill triangles from
-    intersecting the primary surface when trying to reach the part.
+    This function creates a RIBBON of quads (2 triangles each) that form a proper
+    connection from the parting surface boundary to the target surface (part M, 
+    hull ∂H, or primary surface).
     
-    The projected point is the edge midpoint projected to the target surface.
-    Triangle: (bv0, bv1, projected_midpoint)
+    APPROACH: For each boundary vertex in a chain:
+    1. Project the vertex to the closest target surface
+    2. Create quads between adjacent (boundary_vertex, projected_vertex) pairs
     
-    The projected_midpoint vertex should be re-projected to the target during smoothing.
+    This creates a watertight ribbon that bridges the gap between the parting
+    surface and the target surfaces.
     
     Args:
         surface_vertices: Original parting surface vertices
         surface_faces: Original parting surface faces
         boundary_chains: List of (vertex_list, is_closed) tuples
-        part_mesh: Part mesh for projection
+        part_mesh: Part mesh for projection (inner boundary M)
         boundary_edge_info: Dict mapping edge_key to (v0, v1, v_opposite) for winding
         max_distance: Maximum allowed projection distance
         primary_surface_mesh: Optional primary parting surface (for secondary surfaces)
+        hull_mesh: Optional hull mesh for projection (outer boundary ∂H)
     
     Returns:
         Dict with keys:
-        - 'new_vertices': Projected midpoints (to be appended to surface_vertices)
+        - 'new_vertices': Projected vertices (to be appended to surface_vertices)
         - 'new_faces': Face indices referencing combined vertex array
-        - 'part_constrained_indices': Indices of projected vertices (should re-project to part)
+        - 'part_constrained_indices': Indices of projected vertices (should re-project to target)
         - 'fill_boundary_indices': Indices of original boundary vertices used (inner rim)
         - 'inner_rim_edges': Nx2 array of inner rim edge vertex pairs
     """
     n_orig_verts = len(surface_vertices)
-    new_vertices = []  # Projected midpoints
+    new_vertices = []  # Projected boundary vertices
     new_faces = []
-    part_constrained_indices = []  # Track which new vertices should stay on part
+    part_constrained_indices = []  # Track which new vertices should stay on target
     fill_boundary_indices = set()  # Track original boundary vertices used in fill
-    inner_rim_edges = []  # Track edges along the inner rim for boundary neighbor computation
+    inner_rim_edges = []  # Track edges along the inner rim
     
     for chain_idx, (chain_verts, is_closed) in enumerate(boundary_chains):
         if len(chain_verts) < 2:
             continue
         
         n_pts = len(chain_verts)
+        
+        # Project ALL boundary vertices to target surfaces
+        # This creates a continuous projected boundary on the target
+        boundary_positions = np.array([surface_vertices[v] for v in chain_verts])
+        
+        # Project to part mesh
+        proj_pts_part, dist_part, _ = trimesh.proximity.closest_point(part_mesh, boundary_positions)
+        proj_pts = proj_pts_part.copy()
+        proj_dists = dist_part.copy()
+        
+        # Check hull mesh if available
+        if hull_mesh is not None:
+            proj_pts_hull, dist_hull, _ = trimesh.proximity.closest_point(hull_mesh, boundary_positions)
+            # Use hull projection where it's closer
+            hull_closer = dist_hull < proj_dists
+            proj_pts[hull_closer] = proj_pts_hull[hull_closer]
+            proj_dists[hull_closer] = dist_hull[hull_closer]
+        
+        # Check primary mesh if available  
+        if primary_surface_mesh is not None:
+            proj_pts_primary, dist_primary, _ = trimesh.proximity.closest_point(primary_surface_mesh, boundary_positions)
+            # Use primary projection where it's closer
+            primary_closer = dist_primary < proj_dists
+            proj_pts[primary_closer] = proj_pts_primary[primary_closer]
+            proj_dists[primary_closer] = dist_primary[primary_closer]
+        
+        # Create mapping from boundary vertex to its projected vertex index
+        # Only include vertices within max_distance
+        boundary_to_proj = {}  # boundary_vertex_idx -> new_vertex_idx
+        
+        for i, bv in enumerate(chain_verts):
+            if proj_dists[i] <= max_distance:
+                # Check that projected point is actually different from boundary vertex
+                # (if they're the same, no fill needed)
+                dist_moved = np.linalg.norm(proj_pts[i] - boundary_positions[i])
+                if dist_moved > 1e-6:
+                    new_vert_idx = n_orig_verts + len(new_vertices)
+                    new_vertices.append(proj_pts[i])
+                    part_constrained_indices.append(new_vert_idx)
+                    boundary_to_proj[bv] = new_vert_idx
+                    fill_boundary_indices.add(bv)
+        
+        # Now create fill triangles (quads split into 2 triangles)
+        # For each edge in the boundary chain, create a quad if both vertices have projections
         n_edges = n_pts if is_closed else n_pts - 1
         
         for i in range(n_edges):
             next_i = (i + 1) % n_pts
             
-            # Original boundary vertex indices
             bv0 = chain_verts[i]
             bv1 = chain_verts[next_i]
             
-            # Get boundary edge positions
-            b0_pos = surface_vertices[bv0]
-            b1_pos = surface_vertices[bv1]
-            
-            # Check if edge is degenerate
-            edge_len = np.linalg.norm(b1_pos - b0_pos)
-            if edge_len < 1e-8:
+            # Check if both boundary vertices have projections
+            if bv0 not in boundary_to_proj or bv1 not in boundary_to_proj:
+                # One or both vertices didn't get projected - skip or create partial fill
+                # Try single triangle fill as fallback
+                if bv0 in boundary_to_proj:
+                    pv0 = boundary_to_proj[bv0]
+                    # Triangle: bv0, bv1, pv0
+                    new_faces.append([bv0, bv1, pv0])
+                    inner_rim_edges.append([bv0, bv1])
+                elif bv1 in boundary_to_proj:
+                    pv1 = boundary_to_proj[bv1]
+                    # Triangle: bv0, bv1, pv1
+                    new_faces.append([bv0, bv1, pv1])
+                    inner_rim_edges.append([bv0, bv1])
                 continue
             
-            # Compute edge midpoint
-            edge_midpoint = 0.5 * (b0_pos + b1_pos)
-            
-            # Project midpoint to part surface
-            proj_pts_part, distances_part, face_indices_part = trimesh.proximity.closest_point(part_mesh, [edge_midpoint])
-            proj_pt = proj_pts_part[0]
-            proj_dist = distances_part[0]
-            target_mesh = part_mesh
-            face_idx = face_indices_part[0]
-            
-            # If primary surface provided, check if it's closer
-            if primary_surface_mesh is not None:
-                proj_pts_primary, distances_primary, face_indices_primary = trimesh.proximity.closest_point(primary_surface_mesh, [edge_midpoint])
-                if distances_primary[0] < proj_dist:
-                    # Primary surface is closer - use it instead
-                    proj_pt = proj_pts_primary[0]
-                    proj_dist = distances_primary[0]
-                    target_mesh = primary_surface_mesh
-                    face_idx = face_indices_primary[0]
-            
-            # Skip if projection is too far
-            if proj_dist > max_distance:
-                continue
-            
-            # Check that projected point is not too close to either boundary vertex
-            # (would create degenerate triangle)
-            dist_to_b0 = np.linalg.norm(proj_pt - b0_pos)
-            dist_to_b1 = np.linalg.norm(proj_pt - b1_pos)
-            min_dist = min(dist_to_b0, dist_to_b1)
-            
-            # If the projected point is too close, it means the boundary is already
-            # on the target surface. In this case, move along the surface normal
-            # to find a valid projection point.
-            if min_dist < edge_len * MIN_PROJECTION_DISTANCE_FRACTION:
-                # Get the target surface normal at this point
-                target_normal = target_mesh.face_normals[face_idx]
-                
-                # Also get the direction from the adjacent face's interior to the edge
-                edge_key = (min(bv0, bv1), max(bv0, bv1))
-                if edge_key in boundary_edge_info:
-                    adj_v0, adj_v1, adj_opp = boundary_edge_info[edge_key]
-                    interior_dir = edge_midpoint - surface_vertices[adj_opp]
-                    interior_dir = interior_dir / (np.linalg.norm(interior_dir) + 1e-10)
-                    
-                    # Move the projection point along the target surface, away from interior
-                    # Project interior_dir onto the tangent plane of the target surface
-                    tangent_dir = interior_dir - np.dot(interior_dir, target_normal) * target_normal
-                    tangent_len = np.linalg.norm(tangent_dir)
-                    
-                    if tangent_len > 1e-6:
-                        tangent_dir = tangent_dir / tangent_len
-                        # Move by a fraction of the edge length along this direction
-                        offset = edge_len * PROJECTION_OFFSET_FRACTION
-                        candidate_pt = proj_pt + tangent_dir * offset
-                        
-                        # Re-project to ensure it's on the target surface
-                        new_proj_pts, new_dists, _ = trimesh.proximity.closest_point(target_mesh, [candidate_pt])
-                        proj_pt = new_proj_pts[0]
-                        
-                        # Re-check distances
-                        dist_to_b0 = np.linalg.norm(proj_pt - b0_pos)
-                        dist_to_b1 = np.linalg.norm(proj_pt - b1_pos)
-                        min_dist = min(dist_to_b0, dist_to_b1)
-                        
-                        # Still too close? Skip this edge
-                        if min_dist < edge_len * MIN_PROJECTION_DISTANCE_FRACTION:
-                            continue
-                    else:
-                        # Can't find a good tangent direction, skip
-                        continue
-                else:
-                    # No edge info, skip
-                    continue
-            
-            # Create new vertex for the projected midpoint
-            new_vert_idx = n_orig_verts + len(new_vertices)
-            new_vertices.append(proj_pt)
-            part_constrained_indices.append(new_vert_idx)
-            
-            # Track boundary vertices and inner rim edge
-            fill_boundary_indices.add(bv0)
-            fill_boundary_indices.add(bv1)
-            inner_rim_edges.append([bv0, bv1])
+            pv0 = boundary_to_proj[bv0]
+            pv1 = boundary_to_proj[bv1]
             
             # Determine winding direction from adjacent face
             edge_key = (min(bv0, bv1), max(bv0, bv1))
             
-            if edge_key in boundary_edge_info:
-                adj_v0, adj_v1, adj_opp = boundary_edge_info[edge_key]
-                
-                # Compute direction from edge to adjacent face's opposite vertex
-                edge_mid_adj = 0.5 * (surface_vertices[adj_v0] + surface_vertices[adj_v1])
-                to_inside = surface_vertices[adj_opp] - edge_mid_adj
-                
-                # Direction to projected point
-                to_proj = proj_pt - edge_midpoint
-                
-                # If projection is on same side as the opposite vertex, flip winding
-                same_side = np.dot(to_inside, to_proj) > 0
-                
-                if same_side:
-                    # Flip winding: normal points away from inside
-                    new_faces.append([bv0, bv1, new_vert_idx])
-                else:
-                    # Normal winding
-                    new_faces.append([bv0, new_vert_idx, bv1])
+            # Check if pv0 and pv1 are the same (degenerate quad)
+            if pv0 == pv1:
+                # Single triangle
+                new_faces.append([bv0, bv1, pv0])
             else:
-                # No edge info - default winding
-                new_faces.append([bv0, new_vert_idx, bv1])
+                # Full quad as two triangles
+                # The quad has vertices: bv0, bv1, pv1, pv0 (in order)
+                # We need consistent winding
+                
+                if edge_key in boundary_edge_info:
+                    adj_v0, adj_v1, adj_opp = boundary_edge_info[edge_key]
+                    
+                    # Determine which side the adjacent face's interior is on
+                    edge_mid = 0.5 * (surface_vertices[bv0] + surface_vertices[bv1])
+                    to_inside = surface_vertices[adj_opp] - edge_mid
+                    to_proj = new_vertices[pv0 - n_orig_verts] - edge_mid
+                    
+                    same_side = np.dot(to_inside, to_proj) > 0
+                    
+                    if same_side:
+                        # Projected points are on same side as interior - flip winding
+                        # Quad: bv0 -> bv1 -> pv1 -> pv0 (but we need CCW from outside)
+                        new_faces.append([bv0, bv1, pv1])
+                        new_faces.append([bv0, pv1, pv0])
+                    else:
+                        # Normal winding
+                        new_faces.append([bv0, pv0, pv1])
+                        new_faces.append([bv0, pv1, bv1])
+                else:
+                    # No edge info - default winding (assume projection is "outside")
+                    new_faces.append([bv0, pv0, pv1])
+                    new_faces.append([bv0, pv1, bv1])
+            
+            # Track inner rim edge
+            inner_rim_edges.append([bv0, bv1])
     
     if len(new_vertices) == 0:
         return {

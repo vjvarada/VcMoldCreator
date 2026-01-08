@@ -178,6 +178,182 @@ def build_triangle_adjacency(mesh: trimesh.Trimesh) -> Dict[int, List[int]]:
     return adjacency
 
 
+def classify_hull_faces_fast(
+    hull_mesh: trimesh.Trimesh,
+    d1: np.ndarray,
+    d2: np.ndarray,
+    boundary_zone_hops: int = 3
+) -> MoldHalfClassificationResult:
+    """
+    Fast hull face classification following the paper's algorithm exactly.
+    
+    Per paper: "Given the two parting directions, we partition the boundary ∂H
+    into two parts, ∂H1 and ∂H2: we select the two faces F1 and F2 of ∂H whose 
+    normals best align with d1 and d2 and then use a greedy region-growing 
+    approach from F1 and F2 to assign faces to ∂H1 and ∂H2."
+    
+    This is O(n) and much faster than the cavity-based classification.
+    
+    Args:
+        hull_mesh: The hull mesh (∂H) to partition
+        d1: First parting direction (normalized)
+        d2: Second parting direction (normalized)
+        boundary_zone_hops: Number of hops from interface to include in boundary zone
+    
+    Returns:
+        MoldHalfClassificationResult with H1, H2, and boundary zone
+    """
+    import time
+    start_time = time.time()
+    
+    n_faces = len(hull_mesh.faces)
+    face_normals = hull_mesh.face_normals
+    
+    # Normalize directions
+    d1 = d1 / np.linalg.norm(d1)
+    d2 = d2 / np.linalg.norm(d2)
+    
+    # Compute alignment scores for all faces (vectorized)
+    dot1 = face_normals @ d1  # (n_faces,)
+    dot2 = face_normals @ d2  # (n_faces,)
+    
+    # Find seed faces: F1 = best alignment with d1, F2 = best alignment with d2
+    f1 = int(np.argmax(dot1))
+    f2 = int(np.argmax(dot2))
+    
+    logger.debug(f"Seed faces: F1={f1} (dot={dot1[f1]:.3f}), F2={f2} (dot={dot2[f2]:.3f})")
+    
+    # Build adjacency
+    adjacency = build_triangle_adjacency(hull_mesh)
+    
+    # Initialize labels: 0 = unassigned, 1 = H1, 2 = H2
+    labels = np.zeros(n_faces, dtype=np.int8)
+    labels[f1] = 1
+    labels[f2] = 2
+    
+    # Priority queues for greedy expansion
+    # Use numpy arrays for faster processing
+    import heapq
+    
+    # (negative_score, face_idx) - negative so highest score pops first
+    pq1 = []  # H1 candidates
+    pq2 = []  # H2 candidates
+    in_queue = np.zeros(n_faces, dtype=bool)
+    
+    # Add neighbors of seeds to queues
+    for n_idx in adjacency[f1]:
+        if labels[n_idx] == 0:
+            heapq.heappush(pq1, (-dot1[n_idx], n_idx))
+            in_queue[n_idx] = True
+    
+    for n_idx in adjacency[f2]:
+        if labels[n_idx] == 0 and not in_queue[n_idx]:
+            heapq.heappush(pq2, (-dot2[n_idx], n_idx))
+            in_queue[n_idx] = True
+    
+    # Greedy expansion - alternate between H1 and H2
+    while pq1 or pq2:
+        # Expand H1
+        while pq1:
+            neg_score, idx = heapq.heappop(pq1)
+            if labels[idx] != 0:
+                continue
+            
+            # Assign based on which direction this face prefers
+            if dot1[idx] >= dot2[idx]:
+                labels[idx] = 1
+                # Add unassigned neighbors to H1 queue
+                for n_idx in adjacency[idx]:
+                    if labels[n_idx] == 0 and not in_queue[n_idx]:
+                        heapq.heappush(pq1, (-dot1[n_idx], n_idx))
+                        in_queue[n_idx] = True
+                break
+            else:
+                # This face prefers H2, move it there
+                heapq.heappush(pq2, (-dot2[idx], idx))
+        
+        # Expand H2
+        while pq2:
+            neg_score, idx = heapq.heappop(pq2)
+            if labels[idx] != 0:
+                continue
+            
+            if dot2[idx] >= dot1[idx]:
+                labels[idx] = 2
+                # Add unassigned neighbors to H2 queue
+                for n_idx in adjacency[idx]:
+                    if labels[n_idx] == 0 and not in_queue[n_idx]:
+                        heapq.heappush(pq2, (-dot2[n_idx], n_idx))
+                        in_queue[n_idx] = True
+                break
+            else:
+                # This face prefers H1, move it there
+                heapq.heappush(pq1, (-dot1[idx], idx))
+    
+    # Handle any remaining unassigned (disconnected components)
+    unassigned = labels == 0
+    if np.any(unassigned):
+        labels[unassigned] = np.where(dot1[unassigned] >= dot2[unassigned], 1, 2)
+    
+    # Find interface faces (where H1 meets H2)
+    interface_mask = np.zeros(n_faces, dtype=bool)
+    for i in range(n_faces):
+        my_label = labels[i]
+        for n_idx in adjacency[i]:
+            if labels[n_idx] != my_label:
+                interface_mask[i] = True
+                break
+    
+    # Expand boundary zone from interface using BFS
+    distance = np.full(n_faces, -1, dtype=np.int32)
+    distance[interface_mask] = 0
+    
+    queue = list(np.where(interface_mask)[0])
+    head = 0
+    
+    while head < len(queue):
+        idx = queue[head]
+        head += 1
+        d = distance[idx]
+        
+        if d >= boundary_zone_hops:
+            continue
+        
+        for n_idx in adjacency[idx]:
+            if distance[n_idx] == -1:
+                distance[n_idx] = d + 1
+                queue.append(n_idx)
+    
+    # Create boundary zone mask (distance >= 0 and <= boundary_zone_hops)
+    boundary_zone_mask = (distance >= 0) & (distance <= boundary_zone_hops)
+    
+    # Build result sets
+    h1_triangles = set(np.where((labels == 1) & ~boundary_zone_mask)[0])
+    h2_triangles = set(np.where((labels == 2) & ~boundary_zone_mask)[0])
+    boundary_zone_triangles = set(np.where(boundary_zone_mask)[0])
+    
+    # Build side_map (excluding boundary zone)
+    side_map = {}
+    for i in h1_triangles:
+        side_map[i] = 1
+    for i in h2_triangles:
+        side_map[i] = 2
+    
+    elapsed = (time.time() - start_time) * 1000
+    logger.info(f"Hull classification: H1={len(h1_triangles)}, H2={len(h2_triangles)}, "
+               f"boundary={len(boundary_zone_triangles)} in {elapsed:.0f}ms")
+    
+    return MoldHalfClassificationResult(
+        side_map=side_map,
+        h1_triangles=h1_triangles,
+        h2_triangles=h2_triangles,
+        boundary_zone_triangles=boundary_zone_triangles,
+        inner_boundary_triangles=set(),  # Hull has no inner boundary
+        total_triangles=n_faces,
+        outer_boundary_count=n_faces,
+    )
+
+
 def _classify_mold_halves_cpp(
     boundary_mesh: trimesh.Trimesh,
     outer_triangles: Set[int],
@@ -894,6 +1070,61 @@ def classify_mold_halves_fast(
             side[tri] = 1 if align1 >= align2 else 2
     
     return side
+
+
+def identify_outer_boundary_by_distance(
+    boundary_mesh: trimesh.Trimesh,
+    part_mesh: trimesh.Trimesh,
+    tolerance_fraction: float = 0.02
+) -> Tuple[Set[int], Set[int]]:
+    """
+    Fast outer boundary detection using vertex distance to part mesh.
+    
+    A face is "inner" (from part surface) if ALL its vertices are within 
+    tolerance of the part mesh. Otherwise it's "outer" (from hull surface).
+    
+    This is O(n) using KD-tree queries, much faster than the plane-based method.
+    
+    Args:
+        boundary_mesh: The boundary mesh to classify
+        part_mesh: The original part mesh
+        tolerance_fraction: Fraction of mesh size for tolerance (default 2%)
+    
+    Returns:
+        Tuple of (outer_triangles, inner_triangles) sets
+    """
+    from scipy.spatial import cKDTree
+    import time
+    start = time.time()
+    
+    # Compute tolerance based on mesh size
+    bounds = boundary_mesh.bounds
+    mesh_size = np.linalg.norm(bounds[1] - bounds[0])
+    tolerance = mesh_size * tolerance_fraction
+    
+    # Build KD-tree for part mesh vertices
+    part_tree = cKDTree(part_mesh.vertices)
+    
+    # Query distances for all boundary mesh vertices
+    boundary_verts = boundary_mesh.vertices
+    distances, _ = part_tree.query(boundary_verts, k=1)
+    
+    # Mark vertices as "near part" if within tolerance
+    near_part = distances < tolerance  # (n_verts,)
+    
+    # A face is inner if ALL its vertices are near part
+    faces = boundary_mesh.faces  # (n_faces, 3)
+    face_near_part = near_part[faces]  # (n_faces, 3)
+    all_near_part = np.all(face_near_part, axis=1)  # (n_faces,)
+    
+    inner_triangles = set(np.where(all_near_part)[0])
+    outer_triangles = set(np.where(~all_near_part)[0])
+    
+    elapsed = (time.time() - start) * 1000
+    logger.debug(f"Distance-based outer detection: {len(outer_triangles)} outer, "
+                f"{len(inner_triangles)} inner in {elapsed:.0f}ms")
+    
+    return outer_triangles, inner_triangles
 
 
 def identify_outer_boundary_from_tet_labels(
@@ -1652,7 +1883,19 @@ def classify_mold_halves(
         )
     
     # =========================================================================
-    # FALLBACK: Python pipeline
+    # FAST PATH: Hull-based classification (classify small hull, map to boundary)
+    # This is much faster for tet boundary meshes where hull << boundary mesh
+    # =========================================================================
+    if part_mesh is not None and len(hull_mesh.faces) < len(cavity_mesh.faces) / 5:
+        # Hull is much smaller than boundary mesh - use hull-based approach
+        logger.debug(f"Using hull-based classification (hull={len(hull_mesh.faces)}, boundary={n_triangles})")
+        return classify_mold_halves_via_hull(
+            cavity_mesh, hull_mesh, part_mesh,
+            d1, d2, boundary_zone_threshold
+        )
+    
+    # =========================================================================
+    # FALLBACK: Python pipeline (for when tet labels not available)
     # =========================================================================
     
     # Step 1: Identify outer boundary triangles
@@ -1662,7 +1905,13 @@ def classify_mold_halves(
             cavity_mesh, tet_vertices, tet_boundary_labels
         )
         logger.debug(f"Using tet labels: {len(outer_triangles)} outer, {len(inner_boundary_triangles)} inner")
-    elif use_proximity_method or part_mesh is not None:
+    elif part_mesh is not None:
+        # FAST: Use distance-based detection (O(n) with KD-tree)
+        outer_triangles, inner_boundary_triangles = identify_outer_boundary_by_distance(
+            cavity_mesh, part_mesh
+        )
+        logger.debug(f"Using distance method: {len(outer_triangles)} outer, {len(inner_boundary_triangles)} inner")
+    elif use_proximity_method:
         # Slower proximity-based method (for legacy compatibility)
         triangles_info = extract_triangle_info(cavity_mesh)
         outer_triangles = identify_outer_boundary_by_proximity(cavity_mesh, hull_mesh, part_mesh)
@@ -1835,3 +2084,149 @@ def get_mold_half_face_colors(
             colors[tri_idx] = MoldHalfColors.INNER
     
     return colors
+
+
+def classify_mold_halves_via_hull(
+    boundary_mesh: trimesh.Trimesh,
+    hull_mesh: trimesh.Trimesh,
+    part_mesh: trimesh.Trimesh,
+    d1: np.ndarray,
+    d2: np.ndarray,
+    boundary_zone_threshold: float = DEFAULT_BOUNDARY_ZONE_THRESHOLD
+) -> MoldHalfClassificationResult:
+    """
+    Fast mold half classification by classifying hull first, then mapping to boundary mesh.
+    
+    This is MUCH faster than classifying the full boundary mesh because:
+    - Hull mesh: typically 1-5k faces
+    - Tet boundary mesh: can be 50-500k faces
+    
+    Algorithm:
+    1. Classify hull mesh directly using fast region growing (O(hull_faces))
+    2. Identify outer vs inner triangles on boundary mesh using distance to part (O(boundary_faces))
+    3. Map outer triangles to hull classification using nearest centroid (O(outer_faces * log(hull_faces)))
+    
+    Args:
+        boundary_mesh: The tetrahedral boundary mesh (hull + part surfaces)
+        hull_mesh: The original hull mesh (much smaller)
+        part_mesh: The original part mesh
+        d1: First parting direction
+        d2: Second parting direction
+        boundary_zone_threshold: Threshold for boundary zone
+    
+    Returns:
+        MoldHalfClassificationResult
+    """
+    from scipy.spatial import cKDTree
+    import time
+    start_time = time.time()
+    
+    n_boundary_faces = len(boundary_mesh.faces)
+    n_hull_faces = len(hull_mesh.faces)
+    
+    # Normalize directions
+    d1 = d1 / np.linalg.norm(d1)
+    d2 = d2 / np.linalg.norm(d2)
+    
+    # Compute boundary zone hops
+    boundary_zone_hops = round(boundary_zone_threshold * boundary_zone_threshold * 180)
+    
+    # =========================================================================
+    # Step 1: Classify hull mesh (FAST - small mesh)
+    # =========================================================================
+    hull_start = time.time()
+    hull_classification = classify_hull_faces_fast(hull_mesh, d1, d2, boundary_zone_hops)
+    hull_time = (time.time() - hull_start) * 1000
+    
+    logger.debug(f"Hull classification in {hull_time:.0f}ms: "
+                f"H1={len(hull_classification.h1_triangles)}, H2={len(hull_classification.h2_triangles)}")
+    
+    # =========================================================================
+    # Step 2: Identify outer vs inner triangles on boundary mesh
+    # =========================================================================
+    outer_start = time.time()
+    outer_triangles, inner_triangles = identify_outer_boundary_by_distance(boundary_mesh, part_mesh)
+    outer_time = (time.time() - outer_start) * 1000
+    
+    logger.debug(f"Outer detection in {outer_time:.0f}ms: "
+                f"{len(outer_triangles)} outer, {len(inner_triangles)} inner")
+    
+    if len(outer_triangles) == 0:
+        # All triangles are inner (shouldn't happen normally)
+        return MoldHalfClassificationResult(
+            side_map={},
+            h1_triangles=set(),
+            h2_triangles=set(),
+            boundary_zone_triangles=set(),
+            inner_boundary_triangles=inner_triangles,
+            total_triangles=n_boundary_faces,
+            outer_boundary_count=0,
+        )
+    
+    # =========================================================================
+    # Step 3: Map outer triangles to hull classification using nearest centroid
+    # =========================================================================
+    map_start = time.time()
+    
+    # Compute hull face centroids
+    hull_verts = hull_mesh.vertices
+    hull_faces = hull_mesh.faces
+    hull_centroids = hull_verts[hull_faces].mean(axis=1)  # (n_hull, 3)
+    
+    # Build KD-tree for hull centroids
+    hull_tree = cKDTree(hull_centroids)
+    
+    # Compute boundary face centroids (only for outer faces)
+    boundary_verts = boundary_mesh.vertices
+    boundary_faces = boundary_mesh.faces
+    outer_indices = np.array(list(outer_triangles), dtype=np.int64)
+    outer_centroids = boundary_verts[boundary_faces[outer_indices]].mean(axis=1)  # (n_outer, 3)
+    
+    # Find nearest hull face for each outer boundary face
+    _, nearest_hull = hull_tree.query(outer_centroids, k=1)  # (n_outer,)
+    
+    # Create label array for hull faces: 1=H1, 2=H2, 0=boundary_zone
+    hull_labels = np.zeros(n_hull_faces, dtype=np.int8)
+    for idx in hull_classification.h1_triangles:
+        hull_labels[idx] = 1
+    for idx in hull_classification.h2_triangles:
+        hull_labels[idx] = 2
+    # boundary_zone stays 0
+    
+    # Map labels to outer boundary faces
+    outer_labels = hull_labels[nearest_hull]  # (n_outer,)
+    
+    map_time = (time.time() - map_start) * 1000
+    
+    # =========================================================================
+    # Step 4: Build result sets
+    # =========================================================================
+    h1_triangles = set(outer_indices[outer_labels == 1])
+    h2_triangles = set(outer_indices[outer_labels == 2])
+    boundary_zone_triangles = set(outer_indices[outer_labels == 0])
+    
+    # Build side_map
+    side_map = {}
+    for idx in h1_triangles:
+        side_map[idx] = 1
+    for idx in h2_triangles:
+        side_map[idx] = 2
+    
+    total_time = (time.time() - start_time) * 1000
+    
+    logger.info(
+        f"[Hull-based] Mold half classification in {total_time:.0f}ms "
+        f"(hull:{hull_time:.0f}ms, outer:{outer_time:.0f}ms, map:{map_time:.0f}ms): "
+        f"H1={len(h1_triangles)}, H2={len(h2_triangles)}, "
+        f"boundary={len(boundary_zone_triangles)}, inner={len(inner_triangles)}"
+    )
+    
+    return MoldHalfClassificationResult(
+        side_map=side_map,
+        h1_triangles=h1_triangles,
+        h2_triangles=h2_triangles,
+        boundary_zone_triangles=boundary_zone_triangles,
+        inner_boundary_triangles=inner_triangles,
+        total_triangles=n_boundary_faces,
+        outer_boundary_count=len(outer_triangles),
+    )

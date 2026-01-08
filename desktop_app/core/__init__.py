@@ -34,14 +34,6 @@ from core.inflated_hull import (
     ManifoldValidation,
     DEFAULT_INFLATION_PERCENT,
 )
-from core.mold_cavity import (
-    create_mold_cavity,
-    perform_csg_subtraction,
-    validate_cavity_mesh,
-    MoldCavityResult,
-    CavityValidation,
-    CAVITY_COLOR,
-)
 from core.mold_half_classification import (
     classify_mold_halves,
     get_mold_half_face_colors,
@@ -51,6 +43,8 @@ from core.mold_half_classification import (
 from core.tetrahedral_mesh import (
     generate_tetrahedral_mesh,
     tetrahedralize_mesh,
+    classify_tetrahedra,
+    filter_tetrahedra_outside_part,
     extract_edges,
     extract_boundary_surface,
     compute_edge_lengths,
@@ -111,13 +105,6 @@ __all__ = [
     'InflatedHullResult',
     'ManifoldValidation',
     'DEFAULT_INFLATION_PERCENT',
-    # Mold cavity
-    'create_mold_cavity',
-    'perform_csg_subtraction',
-    'validate_cavity_mesh',
-    'MoldCavityResult',
-    'CavityValidation',
-    'CAVITY_COLOR',
     # Mold half classification
     'classify_mold_halves',
     'get_mold_half_face_colors',
