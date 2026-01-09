@@ -1802,6 +1802,17 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             # Current mesh after cleaning
             current_mesh = repaired_result.mesh
             
+            # Track vertex_boundary_type through the pipeline (per paper Section 4.4)
+            # This ensures proper inner/outer boundary re-projection during smoothing
+            current_boundary_type = repaired_result.vertex_boundary_type
+            if current_boundary_type is not None:
+                n_part = np.sum(current_boundary_type == -1)
+                n_hull = np.sum(current_boundary_type == 1) + np.sum(current_boundary_type == 2)
+                n_interior = np.sum(current_boundary_type == 0)
+                self.progress.emit(f"Boundary types preserved: {n_part} part (inner), {n_hull} hull (outer), {n_interior} interior")
+            else:
+                self.progress.emit("WARNING: No vertex_boundary_type available - will use distance-based classification")
+            
             # === Step 3.5: Remove small boundary loops (holes < 4mm perimeter) ===
             from core.parting_surface import remove_small_boundary_loops, PartingSurfaceResult
             
@@ -1809,10 +1820,12 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             hole_removal_start = time.time()
             
             # Wrap current mesh in PartingSurfaceResult for the function
+            # Include vertex_boundary_type so it can be extended for new centroid vertices
             temp_surface = PartingSurfaceResult(
                 mesh=current_mesh,
                 vertices=np.array(current_mesh.vertices),
                 faces=np.array(current_mesh.faces),
+                vertex_boundary_type=current_boundary_type,
                 num_vertices=len(current_mesh.vertices),
                 num_faces=len(current_mesh.faces)
             )
@@ -1830,6 +1843,17 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             if hole_result.holes_filled > 0:
                 self.progress.emit(f"Filled {hole_result.holes_filled} small holes ({hole_removal_time_ms:.0f}ms)")
                 current_mesh = hole_result.mesh
+                
+                # Extend boundary_type for new centroid vertices (they are interior, type 0)
+                if current_boundary_type is not None and hole_result.new_centroid_indices is not None:
+                    new_verts = len(current_mesh.vertices)
+                    old_verts = len(current_boundary_type)
+                    if new_verts > old_verts:
+                        # Extend with interior type (0) for new centroids
+                        extended = np.zeros(new_verts, dtype=np.int8)
+                        extended[:old_verts] = current_boundary_type
+                        current_boundary_type = extended
+                        self.progress.emit(f"Extended boundary_type for {new_verts - old_verts} new centroid vertices")
             else:
                 self.progress.emit(f"No small holes found ({hole_removal_time_ms:.0f}ms)")
             
@@ -1839,14 +1863,12 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             # non-manifold edges that are bounded by construction by the object surface 
             # mesh M and the external boundary ∂H."
             #
-            # The parting surface is NATURALLY bounded by M and ∂H because:
-            # - Cut edges between part surface vertices (with different escape labels) have 
-            #   midpoints ON the part surface M
-            # - Cut edges between hull boundary vertices and interior vertices have midpoints
-            #   near the hull ∂H
+            # IMPORTANT: Per paper, boundary re-projection must use the ORIGINAL surface
+            # that each vertex belonged to, NOT the closest surface by distance.
+            # - Inner boundary (on part M): re-project to part mesh M
+            # - Outer boundary (on hull ∂H): re-project to hull mesh ∂H
             #
-            # Smoothing reprojects boundary vertices to M or ∂H to ensure proper connection.
-            # No gap filling is needed - this matches the paper's approach.
+            # This is tracked via vertex_boundary_type from extraction.
             
             if self.smooth_iterations > 0:
                 self.progress.emit(f"Smoothing surface ({self.smooth_iterations} iterations, λ={self.damping_factor})...")
@@ -1869,7 +1891,8 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                     primary_mesh=None,  # No primary for primary surface smoothing
                     iterations=self.smooth_iterations,
                     damping_factor=self.damping_factor,
-                    excluded_vertices=None  # No excluded vertices - smooth everything
+                    excluded_vertices=None,  # No excluded vertices - smooth everything
+                    vertex_boundary_type=current_boundary_type  # Use tracked boundary types
                 )
                 
                 result.smoothing_time_ms = (time.time() - smoothing_start) * 1000
@@ -1880,6 +1903,76 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                     current_mesh = smoothing_result.mesh
                 else:
                     self.progress.emit("Smoothing returned no mesh, using unsmoothed")
+            
+            # === Step 5: Remove orphan islands (small disconnected regions) ===
+            # Per paper: Surface should be continuous. Small disconnected fragments
+            # are artifacts that should be removed.
+            from core.surface_propagation import remove_isolated_islands
+            from core.parting_surface import PRIMARY_MIN_ISLAND_TRIANGLES
+            
+            self.progress.emit(f"Removing orphan islands (< {PRIMARY_MIN_ISLAND_TRIANGLES} triangles)...")
+            island_start = time.time()
+            
+            cleaned_mesh, islands_removed, tris_removed = remove_isolated_islands(
+                current_mesh,
+                min_triangles=PRIMARY_MIN_ISLAND_TRIANGLES
+            )
+            
+            island_time_ms = (time.time() - island_start) * 1000
+            
+            if islands_removed > 0:
+                self.progress.emit(f"Removed {islands_removed} orphan islands ({tris_removed} triangles) in {island_time_ms:.0f}ms")
+                current_mesh = cleaned_mesh
+            else:
+                self.progress.emit(f"No orphan islands found ({island_time_ms:.0f}ms)")
+            
+            # === Step 6: Fill tubular sections (thin elongated boundary loops) ===
+            from core.parting_surface import fill_tubular_sections
+            
+            self.progress.emit("Detecting and filling tubular sections...")
+            tubular_start = time.time()
+            
+            tubular_result = fill_tubular_sections(current_mesh)
+            tubular_time_ms = (time.time() - tubular_start) * 1000
+            
+            if tubular_result.tubular_sections_filled > 0:
+                self.progress.emit(f"Filled {tubular_result.tubular_sections_filled} tubular sections "
+                                  f"({tubular_result.fill_faces_added} faces) in {tubular_time_ms:.0f}ms")
+                current_mesh = tubular_result.mesh
+            else:
+                self.progress.emit(f"No tubular sections found ({tubular_time_ms:.0f}ms)")
+            
+            # === Step 7: Remove thin flat sections (degenerate elongated regions) ===
+            from core.parting_surface import remove_thin_flat_sections
+            
+            self.progress.emit("Detecting and removing thin flat sections...")
+            thin_start = time.time()
+            
+            thin_result = remove_thin_flat_sections(current_mesh)
+            thin_time_ms = (time.time() - thin_start) * 1000
+            
+            if thin_result.thin_sections_removed > 0:
+                self.progress.emit(f"Removed {thin_result.thin_sections_removed} thin sections "
+                                  f"({thin_result.faces_removed} faces) in {thin_time_ms:.0f}ms")
+                current_mesh = thin_result.mesh
+            else:
+                self.progress.emit(f"No thin flat sections found ({thin_time_ms:.0f}ms)")
+            
+            # === Step 8: Detect and repair self-folding geometry ===
+            from core.parting_surface import repair_self_folding
+            
+            self.progress.emit("Checking for self-folding geometry...")
+            fold_start = time.time()
+            
+            fold_result = repair_self_folding(current_mesh, remove_intersecting=False)
+            fold_time_ms = (time.time() - fold_start) * 1000
+            
+            if fold_result.self_folding_detected:
+                self.progress.emit(f"Self-folding detected: fixed {fold_result.flipped_faces_fixed} normal issues "
+                                  f"in {fold_time_ms:.0f}ms")
+                current_mesh = fold_result.mesh
+            else:
+                self.progress.emit(f"No self-folding detected ({fold_time_ms:.0f}ms)")
             
             # Set final result
             result.mesh = current_mesh

@@ -609,7 +609,8 @@ def smooth_membrane_with_boundary_reprojection(
     iterations: int = 5,
     damping_factor: float = 0.5,
     excluded_vertices: Optional[np.ndarray] = None,
-    use_fast_smoothing: bool = True
+    use_fast_smoothing: bool = True,
+    vertex_boundary_type: Optional[np.ndarray] = None
 ) -> SmoothingResult:
     """
     Smooth the membrane surface following the algorithm from Section 4.4 of the paper.
@@ -624,6 +625,12 @@ def smooth_membrane_with_boundary_reprojection(
     Each smoothing step is performed using a damping factor (0.5 in our experiments)
     to ensure a proper convergence to the final solution."
     
+    IMPORTANT: The key phrase is "which of the two surfaces they belonged to ORIGINALLY".
+    This means we must track vertex boundary origin during extraction, NOT re-classify
+    by closest distance during smoothing:
+    - INNER boundary vertices (on part surface M) must re-project to part M
+    - OUTER boundary vertices (on hull boundary ∂H) must re-project to hull ∂H
+    
     Args:
         membrane_mesh: The triangulated cut surface C to smooth
         part_mesh: The part/object surface mesh M (boundary constraint)
@@ -633,6 +640,11 @@ def smooth_membrane_with_boundary_reprojection(
         damping_factor: Smoothing damping factor (0.5 per paper)
         excluded_vertices: Optional array of vertex indices to exclude from smoothing
                           (e.g., gap-fill vertices that should remain fixed)
+        vertex_boundary_type: Array tracking original boundary type for each vertex
+                             -1 = on part surface M (INNER boundary, re-project to part)
+                              0 = interior (no boundary constraint)
+                              1/2 = on hull boundary ∂H (OUTER boundary, re-project to hull)
+                             If None, falls back to distance-based classification
     
     Returns:
         SmoothingResult with smoothed mesh and statistics
@@ -698,90 +710,213 @@ def smooth_membrane_with_boundary_reprojection(
                f"({len(boundary_verts)} boundary, {len(interior_verts)} interior, {len(excluded_set)} excluded)")
     
     # Classify boundary vertices: which surface do they belong to?
-    # We use TWO thresholds:
-    # 1. A tight threshold to determine which surface the vertex is ON
-    # 2. A looser threshold to allow re-projection even if not exactly on surface
-    boundary_surface = {}  # vertex index -> 'part', 'hull', 'primary', or 'closest'
+    # Per paper Section 4.4: re-project to "the original surface ... they belonged to originally"
+    # 
+    # NEW (correct): Use vertex_boundary_type from extraction if available
+    #   -1 = on part surface M (INNER boundary) → re-project to part
+    #    0 = interior (no boundary constraint)
+    #   1/2 = on hull boundary ∂H (OUTER boundary) → re-project to hull
+    #
+    # FALLBACK (old): Distance-based classification (may cause issues)
+    
+    boundary_surface = {}  # vertex index -> 'part', 'hull', 'primary', or 'patch'
     
     mesh_scale = np.linalg.norm(membrane_mesh.bounds[1] - membrane_mesh.bounds[0])
     
-    # Tight tolerance for classification (which surface is this vertex ON)
-    on_surface_tolerance = mesh_scale * ON_SURFACE_TOLERANCE_FRACTION
+    # Check if we have proper boundary type information from extraction
+    use_boundary_type_classification = (
+        vertex_boundary_type is not None and 
+        len(vertex_boundary_type) == n_verts
+    )
     
-    # Loose tolerance for re-projection (allow bridging gaps)
-    # Any boundary vertex within this distance will be re-projected to closest surface
-    max_reproject_distance = mesh_scale * MAX_REPROJECT_DISTANCE_FRACTION
-    
-    # OPTIMIZATION: Batch all distance queries instead of one-by-one
-    boundary_verts_array = np.array(boundary_verts, dtype=np.int64)
-    boundary_positions = vertices[boundary_verts_array]
-    n_boundary = len(boundary_verts_array)
-    
-    # Compute distances to all surfaces in batch
-    dist_to_part = np.full(n_boundary, np.inf)
-    dist_to_hull = np.full(n_boundary, np.inf)
-    dist_to_primary = np.full(n_boundary, np.inf)
-    
-    if part_proximity is not None:
-        _, dist_to_part, _ = part_proximity.on_surface(boundary_positions)
-    
-    if hull_proximity is not None:
-        _, dist_to_hull, _ = hull_proximity.on_surface(boundary_positions)
-    
-    if primary_proximity is not None:
-        _, dist_to_primary, _ = primary_proximity.on_surface(boundary_positions)
-    
-    # Classify each boundary vertex based on distances
-    for i, vi in enumerate(boundary_verts):
-        d_part = dist_to_part[i]
-        d_hull = dist_to_hull[i]
-        d_primary = dist_to_primary[i]
+    if use_boundary_type_classification:
+        # === NEW CORRECT CLASSIFICATION ===
+        # Use the vertex_boundary_type from extraction (per paper Section 4.4)
+        logger.info("Using vertex_boundary_type for boundary classification (per paper Section 4.4)")
         
-        # First, check if vertex is clearly ON one surface (within tight tolerance)
-        # Priority: primary > part > hull (for secondary surfaces touching primary)
-        # For primary surfaces: part > hull
-        if primary_proximity is not None and d_primary < on_surface_tolerance:
-            boundary_surface[vi] = 'primary'
-        elif d_part < on_surface_tolerance:
-            boundary_surface[vi] = 'part'
-        elif d_hull < on_surface_tolerance:
-            boundary_surface[vi] = 'hull'
-        else:
-            # Not clearly ON any surface - find the CLOSEST surface within max distance
-            # This handles corners and gap-bridging cases
-            min_dist = min(d_part, d_hull, d_primary if primary_proximity else np.inf)
-            
-            if min_dist < max_reproject_distance:
-                # Re-project to closest surface to bridge the gap
-                if d_part == min_dist:
-                    boundary_surface[vi] = 'closest_part'
-                elif d_hull == min_dist:
-                    boundary_surface[vi] = 'closest_hull'
-                else:
-                    boundary_surface[vi] = 'closest_primary'
+        for vi in boundary_verts:
+            bt = vertex_boundary_type[vi]
+            if bt == -1:
+                # INNER boundary - originally on part surface M
+                boundary_surface[vi] = 'part'
+            elif bt in (1, 2):
+                # OUTER boundary - originally on hull boundary ∂H
+                boundary_surface[vi] = 'hull'
             else:
-                # Too far from all surfaces - leave as 'patch'
+                # Interior vertex that somehow became a boundary vertex
+                # This can happen with gap-fill triangles or mesh modifications
+                # Fall back to distance-based classification for these
                 boundary_surface[vi] = 'patch'
-    
-    part_count = sum(1 for s in boundary_surface.values() if s in ('part', 'closest_part'))
-    hull_count = sum(1 for s in boundary_surface.values() if s in ('hull', 'closest_hull'))
-    primary_count = sum(1 for s in boundary_surface.values() if s in ('primary', 'closest_primary'))
-    patch_count = sum(1 for s in boundary_surface.values() if s == 'patch')
-    closest_count = sum(1 for s in boundary_surface.values() if s.startswith('closest_'))
-    
-    # Log distance statistics for debugging
-    if part_proximity is not None:
-        logger.info(f"Part distances - min: {dist_to_part.min():.4f}, max: {dist_to_part.max():.4f}, "
-                   f"mean: {dist_to_part.mean():.4f}")
-    if hull_proximity is not None:
-        logger.info(f"Hull distances - min: {dist_to_hull.min():.4f}, max: {dist_to_hull.max():.4f}, "
-                   f"mean: {dist_to_hull.mean():.4f}")
-    if primary_proximity is not None:
-        logger.info(f"Primary distances - min: {dist_to_primary.min():.4f}, max: {dist_to_primary.max():.4f}, "
-                   f"mean: {dist_to_primary.mean():.4f}")
-    logger.info(f"Tolerances: on-surface={on_surface_tolerance:.4f}, max-reproject={max_reproject_distance:.4f} (mesh scale: {mesh_scale:.4f})")
-    logger.info(f"Boundary classification: {part_count} to part, "
-               f"{hull_count} to hull, {primary_count} to primary, {patch_count} patch ({closest_count} gap-bridging)")
+        
+        part_count = sum(1 for s in boundary_surface.values() if s == 'part')
+        hull_count = sum(1 for s in boundary_surface.values() if s == 'hull')
+        patch_count = sum(1 for s in boundary_surface.values() if s == 'patch')
+        
+        logger.info(f"Boundary classification (from extraction): {part_count} to part (inner), "
+                   f"{hull_count} to hull (outer), {patch_count} patch (needs fallback)")
+        
+        # For 'patch' vertices, use NEIGHBOR PROPAGATION first, then distance as last resort
+        # This is important because the inflated hull CONTAINS the part mesh, so interior-
+        # turned-boundary vertices may be closer to part by distance but topologically
+        # belong to the outer (hull) boundary chain.
+        if patch_count > 0:
+            from trimesh.proximity import ProximityQuery
+            
+            # Build boundary adjacency to find neighbors along boundary edges
+            boundary_adjacency = {v: set() for v in boundary_verts}
+            for v0, v1 in boundary_edges:
+                boundary_adjacency[v0].add(v1)
+                boundary_adjacency[v1].add(v0)
+            
+            # STEP 1: Propagate from already-classified vertices to their patch neighbors
+            # This uses the boundary chain topology rather than distance
+            propagated_count = 0
+            changed = True
+            max_propagation_rounds = 10  # Prevent infinite loop
+            propagation_round = 0
+            
+            while changed and propagation_round < max_propagation_rounds:
+                changed = False
+                propagation_round += 1
+                for vi in list(boundary_verts):
+                    if boundary_surface.get(vi) != 'patch':
+                        continue
+                    
+                    # Look at neighbors along boundary edges
+                    neighbors = boundary_adjacency.get(vi, set())
+                    neighbor_types = [boundary_surface.get(n) for n in neighbors if n in boundary_surface]
+                    
+                    # Count non-patch classifications
+                    part_neighbors = sum(1 for t in neighbor_types if t in ('part', 'closest_part'))
+                    hull_neighbors = sum(1 for t in neighbor_types if t in ('hull', 'closest_hull'))
+                    
+                    # If ALL classified neighbors agree, propagate that classification
+                    if part_neighbors > 0 and hull_neighbors == 0:
+                        boundary_surface[vi] = 'propagated_part'
+                        changed = True
+                        propagated_count += 1
+                    elif hull_neighbors > 0 and part_neighbors == 0:
+                        boundary_surface[vi] = 'propagated_hull'
+                        changed = True
+                        propagated_count += 1
+                    # If neighbors disagree (mixed), leave as 'patch' for distance fallback
+            
+            logger.info(f"Propagation classified {propagated_count} patch vertices in {propagation_round} rounds")
+            
+            # STEP 2: For remaining 'patch' vertices, use distance-based fallback
+            remaining_patches = [vi for vi in boundary_verts if boundary_surface.get(vi) == 'patch']
+            
+            if len(remaining_patches) > 0 and (part_mesh is not None or hull_mesh is not None):
+                patch_positions = vertices[remaining_patches]
+                
+                # Build proximity queries
+                if part_mesh is not None and len(part_mesh.faces) > 0:
+                    part_prox = ProximityQuery(part_mesh)
+                    _, dist_to_part, _ = part_prox.on_surface(patch_positions)
+                else:
+                    dist_to_part = np.full(len(remaining_patches), np.inf)
+                
+                if hull_mesh is not None and len(hull_mesh.faces) > 0:
+                    hull_prox = ProximityQuery(hull_mesh)
+                    _, dist_to_hull, _ = hull_prox.on_surface(patch_positions)
+                else:
+                    dist_to_hull = np.full(len(remaining_patches), np.inf)
+                
+                for i, vi in enumerate(remaining_patches):
+                    if dist_to_part[i] < dist_to_hull[i]:
+                        boundary_surface[vi] = 'closest_part'
+                    else:
+                        boundary_surface[vi] = 'closest_hull'
+                
+                logger.info(f"Distance fallback for {len(remaining_patches)} remaining patch vertices: "
+                           f"{sum(1 for vi in remaining_patches if boundary_surface[vi] == 'closest_part')} to part, "
+                           f"{sum(1 for vi in remaining_patches if boundary_surface[vi] == 'closest_hull')} to hull")
+            
+            # Summary of all fallback classifications
+            total_part = sum(1 for vi in boundary_verts if boundary_surface.get(vi) in ('propagated_part', 'closest_part'))
+            total_hull = sum(1 for vi in boundary_verts if boundary_surface.get(vi) in ('propagated_hull', 'closest_hull'))
+            logger.info(f"Total fallback classification: {total_part} to part, {total_hull} to hull")
+        
+        primary_count = 0  # Not used for primary surfaces
+        closest_count = sum(1 for s in boundary_surface.values() if s.startswith('closest_'))
+        
+    else:
+        # === FALLBACK: DISTANCE-BASED CLASSIFICATION ===
+        # This is the old method - may cause incorrect re-projection
+        logger.warning("No vertex_boundary_type provided - using distance-based classification (may be inaccurate)")
+        
+        # Tight tolerance for classification (which surface is this vertex ON)
+        on_surface_tolerance = mesh_scale * ON_SURFACE_TOLERANCE_FRACTION
+        
+        # Loose tolerance for re-projection (allow bridging gaps)
+        max_reproject_distance = mesh_scale * MAX_REPROJECT_DISTANCE_FRACTION
+        
+        # OPTIMIZATION: Batch all distance queries instead of one-by-one
+        boundary_verts_array = np.array(boundary_verts, dtype=np.int64)
+        boundary_positions = vertices[boundary_verts_array]
+        n_boundary = len(boundary_verts_array)
+        
+        # Compute distances to all surfaces in batch
+        dist_to_part = np.full(n_boundary, np.inf)
+        dist_to_hull = np.full(n_boundary, np.inf)
+        dist_to_primary = np.full(n_boundary, np.inf)
+        
+        if part_proximity is not None:
+            _, dist_to_part, _ = part_proximity.on_surface(boundary_positions)
+        
+        if hull_proximity is not None:
+            _, dist_to_hull, _ = hull_proximity.on_surface(boundary_positions)
+        
+        if primary_proximity is not None:
+            _, dist_to_primary, _ = primary_proximity.on_surface(boundary_positions)
+        
+        # Classify each boundary vertex based on distances
+        for i, vi in enumerate(boundary_verts):
+            d_part = dist_to_part[i]
+            d_hull = dist_to_hull[i]
+            d_primary = dist_to_primary[i]
+            
+            # First, check if vertex is clearly ON one surface (within tight tolerance)
+            # Priority: primary > part > hull (for secondary surfaces touching primary)
+            if primary_proximity is not None and d_primary < on_surface_tolerance:
+                boundary_surface[vi] = 'primary'
+            elif d_part < on_surface_tolerance:
+                boundary_surface[vi] = 'part'
+            elif d_hull < on_surface_tolerance:
+                boundary_surface[vi] = 'hull'
+            else:
+                # Not clearly ON any surface - find the CLOSEST surface within max distance
+                min_dist = min(d_part, d_hull, d_primary if primary_proximity else np.inf)
+                
+                if min_dist < max_reproject_distance:
+                    if d_part == min_dist:
+                        boundary_surface[vi] = 'closest_part'
+                    elif d_hull == min_dist:
+                        boundary_surface[vi] = 'closest_hull'
+                    else:
+                        boundary_surface[vi] = 'closest_primary'
+                else:
+                    boundary_surface[vi] = 'patch'
+        
+        part_count = sum(1 for s in boundary_surface.values() if s in ('part', 'closest_part'))
+        hull_count = sum(1 for s in boundary_surface.values() if s in ('hull', 'closest_hull'))
+        primary_count = sum(1 for s in boundary_surface.values() if s in ('primary', 'closest_primary'))
+        patch_count = sum(1 for s in boundary_surface.values() if s == 'patch')
+        closest_count = sum(1 for s in boundary_surface.values() if s.startswith('closest_'))
+        
+        # Log distance statistics for debugging
+        if part_proximity is not None:
+            logger.info(f"Part distances - min: {dist_to_part.min():.4f}, max: {dist_to_part.max():.4f}, "
+                       f"mean: {dist_to_part.mean():.4f}")
+        if hull_proximity is not None:
+            logger.info(f"Hull distances - min: {dist_to_hull.min():.4f}, max: {dist_to_hull.max():.4f}, "
+                       f"mean: {dist_to_hull.mean():.4f}")
+        if primary_proximity is not None:
+            logger.info(f"Primary distances - min: {dist_to_primary.min():.4f}, max: {dist_to_primary.max():.4f}, "
+                       f"mean: {dist_to_primary.mean():.4f}")
+        logger.info(f"Tolerances: on-surface={on_surface_tolerance:.4f}, max-reproject={max_reproject_distance:.4f} (mesh scale: {mesh_scale:.4f})")
+        logger.info(f"Boundary classification (distance-based): {part_count} to part, "
+                   f"{hull_count} to hull, {primary_count} to primary, {patch_count} patch ({closest_count} gap-bridging)")
     
     # Build vertex adjacency (along boundary and overall)
     vertex_neighbors = [set() for _ in range(n_verts)]
@@ -821,9 +956,9 @@ def smooth_membrane_with_boundary_reprojection(
         if vi in excluded_set:
             continue
         surface_type = boundary_surface.get(vi, 'patch')
-        if surface_type in ('part', 'closest_part'):
+        if surface_type in ('part', 'closest_part', 'propagated_part'):
             part_boundary_indices.append(vi)
-        elif surface_type in ('hull', 'closest_hull'):
+        elif surface_type in ('hull', 'closest_hull', 'propagated_hull'):
             hull_boundary_indices.append(vi)
         elif surface_type in ('primary', 'closest_primary'):
             primary_boundary_indices.append(vi)

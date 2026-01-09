@@ -46,6 +46,17 @@ DISTANCE_THRESHOLD_EDGE_MULTIPLIER = 3.0  # threshold = median_edge_length * thi
 # Small polyline removal thresholds
 DEFAULT_MIN_LOOP_PERIMETER = 4.0  # Default minimum perimeter in mm for closed loops to keep
 
+# Tubular section detection thresholds
+# A "tubular" section is a small-diameter closed boundary loop
+# We detect these by comparing perimeter to the "span" (max distance across loop)
+TUBULAR_ASPECT_RATIO_THRESHOLD = 6.0  # perimeter / span ratio above this is tubular
+TUBULAR_MAX_PERIMETER = 15.0  # Maximum perimeter (mm) to consider for tubular detection
+MIN_TUBULAR_VERTICES = 6  # Minimum vertices in loop to consider tubular
+
+# Island removal for primary surfaces
+PRIMARY_MIN_ISLAND_TRIANGLES = 10  # Minimum triangles to keep an island (primary surface)
+PRIMARY_MIN_ISLAND_AREA_FRACTION = 0.01  # Islands with area < 1% of total are removed
+
 
 # =============================================================================
 # MARCHING TETRAHEDRA LOOKUP TABLES
@@ -173,6 +184,14 @@ class PartingSurfaceResult:
     # vertex_to_edge[sv] = global edge index that this vertex sits on
     vertex_to_edge: Optional[np.ndarray] = None
     
+    # Boundary type for each vertex (per paper Section 4.3-4.4):
+    # -1 = placed on part surface M (INNER boundary - re-project to part)
+    #  0 = interior (midpoint - no boundary constraint)
+    #  1 = placed on hull H1 boundary (OUTER boundary - re-project to hull)
+    #  2 = placed on hull H2 boundary (OUTER boundary - re-project to hull)
+    # This is used during smoothing to correctly re-project boundary vertices
+    vertex_boundary_type: Optional[np.ndarray] = None
+    
     # Statistics
     num_vertices: int = 0
     num_faces: int = 0
@@ -249,7 +268,7 @@ def extract_parting_surface(
         return result
     
     # Step 1: Compute cut point positions for all cut edges
-    # Per paper: surface is "bounded by construction" by M and ∂H
+    # Per paper Section 4.3: surface is "bounded by construction" by M and ∂H
     # For edges touching a boundary surface, place vertex ON that surface (not at midpoint)
     cut_edge_indices = np.where(cut_edge_flags)[0]
     
@@ -258,6 +277,13 @@ def extract_parting_surface(
     
     # Compute cut point positions with boundary-aware placement
     surface_vertices = np.zeros((len(cut_edge_indices), 3), dtype=np.float64)
+    
+    # Track boundary type for each vertex (per paper Section 4.4):
+    # -1 = on part surface M (INNER boundary - re-project to part during smoothing)
+    #  0 = interior midpoint (no boundary constraint)
+    #  1 = on hull H1 boundary (OUTER boundary - re-project to hull)
+    #  2 = on hull H2 boundary (OUTER boundary - re-project to hull)
+    vertex_boundary_type = np.zeros(len(cut_edge_indices), dtype=np.int8)
     
     # Track statistics for logging
     n_part_boundary = 0   # Cut points placed on part surface M
@@ -274,37 +300,64 @@ def extract_parting_surface(
             
             # Check if either vertex is on part surface M (boundary_label == -1)
             # If so, place cut point at that vertex to ensure surface is bounded by M
+            # Mark as INNER boundary (type -1) for re-projection to part during smoothing
             if bl0 == -1 and bl1 != -1:
                 # v0 is on part surface, v1 is not → place at v0
                 surface_vertices[i] = verts[v0]
+                vertex_boundary_type[i] = -1  # INNER boundary - re-project to part M
                 n_part_boundary += 1
             elif bl1 == -1 and bl0 != -1:
                 # v1 is on part surface, v0 is not → place at v1
                 surface_vertices[i] = verts[v1]
+                vertex_boundary_type[i] = -1  # INNER boundary - re-project to part M
+                n_part_boundary += 1
+            elif bl0 == -1 and bl1 == -1:
+                # BOTH on part surface → use midpoint but still mark as part boundary
+                surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
+                vertex_boundary_type[i] = -1  # INNER boundary - re-project to part M
                 n_part_boundary += 1
             # Check if either vertex is on hull boundary ∂H (boundary_label == 1 or 2)
             # If so, place cut point at that vertex to ensure surface is bounded by ∂H
-            elif bl0 in (1, 2) and bl1 not in (1, 2, -1):
+            # Mark as OUTER boundary (type 1 or 2) for re-projection to hull during smoothing
+            elif bl0 in (1, 2) and bl1 == 0:
                 # v0 is on hull boundary, v1 is interior → place at v0
                 surface_vertices[i] = verts[v0]
+                vertex_boundary_type[i] = bl0  # OUTER boundary - re-project to hull ∂H
                 n_hull_boundary += 1
-            elif bl1 in (1, 2) and bl0 not in (1, 2, -1):
+            elif bl1 in (1, 2) and bl0 == 0:
                 # v1 is on hull boundary, v0 is interior → place at v1
                 surface_vertices[i] = verts[v1]
+                vertex_boundary_type[i] = bl1  # OUTER boundary - re-project to hull ∂H
+                n_hull_boundary += 1
+            elif bl0 in (1, 2) and bl1 in (1, 2):
+                # BOTH on hull boundary → use midpoint but still mark as hull boundary
+                surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
+                vertex_boundary_type[i] = bl0  # OUTER boundary - re-project to hull ∂H
+                n_hull_boundary += 1
+            elif (bl0 in (1, 2) and bl1 == -1) or (bl1 in (1, 2) and bl0 == -1):
+                # One on hull, one on part - this is a seam edge
+                # Place at midpoint, but should still connect to BOTH boundaries
+                # For re-projection, prefer hull since outer boundary projection is critical
+                surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
+                # Mark as hull boundary since we want outer edges to project to hull
+                vertex_boundary_type[i] = bl0 if bl0 in (1, 2) else bl1  # OUTER boundary
                 n_hull_boundary += 1
             else:
-                # Both interior, or both on same boundary type → use midpoint
+                # Both interior (bl0 == 0 and bl1 == 0) → use midpoint
                 surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
+                vertex_boundary_type[i] = 0  # Interior - no boundary constraint
                 n_midpoint += 1
         else:
             # No boundary labels available → use midpoint (fallback)
             surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
+            vertex_boundary_type[i] = 0  # Interior - no boundary constraint
             n_midpoint += 1
     
-    logger.info(f"Cut point placement: {n_part_boundary} on part M, "
-                f"{n_hull_boundary} on hull ∂H, {n_midpoint} midpoints")
+    logger.info(f"Cut point placement: {n_part_boundary} on part M (inner), "
+                f"{n_hull_boundary} on hull ∂H (outer), {n_midpoint} midpoints (interior)")
     
     result.vertex_to_edge = cut_edge_indices.copy()
+    result.vertex_boundary_type = vertex_boundary_type
     
     # Step 2: Process each tetrahedron
     triangles = []
@@ -590,9 +643,12 @@ def repair_parting_surface(
     Clean the parting surface mesh by merging vertices and removing degenerate faces.
     
     This performs:
-    1. Merge duplicate/close vertices
+    1. Merge duplicate/close vertices (preserving boundary types)
     2. Remove degenerate faces (zero area)
     3. Remove small area triangles (< min_area)
+    
+    IMPORTANT: This function preserves vertex_boundary_type through the repair process
+    by tracking vertex merging and keeping boundary types from merged vertices.
     
     Args:
         surface: PartingSurfaceResult to clean
@@ -600,7 +656,7 @@ def repair_parting_surface(
         merge_threshold: Distance threshold for vertex merging
     
     Returns:
-        Cleaned PartingSurfaceResult
+        Cleaned PartingSurfaceResult with updated vertex_boundary_type
     """
     if surface.mesh is None:
         return surface
@@ -613,9 +669,74 @@ def repair_parting_surface(
         initial_verts = len(mesh.vertices)
         initial_faces = len(mesh.faces)
         
+        # Track vertex boundary type through the repair process
+        has_boundary_type = surface.vertex_boundary_type is not None and len(surface.vertex_boundary_type) == initial_verts
+        current_boundary_type = surface.vertex_boundary_type.copy() if has_boundary_type else None
+        
         # Step 1: Merge close vertices
         if merge_vertices:
-            mesh.merge_vertices(merge_tex=False, merge_norm=False)
+            # Before merge, we need to track which vertices get merged
+            # trimesh.merge_vertices() doesn't give us a mapping, so we rebuild manually
+            from scipy.spatial import cKDTree
+            
+            vertices = np.array(mesh.vertices)
+            faces = np.array(mesh.faces)
+            
+            # Find unique vertices
+            tree = cKDTree(vertices)
+            # pairs contains (i, j) pairs where dist(v_i, v_j) < merge_threshold
+            # We need the first unique representative for each group
+            used = np.zeros(len(vertices), dtype=bool)
+            vertex_map = np.arange(len(vertices))  # Maps old indices to new indices
+            new_vertices = []
+            new_boundary_type = [] if has_boundary_type else None
+            
+            for i in range(len(vertices)):
+                if used[i]:
+                    continue
+                    
+                # Find all vertices close to this one
+                neighbors = tree.query_ball_point(vertices[i], merge_threshold)
+                
+                # Mark all neighbors as used and map them to this vertex
+                for j in neighbors:
+                    used[j] = True
+                    vertex_map[j] = len(new_vertices)
+                
+                new_vertices.append(vertices[i])
+                
+                # For boundary type, take the most "extreme" type from merged vertices
+                # Priority: 1/2 (hull/outer) > -1 (part/inner) > 0 (interior)
+                # 
+                # IMPORTANT: Hull takes priority because for the PRIMARY parting surface,
+                # we want the OUTER boundary to project to the hull ∂H, not the part M.
+                # If a part vertex and hull vertex are close enough to merge, they're
+                # at a seam edge and the outer boundary projection is more critical.
+                if has_boundary_type:
+                    merged_types = [current_boundary_type[j] for j in neighbors]
+                    if 1 in merged_types or 2 in merged_types:
+                        # Outer boundary (hull) takes priority
+                        hull_types = [t for t in merged_types if t in (1, 2)]
+                        new_boundary_type.append(hull_types[0])
+                    elif -1 in merged_types:
+                        # Inner boundary (part)
+                        new_boundary_type.append(-1)
+                    else:
+                        new_boundary_type.append(0)
+            
+            new_vertices = np.array(new_vertices)
+            new_faces = vertex_map[faces]
+            
+            # Remove degenerate faces (where two or more vertices are the same after merge)
+            valid_faces_mask = (new_faces[:, 0] != new_faces[:, 1]) & \
+                              (new_faces[:, 1] != new_faces[:, 2]) & \
+                              (new_faces[:, 0] != new_faces[:, 2])
+            new_faces = new_faces[valid_faces_mask]
+            
+            mesh = trimesh.Trimesh(vertices=new_vertices, faces=new_faces)
+            current_boundary_type = np.array(new_boundary_type, dtype=np.int8) if has_boundary_type else None
+            
+            logger.debug(f"Vertex merge: {initial_verts} -> {len(new_vertices)} vertices")
         
         # Step 2: Remove degenerate faces (zero area)
         valid_faces = mesh.nondegenerate_faces()
@@ -624,9 +745,9 @@ def repair_parting_surface(
                 vertices=mesh.vertices,
                 faces=mesh.faces[valid_faces]
             )
+            # Boundary type stays the same - only faces changed
         
         # Step 3: Remove very small triangles (potential self-intersection sources)
-        # These often result from 5-edge configs where triangles nearly collapse
         if len(mesh.faces) > 0:
             areas = mesh.area_faces
             median_area = np.median(areas)
@@ -639,13 +760,30 @@ def repair_parting_surface(
                     vertices=mesh.vertices,
                     faces=mesh.faces[valid_area_mask]
                 )
-                mesh.remove_unreferenced_vertices()
+        
+        # Step 4: Remove unreferenced vertices (and update boundary type)
+        if len(mesh.faces) > 0:
+            referenced = np.unique(mesh.faces.ravel())
+            if len(referenced) < len(mesh.vertices):
+                # Need to remap vertices
+                old_to_new = np.full(len(mesh.vertices), -1, dtype=np.int64)
+                old_to_new[referenced] = np.arange(len(referenced))
+                
+                new_vertices = mesh.vertices[referenced]
+                new_faces = old_to_new[mesh.faces]
+                
+                mesh = trimesh.Trimesh(vertices=new_vertices, faces=new_faces)
+                
+                # Update boundary type to match new vertex indices
+                if has_boundary_type and current_boundary_type is not None:
+                    current_boundary_type = current_boundary_type[referenced]
         
         result = PartingSurfaceResult(
             mesh=mesh,
             vertices=np.array(mesh.vertices),
             faces=np.array(mesh.faces),
-            vertex_to_edge=None,  # Invalidated by merge
+            vertex_to_edge=None,  # Invalidated by merge - mapping no longer valid
+            vertex_boundary_type=current_boundary_type,  # PRESERVED through repair
             num_vertices=len(mesh.vertices),
             num_faces=len(mesh.faces),
             num_tets_processed=surface.num_tets_processed,
@@ -657,6 +795,10 @@ def repair_parting_surface(
         vert_diff = initial_verts - result.num_vertices
         face_diff = initial_faces - result.num_faces
         logger.info(f"Cleaned parting surface: merged {vert_diff} verts, removed {face_diff} faces in {elapsed:.1f}ms")
+        if has_boundary_type:
+            bt = result.vertex_boundary_type
+            logger.info(f"Preserved boundary types: {np.sum(bt == -1)} part (inner), "
+                       f"{np.sum(bt == 1) + np.sum(bt == 2)} hull (outer), {np.sum(bt == 0)} interior")
         
         return result
         
@@ -728,7 +870,8 @@ def close_parting_surface_gaps(
     distance_threshold: float = None,
     method: str = 'smart_curtain',
     primary_surface_mesh: trimesh.Trimesh = None,
-    hull_mesh: trimesh.Trimesh = None
+    hull_mesh: trimesh.Trimesh = None,
+    vertex_boundary_type: np.ndarray = None
 ) -> GapClosingResult:
     """
     Close gaps between parting surface boundary edges and target surfaces.
@@ -737,8 +880,8 @@ def close_parting_surface_gaps(
     construction by the object surface mesh M and the external boundary ∂H."
     
     This function connects parting surface boundary edges to:
-    1. The part mesh M (inner boundary)
-    2. The hull mesh ∂H (outer boundary) - NEW
+    1. The part mesh M (inner boundary) - for vertices with boundary_type == -1
+    2. The hull mesh ∂H (outer boundary) - for vertices with boundary_type == 1/2
     3. The primary surface (for secondary surfaces)
     
     IMPORTANT: This function returns the mesh with properly connected fill geometry.
@@ -889,11 +1032,16 @@ def close_parting_surface_gaps(
     result.boundary_loops_found = len(boundary_chains)
     logger.info(f"Found {len(boundary_chains)} boundary chains near {target_desc}")
     
+    # Get vertex_boundary_type from surface if not provided
+    if vertex_boundary_type is None:
+        vertex_boundary_type = surface.vertex_boundary_type
+    
     # === Step 4: Create fill geometry with proper vertex sharing ===
     fill_result = _create_connected_fill(
         vertices, faces, boundary_chains, part_mesh, boundary_edge_info, distance_threshold,
         primary_surface_mesh=primary_surface_mesh,
-        hull_mesh=hull_mesh
+        hull_mesh=hull_mesh,
+        vertex_boundary_type=vertex_boundary_type
     )
     new_vertices = fill_result['new_vertices']
     new_faces = fill_result['new_faces']
@@ -974,6 +1122,785 @@ def close_parting_surface_gaps(
 
 
 # =============================================================================
+# TUBULAR SECTION DETECTION AND FILLING
+# =============================================================================
+
+@dataclass
+class TubularSectionInfo:
+    """Information about a detected tubular (thin, elongated) boundary loop."""
+    loop_vertices: List[int] = None  # Vertex indices forming the loop
+    perimeter: float = 0.0           # Total perimeter of the loop
+    span: float = 0.0                # Maximum distance across the loop
+    aspect_ratio: float = 0.0        # perimeter / span ratio
+    centroid: np.ndarray = None      # Center of the loop
+    is_tubular: bool = False         # Whether this meets tubular criteria
+
+
+@dataclass
+class TubularDetectionResult:
+    """Result of tubular section detection and filling."""
+    mesh: Optional[trimesh.Trimesh] = None
+    tubular_sections_found: int = 0
+    tubular_sections_filled: int = 0
+    fill_faces_added: int = 0
+    
+    # Details of each tubular section
+    tubular_info: List[TubularSectionInfo] = None
+    
+    processing_time_ms: float = 0.0
+
+
+def detect_tubular_sections(
+    mesh: trimesh.Trimesh,
+    aspect_threshold: float = TUBULAR_ASPECT_RATIO_THRESHOLD,
+    max_perimeter: float = TUBULAR_MAX_PERIMETER,
+    min_vertices: int = MIN_TUBULAR_VERTICES
+) -> List[TubularSectionInfo]:
+    """
+    Detect tubular (thin, elongated) boundary loops in a mesh.
+    
+    Tubular sections are characterized by:
+    - High perimeter-to-span ratio (elongated shape)
+    - Small overall size (limited perimeter)
+    - Closed boundary loops
+    
+    These often form at the ends of thin protrusions or where the surface
+    pinches down to a narrow tube.
+    
+    Args:
+        mesh: Input mesh to analyze
+        aspect_threshold: Minimum perimeter/span ratio to consider tubular
+        max_perimeter: Maximum perimeter to consider for tubular detection
+        min_vertices: Minimum vertices in loop to consider
+    
+    Returns:
+        List of TubularSectionInfo for each detected tubular section
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return []
+    
+    vertices = np.array(mesh.vertices, dtype=np.float64)
+    faces = np.array(mesh.faces, dtype=np.int64)
+    
+    # Find boundary edges
+    edge_to_faces = {}
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            if edge_key not in edge_to_faces:
+                edge_to_faces[edge_key] = []
+            edge_to_faces[edge_key].append(fi)
+    
+    boundary_edges = [(v0, v1) for (v0, v1), flist in edge_to_faces.items() if len(flist) == 1]
+    
+    if not boundary_edges:
+        return []
+    
+    # Build closed loops from boundary edges
+    boundary_chains = _build_boundary_chains(np.array(boundary_edges, dtype=np.int64))
+    closed_loops = [(chain, is_closed) for chain, is_closed in boundary_chains if is_closed]
+    
+    tubular_sections = []
+    
+    for chain_verts, _ in closed_loops:
+        if len(chain_verts) < min_vertices:
+            continue
+        
+        # Calculate perimeter
+        perimeter = 0.0
+        n_verts = len(chain_verts)
+        for i in range(n_verts):
+            v0 = chain_verts[i]
+            v1 = chain_verts[(i + 1) % n_verts]
+            perimeter += np.linalg.norm(vertices[v1] - vertices[v0])
+        
+        if perimeter > max_perimeter:
+            continue
+        
+        # Calculate span (maximum distance between any two loop vertices)
+        loop_positions = vertices[chain_verts]
+        if len(loop_positions) >= 2:
+            from scipy.spatial.distance import pdist
+            distances = pdist(loop_positions)
+            span = np.max(distances) if len(distances) > 0 else 0.0
+        else:
+            span = 0.0
+        
+        # Avoid division by zero
+        if span < 1e-6:
+            span = 1e-6
+        
+        aspect_ratio = perimeter / span
+        centroid = np.mean(loop_positions, axis=0)
+        
+        is_tubular = aspect_ratio > aspect_threshold
+        
+        info = TubularSectionInfo(
+            loop_vertices=list(chain_verts),
+            perimeter=perimeter,
+            span=span,
+            aspect_ratio=aspect_ratio,
+            centroid=centroid,
+            is_tubular=is_tubular
+        )
+        
+        if is_tubular:
+            logger.debug(f"Tubular section: {len(chain_verts)} verts, "
+                        f"perimeter={perimeter:.2f}, span={span:.2f}, "
+                        f"aspect={aspect_ratio:.2f}")
+        
+        tubular_sections.append(info)
+    
+    n_tubular = sum(1 for s in tubular_sections if s.is_tubular)
+    logger.info(f"Tubular detection: found {n_tubular} tubular sections out of "
+                f"{len(closed_loops)} closed loops")
+    
+    return tubular_sections
+
+
+def fill_tubular_sections(
+    mesh: trimesh.Trimesh,
+    tubular_infos: List[TubularSectionInfo] = None,
+    aspect_threshold: float = TUBULAR_ASPECT_RATIO_THRESHOLD,
+    max_perimeter: float = TUBULAR_MAX_PERIMETER
+) -> TubularDetectionResult:
+    """
+    Fill tubular (thin, elongated) boundary loops with fan triangulation.
+    
+    This closes thin "tubes" that often form at the ends of protrusions
+    or narrow regions of the parting surface.
+    
+    Args:
+        mesh: Input mesh
+        tubular_infos: Pre-computed tubular section info (or None to detect)
+        aspect_threshold: Minimum perimeter/span ratio to fill
+        max_perimeter: Maximum perimeter to consider
+    
+    Returns:
+        TubularDetectionResult with filled mesh
+    """
+    import time
+    start = time.time()
+    
+    result = TubularDetectionResult()
+    result.tubular_info = []
+    
+    if mesh is None or len(mesh.faces) == 0:
+        return result
+    
+    # Detect tubular sections if not provided
+    if tubular_infos is None:
+        tubular_infos = detect_tubular_sections(
+            mesh, aspect_threshold, max_perimeter
+        )
+    
+    result.tubular_info = tubular_infos
+    result.tubular_sections_found = sum(1 for s in tubular_infos if s.is_tubular)
+    
+    if result.tubular_sections_found == 0:
+        result.mesh = mesh
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    # Fill tubular sections with fan triangulation
+    vertices = list(mesh.vertices)
+    faces = list(mesh.faces)
+    
+    for info in tubular_infos:
+        if not info.is_tubular:
+            continue
+        
+        # Add centroid as new vertex
+        centroid_idx = len(vertices)
+        vertices.append(info.centroid)
+        
+        # Create fan triangulation
+        loop = info.loop_vertices
+        n_loop = len(loop)
+        for i in range(n_loop):
+            v0 = loop[i]
+            v1 = loop[(i + 1) % n_loop]
+            faces.append([v0, v1, centroid_idx])
+            result.fill_faces_added += 1
+        
+        result.tubular_sections_filled += 1
+    
+    # Create result mesh
+    try:
+        result.mesh = trimesh.Trimesh(
+            vertices=np.array(vertices),
+            faces=np.array(faces),
+            process=False
+        )
+        result.mesh.fix_normals()
+    except Exception as e:
+        logger.error(f"Failed to create filled mesh: {e}")
+        result.mesh = mesh
+    
+    result.processing_time_ms = (time.time() - start) * 1000
+    
+    logger.info(f"Tubular filling: filled {result.tubular_sections_filled} sections, "
+                f"added {result.fill_faces_added} faces in {result.processing_time_ms:.1f}ms")
+    
+    return result
+
+
+# =============================================================================
+# THIN FLAT SECTION DETECTION
+# =============================================================================
+
+@dataclass
+class ThinSectionInfo:
+    """Information about a detected thin flat section of the mesh."""
+    face_indices: List[int] = None   # Triangle indices in this section
+    area: float = 0.0                # Total area of the section
+    perimeter: float = 0.0           # Boundary perimeter of the section
+    bounding_box_dims: np.ndarray = None  # [width, height, depth]
+    aspect_ratio: float = 0.0        # Ratio of longest to shortest bbox dimension
+    is_thin: bool = False            # Whether this meets thin criteria
+
+
+@dataclass
+class ThinSectionResult:
+    """Result of thin section detection."""
+    thin_sections_found: int = 0
+    thin_sections_removed: int = 0
+    faces_removed: int = 0
+    mesh: Optional[trimesh.Trimesh] = None
+    thin_section_info: List[ThinSectionInfo] = None
+    processing_time_ms: float = 0.0
+
+
+def detect_thin_flat_sections(
+    mesh: trimesh.Trimesh,
+    area_threshold_fraction: float = 0.02,
+    aspect_ratio_threshold: float = 10.0
+) -> List[ThinSectionInfo]:
+    """
+    Detect thin, flat sections of the mesh that may be problematic.
+    
+    Thin sections are characterized by:
+    - Small area relative to total mesh area
+    - High aspect ratio (elongated in one direction)
+    - Nearly coplanar triangles
+    
+    These often form as degenerate regions that should be removed or repaired.
+    
+    Args:
+        mesh: Input mesh to analyze
+        area_threshold_fraction: Maximum area fraction to consider thin
+        aspect_ratio_threshold: Minimum aspect ratio to consider thin
+    
+    Returns:
+        List of ThinSectionInfo for detected thin sections
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return []
+    
+    # Split mesh into connected components
+    try:
+        components = mesh.split(only_watertight=False)
+    except Exception as e:
+        logger.warning(f"Could not split mesh for thin section detection: {e}")
+        return []
+    
+    if len(components) <= 1:
+        return []
+    
+    total_area = mesh.area
+    thin_sections = []
+    
+    for comp in components:
+        if len(comp.faces) < 3:
+            continue
+        
+        comp_area = comp.area
+        area_fraction = comp_area / total_area if total_area > 0 else 0
+        
+        # Skip components that are too large
+        if area_fraction > area_threshold_fraction:
+            continue
+        
+        # Calculate bounding box dimensions
+        bbox = comp.bounds
+        dims = bbox[1] - bbox[0]  # [width, height, depth]
+        
+        # Calculate aspect ratio (longest / shortest dimension)
+        dims_sorted = np.sort(dims)
+        if dims_sorted[0] > 1e-6:
+            aspect_ratio = dims_sorted[2] / dims_sorted[0]
+        else:
+            aspect_ratio = float('inf')
+        
+        # Calculate boundary perimeter
+        boundary_edges = []
+        edge_count = {}
+        for face in comp.faces:
+            for i in range(3):
+                e = tuple(sorted([face[i], face[(i+1)%3]]))
+                edge_count[e] = edge_count.get(e, 0) + 1
+        
+        perimeter = 0.0
+        for e, count in edge_count.items():
+            if count == 1:  # Boundary edge
+                perimeter += np.linalg.norm(comp.vertices[e[1]] - comp.vertices[e[0]])
+        
+        is_thin = aspect_ratio > aspect_ratio_threshold
+        
+        info = ThinSectionInfo(
+            face_indices=list(range(len(comp.faces))),
+            area=comp_area,
+            perimeter=perimeter,
+            bounding_box_dims=dims,
+            aspect_ratio=aspect_ratio,
+            is_thin=is_thin
+        )
+        
+        if is_thin:
+            logger.debug(f"Thin section: {len(comp.faces)} faces, "
+                        f"area={comp_area:.4f}, aspect={aspect_ratio:.2f}")
+        
+        thin_sections.append(info)
+    
+    n_thin = sum(1 for s in thin_sections if s.is_thin)
+    logger.info(f"Thin section detection: found {n_thin} thin sections out of "
+                f"{len(components)-1} small components")
+    
+    return thin_sections
+
+
+def remove_thin_flat_sections(
+    mesh: trimesh.Trimesh,
+    area_threshold_fraction: float = 0.02,
+    aspect_ratio_threshold: float = 10.0
+) -> ThinSectionResult:
+    """
+    Remove thin, flat sections from the mesh.
+    
+    Args:
+        mesh: Input mesh
+        area_threshold_fraction: Maximum area fraction to consider thin
+        aspect_ratio_threshold: Minimum aspect ratio to consider thin
+    
+    Returns:
+        ThinSectionResult with cleaned mesh
+    """
+    import time
+    start = time.time()
+    
+    result = ThinSectionResult()
+    result.thin_section_info = []
+    
+    if mesh is None or len(mesh.faces) == 0:
+        return result
+    
+    # Split mesh into connected components
+    try:
+        components = mesh.split(only_watertight=False)
+    except Exception as e:
+        logger.warning(f"Could not split mesh: {e}")
+        result.mesh = mesh
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    if len(components) <= 1:
+        result.mesh = mesh
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    total_area = mesh.area
+    kept_components = []
+    
+    for comp in components:
+        if len(comp.faces) < 3:
+            result.faces_removed += len(comp.faces)
+            continue
+        
+        comp_area = comp.area
+        area_fraction = comp_area / total_area if total_area > 0 else 0
+        
+        # Large components are always kept
+        if area_fraction > area_threshold_fraction:
+            kept_components.append(comp)
+            continue
+        
+        # Calculate aspect ratio
+        bbox = comp.bounds
+        dims = bbox[1] - bbox[0]
+        dims_sorted = np.sort(dims)
+        if dims_sorted[0] > 1e-6:
+            aspect_ratio = dims_sorted[2] / dims_sorted[0]
+        else:
+            aspect_ratio = float('inf')
+        
+        info = ThinSectionInfo(
+            face_indices=list(range(len(comp.faces))),
+            area=comp_area,
+            bounding_box_dims=dims,
+            aspect_ratio=aspect_ratio,
+            is_thin=(aspect_ratio > aspect_ratio_threshold)
+        )
+        result.thin_section_info.append(info)
+        
+        if info.is_thin:
+            result.thin_sections_found += 1
+            result.thin_sections_removed += 1
+            result.faces_removed += len(comp.faces)
+            logger.debug(f"Removing thin section: {len(comp.faces)} faces, aspect={aspect_ratio:.2f}")
+        else:
+            kept_components.append(comp)
+    
+    # Reconstruct mesh from kept components
+    if len(kept_components) == 0:
+        logger.warning("All components removed as thin sections!")
+        result.mesh = mesh  # Return original if all would be removed
+    elif len(kept_components) == 1:
+        result.mesh = kept_components[0]
+    else:
+        result.mesh = trimesh.util.concatenate(kept_components)
+    
+    result.processing_time_ms = (time.time() - start) * 1000
+    
+    logger.info(f"Thin section removal: removed {result.thin_sections_removed} sections, "
+                f"{result.faces_removed} faces in {result.processing_time_ms:.1f}ms")
+    
+    return result
+
+
+# =============================================================================
+# SELF-FOLDING / SELF-INTERSECTION DETECTION
+# =============================================================================
+
+@dataclass
+class SelfFoldingInfo:
+    """Information about detected self-folding regions."""
+    problem_face_indices: List[int] = None   # Faces with normal inconsistency
+    flipped_normal_count: int = 0            # Number of faces with flipped normals
+    self_intersection_count: int = 0         # Number of self-intersecting face pairs
+    avg_normal_consistency: float = 1.0      # Average dot product of adjacent normals (1.0 = consistent)
+
+
+@dataclass
+class SelfFoldingResult:
+    """Result of self-folding detection and repair."""
+    mesh: Optional[trimesh.Trimesh] = None
+    self_folding_detected: bool = False
+    flipped_faces_found: int = 0
+    flipped_faces_fixed: int = 0
+    self_intersections_found: int = 0
+    faces_removed_for_intersection: int = 0
+    info: Optional[SelfFoldingInfo] = None
+    processing_time_ms: float = 0.0
+
+
+def detect_self_folding(
+    mesh: trimesh.Trimesh,
+    normal_consistency_threshold: float = 0.0  # cos(90°) - adjacent faces shouldn't fold >90°
+) -> SelfFoldingInfo:
+    """
+    Detect self-folding regions where the mesh folds back on itself.
+    
+    Self-folding is detected by:
+    1. Adjacent faces with inconsistent normal directions
+    2. Sharp changes in normal direction (>90 degree turns)
+    
+    This does NOT perform self-intersection tests (expensive).
+    Use detect_self_intersections() for that.
+    
+    Args:
+        mesh: Input mesh to analyze
+        normal_consistency_threshold: Minimum dot product of adjacent face normals
+                                     (0.0 = allow up to 90°, -1.0 = allow all)
+    
+    Returns:
+        SelfFoldingInfo with detection results
+    """
+    info = SelfFoldingInfo(problem_face_indices=[])
+    
+    if mesh is None or len(mesh.faces) == 0:
+        return info
+    
+    # Get face normals
+    try:
+        face_normals = mesh.face_normals
+    except Exception as e:
+        logger.warning(f"Could not compute face normals: {e}")
+        return info
+    
+    if face_normals is None or len(face_normals) == 0:
+        return info
+    
+    # Build face adjacency (faces sharing an edge)
+    edge_to_faces = {}
+    faces = mesh.faces
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            if edge_key not in edge_to_faces:
+                edge_to_faces[edge_key] = []
+            edge_to_faces[edge_key].append(fi)
+    
+    # Check normal consistency between adjacent faces
+    normal_consistency_sum = 0.0
+    n_comparisons = 0
+    problem_faces = set()
+    
+    for edge_key, face_list in edge_to_faces.items():
+        if len(face_list) != 2:
+            continue  # Boundary edge or non-manifold
+        
+        fi, fj = face_list
+        n1 = face_normals[fi]
+        n2 = face_normals[fj]
+        
+        # Dot product indicates alignment (1 = same direction, -1 = opposite)
+        dot = np.dot(n1, n2)
+        normal_consistency_sum += dot
+        n_comparisons += 1
+        
+        if dot < normal_consistency_threshold:
+            # These faces have inconsistent normals (folding)
+            problem_faces.add(fi)
+            problem_faces.add(fj)
+            info.flipped_normal_count += 1
+    
+    info.problem_face_indices = list(problem_faces)
+    
+    if n_comparisons > 0:
+        info.avg_normal_consistency = normal_consistency_sum / n_comparisons
+    
+    if len(problem_faces) > 0:
+        logger.info(f"Self-folding detection: {len(problem_faces)} problem faces, "
+                   f"{info.flipped_normal_count} inconsistent normal pairs, "
+                   f"avg consistency: {info.avg_normal_consistency:.3f}")
+    
+    return info
+
+
+def detect_self_intersections(
+    mesh: trimesh.Trimesh,
+    sample_fraction: float = 0.1
+) -> List[Tuple[int, int]]:
+    """
+    Detect self-intersecting triangles in the mesh.
+    
+    This is an expensive operation, so we optionally sample a fraction of faces.
+    
+    Args:
+        mesh: Input mesh to analyze
+        sample_fraction: Fraction of faces to sample (1.0 = all faces)
+    
+    Returns:
+        List of (face_i, face_j) pairs that intersect
+    """
+    if mesh is None or len(mesh.faces) < 2:
+        return []
+    
+    try:
+        # Use trimesh's built-in intersection detection if available
+        if hasattr(mesh, 'ray') and hasattr(mesh.ray, 'intersects_id'):
+            # Ray-based approximate detection
+            pass
+        
+        # Simple bounding box-based culling for potential intersections
+        # (Full triangle-triangle intersection is O(n²) expensive)
+        
+        faces = mesh.faces
+        vertices = mesh.vertices
+        n_faces = len(faces)
+        
+        # Compute face bounding boxes
+        face_mins = np.zeros((n_faces, 3))
+        face_maxs = np.zeros((n_faces, 3))
+        
+        for fi in range(n_faces):
+            face_verts = vertices[faces[fi]]
+            face_mins[fi] = face_verts.min(axis=0)
+            face_maxs[fi] = face_verts.max(axis=0)
+        
+        # Sample faces if requested
+        if sample_fraction < 1.0:
+            n_sample = max(1, int(n_faces * sample_fraction))
+            sample_indices = np.random.choice(n_faces, n_sample, replace=False)
+        else:
+            sample_indices = np.arange(n_faces)
+        
+        intersecting_pairs = []
+        
+        # Check each sampled face against others with overlapping bboxes
+        for fi in sample_indices:
+            # Find faces with potentially overlapping bboxes
+            overlap_mask = np.all(face_mins <= face_maxs[fi], axis=1) & \
+                          np.all(face_maxs >= face_mins[fi], axis=1)
+            overlap_indices = np.where(overlap_mask)[0]
+            
+            for fj in overlap_indices:
+                if fj <= fi:  # Skip self and already-checked pairs
+                    continue
+                
+                # Check if triangles share a vertex (adjacent triangles aren't self-intersecting)
+                if len(set(faces[fi]) & set(faces[fj])) > 0:
+                    continue
+                
+                # Do detailed triangle-triangle intersection test
+                # (Using simplified edge-plane test)
+                tri_i = vertices[faces[fi]]
+                tri_j = vertices[faces[fj]]
+                
+                if _triangles_intersect(tri_i, tri_j):
+                    intersecting_pairs.append((fi, fj))
+        
+        if len(intersecting_pairs) > 0:
+            logger.info(f"Self-intersection detection: found {len(intersecting_pairs)} "
+                       f"intersecting face pairs (sampled {len(sample_indices)}/{n_faces} faces)")
+        
+        return intersecting_pairs
+        
+    except Exception as e:
+        logger.warning(f"Self-intersection detection failed: {e}")
+        return []
+
+
+def _triangles_intersect(tri1: np.ndarray, tri2: np.ndarray) -> bool:
+    """
+    Test if two triangles intersect in 3D space.
+    
+    Uses the Möller triangle-triangle intersection test.
+    
+    Args:
+        tri1: 3x3 array of triangle 1 vertices
+        tri2: 3x3 array of triangle 2 vertices
+    
+    Returns:
+        True if triangles intersect
+    """
+    # Simple separation axis test (approximate)
+    # Check if all vertices of one triangle are on one side of the other's plane
+    
+    def plane_side(point, tri):
+        """Return signed distance from point to triangle's plane."""
+        v0 = tri[0]
+        n = np.cross(tri[1] - v0, tri[2] - v0)
+        n_len = np.linalg.norm(n)
+        if n_len < 1e-10:
+            return 0  # Degenerate triangle
+        n = n / n_len
+        return np.dot(point - v0, n)
+    
+    # Check if all vertices of tri2 are on same side of tri1's plane
+    sides1 = [plane_side(tri2[i], tri1) for i in range(3)]
+    if all(s > 1e-8 for s in sides1) or all(s < -1e-8 for s in sides1):
+        return False
+    
+    # Check if all vertices of tri1 are on same side of tri2's plane
+    sides2 = [plane_side(tri1[i], tri2) for i in range(3)]
+    if all(s > 1e-8 for s in sides2) or all(s < -1e-8 for s in sides2):
+        return False
+    
+    # Triangles potentially intersect (conservative - may have false positives)
+    # For a full implementation, would need the interval overlap test
+    return True
+
+
+def repair_self_folding(
+    mesh: trimesh.Trimesh,
+    normal_consistency_threshold: float = 0.0,
+    remove_intersecting: bool = False,
+    max_iterations: int = 3
+) -> SelfFoldingResult:
+    """
+    Attempt to repair self-folding regions in the mesh.
+    
+    Repair strategies:
+    1. Fix inconsistent face normals
+    2. Optionally remove self-intersecting faces
+    
+    Args:
+        mesh: Input mesh
+        normal_consistency_threshold: Minimum dot product for normal consistency
+        remove_intersecting: If True, remove self-intersecting faces
+        max_iterations: Maximum iterations for normal fixing
+    
+    Returns:
+        SelfFoldingResult with repaired mesh
+    """
+    import time
+    start = time.time()
+    
+    result = SelfFoldingResult()
+    
+    if mesh is None or len(mesh.faces) == 0:
+        return result
+    
+    # Work with a copy
+    working_mesh = mesh.copy()
+    
+    # Step 1: Detect self-folding
+    info = detect_self_folding(working_mesh, normal_consistency_threshold)
+    result.info = info
+    result.flipped_faces_found = info.flipped_normal_count
+    
+    if info.flipped_normal_count == 0 and not remove_intersecting:
+        result.mesh = working_mesh
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    result.self_folding_detected = True
+    
+    # Step 2: Try to fix normals using trimesh's built-in method
+    for iteration in range(max_iterations):
+        try:
+            working_mesh.fix_normals()
+            
+            # Re-check after fix
+            new_info = detect_self_folding(working_mesh, normal_consistency_threshold)
+            result.flipped_faces_fixed = info.flipped_normal_count - new_info.flipped_normal_count
+            
+            if new_info.flipped_normal_count == 0:
+                break
+                
+        except Exception as e:
+            logger.warning(f"Normal fix iteration {iteration} failed: {e}")
+            break
+    
+    # Step 3: Optionally detect and remove self-intersecting faces
+    if remove_intersecting:
+        intersecting_pairs = detect_self_intersections(working_mesh)
+        result.self_intersections_found = len(intersecting_pairs)
+        
+        if len(intersecting_pairs) > 0:
+            # Collect all faces involved in intersections
+            problem_faces = set()
+            for fi, fj in intersecting_pairs:
+                problem_faces.add(fi)
+                problem_faces.add(fj)
+            
+            # Remove problematic faces
+            keep_mask = np.ones(len(working_mesh.faces), dtype=bool)
+            keep_mask[list(problem_faces)] = False
+            
+            new_faces = working_mesh.faces[keep_mask]
+            working_mesh = trimesh.Trimesh(
+                vertices=working_mesh.vertices,
+                faces=new_faces
+            )
+            working_mesh.remove_unreferenced_vertices()
+            
+            result.faces_removed_for_intersection = len(problem_faces)
+    
+    result.mesh = working_mesh
+    result.processing_time_ms = (time.time() - start) * 1000
+    
+    logger.info(f"Self-folding repair: fixed {result.flipped_faces_fixed} normals, "
+                f"removed {result.faces_removed_for_intersection} intersecting faces "
+                f"in {result.processing_time_ms:.1f}ms")
+    
+    return result
+
+
+# =============================================================================
 # SMALL POLYLINE REMOVAL AND HOLE FILLING
 # =============================================================================
 
@@ -992,6 +1919,9 @@ class SmallHoleRemovalResult:
     
     # Perimeter info for removed loops
     removed_loop_perimeters: List[float] = None
+    
+    # Indices of new centroid vertices (for boundary_type extension)
+    new_centroid_indices: Optional[List[int]] = None
     
     # Timing
     processing_time_ms: float = 0.0
@@ -1148,6 +2078,9 @@ def remove_small_boundary_loops(
     
     result.loops_removed = len(small_loops)
     
+    # Store centroid indices for boundary_type extension
+    result.new_centroid_indices = fill_vertex_indices
+    
     # Convert to arrays
     filled_vertices = np.array(new_vertices_list, dtype=np.float64)
     filled_faces = np.array(new_faces_list, dtype=np.int64)
@@ -1155,7 +2088,7 @@ def remove_small_boundary_loops(
     # === Step 5: Optional local smoothing of fill regions ===
     if smooth_fill and fill_vertex_indices:
         filled_vertices = _smooth_fill_vertices(
-            filled_vertices, 
+            filled_vertices,
             filled_faces, 
             fill_vertex_indices, 
             iterations=smooth_iterations
@@ -1353,7 +2286,8 @@ def _create_connected_fill(
     boundary_edge_info: Dict,
     max_distance: float,
     primary_surface_mesh: trimesh.Trimesh = None,
-    hull_mesh: trimesh.Trimesh = None
+    hull_mesh: trimesh.Trimesh = None,
+    vertex_boundary_type: np.ndarray = None
 ) -> Dict:
     """
     Create fill geometry that connects parting surface boundary to target surfaces.
@@ -1365,12 +2299,16 @@ def _create_connected_fill(
     connection from the parting surface boundary to the target surface (part M, 
     hull ∂H, or primary surface).
     
-    APPROACH: For each boundary vertex in a chain:
-    1. Project the vertex to the closest target surface
-    2. Create quads between adjacent (boundary_vertex, projected_vertex) pairs
+    IMPORTANT (per paper Section 4.4): Boundary vertices must be projected to
+    their ORIGINAL surface:
+    - Inner boundary (vertex_boundary_type == -1): project to part mesh M
+    - Outer boundary (vertex_boundary_type == 1 or 2): project to hull mesh ∂H
+    - If vertex_boundary_type is None, fall back to closest surface
     
-    This creates a watertight ribbon that bridges the gap between the parting
-    surface and the target surfaces.
+    APPROACH: For each boundary vertex in a chain:
+    1. Determine which surface to project to based on boundary type
+    2. Project the vertex to the appropriate target surface
+    3. Create quads between adjacent (boundary_vertex, projected_vertex) pairs
     
     Args:
         surface_vertices: Original parting surface vertices
@@ -1381,6 +2319,8 @@ def _create_connected_fill(
         max_distance: Maximum allowed projection distance
         primary_surface_mesh: Optional primary parting surface (for secondary surfaces)
         hull_mesh: Optional hull mesh for projection (outer boundary ∂H)
+        vertex_boundary_type: Array of boundary type per vertex 
+                             (-1=part M inner, 0=interior, 1/2=hull ∂H outer)
     
     Returns:
         Dict with keys:
@@ -1397,36 +2337,83 @@ def _create_connected_fill(
     fill_boundary_indices = set()  # Track original boundary vertices used in fill
     inner_rim_edges = []  # Track edges along the inner rim
     
+    # Check if we have proper boundary type info
+    use_boundary_type = vertex_boundary_type is not None and len(vertex_boundary_type) >= n_orig_verts
+    if use_boundary_type:
+        logger.info("Using vertex_boundary_type for projection target selection")
+    else:
+        logger.info("No vertex_boundary_type - using closest surface for projection")
+    
     for chain_idx, (chain_verts, is_closed) in enumerate(boundary_chains):
         if len(chain_verts) < 2:
             continue
         
         n_pts = len(chain_verts)
         
-        # Project ALL boundary vertices to target surfaces
-        # This creates a continuous projected boundary on the target
+        # Get boundary positions
         boundary_positions = np.array([surface_vertices[v] for v in chain_verts])
         
-        # Project to part mesh
-        proj_pts_part, dist_part, _ = trimesh.proximity.closest_point(part_mesh, boundary_positions)
-        proj_pts = proj_pts_part.copy()
-        proj_dists = dist_part.copy()
+        # Initialize projection arrays
+        proj_pts = np.zeros_like(boundary_positions)
+        proj_dists = np.full(n_pts, np.inf)
         
-        # Check hull mesh if available
-        if hull_mesh is not None:
-            proj_pts_hull, dist_hull, _ = trimesh.proximity.closest_point(hull_mesh, boundary_positions)
-            # Use hull projection where it's closer
-            hull_closer = dist_hull < proj_dists
-            proj_pts[hull_closer] = proj_pts_hull[hull_closer]
-            proj_dists[hull_closer] = dist_hull[hull_closer]
-        
-        # Check primary mesh if available  
-        if primary_surface_mesh is not None:
-            proj_pts_primary, dist_primary, _ = trimesh.proximity.closest_point(primary_surface_mesh, boundary_positions)
-            # Use primary projection where it's closer
-            primary_closer = dist_primary < proj_dists
-            proj_pts[primary_closer] = proj_pts_primary[primary_closer]
-            proj_dists[primary_closer] = dist_primary[primary_closer]
+        if use_boundary_type:
+            # === NEW CORRECT PROJECTION: Use vertex_boundary_type ===
+            # Inner boundary vertices (-1) → project to part mesh M
+            # Outer boundary vertices (1, 2) → project to hull mesh ∂H
+            
+            for i, bv in enumerate(chain_verts):
+                bt = vertex_boundary_type[bv] if bv < len(vertex_boundary_type) else 0
+                
+                if bt == -1:
+                    # Inner boundary - project to part mesh M
+                    proj_pt, dist, _ = trimesh.proximity.closest_point(part_mesh, boundary_positions[i:i+1])
+                    proj_pts[i] = proj_pt[0]
+                    proj_dists[i] = dist[0]
+                elif bt in (1, 2) and hull_mesh is not None:
+                    # Outer boundary - project to hull mesh ∂H
+                    proj_pt, dist, _ = trimesh.proximity.closest_point(hull_mesh, boundary_positions[i:i+1])
+                    proj_pts[i] = proj_pt[0]
+                    proj_dists[i] = dist[0]
+                else:
+                    # Interior vertex or no appropriate mesh - use closest of all available
+                    proj_pt_part, dist_part, _ = trimesh.proximity.closest_point(part_mesh, boundary_positions[i:i+1])
+                    proj_pts[i] = proj_pt_part[0]
+                    proj_dists[i] = dist_part[0]
+                    
+                    if hull_mesh is not None:
+                        proj_pt_hull, dist_hull, _ = trimesh.proximity.closest_point(hull_mesh, boundary_positions[i:i+1])
+                        if dist_hull[0] < proj_dists[i]:
+                            proj_pts[i] = proj_pt_hull[0]
+                            proj_dists[i] = dist_hull[0]
+                    
+                    if primary_surface_mesh is not None:
+                        proj_pt_prim, dist_prim, _ = trimesh.proximity.closest_point(primary_surface_mesh, boundary_positions[i:i+1])
+                        if dist_prim[0] < proj_dists[i]:
+                            proj_pts[i] = proj_pt_prim[0]
+                            proj_dists[i] = dist_prim[0]
+        else:
+            # === FALLBACK: Project to closest surface ===
+            # This is the old behavior when no boundary type info is available
+            
+            # Project to part mesh
+            proj_pts_part, dist_part, _ = trimesh.proximity.closest_point(part_mesh, boundary_positions)
+            proj_pts = proj_pts_part.copy()
+            proj_dists = dist_part.copy()
+            
+            # Check hull mesh if available
+            if hull_mesh is not None:
+                proj_pts_hull, dist_hull, _ = trimesh.proximity.closest_point(hull_mesh, boundary_positions)
+                hull_closer = dist_hull < proj_dists
+                proj_pts[hull_closer] = proj_pts_hull[hull_closer]
+                proj_dists[hull_closer] = dist_hull[hull_closer]
+            
+            # Check primary mesh if available  
+            if primary_surface_mesh is not None:
+                proj_pts_primary, dist_primary, _ = trimesh.proximity.closest_point(primary_surface_mesh, boundary_positions)
+                primary_closer = dist_primary < proj_dists
+                proj_pts[primary_closer] = proj_pts_primary[primary_closer]
+                proj_dists[primary_closer] = dist_primary[primary_closer]
         
         # Create mapping from boundary vertex to its projected vertex index
         # Only include vertices within max_distance
