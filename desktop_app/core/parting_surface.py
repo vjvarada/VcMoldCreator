@@ -72,32 +72,47 @@ TET_EDGES = [
     (2, 3),  # Edge 5
 ]
 
+# Face definitions: face index -> (vertex_a, vertex_b, vertex_c)
+# Each face is opposite to a vertex (face i is opposite to vertex i)
+TET_FACES = [
+    (1, 2, 3),  # Face 0: opposite to v0, edges: 3(v1-v2), 4(v1-v3), 5(v2-v3)
+    (0, 2, 3),  # Face 1: opposite to v1, edges: 1(v0-v2), 2(v0-v3), 5(v2-v3)
+    (0, 1, 3),  # Face 2: opposite to v2, edges: 0(v0-v1), 2(v0-v3), 4(v1-v3)
+    (0, 1, 2),  # Face 3: opposite to v3, edges: 0(v0-v1), 1(v0-v2), 3(v1-v2)
+]
 
-def _build_marching_tet_table() -> Dict[int, List[Tuple[int, int, int]]]:
+# Map from face index to the 3 edge indices that form that face
+TET_FACE_EDGES = [
+    (3, 4, 5),  # Face 0 (v1,v2,v3): edges 3, 4, 5
+    (1, 2, 5),  # Face 1 (v0,v2,v3): edges 1, 2, 5
+    (0, 2, 4),  # Face 2 (v0,v1,v3): edges 0, 2, 4
+    (0, 1, 3),  # Face 3 (v0,v1,v2): edges 0, 1, 3
+]
+
+
+def _build_marching_tet_table() -> Dict[int, List[Tuple]]:
     """
     Build the marching tetrahedra lookup table.
     
-    Based on the paper's vertex-classification approach, we only generate
-    triangles for configurations that arise from clean vertex separation
-    (H1 vs H2 labels), which produces only 3-edge and 4-edge configurations.
+    Per Nielson & Franke 1997 "Computing the Separating Surface for Segmented Data",
+    we implement ALL 5 cases for complete surface extraction:
     
-    Edge numbering (for reference):
+    Case 0: All same label (0 edges cut) → No surface
+    Case 1: 3+1 (3 edges cut) → 1 triangle using mid-edge points
+    Case 2: 2+2 (4 edges cut) → 2 triangles (quad) using mid-edge points
+    Case 3: 2+1+1 (5 edges cut) → 5 triangles using mid-edge + face vertex
+    Case 4: 1+1+1+1 (6 edges cut) → 12 triangles using mid-edge + face + inner vertices
+    
+    Edge numbering:
         Edge 0: (v0, v1)    Edge 3: (v1, v2)
         Edge 1: (v0, v2)    Edge 4: (v1, v3)
         Edge 2: (v0, v3)    Edge 5: (v2, v3)
     
-    Active configurations:
-        0 edges: Config 0 - no surface
-        3 edges: 4 configs (7, 25, 42, 52) - single triangle (vertex isolated)
-        4 edges: 3 configs (30, 45, 51) - quad (2 triangles)
-    
-    Disabled configurations (produce self-intersections):
-        5 edges: 6 configs - non-manifold geometry
-        6 edges: Config 63 - tetrahedral singularity
-    
     Returns:
-        Dictionary mapping 6-bit config -> list of triangles
-        Each triangle is (edge_a, edge_b, edge_c) using local edge indices.
+        Dictionary mapping 6-bit config -> list of triangle specs
+        - For 0-4 edge configs: [(e0, e1, e2), ...] using edge indices
+        - For 5-edge configs: special marker 'FACE_VERTEX' 
+        - For 6-edge config: special marker 'INNER_VERTEX'
     """
     table = {}
     
@@ -106,61 +121,271 @@ def _build_marching_tet_table() -> Dict[int, List[Tuple[int, int, int]]]:
         table[i] = []
     
     # ===========================================================================
-    # 3-EDGE CONFIGS: Single triangle (vertex isolated from others)
+    # 3-EDGE CONFIGS (Case 1): Single triangle (vertex isolated from others)
+    # In a 2-label system, only 4 configs are geometrically valid:
+    # Each isolates exactly one vertex from the other three.
     # ===========================================================================
-    # Vertex 0 isolated: edges 0,1,2 cut (edges from v0)
-    # Config = 1 + 2 + 4 = 7
+    # Vertex 0 isolated: edges 0,1,2 cut (all edges from v0)
+    # Config 7 = 000111 (edges 0,1,2)
     table[7] = [(0, 1, 2)]
     
-    # Vertex 1 isolated: edges 0,3,4 cut (edges from v1)
-    # Config = 1 + 8 + 16 = 25
+    # Vertex 1 isolated: edges 0,3,4 cut (all edges from v1)
+    # Config 25 = 011001 (edges 0,3,4)
     table[25] = [(0, 3, 4)]
     
-    # Vertex 2 isolated: edges 1,3,5 cut (edges from v2)
-    # Config = 2 + 8 + 32 = 42
+    # Vertex 2 isolated: edges 1,3,5 cut (all edges from v2)
+    # Config 42 = 101010 (edges 1,3,5)
     table[42] = [(1, 3, 5)]
     
-    # Vertex 3 isolated: edges 2,4,5 cut (edges from v3)
-    # Config = 4 + 16 + 32 = 52
+    # Vertex 3 isolated: edges 2,4,5 cut (all edges from v3)
+    # Config 52 = 110100 (edges 2,4,5)
     table[52] = [(2, 4, 5)]
     
     # ===========================================================================
-    # 4-EDGE CONFIGS: Quadrilateral surface (2 triangles)
+    # 4-EDGE CONFIGS (Case 2): Quadrilateral surface (2 triangles)
+    # In a 2-label system, only 3 configs are geometrically valid:
+    # Each separates 2 vertices from the other 2 (opposite edges uncut).
     # ===========================================================================
-    # Split {v0,v1} vs {v2,v3}: edges 1,2,3,4 cut
-    # Config = 2 + 4 + 8 + 16 = 30
+    # Split {v0,v1} vs {v2,v3}: edges 1,2,3,4 cut (edges 0,5 uncut)
+    # Config 30 = 011110
     table[30] = [(1, 3, 4), (1, 4, 2)]
     
-    # Split {v0,v2} vs {v1,v3}: edges 0,2,3,5 cut
-    # Config = 1 + 4 + 8 + 32 = 45
+    # Split {v0,v2} vs {v1,v3}: edges 0,2,3,5 cut (edges 1,4 uncut)
+    # Config 45 = 101101
     table[45] = [(0, 3, 5), (0, 5, 2)]
     
-    # Split {v0,v3} vs {v1,v2}: edges 0,1,4,5 cut
-    # Config = 1 + 2 + 16 + 32 = 51
+    # Split {v0,v3} vs {v1,v2}: edges 0,1,4,5 cut (edges 2,3 uncut)
+    # Config 51 = 110011
     table[51] = [(0, 4, 5), (0, 5, 1)]
     
     # ===========================================================================
-    # 5-EDGE CONFIGS: DISABLED - These produce non-manifold/self-intersecting geometry
+    # 5-EDGE CONFIGS (Case 3): Per Nielson & Franke 1997
+    # When 5 edges are cut, 2 vertices share the same label and 2 others differ.
+    # This requires a FACE VERTEX at the centroid of 3 mid-edge points.
+    # All 6 such configs are valid (one for each edge that could be uncut).
     # ===========================================================================
-    # When 5 edges are cut, the resulting triangles share vertices in ways that
-    # create self-intersections. Following the original paper approach, we skip
-    # these configurations. Tetrahedra with 5 cut edges will not contribute triangles.
-    #
-    # Configs 62, 61, 59, 55, 47, 31 are left empty (no triangles).
+    # Config 62 = 111110 (edge 0 not cut) → v0, v1 same label
+    # Config 61 = 111101 (edge 1 not cut) → v0, v2 same label
+    # Config 59 = 111011 (edge 2 not cut) → v0, v3 same label
+    # Config 55 = 110111 (edge 3 not cut) → v1, v2 same label
+    # Config 47 = 101111 (edge 4 not cut) → v1, v3 same label
+    # Config 31 = 011111 (edge 5 not cut) → v2, v3 same label
+    
+    table[62] = 'FACE_VERTEX'  # Edge 0 not cut
+    table[61] = 'FACE_VERTEX'  # Edge 1 not cut
+    table[59] = 'FACE_VERTEX'  # Edge 2 not cut
+    table[55] = 'FACE_VERTEX'  # Edge 3 not cut
+    table[47] = 'FACE_VERTEX'  # Edge 4 not cut
+    table[31] = 'FACE_VERTEX'  # Edge 5 not cut
     
     # ===========================================================================
-    # 6-EDGE CONFIG: DISABLED - Tetrahedral singularity causes self-intersections
+    # 6-EDGE CONFIG (Case 4): Per Nielson & Franke 1997
+    # When all 6 edges are cut, all 4 vertices have different labels
+    # This requires 4 FACE VERTICES + 1 INNER VERTEX (mid-tetrahedron)
+    # Generates 12 triangles (3 per face)
     # ===========================================================================
-    # When all 6 edges are cut, the 4 triangles (one per face) self-intersect.
-    # Following the original paper approach, we skip this configuration.
-    #
-    # Config 63 is left empty (no triangles).
+    table[63] = 'INNER_VERTEX'
     
     return table
 
 
 # Pre-build the lookup table
 MARCHING_TET_TABLE = _build_marching_tet_table()
+
+
+def validate_marching_tet_table() -> Dict[str, any]:
+    """
+    Validate the Marching Tetrahedra lookup table for completeness and correctness.
+    
+    Per Nielson & Franke 1997, the table should cover:
+    - 0 edges: 1 config (no surface)
+    - 1 edge: 6 configs (no valid 2-region surface)
+    - 2 edges: 15 configs (no valid 2-region surface)
+    - 3 edges: 8 configs (4 + 4 complements) → 1 triangle each
+    - 4 edges: 6 configs (3 + 3 complements) → 2 triangles each
+    - 5 edges: 6 configs → 5 triangles each (requires face vertex)
+    - 6 edges: 1 config → 12 triangles (requires face + inner vertices)
+    
+    Returns:
+        Dictionary with validation results and statistics
+    """
+    results = {
+        'total_configs': 64,
+        'by_edge_count': {},
+        'surface_configs': 0,
+        'empty_configs': 0,
+        'face_vertex_configs': 0,
+        'inner_vertex_configs': 0,
+        'valid': True,
+        'errors': []
+    }
+    
+    for n_edges in range(7):
+        results['by_edge_count'][n_edges] = {'count': 0, 'with_surface': 0, 'configs': []}
+    
+    for config in range(64):
+        n_edges = bin(config).count('1')
+        entry = MARCHING_TET_TABLE.get(config, [])
+        
+        results['by_edge_count'][n_edges]['count'] += 1
+        results['by_edge_count'][n_edges]['configs'].append(config)
+        
+        if entry == 'FACE_VERTEX':
+            results['face_vertex_configs'] += 1
+            results['surface_configs'] += 1
+            results['by_edge_count'][n_edges]['with_surface'] += 1
+        elif entry == 'INNER_VERTEX':
+            results['inner_vertex_configs'] += 1
+            results['surface_configs'] += 1
+            results['by_edge_count'][n_edges]['with_surface'] += 1
+        elif entry:
+            results['surface_configs'] += 1
+            results['by_edge_count'][n_edges]['with_surface'] += 1
+        else:
+            results['empty_configs'] += 1
+    
+    # Validate expected counts for 2-label Marching Tetrahedra
+    # Note: In a 2-label system, not all edge configurations are geometrically valid
+    expected = {
+        0: (1, 0),   # 1 config, 0 with surface (all same label)
+        1: (6, 0),   # 6 configs, 0 with surface (invalid: need at least 3 edges)
+        2: (15, 0),  # 15 configs, 0 with surface (invalid: need at least 3 edges)
+        3: (20, 4),  # 20 configs, 4 with surface (isolate 1 vertex)
+        4: (15, 3),  # 15 configs, 3 with surface (split 2+2 vertices)
+        5: (6, 6),   # 6 configs, 6 with surface (5-edge requires face vertex)
+        6: (1, 1),   # 1 config, 1 with surface (6-edge requires inner vertex)
+    }
+    
+    for n_edges, (exp_count, exp_surface) in expected.items():
+        actual_count = results['by_edge_count'][n_edges]['count']
+        actual_surface = results['by_edge_count'][n_edges]['with_surface']
+        
+        if actual_count != exp_count:
+            results['valid'] = False
+            results['errors'].append(f"{n_edges} edges: expected {exp_count} configs, got {actual_count}")
+        
+        if actual_surface != exp_surface:
+            results['valid'] = False
+            results['errors'].append(f"{n_edges} edges: expected {exp_surface} surface configs, got {actual_surface}")
+    
+    return results
+
+
+def _get_5_edge_triangles(config: int, edge_to_vertex: Dict[int, int], 
+                          face_vertex_idx: int) -> List[List[int]]:
+    """
+    Generate triangles for 5-edge configuration using face vertex.
+    
+    Per Nielson & Franke 1997 Case 3: When 5 edges are cut, two vertices share
+    the same label (connected by the uncut edge). The separating surface requires
+    a face vertex at the centroid of 3 mid-edge points on a face where all 3
+    edges are cut.
+    
+    In a 5-edge config, there are exactly 2 faces with all 3 edges cut (the faces
+    opposite to the two same-label vertices). We use the first such face.
+    
+    This generates 5 triangles total:
+    - 3 triangles forming a fan from face_vertex to mid-edge pairs on the chosen face
+    - 2 triangles connecting the remaining 2 mid-edge points (on other faces) to 
+      the face vertex and appropriate adjacent mid-edge points
+    
+    Args:
+        config: The 6-bit configuration (one of 62, 61, 59, 55, 47, 31)
+        edge_to_vertex: Map from local edge index to surface vertex index
+        face_vertex_idx: Index of the face vertex in surface vertices
+    
+    Returns:
+        List of triangles (each as [v0, v1, v2] surface vertex indices)
+    """
+    # Find which edge is NOT cut (connects the two same-label vertices)
+    uncut_edge = None
+    for e in range(6):
+        if not (config & (1 << e)):
+            uncut_edge = e
+            break
+    
+    if uncut_edge is None:
+        logger.warning(f"5-edge config {config}: could not find uncut edge")
+        return []
+    
+    # Find a face where ALL 3 edges are cut
+    # In 5-edge config, there are exactly 2 such faces
+    target_face = None
+    for face_idx, face_edges in enumerate(TET_FACE_EDGES):
+        if all(e in edge_to_vertex for e in face_edges):
+            target_face = face_idx
+            break
+    
+    if target_face is None:
+        logger.warning(f"5-edge config {config}: could not find face with 3 cut edges")
+        return []
+    
+    triangles = []
+    face_edges = TET_FACE_EDGES[target_face]
+    
+    # Create 3 triangles: fan from face_vertex to consecutive mid-edge pairs on face
+    for i in range(3):
+        e1 = face_edges[i]
+        e2 = face_edges[(i + 1) % 3]
+        triangles.append([edge_to_vertex[e1], edge_to_vertex[e2], face_vertex_idx])
+    
+    # Find the 2 remaining cut edges (not on target face)
+    remaining_cut_edges = [e for e in range(6) if e != uncut_edge and e not in face_edges and e in edge_to_vertex]
+    
+    # Create 2 triangles connecting remaining edges to face vertex
+    # Each remaining edge shares exactly one endpoint with one of the face edges
+    for re in remaining_cut_edges:
+        re_verts = set(TET_EDGES[re])
+        # Find which face edge shares a vertex with this remaining edge
+        for fe in face_edges:
+            fe_verts = set(TET_EDGES[fe])
+            if re_verts & fe_verts:  # Shared vertex
+                triangles.append([edge_to_vertex[re], edge_to_vertex[fe], face_vertex_idx])
+                break
+    
+    return triangles
+
+
+def _get_6_edge_triangles(edge_to_vertex: Dict[int, int],
+                          face_vertex_indices: List[int],
+                          inner_vertex_idx: int) -> List[List[int]]:
+    """
+    Generate triangles for 6-edge configuration using face and inner vertices.
+    
+    Per Nielson & Franke 1997 Case 4: All 6 edges are cut, meaning all 4 vertices
+    have different labels. The separating surface requires:
+    - 4 face vertices (one per tetrahedron face, at centroid of 3 mid-edge points)
+    - 1 inner vertex (at centroid of 4 face vertices = mid-tetrahedron)
+    
+    This generates 12 triangles (3 per face):
+    - For each face, create 3 triangles connecting inner_vertex → face_vertex → mid_edge
+    
+    Args:
+        edge_to_vertex: Map from local edge index to surface vertex index
+        face_vertex_indices: List of 4 face vertex indices (one per face, in order)
+        inner_vertex_idx: Index of the inner (mid-tetrahedron) vertex
+    
+    Returns:
+        List of triangles (each as [v0, v1, v2] surface vertex indices)
+    """
+    if len(face_vertex_indices) != 4:
+        logger.warning(f"6-edge config: expected 4 face vertices, got {len(face_vertex_indices)}")
+        return []
+    
+    triangles = []
+    
+    # For each of the 4 faces, create 3 triangles
+    # Each triangle connects: inner_vertex → face_vertex → mid_edge
+    for face_idx, face_edges in enumerate(TET_FACE_EDGES):
+        face_v = face_vertex_indices[face_idx]
+        
+        # Create 3 triangles for this face
+        for e in face_edges:
+            if e in edge_to_vertex:
+                # Triangle: inner_vertex → face_vertex → mid_edge
+                triangles.append([inner_vertex_idx, face_v, edge_to_vertex[e]])
+    
+    return triangles
 
 
 # =============================================================================
@@ -356,15 +581,20 @@ def extract_parting_surface(
     logger.info(f"Cut point placement: {n_part_boundary} on part M (inner), "
                 f"{n_hull_boundary} on hull ∂H (outer), {n_midpoint} midpoints (interior)")
     
-    result.vertex_to_edge = cut_edge_indices.copy()
-    result.vertex_boundary_type = vertex_boundary_type
-    
     # Step 2: Process each tetrahedron
     triangles = []
     tets_contributing = 0
     
     # Track configuration statistics for debugging
     config_counts = {}
+    
+    # Track dynamically created vertices (face vertices, inner vertices)
+    # These are appended to surface_vertices and tracked in extended arrays
+    dynamic_vertices = []  # List of (position, boundary_type, edge_index=-1)
+    
+    # Counters for special configs
+    n_5edge_configs = 0
+    n_6edge_configs = 0
     
     for t in range(len(tetrahedra)):
         # Get the 6 global edge indices for this tet
@@ -381,12 +611,106 @@ def extract_parting_surface(
         config_counts[config] = config_counts.get(config, 0) + 1
         
         # Look up triangles from table
-        table_triangles = MARCHING_TET_TABLE.get(config, [])
+        table_entry = MARCHING_TET_TABLE.get(config, [])
         
-        if table_triangles:
+        # Build local edge-to-vertex mapping for this tet
+        local_edge_to_vertex = {}
+        for local_e in range(6):
+            global_e = int(tet_edges[local_e])
+            if global_e in edge_to_surface_vertex:
+                local_edge_to_vertex[local_e] = edge_to_surface_vertex[global_e]
+        
+        if table_entry == 'FACE_VERTEX':
+            # =================================================================
+            # 5-EDGE CONFIGURATION (Case 3 per Nielson & Franke 1997)
+            # Requires a face vertex at centroid of 3 mid-edge points
+            # =================================================================
+            n_5edge_configs += 1
             tets_contributing += 1
             
-            for local_tri in table_triangles:
+            # Find a face where ALL 3 edges are cut
+            # In 5-edge config, there are exactly 2 such faces
+            target_face = None
+            for face_idx, face_edges in enumerate(TET_FACE_EDGES):
+                if all(fe in local_edge_to_vertex for fe in face_edges):
+                    target_face = face_idx
+                    break
+            
+            if target_face is None:
+                logger.warning(f"Tet {t}: 5-edge config {config} but no face with 3 cut edges")
+                continue
+            
+            # Get the 3 cut edges on the target face
+            face_edges = TET_FACE_EDGES[target_face]
+            
+            # Compute face vertex position: centroid of 3 mid-edge points
+            # Per Nielson & Franke: m_ijk = (m_ij + m_ik + m_jk) / 3
+            mid_edge_positions = []
+            for fe in face_edges:
+                sv_idx = local_edge_to_vertex[fe]
+                mid_edge_positions.append(surface_vertices[sv_idx])
+            
+            face_vertex_pos = np.mean(mid_edge_positions, axis=0)
+            
+            # Add face vertex to dynamic vertices
+            face_vertex_idx = len(surface_vertices) + len(dynamic_vertices)
+            dynamic_vertices.append((face_vertex_pos, 0, -1))  # boundary_type=0 (interior)
+            
+            # Generate triangles using the helper function
+            tris = _get_5_edge_triangles(config, local_edge_to_vertex, face_vertex_idx)
+            triangles.extend(tris)
+            
+        elif table_entry == 'INNER_VERTEX':
+            # =================================================================
+            # 6-EDGE CONFIGURATION (Case 4 per Nielson & Franke 1997)
+            # Requires 4 face vertices + 1 inner vertex (mid-tetrahedron)
+            # =================================================================
+            n_6edge_configs += 1
+            tets_contributing += 1
+            
+            # Compute 4 face vertices (one per face)
+            face_vertex_indices = []
+            face_vertex_positions = []
+            
+            for face_idx, face_edges in enumerate(TET_FACE_EDGES):
+                # Face vertex = centroid of 3 mid-edge points on this face
+                mid_edge_positions = []
+                for fe in face_edges:
+                    if fe in local_edge_to_vertex:
+                        sv_idx = local_edge_to_vertex[fe]
+                        mid_edge_positions.append(surface_vertices[sv_idx])
+                
+                if len(mid_edge_positions) < 3:
+                    continue
+                
+                face_v_pos = np.mean(mid_edge_positions, axis=0)
+                face_vertex_positions.append(face_v_pos)
+                
+                face_v_idx = len(surface_vertices) + len(dynamic_vertices)
+                dynamic_vertices.append((face_v_pos, 0, -1))  # boundary_type=0 (interior)
+                face_vertex_indices.append(face_v_idx)
+            
+            if len(face_vertex_indices) < 4:
+                continue
+            
+            # Compute inner vertex: centroid of 4 face vertices
+            # Per Nielson & Franke: m_t = (m_ijk + m_jkl + m_ikl + m_ijl) / 4
+            inner_vertex_pos = np.mean(face_vertex_positions, axis=0)
+            inner_vertex_idx = len(surface_vertices) + len(dynamic_vertices)
+            dynamic_vertices.append((inner_vertex_pos, 0, -1))  # boundary_type=0 (interior)
+            
+            # Generate triangles using the helper function
+            tris = _get_6_edge_triangles(local_edge_to_vertex, face_vertex_indices, inner_vertex_idx)
+            triangles.extend(tris)
+            
+        elif table_entry:
+            # =================================================================
+            # STANDARD CONFIGURATIONS (Cases 1 & 2: 3 or 4 edges cut)
+            # Simple triangles using only mid-edge vertices
+            # =================================================================
+            tets_contributing += 1
+            
+            for local_tri in table_entry:
                 # Convert local edge indices to surface vertex indices
                 tri_verts = []
                 valid = True
@@ -403,20 +727,47 @@ def extract_parting_surface(
                 if valid and len(tri_verts) == 3:
                     triangles.append(tri_verts)
     
+    # Append dynamic vertices to surface_vertices array
+    if dynamic_vertices:
+        dynamic_positions = np.array([dv[0] for dv in dynamic_vertices], dtype=np.float64)
+        surface_vertices = np.vstack([surface_vertices, dynamic_positions])
+        
+        # Extend boundary type array
+        dynamic_boundary_types = np.array([dv[1] for dv in dynamic_vertices], dtype=np.int8)
+        vertex_boundary_type = np.concatenate([vertex_boundary_type, dynamic_boundary_types])
+        
+        # Extend edge mapping array (-1 for dynamic vertices not on edges)
+        dynamic_edge_indices = np.full(len(dynamic_vertices), -1, dtype=np.int64)
+        cut_edge_indices = np.concatenate([cut_edge_indices, dynamic_edge_indices])
+        
+        logger.info(f"Added {len(dynamic_vertices)} dynamic vertices "
+                    f"({n_5edge_configs} 5-edge configs, {n_6edge_configs} 6-edge configs)")
+    
+    # Store extended arrays in result
+    result.vertex_to_edge = cut_edge_indices.copy()
+    result.vertex_boundary_type = vertex_boundary_type.copy()
+    
     # Log configuration statistics
     logger.info(f"Configuration statistics ({len(config_counts)} unique configs):")
     high_config_tets = 0  # Count tets with 5+ edges cut
     for config in sorted(config_counts.keys()):
         n_edges = bin(config).count('1')
-        has_triangles = len(MARCHING_TET_TABLE.get(config, [])) > 0
-        status = "→ triangles" if has_triangles else "→ EMPTY (no triangles)"
+        table_entry = MARCHING_TET_TABLE.get(config, [])
+        if table_entry == 'FACE_VERTEX':
+            status = "→ 5-edge (face vertex)"
+        elif table_entry == 'INNER_VERTEX':
+            status = "→ 6-edge (inner vertex)"
+        elif table_entry:
+            status = "→ triangles"
+        else:
+            status = "→ EMPTY (no triangles)"
         if config_counts[config] > 10:  # Only log significant configs
             logger.info(f"  Config {config:2d} ({config:06b}, {n_edges} edges): {config_counts[config]:5d} tets {status}")
         if n_edges >= 5:
             high_config_tets += config_counts[config]
     
     if high_config_tets > 0:
-        logger.warning(f"  {high_config_tets} tets with 5+ edges cut - potential self-intersections")
+        logger.info(f"  {high_config_tets} tets with 5+ edges cut - now handled with face/inner vertices")
     
     result.num_tets_contributing = tets_contributing
     
@@ -1808,20 +2159,30 @@ def repair_self_folding(
     mesh: trimesh.Trimesh,
     normal_consistency_threshold: float = 0.0,
     remove_intersecting: bool = False,
-    max_iterations: int = 3
+    max_iterations: int = 3,
+    unfold_iterations: int = 5,
+    unfold_strength: float = 0.3
 ) -> SelfFoldingResult:
     """
     Attempt to repair self-folding regions in the mesh.
     
+    Self-folding occurs when portions of the membrane fold back on themselves,
+    creating regions where faces have opposite normals to their neighbors.
+    
     Repair strategies:
-    1. Fix inconsistent face normals
-    2. Optionally remove self-intersecting faces
+    1. Identify folded regions by detecting faces with inconsistent normals
+    2. Apply targeted local smoothing to "unfold" these regions
+    3. Fix face normals for consistency
+    4. Optionally remove faces that can't be repaired
     
     Args:
         mesh: Input mesh
         normal_consistency_threshold: Minimum dot product for normal consistency
+                                     (0.0 = allow up to 90°)
         remove_intersecting: If True, remove self-intersecting faces
-        max_iterations: Maximum iterations for normal fixing
+        max_iterations: Maximum iterations for the repair loop
+        unfold_iterations: Number of local smoothing iterations for folded regions
+        unfold_strength: Strength of local smoothing (0-1)
     
     Returns:
         SelfFoldingResult with repaired mesh
@@ -1836,6 +2197,8 @@ def repair_self_folding(
     
     # Work with a copy
     working_mesh = mesh.copy()
+    vertices = working_mesh.vertices.copy()
+    faces = working_mesh.faces
     
     # Step 1: Detect self-folding
     info = detect_self_folding(working_mesh, normal_consistency_threshold)
@@ -1849,7 +2212,47 @@ def repair_self_folding(
     
     result.self_folding_detected = True
     
-    # Step 2: Try to fix normals using trimesh's built-in method
+    # Step 2: Identify vertices in folded regions
+    problem_faces = set(info.problem_face_indices)
+    problem_vertices = set()
+    for fi in problem_faces:
+        problem_vertices.update(faces[fi])
+    
+    if len(problem_vertices) > 0:
+        logger.debug(f"Found {len(problem_vertices)} vertices in folded regions")
+        
+        # Build vertex adjacency
+        vertex_neighbors = {v: set() for v in range(len(vertices))}
+        for face in faces:
+            for i in range(3):
+                vi = face[i]
+                for j in range(3):
+                    if i != j:
+                        vertex_neighbors[vi].add(face[j])
+        
+        # Step 3: Apply targeted local smoothing to unfold regions
+        # Only smooth vertices that are part of folded faces
+        for unfold_iter in range(unfold_iterations):
+            new_vertices = vertices.copy()
+            
+            for vi in problem_vertices:
+                neighbors = list(vertex_neighbors[vi])
+                if len(neighbors) < 2:
+                    continue
+                
+                # Compute centroid of neighbors
+                neighbor_positions = vertices[neighbors]
+                centroid = neighbor_positions.mean(axis=0)
+                
+                # Move toward centroid (unfold)
+                new_vertices[vi] = vertices[vi] + unfold_strength * (centroid - vertices[vi])
+            
+            vertices = new_vertices
+        
+        # Update mesh with unfolded vertices
+        working_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    
+    # Step 4: Fix normals using trimesh's built-in method
     for iteration in range(max_iterations):
         try:
             working_mesh.fix_normals()
@@ -1865,7 +2268,57 @@ def repair_self_folding(
             logger.warning(f"Normal fix iteration {iteration} failed: {e}")
             break
     
-    # Step 3: Optionally detect and remove self-intersecting faces
+    # Step 5: If still have problems, try removing the worst offending faces
+    final_info = detect_self_folding(working_mesh, normal_consistency_threshold)
+    
+    if final_info.flipped_normal_count > 0 and len(final_info.problem_face_indices) > 0:
+        # Find faces that are severely folded (normal opposite to neighbors)
+        face_normals = working_mesh.face_normals
+        edge_to_faces = {}
+        for fi, face in enumerate(working_mesh.faces):
+            for i in range(3):
+                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                edge_key = (min(v0, v1), max(v0, v1))
+                if edge_key not in edge_to_faces:
+                    edge_to_faces[edge_key] = []
+                edge_to_faces[edge_key].append(fi)
+        
+        # Score each problem face by how badly it disagrees with neighbors
+        face_scores = {}
+        for fi in final_info.problem_face_indices:
+            score = 0
+            n_neighbors = 0
+            for i in range(3):
+                v0, v1 = int(working_mesh.faces[fi, i]), int(working_mesh.faces[fi, (i + 1) % 3])
+                edge_key = (min(v0, v1), max(v0, v1))
+                for fj in edge_to_faces.get(edge_key, []):
+                    if fj != fi:
+                        dot = np.dot(face_normals[fi], face_normals[fj])
+                        score += (1.0 - dot) / 2.0  # 0 = aligned, 1 = opposite
+                        n_neighbors += 1
+            if n_neighbors > 0:
+                face_scores[fi] = score / n_neighbors
+        
+        # Remove faces that are severely reversed (score > 0.7 means mostly opposite)
+        faces_to_remove = [fi for fi, score in face_scores.items() if score > 0.7]
+        
+        if faces_to_remove and len(faces_to_remove) < len(working_mesh.faces) * 0.1:
+            # Only remove if less than 10% of faces
+            keep_mask = np.ones(len(working_mesh.faces), dtype=bool)
+            keep_mask[faces_to_remove] = False
+            
+            new_faces = working_mesh.faces[keep_mask]
+            working_mesh = trimesh.Trimesh(
+                vertices=working_mesh.vertices,
+                faces=new_faces,
+                process=False
+            )
+            working_mesh.remove_unreferenced_vertices()
+            
+            result.faces_removed_for_intersection = len(faces_to_remove)
+            logger.info(f"Removed {len(faces_to_remove)} severely folded faces")
+    
+    # Step 6: Optionally detect and remove self-intersecting faces
     if remove_intersecting:
         intersecting_pairs = detect_self_intersections(working_mesh)
         result.self_intersections_found = len(intersecting_pairs)
@@ -1884,18 +2337,1677 @@ def repair_self_folding(
             new_faces = working_mesh.faces[keep_mask]
             working_mesh = trimesh.Trimesh(
                 vertices=working_mesh.vertices,
-                faces=new_faces
+                faces=new_faces,
+                process=False
             )
             working_mesh.remove_unreferenced_vertices()
             
-            result.faces_removed_for_intersection = len(problem_faces)
+            result.faces_removed_for_intersection += len(problem_faces)
     
     result.mesh = working_mesh
     result.processing_time_ms = (time.time() - start) * 1000
     
     logger.info(f"Self-folding repair: fixed {result.flipped_faces_fixed} normals, "
-                f"removed {result.faces_removed_for_intersection} intersecting faces "
+                f"removed {result.faces_removed_for_intersection} folded/intersecting faces "
                 f"in {result.processing_time_ms:.1f}ms")
+    
+    return result
+
+
+# =============================================================================
+# MESH QUALITY IMPROVEMENT - FIX THIN TRIANGLES
+# =============================================================================
+
+@dataclass
+class MeshQualityResult:
+    """Result of mesh quality improvement."""
+    mesh: Optional[trimesh.Trimesh] = None
+    
+    # Statistics
+    thin_triangles_found: int = 0
+    triangles_collapsed: int = 0
+    triangles_split: int = 0
+    edges_collapsed: int = 0
+    vertex_only_removed: int = 0  # Triangles only connected by vertices, not edges
+    degenerate_removed: int = 0   # Zero/near-zero area triangles
+    duplicate_removed: int = 0    # Duplicate faces
+    ear_removed: int = 0          # Triangles with 2 boundary edges
+    non_manifold_removed: int = 0 # Triangles on non-manifold edges
+    tiny_removed: int = 0         # Very small area triangles
+    
+    # Quality metrics before/after
+    min_aspect_before: float = 0.0
+    avg_aspect_before: float = 0.0
+    min_aspect_after: float = 0.0
+    avg_aspect_after: float = 0.0
+    
+    # Timing
+    processing_time_ms: float = 0.0
+
+
+def _compute_all_aspect_ratios(mesh: trimesh.Trimesh) -> np.ndarray:
+    """Compute aspect ratio for all triangles in mesh."""
+    triangles = mesh.triangles  # (n_faces, 3, 3)
+    
+    # Edge vectors
+    e0 = triangles[:, 1] - triangles[:, 0]  # V0 -> V1
+    e1 = triangles[:, 2] - triangles[:, 1]  # V1 -> V2
+    e2 = triangles[:, 0] - triangles[:, 2]  # V2 -> V0
+    
+    # Edge lengths
+    a = np.linalg.norm(e0, axis=1)
+    b = np.linalg.norm(e1, axis=1)
+    c = np.linalg.norm(e2, axis=1)
+    
+    # Semi-perimeter
+    s = (a + b + c) / 2
+    
+    # Area via Heron's formula (with numerical stability)
+    area_sq = s * (s - a) * (s - b) * (s - c)
+    area_sq = np.maximum(area_sq, 0)  # Clamp negative values
+    area = np.sqrt(area_sq)
+    
+    # Aspect ratio = 4 * area^2 / (s * a * b * c) * 2
+    # Normalized so equilateral = 1
+    denom = s * a * b * c
+    denom = np.where(denom < 1e-20, 1e-20, denom)  # Avoid division by zero
+    
+    ratio = (4 * area * area) / denom
+    aspect = np.minimum(ratio * 2, 1.0)
+    
+    return aspect
+
+
+def improve_mesh_quality(
+    mesh: trimesh.Trimesh,
+    min_aspect_ratio: float = 0.15,
+    max_iterations: int = 3,
+    collapse_thin_triangles: bool = True,
+    split_thin_triangles: bool = False
+) -> MeshQualityResult:
+    """
+    Improve mesh quality by fixing thin/degenerate triangles.
+    
+    This function identifies triangles with low aspect ratios and improves them by:
+    1. Edge collapse - collapse the shortest edge of thin triangles
+    2. Triangle splitting - split thin triangles at centroid (optional)
+    
+    Args:
+        mesh: Input mesh to improve
+        min_aspect_ratio: Triangles below this threshold are considered thin
+        max_iterations: Maximum improvement iterations
+        collapse_thin_triangles: Whether to collapse edges of thin triangles
+        split_thin_triangles: Whether to split thin triangles (adds vertices)
+    
+    Returns:
+        MeshQualityResult with improved mesh and statistics
+    """
+    import time
+    start = time.time()
+    
+    result = MeshQualityResult()
+    
+    if mesh is None or len(mesh.faces) == 0:
+        return result
+    
+    # Compute initial quality metrics
+    initial_aspects = _compute_all_aspect_ratios(mesh)
+    result.min_aspect_before = float(np.min(initial_aspects))
+    result.avg_aspect_before = float(np.mean(initial_aspects))
+    
+    thin_mask = initial_aspects < min_aspect_ratio
+    result.thin_triangles_found = int(np.sum(thin_mask))
+    
+    if result.thin_triangles_found == 0:
+        logger.info(f"No thin triangles found (min aspect ratio: {result.min_aspect_before:.4f})")
+        result.mesh = mesh
+        result.min_aspect_after = result.min_aspect_before
+        result.avg_aspect_after = result.avg_aspect_before
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    logger.info(f"Found {result.thin_triangles_found} thin triangles (aspect < {min_aspect_ratio})")
+    
+    working_mesh = mesh.copy()
+    
+    for iteration in range(max_iterations):
+        # Recompute aspects
+        aspects = _compute_all_aspect_ratios(working_mesh)
+        thin_mask = aspects < min_aspect_ratio
+        n_thin = np.sum(thin_mask)
+        
+        if n_thin == 0:
+            break
+        
+        logger.debug(f"Iteration {iteration + 1}: {n_thin} thin triangles remaining")
+        
+        if collapse_thin_triangles:
+            # Strategy: collapse shortest edge in thin triangles
+            working_mesh, n_collapsed = _collapse_thin_triangle_edges(
+                working_mesh, thin_mask, aspects
+            )
+            result.edges_collapsed += n_collapsed
+            result.triangles_collapsed += n_collapsed
+        
+        if split_thin_triangles and n_thin > 0:
+            # Recompute after collapse
+            aspects = _compute_all_aspect_ratios(working_mesh)
+            thin_mask = aspects < min_aspect_ratio
+            
+            if np.sum(thin_mask) > 0:
+                working_mesh, n_split = _split_thin_triangles(working_mesh, thin_mask)
+                result.triangles_split += n_split
+    
+    # Final quality metrics
+    final_aspects = _compute_all_aspect_ratios(working_mesh)
+    result.min_aspect_after = float(np.min(final_aspects))
+    result.avg_aspect_after = float(np.mean(final_aspects))
+    
+    # === Additional triangle cleaning passes ===
+    
+    # 1. Remove degenerate (zero-area) triangles
+    working_mesh, n_degen = _remove_degenerate_triangles(working_mesh)
+    result.degenerate_removed = n_degen
+    
+    # 2. Remove duplicate triangles
+    working_mesh, n_dup = _remove_duplicate_triangles(working_mesh)
+    result.duplicate_removed = n_dup
+    
+    # 3. Remove ear triangles (2 boundary edges)
+    working_mesh, n_ear = _remove_ear_triangles(working_mesh)
+    result.ear_removed = n_ear
+    
+    # 4. Remove triangles on non-manifold edges (>2 faces sharing edge)
+    working_mesh, n_nm = _remove_non_manifold_triangles(working_mesh)
+    result.non_manifold_removed = n_nm
+    
+    # 5. Remove vertex-only connected triangles (no shared edges)
+    working_mesh, n_vo = _remove_vertex_only_triangles(working_mesh)
+    result.vertex_only_removed = n_vo
+    
+    # 6. Remove very small triangles (area < 1% of median)
+    working_mesh, n_tiny = _remove_tiny_triangles(working_mesh, area_threshold_fraction=0.01)
+    result.tiny_removed = n_tiny
+    
+    total_removed = n_degen + n_dup + n_ear + n_nm + n_vo + n_tiny
+    
+    result.mesh = working_mesh
+    result.processing_time_ms = (time.time() - start) * 1000
+    
+    logger.info(f"Mesh quality improvement: "
+                f"collapsed {result.edges_collapsed} edges, split {result.triangles_split} triangles, "
+                f"removed: {result.degenerate_removed} degenerate, {result.duplicate_removed} duplicate, "
+                f"{result.ear_removed} ear, {result.non_manifold_removed} non-manifold, "
+                f"{result.vertex_only_removed} vertex-only, {result.tiny_removed} tiny "
+                f"(total {total_removed} removed), "
+                f"aspect ratio: {result.min_aspect_before:.4f} → {result.min_aspect_after:.4f} (min) "
+                f"in {result.processing_time_ms:.1f}ms")
+    
+    return result
+
+
+def _remove_vertex_only_triangles(mesh: trimesh.Trimesh) -> Tuple[trimesh.Trimesh, int]:
+    """
+    Remove triangles that are only connected to the mesh by vertices, not edges.
+    
+    These are "dangling" triangles that don't share any edges with neighboring triangles,
+    only sharing vertices. Such triangles create non-manifold geometry.
+    
+    Returns:
+        Tuple of (new_mesh, num_removed)
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh, 0
+    
+    faces = mesh.faces
+    n_faces = len(faces)
+    
+    # Build edge-to-face mapping
+    # Each edge is represented as a sorted tuple (min_vertex, max_vertex)
+    edge_to_faces = {}
+    
+    for fi, face in enumerate(faces):
+        v0, v1, v2 = face[0], face[1], face[2]
+        
+        # Three edges per face
+        edges = [
+            (min(v0, v1), max(v0, v1)),
+            (min(v1, v2), max(v1, v2)),
+            (min(v2, v0), max(v2, v0))
+        ]
+        
+        for edge in edges:
+            if edge not in edge_to_faces:
+                edge_to_faces[edge] = []
+            edge_to_faces[edge].append(fi)
+    
+    # Find triangles with no shared edges (all 3 edges have only 1 face)
+    vertex_only_triangles = []
+    
+    for fi, face in enumerate(faces):
+        v0, v1, v2 = face[0], face[1], face[2]
+        
+        edges = [
+            (min(v0, v1), max(v0, v1)),
+            (min(v1, v2), max(v1, v2)),
+            (min(v2, v0), max(v2, v0))
+        ]
+        
+        # Count edges shared with other triangles
+        shared_edges = 0
+        for edge in edges:
+            if len(edge_to_faces[edge]) > 1:
+                shared_edges += 1
+        
+        # If no edges are shared, this triangle is only vertex-connected
+        if shared_edges == 0:
+            vertex_only_triangles.append(fi)
+    
+    if len(vertex_only_triangles) == 0:
+        return mesh, 0
+    
+    logger.debug(f"Found {len(vertex_only_triangles)} vertex-only connected triangles to remove")
+    
+    # Create mask for faces to keep
+    keep_mask = np.ones(n_faces, dtype=bool)
+    keep_mask[vertex_only_triangles] = False
+    
+    new_faces = faces[keep_mask]
+    
+    new_mesh = trimesh.Trimesh(
+        vertices=mesh.vertices.copy(),
+        faces=new_faces,
+        process=False
+    )
+    new_mesh.remove_unreferenced_vertices()
+    
+    return new_mesh, len(vertex_only_triangles)
+
+
+def _remove_degenerate_triangles(mesh: trimesh.Trimesh, area_threshold: float = 1e-10) -> Tuple[trimesh.Trimesh, int]:
+    """
+    Remove degenerate (zero or near-zero area) triangles.
+    
+    These are triangles where vertices are collinear or nearly collinear.
+    
+    Args:
+        mesh: Input mesh
+        area_threshold: Absolute area below which triangles are considered degenerate
+    
+    Returns:
+        Tuple of (new_mesh, num_removed)
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh, 0
+    
+    # Compute triangle areas
+    areas = mesh.area_faces
+    
+    # Find degenerate triangles
+    degenerate_mask = areas < area_threshold
+    n_degenerate = np.sum(degenerate_mask)
+    
+    if n_degenerate == 0:
+        return mesh, 0
+    
+    logger.debug(f"Found {n_degenerate} degenerate (zero-area) triangles to remove")
+    
+    # Keep non-degenerate faces
+    keep_mask = ~degenerate_mask
+    new_faces = mesh.faces[keep_mask]
+    
+    new_mesh = trimesh.Trimesh(
+        vertices=mesh.vertices.copy(),
+        faces=new_faces,
+        process=False
+    )
+    new_mesh.remove_unreferenced_vertices()
+    
+    return new_mesh, int(n_degenerate)
+
+
+def _remove_duplicate_triangles(mesh: trimesh.Trimesh) -> Tuple[trimesh.Trimesh, int]:
+    """
+    Remove duplicate triangles (same vertices, any winding order).
+    
+    Returns:
+        Tuple of (new_mesh, num_removed)
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh, 0
+    
+    faces = mesh.faces
+    n_faces = len(faces)
+    
+    # Create canonical form of each face (sorted vertices)
+    canonical = np.sort(faces, axis=1)
+    
+    # Find unique faces
+    _, unique_indices, counts = np.unique(
+        canonical, axis=0, return_index=True, return_counts=True
+    )
+    
+    n_duplicates = n_faces - len(unique_indices)
+    
+    if n_duplicates == 0:
+        return mesh, 0
+    
+    logger.debug(f"Found {n_duplicates} duplicate triangles to remove")
+    
+    # Keep only unique faces
+    new_faces = faces[np.sort(unique_indices)]
+    
+    new_mesh = trimesh.Trimesh(
+        vertices=mesh.vertices.copy(),
+        faces=new_faces,
+        process=False
+    )
+    new_mesh.remove_unreferenced_vertices()
+    
+    return new_mesh, n_duplicates
+
+
+def _remove_ear_triangles(mesh: trimesh.Trimesh) -> Tuple[trimesh.Trimesh, int]:
+    """
+    Remove ear triangles - triangles with 2 boundary edges.
+    
+    These are triangles that stick out from the mesh with only one edge
+    connected to the interior. They're often artifacts from mesh operations.
+    
+    Returns:
+        Tuple of (new_mesh, num_removed)
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh, 0
+    
+    faces = mesh.faces
+    n_faces = len(faces)
+    
+    # Build edge-to-face mapping
+    edge_to_faces = {}
+    
+    for fi, face in enumerate(faces):
+        v0, v1, v2 = face[0], face[1], face[2]
+        edges = [
+            (min(v0, v1), max(v0, v1)),
+            (min(v1, v2), max(v1, v2)),
+            (min(v2, v0), max(v2, v0))
+        ]
+        for edge in edges:
+            if edge not in edge_to_faces:
+                edge_to_faces[edge] = []
+            edge_to_faces[edge].append(fi)
+    
+    # Find ear triangles (2 boundary edges = 2 edges with only 1 face)
+    ear_triangles = []
+    
+    for fi, face in enumerate(faces):
+        v0, v1, v2 = face[0], face[1], face[2]
+        edges = [
+            (min(v0, v1), max(v0, v1)),
+            (min(v1, v2), max(v1, v2)),
+            (min(v2, v0), max(v2, v0))
+        ]
+        
+        # Count boundary edges (edges with only 1 face)
+        boundary_edges = sum(1 for e in edges if len(edge_to_faces[e]) == 1)
+        
+        if boundary_edges >= 2:
+            ear_triangles.append(fi)
+    
+    if len(ear_triangles) == 0:
+        return mesh, 0
+    
+    logger.debug(f"Found {len(ear_triangles)} ear triangles (2+ boundary edges) to remove")
+    
+    # Create mask for faces to keep
+    keep_mask = np.ones(n_faces, dtype=bool)
+    keep_mask[ear_triangles] = False
+    
+    new_faces = faces[keep_mask]
+    
+    new_mesh = trimesh.Trimesh(
+        vertices=mesh.vertices.copy(),
+        faces=new_faces,
+        process=False
+    )
+    new_mesh.remove_unreferenced_vertices()
+    
+    return new_mesh, len(ear_triangles)
+
+
+def _remove_non_manifold_triangles(mesh: trimesh.Trimesh) -> Tuple[trimesh.Trimesh, int]:
+    """
+    Remove triangles that share non-manifold edges (edges with >2 faces).
+    
+    Non-manifold edges cause problems for CSG operations and make the mesh
+    not watertight. We remove all triangles incident to such edges.
+    
+    Returns:
+        Tuple of (new_mesh, num_removed)
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh, 0
+    
+    faces = mesh.faces
+    n_faces = len(faces)
+    
+    # Build edge-to-face mapping
+    edge_to_faces = {}
+    
+    for fi, face in enumerate(faces):
+        v0, v1, v2 = face[0], face[1], face[2]
+        edges = [
+            (min(v0, v1), max(v0, v1)),
+            (min(v1, v2), max(v1, v2)),
+            (min(v2, v0), max(v2, v0))
+        ]
+        for edge in edges:
+            if edge not in edge_to_faces:
+                edge_to_faces[edge] = []
+            edge_to_faces[edge].append(fi)
+    
+    # Find non-manifold edges (>2 faces)
+    non_manifold_edges = {e for e, flist in edge_to_faces.items() if len(flist) > 2}
+    
+    if len(non_manifold_edges) == 0:
+        return mesh, 0
+    
+    # Find all triangles incident to non-manifold edges
+    triangles_to_remove = set()
+    for edge in non_manifold_edges:
+        triangles_to_remove.update(edge_to_faces[edge])
+    
+    if len(triangles_to_remove) == 0:
+        return mesh, 0
+    
+    logger.debug(f"Found {len(non_manifold_edges)} non-manifold edges, "
+                 f"removing {len(triangles_to_remove)} incident triangles")
+    
+    # Create mask for faces to keep
+    keep_mask = np.ones(n_faces, dtype=bool)
+    keep_mask[list(triangles_to_remove)] = False
+    
+    new_faces = faces[keep_mask]
+    
+    new_mesh = trimesh.Trimesh(
+        vertices=mesh.vertices.copy(),
+        faces=new_faces,
+        process=False
+    )
+    new_mesh.remove_unreferenced_vertices()
+    
+    return new_mesh, len(triangles_to_remove)
+
+
+def _remove_tiny_triangles(mesh: trimesh.Trimesh, area_threshold_fraction: float = 0.01) -> Tuple[trimesh.Trimesh, int]:
+    """
+    Remove very small triangles relative to the mesh's median triangle area.
+    
+    Args:
+        mesh: Input mesh
+        area_threshold_fraction: Remove triangles with area < fraction * median_area
+    
+    Returns:
+        Tuple of (new_mesh, num_removed)
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh, 0
+    
+    # Compute triangle areas
+    areas = mesh.area_faces
+    
+    if len(areas) == 0:
+        return mesh, 0
+    
+    # Use median to be robust to outliers
+    median_area = np.median(areas)
+    threshold = area_threshold_fraction * median_area
+    
+    # Find tiny triangles
+    tiny_mask = areas < threshold
+    n_tiny = np.sum(tiny_mask)
+    
+    if n_tiny == 0:
+        return mesh, 0
+    
+    logger.debug(f"Found {n_tiny} tiny triangles (area < {threshold:.6f}) to remove")
+    
+    # Keep non-tiny faces
+    keep_mask = ~tiny_mask
+    new_faces = mesh.faces[keep_mask]
+    
+    new_mesh = trimesh.Trimesh(
+        vertices=mesh.vertices.copy(),
+        faces=new_faces,
+        process=False
+    )
+    new_mesh.remove_unreferenced_vertices()
+    
+    return new_mesh, int(n_tiny)
+
+
+def _collapse_thin_triangle_edges(
+    mesh: trimesh.Trimesh,
+    thin_mask: np.ndarray,
+    aspects: np.ndarray
+) -> Tuple[trimesh.Trimesh, int]:
+    """
+    Collapse shortest edges in thin triangles.
+    
+    For each thin triangle, identifies the shortest edge and collapses it
+    by merging the two vertices to their midpoint.
+    
+    Returns:
+        Tuple of (new_mesh, num_collapsed)
+    """
+    vertices = mesh.vertices.copy()
+    faces = mesh.faces.copy()
+    
+    thin_indices = np.where(thin_mask)[0]
+    
+    # Sort by aspect ratio (worst first) to prioritize the thinnest
+    sorted_indices = thin_indices[np.argsort(aspects[thin_indices])]
+    
+    # Track which vertices have been merged
+    vertex_map = np.arange(len(vertices))  # Maps old index to new index
+    collapsed_count = 0
+    max_collapses = min(len(sorted_indices), len(faces) // 10)  # Limit to 10% of faces per iteration
+    
+    for fi in sorted_indices[:max_collapses]:
+        if fi >= len(faces):
+            continue
+        
+        face = faces[fi]
+        v0, v1, v2 = face[0], face[1], face[2]
+        
+        # Map to current vertex indices
+        v0, v1, v2 = vertex_map[v0], vertex_map[v1], vertex_map[v2]
+        
+        # Skip if already collapsed (vertices merged)
+        if v0 == v1 or v1 == v2 or v2 == v0:
+            continue
+        
+        # Get vertex positions
+        p0, p1, p2 = vertices[v0], vertices[v1], vertices[v2]
+        
+        # Find shortest edge
+        e01 = np.linalg.norm(p1 - p0)
+        e12 = np.linalg.norm(p2 - p1)
+        e20 = np.linalg.norm(p0 - p2)
+        
+        min_edge = min(e01, e12, e20)
+        
+        # Collapse shortest edge
+        if min_edge == e01:
+            # Merge v0 and v1 to midpoint
+            midpoint = (p0 + p1) / 2
+            vertices[v0] = midpoint
+            vertex_map[vertex_map == v1] = v0
+        elif min_edge == e12:
+            # Merge v1 and v2 to midpoint
+            midpoint = (p1 + p2) / 2
+            vertices[v1] = midpoint
+            vertex_map[vertex_map == v2] = v1
+        else:
+            # Merge v2 and v0 to midpoint
+            midpoint = (p2 + p0) / 2
+            vertices[v2] = midpoint
+            vertex_map[vertex_map == v0] = v2
+        
+        collapsed_count += 1
+    
+    if collapsed_count == 0:
+        return mesh, 0
+    
+    # Remap faces to new vertex indices
+    new_faces = vertex_map[faces]
+    
+    # Remove degenerate faces (where any two vertices are the same)
+    valid_mask = (new_faces[:, 0] != new_faces[:, 1]) & \
+                 (new_faces[:, 1] != new_faces[:, 2]) & \
+                 (new_faces[:, 2] != new_faces[:, 0])
+    
+    new_faces = new_faces[valid_mask]
+    
+    # Create new mesh
+    new_mesh = trimesh.Trimesh(
+        vertices=vertices,
+        faces=new_faces,
+        process=False
+    )
+    new_mesh.remove_unreferenced_vertices()
+    
+    return new_mesh, collapsed_count
+
+
+def _split_thin_triangles(
+    mesh: trimesh.Trimesh,
+    thin_mask: np.ndarray
+) -> Tuple[trimesh.Trimesh, int]:
+    """
+    Split thin triangles by adding a vertex at centroid.
+    
+    Each thin triangle is replaced by 3 triangles sharing the centroid.
+    This can help improve aspect ratios in some cases.
+    
+    Returns:
+        Tuple of (new_mesh, num_split)
+    """
+    vertices = list(mesh.vertices)
+    faces = list(mesh.faces)
+    
+    thin_indices = np.where(thin_mask)[0]
+    split_count = 0
+    
+    # Collect faces to remove and new faces to add
+    faces_to_remove = set()
+    new_faces = []
+    
+    for fi in thin_indices:
+        face = faces[fi]
+        v0, v1, v2 = face[0], face[1], face[2]
+        
+        # Compute centroid
+        p0, p1, p2 = mesh.vertices[v0], mesh.vertices[v1], mesh.vertices[v2]
+        centroid = (p0 + p1 + p2) / 3
+        
+        # Add centroid as new vertex
+        centroid_idx = len(vertices)
+        vertices.append(centroid)
+        
+        # Create 3 new faces
+        new_faces.append([v0, v1, centroid_idx])
+        new_faces.append([v1, v2, centroid_idx])
+        new_faces.append([v2, v0, centroid_idx])
+        
+        faces_to_remove.add(fi)
+        split_count += 1
+    
+    # Build final face list
+    final_faces = [f for i, f in enumerate(faces) if i not in faces_to_remove]
+    final_faces.extend(new_faces)
+    
+    new_mesh = trimesh.Trimesh(
+        vertices=np.array(vertices),
+        faces=np.array(final_faces),
+        process=False
+    )
+    
+    return new_mesh, split_count
+
+
+# =============================================================================
+# COMPREHENSIVE COMPONENT CLEANUP - KEEP ONLY MAIN MEMBRANE
+# =============================================================================
+
+@dataclass
+class ComponentCleanupResult:
+    """Result of comprehensive component cleanup."""
+    mesh: Optional[trimesh.Trimesh] = None
+    
+    # Statistics
+    total_components_found: int = 0
+    components_removed: int = 0
+    faces_removed: int = 0
+    
+    # Main component info
+    main_component_faces: int = 0
+    main_component_area: float = 0.0
+    
+    # Reasons for removal
+    removed_by_size: int = 0
+    removed_by_area: int = 0
+    removed_by_intersection: int = 0
+    removed_by_distance: int = 0
+    
+    # Timing
+    processing_time_ms: float = 0.0
+
+
+def _check_meshes_intersect(mesh1: trimesh.Trimesh, mesh2: trimesh.Trimesh, 
+                            sample_count: int = 50) -> bool:
+    """
+    Check if two meshes intersect by sampling points and checking containment.
+    
+    Uses a fast approximation: samples points from mesh1's faces and checks
+    if any are inside mesh2's convex hull or very close to mesh2.
+    
+    Args:
+        mesh1: First mesh
+        mesh2: Second mesh
+        sample_count: Number of sample points to check
+    
+    Returns:
+        True if meshes likely intersect
+    """
+    try:
+        # Quick bounding box check first
+        min1, max1 = mesh1.bounds
+        min2, max2 = mesh2.bounds
+        
+        # If bounding boxes don't overlap, meshes can't intersect
+        if (max1[0] < min2[0] or min1[0] > max2[0] or
+            max1[1] < min2[1] or min1[1] > max2[1] or
+            max1[2] < min2[2] or min1[2] > max2[2]):
+            return False
+        
+        # Sample points from mesh1's face centroids
+        n_faces = len(mesh1.faces)
+        if n_faces == 0:
+            return False
+        
+        sample_indices = np.random.choice(n_faces, min(sample_count, n_faces), replace=False)
+        sample_points = mesh1.triangles_center[sample_indices]
+        
+        # Check proximity to mesh2
+        _, distances, _ = trimesh.proximity.closest_point(mesh2, sample_points)
+        
+        # If any sample point is very close to mesh2, consider it intersecting
+        # Use a threshold based on mesh2's average edge length
+        edges = mesh2.edges_unique
+        if len(edges) > 0:
+            edge_lengths = np.linalg.norm(
+                mesh2.vertices[edges[:, 1]] - mesh2.vertices[edges[:, 0]], axis=1
+            )
+            threshold = np.median(edge_lengths) * 0.5
+        else:
+            threshold = 0.1
+        
+        if np.any(distances < threshold):
+            return True
+        
+        return False
+        
+    except Exception as e:
+        logger.debug(f"Intersection check failed: {e}")
+        return False
+
+
+def _compute_component_distance_to_main(component: trimesh.Trimesh, 
+                                        main_mesh: trimesh.Trimesh) -> float:
+    """
+    Compute the minimum distance from a component to the main mesh.
+    
+    Args:
+        component: The component mesh
+        main_mesh: The main/largest mesh
+    
+    Returns:
+        Minimum distance between component boundary and main mesh
+    """
+    try:
+        # Sample points from component
+        n_verts = len(component.vertices)
+        sample_count = min(50, n_verts)
+        sample_indices = np.random.choice(n_verts, sample_count, replace=False)
+        sample_points = component.vertices[sample_indices]
+        
+        # Find closest points on main mesh
+        _, distances, _ = trimesh.proximity.closest_point(main_mesh, sample_points)
+        
+        return float(np.min(distances))
+        
+    except Exception as e:
+        logger.debug(f"Distance computation failed: {e}")
+        return float('inf')
+
+
+def cleanup_membrane_components(
+    membrane_mesh: trimesh.Trimesh,
+    part_mesh: Optional[trimesh.Trimesh] = None,
+    min_area_fraction: float = 0.02,
+    min_face_count: int = 20,
+    max_distance_from_main: float = None,
+    remove_intersecting: bool = True
+) -> ComponentCleanupResult:
+    """
+    Comprehensive cleanup of membrane mesh to keep only the main component.
+    
+    This function identifies and removes:
+    1. Small disconnected islands (by face count and area)
+    2. Components that intersect with the main membrane (self-intersection artifacts)
+    3. Components that are too far from the main membrane (orphans)
+    
+    The "main" component is identified as the largest by area.
+    
+    Args:
+        membrane_mesh: The membrane mesh to clean up
+        part_mesh: Optional part mesh for context (unused currently but reserved)
+        min_area_fraction: Components with area < this fraction of main are removed
+        min_face_count: Components with fewer faces than this are always removed
+        max_distance_from_main: Components farther than this from main are removed (auto if None)
+        remove_intersecting: Whether to remove components that intersect the main
+    
+    Returns:
+        ComponentCleanupResult with cleaned mesh and statistics
+    """
+    import time
+    start = time.time()
+    
+    result = ComponentCleanupResult()
+    
+    if membrane_mesh is None or len(membrane_mesh.faces) == 0:
+        logger.warning("No membrane mesh provided for component cleanup")
+        return result
+    
+    # Split into connected components
+    try:
+        components = membrane_mesh.split(only_watertight=False)
+    except Exception as e:
+        logger.warning(f"Could not split mesh into components: {e}")
+        result.mesh = membrane_mesh
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    result.total_components_found = len(components)
+    
+    if len(components) <= 1:
+        # Single component - nothing to clean
+        result.mesh = membrane_mesh
+        if len(components) == 1:
+            result.main_component_faces = len(components[0].faces)
+            result.main_component_area = float(components[0].area)
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    logger.info(f"Found {len(components)} connected components in membrane")
+    
+    # Compute area for each component and find the main (largest) one
+    component_info = []
+    for i, comp in enumerate(components):
+        area = float(comp.area) if len(comp.faces) > 0 else 0.0
+        n_faces = len(comp.faces)
+        component_info.append({
+            'index': i,
+            'mesh': comp,
+            'area': area,
+            'n_faces': n_faces
+        })
+    
+    # Sort by area (descending) - largest is main
+    component_info.sort(key=lambda x: x['area'], reverse=True)
+    
+    main_component = component_info[0]
+    main_mesh = main_component['mesh']
+    main_area = main_component['area']
+    
+    result.main_component_faces = main_component['n_faces']
+    result.main_component_area = main_area
+    
+    logger.info(f"Main component: {main_component['n_faces']} faces, area={main_area:.4f}")
+    
+    # Auto-compute max distance if not provided
+    if max_distance_from_main is None:
+        mesh_scale = np.linalg.norm(membrane_mesh.bounds[1] - membrane_mesh.bounds[0])
+        max_distance_from_main = mesh_scale * 0.1  # 10% of mesh scale
+    
+    # Evaluate each non-main component
+    kept_components = [main_mesh]
+    
+    for info in component_info[1:]:  # Skip main (index 0)
+        comp = info['mesh']
+        area = info['area']
+        n_faces = info['n_faces']
+        should_remove = False
+        removal_reason = None
+        
+        # Check 1: Minimum face count
+        if n_faces < min_face_count:
+            should_remove = True
+            removal_reason = 'size'
+            result.removed_by_size += 1
+        
+        # Check 2: Minimum area fraction
+        elif main_area > 0 and (area / main_area) < min_area_fraction:
+            should_remove = True
+            removal_reason = 'area'
+            result.removed_by_area += 1
+        
+        # Check 3: Intersection with main (artifact)
+        elif remove_intersecting and _check_meshes_intersect(comp, main_mesh):
+            should_remove = True
+            removal_reason = 'intersection'
+            result.removed_by_intersection += 1
+        
+        # Check 4: Distance from main
+        else:
+            dist = _compute_component_distance_to_main(comp, main_mesh)
+            if dist > max_distance_from_main:
+                should_remove = True
+                removal_reason = 'distance'
+                result.removed_by_distance += 1
+        
+        if should_remove:
+            result.components_removed += 1
+            result.faces_removed += n_faces
+            logger.debug(f"Removing component with {n_faces} faces, area={area:.4f} (reason: {removal_reason})")
+        else:
+            kept_components.append(comp)
+            logger.debug(f"Keeping component with {n_faces} faces, area={area:.4f}")
+    
+    # Combine kept components
+    if len(kept_components) == 1:
+        result.mesh = kept_components[0]
+    else:
+        result.mesh = trimesh.util.concatenate(kept_components)
+    
+    result.processing_time_ms = (time.time() - start) * 1000
+    
+    logger.info(f"Component cleanup: removed {result.components_removed}/{result.total_components_found-1} "
+                f"secondary components ({result.faces_removed} faces) - "
+                f"by size: {result.removed_by_size}, by area: {result.removed_by_area}, "
+                f"by intersection: {result.removed_by_intersection}, by distance: {result.removed_by_distance} "
+                f"in {result.processing_time_ms:.1f}ms")
+    
+    return result
+
+
+# =============================================================================
+# ROBUST GAP CLOSING WITH QUALITY-CONTROLLED TRIANGULATION
+# =============================================================================
+
+@dataclass
+class GapClosingResult:
+    """Result of closing gaps between membrane boundary and part surface."""
+    mesh: Optional[trimesh.Trimesh] = None
+    
+    # Statistics
+    boundary_loops_found: int = 0
+    inner_boundary_loops: int = 0
+    gap_faces_added: int = 0
+    gap_vertices_added: int = 0
+    edges_subdivided: int = 0
+    thin_triangles_avoided: int = 0
+    
+    # Average gap distance before closing
+    avg_gap_distance: float = 0.0
+    max_gap_distance: float = 0.0
+    
+    # Quality metrics
+    min_triangle_aspect_ratio: float = 0.0
+    avg_triangle_aspect_ratio: float = 0.0
+    
+    # Timing
+    processing_time_ms: float = 0.0
+
+
+def _compute_triangle_aspect_ratio(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray) -> float:
+    """
+    Compute aspect ratio of a triangle (0 = degenerate, 1 = equilateral).
+    
+    Uses the ratio of the inscribed circle radius to the circumscribed circle radius,
+    normalized to 1 for an equilateral triangle.
+    """
+    a = np.linalg.norm(p1 - p0)
+    b = np.linalg.norm(p2 - p1)
+    c = np.linalg.norm(p0 - p2)
+    
+    if a < 1e-10 or b < 1e-10 or c < 1e-10:
+        return 0.0
+    
+    # Semi-perimeter
+    s = (a + b + c) / 2
+    
+    # Area via Heron's formula
+    area_sq = s * (s - a) * (s - b) * (s - c)
+    if area_sq <= 0:
+        return 0.0
+    area = np.sqrt(area_sq)
+    
+    # Inradius = area / s
+    # Circumradius = (a * b * c) / (4 * area)
+    # Ratio = inradius / circumradius = 4 * area^2 / (s * a * b * c)
+    # For equilateral: ratio = 0.5, so we normalize by 2
+    ratio = (4 * area * area) / (s * a * b * c)
+    return min(1.0, ratio * 2)
+
+
+def _find_best_projection_on_part(
+    point: np.ndarray,
+    part_mesh: trimesh.Trimesh,
+    neighbor_projections: List[np.ndarray],
+    search_radius: float
+) -> Tuple[np.ndarray, float]:
+    """
+    Find the best projection point on part surface considering neighbors.
+    
+    Instead of just closest point, this considers:
+    1. Distance to original point
+    2. Smoothness with neighboring projections
+    3. Avoids projecting to topologically distant parts
+    
+    Returns:
+        Tuple of (projection_point, distance)
+    """
+    # Get closest point as baseline
+    closest_pts, closest_dists, closest_faces = trimesh.proximity.closest_point(
+        part_mesh, point.reshape(1, 3)
+    )
+    closest_pt = closest_pts[0]
+    closest_dist = closest_dists[0]
+    
+    # If no neighbors or very close, just use closest
+    if len(neighbor_projections) == 0 or closest_dist < 1e-6:
+        return closest_pt, closest_dist
+    
+    # Compute neighbor centroid
+    neighbor_center = np.mean(neighbor_projections, axis=0)
+    
+    # If closest point is near the neighbor centroid, use it
+    dist_to_neighbors = np.linalg.norm(closest_pt - neighbor_center)
+    avg_neighbor_spread = np.mean([np.linalg.norm(p - neighbor_center) for p in neighbor_projections])
+    
+    # If within expected spread, accept the closest point
+    if dist_to_neighbors < avg_neighbor_spread * 3 + search_radius:
+        return closest_pt, closest_dist
+    
+    # Otherwise, try to find a better point by sampling
+    # This handles cases where closest point jumps to wrong part of mesh
+    
+    # Sample points in direction from point toward neighbor center
+    direction = neighbor_center - point
+    if np.linalg.norm(direction) > 1e-10:
+        direction = direction / np.linalg.norm(direction)
+        
+        # Try a point closer to neighbor center
+        candidate = point + direction * closest_dist * 0.5
+        cand_pts, cand_dists, _ = trimesh.proximity.closest_point(
+            part_mesh, candidate.reshape(1, 3)
+        )
+        
+        cand_pt = cand_pts[0]
+        cand_dist_to_neighbors = np.linalg.norm(cand_pt - neighbor_center)
+        
+        # Use candidate if it's closer to neighbors and not too far from original point
+        total_dist = np.linalg.norm(cand_pt - point)
+        if cand_dist_to_neighbors < dist_to_neighbors * 0.7 and total_dist < search_radius:
+            return cand_pt, total_dist
+    
+    return closest_pt, closest_dist
+
+
+def _subdivide_gap_edge(
+    v0: np.ndarray, v1: np.ndarray,
+    p0: np.ndarray, p1: np.ndarray,
+    part_mesh: trimesh.Trimesh,
+    target_edge_length: float,
+    min_aspect_ratio: float = 0.15
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """
+    Subdivide a gap edge if it would create thin triangles.
+    
+    Given boundary edge (v0, v1) and their projections (p0, p1), determines
+    if subdivision is needed and returns interpolated vertices.
+    
+    Returns:
+        Tuple of (boundary_points, projection_points) including endpoints
+    """
+    boundary_len = np.linalg.norm(v1 - v0)
+    projection_len = np.linalg.norm(p1 - p0)
+    gap_dist = (np.linalg.norm(p0 - v0) + np.linalg.norm(p1 - v1)) / 2
+    
+    # Check if quad triangles would be thin
+    # Test the two triangles that would be created: (v0, v1, p1) and (v0, p1, p0)
+    aspect1 = _compute_triangle_aspect_ratio(v0, v1, p1)
+    aspect2 = _compute_triangle_aspect_ratio(v0, p1, p0)
+    
+    # Also check alternative diagonal: (v0, v1, p0) and (v1, p1, p0)
+    aspect3 = _compute_triangle_aspect_ratio(v0, v1, p0)
+    aspect4 = _compute_triangle_aspect_ratio(v1, p1, p0)
+    
+    # Use diagonal that gives better minimum aspect ratio
+    min_aspect_diag1 = min(aspect1, aspect2)
+    min_aspect_diag2 = min(aspect3, aspect4)
+    
+    # If both diagonals give acceptable triangles, no subdivision needed
+    if max(min_aspect_diag1, min_aspect_diag2) >= min_aspect_ratio:
+        return [v0, v1], [p0, p1]
+    
+    # Determine number of subdivisions needed
+    # Based on longest edge relative to target length
+    max_edge = max(boundary_len, projection_len, gap_dist * 2)
+    n_subdivisions = max(1, int(np.ceil(max_edge / target_edge_length)))
+    n_subdivisions = min(n_subdivisions, 10)  # Cap at 10 subdivisions
+    
+    if n_subdivisions <= 1:
+        return [v0, v1], [p0, p1]
+    
+    # Create subdivided points
+    boundary_points = []
+    projection_points = []
+    
+    for i in range(n_subdivisions + 1):
+        t = i / n_subdivisions
+        
+        # Interpolate on boundary
+        b_pt = v0 + t * (v1 - v0)
+        boundary_points.append(b_pt)
+        
+        # Interpolate projection - but re-project to part surface for accuracy
+        p_interp = p0 + t * (p1 - p0)
+        # Re-project to ensure it's on the part surface
+        proj_pts, _, _ = trimesh.proximity.closest_point(part_mesh, p_interp.reshape(1, 3))
+        projection_points.append(proj_pts[0])
+    
+    return boundary_points, projection_points
+
+
+def close_membrane_gaps_robust(
+    membrane_mesh: trimesh.Trimesh,
+    part_mesh: trimesh.Trimesh,
+    vertex_boundary_type: Optional[np.ndarray] = None,
+    max_gap_distance: float = None,
+    min_gap_distance: float = 0.001,
+    target_edge_length: float = None,
+    min_aspect_ratio: float = 0.15
+) -> GapClosingResult:
+    """
+    Robustly close gaps between membrane boundary and part surface.
+    
+    This improved algorithm addresses issues with the simple flange approach:
+    1. Quality-controlled triangulation - avoids thin triangles
+    2. Adaptive edge subdivision - adds vertices when needed
+    3. Better projection finding - avoids projecting to wrong part of mesh
+    4. Consistent winding - ensures proper normals
+    
+    Algorithm:
+    1. Find all boundary loops of the membrane
+    2. Identify inner loops (should connect to part)
+    3. For each inner loop:
+       a. Project vertices to part with neighbor-aware projection
+       b. Check triangle quality; subdivide edges if needed
+       c. Create triangles with proper winding
+    4. Handle any remaining small holes with fan triangulation
+    
+    Args:
+        membrane_mesh: The membrane mesh with boundary edges
+        part_mesh: The part/object surface to connect to
+        vertex_boundary_type: Optional array of boundary types (-1=inner, 0=interior, 1/2=outer)
+        max_gap_distance: Maximum gap to bridge (auto-computed if None)
+        min_gap_distance: Gaps smaller than this are snapped
+        target_edge_length: Target edge length for subdivision (auto-computed if None)
+        min_aspect_ratio: Minimum acceptable triangle aspect ratio (0-1)
+    
+    Returns:
+        GapClosingResult with the combined mesh
+    """
+    import time
+    start = time.time()
+    
+    result = GapClosingResult()
+    
+    if membrane_mesh is None or len(membrane_mesh.faces) == 0:
+        logger.warning("No membrane mesh provided for gap closing")
+        return result
+    
+    if part_mesh is None or len(part_mesh.faces) == 0:
+        logger.warning("No part mesh provided for gap closing")
+        result.mesh = membrane_mesh
+        return result
+    
+    vertices = list(membrane_mesh.vertices)
+    faces = list(membrane_mesh.faces)
+    n_orig_verts = len(vertices)
+    
+    # Auto-compute parameters
+    mesh_scale = np.linalg.norm(membrane_mesh.bounds[1] - membrane_mesh.bounds[0])
+    if max_gap_distance is None:
+        max_gap_distance = mesh_scale * 0.15  # 15% of mesh scale
+    if target_edge_length is None:
+        # Use average edge length of membrane
+        edges = membrane_mesh.edges_unique
+        edge_lengths = np.linalg.norm(
+            np.array(vertices)[edges[:, 1]] - np.array(vertices)[edges[:, 0]], 
+            axis=1
+        )
+        target_edge_length = np.median(edge_lengths) * 1.5
+    
+    # Step 1: Find boundary edges
+    edge_to_faces = {}
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i+1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            if edge_key not in edge_to_faces:
+                edge_to_faces[edge_key] = []
+            edge_to_faces[edge_key].append(fi)
+    
+    boundary_edges = [(v0, v1) for (v0, v1), flist in edge_to_faces.items() if len(flist) == 1]
+    
+    if len(boundary_edges) == 0:
+        logger.info("Membrane is watertight - no gap closing needed")
+        result.mesh = membrane_mesh
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    # Step 2: Build boundary loops
+    boundary_loops = _build_boundary_chains(np.array(boundary_edges, dtype=np.int64))
+    result.boundary_loops_found = len(boundary_loops)
+    
+    # Step 3: Identify inner boundary loops
+    inner_loops = []
+    vertices_np = np.array(vertices)
+    
+    for loop_verts, is_closed in boundary_loops:
+        if not is_closed or len(loop_verts) < 3:
+            continue
+        
+        # Determine if this is an inner loop (should connect to part)
+        if vertex_boundary_type is not None and len(vertex_boundary_type) >= n_orig_verts:
+            inner_count = sum(1 for v in loop_verts if v < len(vertex_boundary_type) and vertex_boundary_type[v] == -1)
+            is_inner = inner_count > len(loop_verts) * 0.5
+        else:
+            loop_positions = vertices_np[loop_verts]
+            _, distances, _ = trimesh.proximity.closest_point(part_mesh, loop_positions)
+            avg_dist = np.mean(distances)
+            is_inner = avg_dist < max_gap_distance
+        
+        if is_inner:
+            inner_loops.append(list(loop_verts))
+    
+    result.inner_boundary_loops = len(inner_loops)
+    
+    if len(inner_loops) == 0:
+        logger.info("No inner boundary loops found - no gap closing needed")
+        result.mesh = membrane_mesh
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    logger.info(f"Closing gaps for {len(inner_loops)} inner boundary loops")
+    
+    # Step 4: Process each inner loop
+    new_vertices = []
+    new_faces = []
+    gap_distances = []
+    triangle_aspects = []
+    edges_subdivided = 0
+    thin_avoided = 0
+    
+    for loop_verts in inner_loops:
+        n_loop = len(loop_verts)
+        
+        # First pass: compute initial projections for all vertices
+        loop_positions = np.array([vertices[v] for v in loop_verts])
+        initial_proj, initial_dists, _ = trimesh.proximity.closest_point(part_mesh, loop_positions)
+        
+        gap_distances.extend(initial_dists)
+        
+        # Second pass: refine projections considering neighbors
+        projections = []
+        for i in range(n_loop):
+            prev_i = (i - 1) % n_loop
+            next_i = (i + 1) % n_loop
+            
+            neighbor_projs = [initial_proj[prev_i], initial_proj[next_i]]
+            
+            refined_proj, refined_dist = _find_best_projection_on_part(
+                loop_positions[i],
+                part_mesh,
+                neighbor_projs,
+                max_gap_distance
+            )
+            projections.append(refined_proj)
+        
+        # Third pass: create triangles with quality control
+        for i in range(n_loop):
+            next_i = (i + 1) % n_loop
+            
+            v0_pos = loop_positions[i]
+            v1_pos = loop_positions[next_i]
+            p0_pos = projections[i]
+            p1_pos = projections[next_i]
+            
+            dist0 = np.linalg.norm(p0_pos - v0_pos)
+            dist1 = np.linalg.norm(p1_pos - v1_pos)
+            
+            # Handle snap cases
+            if dist0 < min_gap_distance and dist1 < min_gap_distance:
+                # Both vertices snap - update original vertices
+                vertices[loop_verts[i]] = p0_pos.tolist()
+                vertices[loop_verts[next_i]] = p1_pos.tolist()
+                continue
+            
+            # Check if we need subdivision
+            boundary_pts, proj_pts = _subdivide_gap_edge(
+                v0_pos, v1_pos, p0_pos, p1_pos,
+                part_mesh, target_edge_length, min_aspect_ratio
+            )
+            
+            if len(boundary_pts) > 2:
+                edges_subdivided += 1
+            
+            # Create vertices for subdivision points (skip endpoints which are original verts)
+            sub_boundary_indices = []
+            sub_proj_indices = []
+            
+            for j, (b_pt, p_pt) in enumerate(zip(boundary_pts, proj_pts)):
+                if j == 0:
+                    # First point is loop_verts[i]
+                    b_idx = loop_verts[i]
+                    # Check if it should snap
+                    if dist0 < min_gap_distance:
+                        vertices[b_idx] = p_pt.tolist()
+                        p_idx = b_idx
+                    else:
+                        p_idx = n_orig_verts + len(new_vertices)
+                        new_vertices.append(p_pt.tolist())
+                elif j == len(boundary_pts) - 1:
+                    # Last point is loop_verts[next_i]
+                    b_idx = loop_verts[next_i]
+                    if dist1 < min_gap_distance:
+                        vertices[b_idx] = p_pt.tolist()
+                        p_idx = b_idx
+                    else:
+                        p_idx = n_orig_verts + len(new_vertices)
+                        new_vertices.append(p_pt.tolist())
+                else:
+                    # Intermediate subdivision point
+                    b_idx = n_orig_verts + len(new_vertices)
+                    new_vertices.append(b_pt.tolist())
+                    p_idx = n_orig_verts + len(new_vertices)
+                    new_vertices.append(p_pt.tolist())
+                
+                sub_boundary_indices.append(b_idx)
+                sub_proj_indices.append(p_idx)
+            
+            # Create triangles for each sub-segment
+            for j in range(len(sub_boundary_indices) - 1):
+                bv0 = sub_boundary_indices[j]
+                bv1 = sub_boundary_indices[j + 1]
+                pv0 = sub_proj_indices[j]
+                pv1 = sub_proj_indices[j + 1]
+                
+                # Get vertex positions for triangle creation
+                bv0_pos = np.array(vertices[bv0]) if bv0 < len(vertices) else np.array(new_vertices[bv0 - n_orig_verts])
+                bv1_pos = np.array(vertices[bv1]) if bv1 < len(vertices) else np.array(new_vertices[bv1 - n_orig_verts])
+                pv0_pos = np.array(vertices[pv0]) if pv0 < len(vertices) else np.array(new_vertices[pv0 - n_orig_verts])
+                pv1_pos = np.array(vertices[pv1]) if pv1 < len(vertices) else np.array(new_vertices[pv1 - n_orig_verts])
+                
+                # Skip degenerate cases
+                if bv0 == pv0 and bv1 == pv1:
+                    continue
+                if bv0 == pv0:
+                    # Single triangle
+                    aspect = _compute_triangle_aspect_ratio(bv0_pos, bv1_pos, pv1_pos)
+                    if aspect >= min_aspect_ratio * 0.5:  # Allow slightly lower for single triangles
+                        new_faces.append([bv0, bv1, pv1])
+                        triangle_aspects.append(aspect)
+                    else:
+                        thin_avoided += 1
+                    continue
+                if bv1 == pv1:
+                    aspect = _compute_triangle_aspect_ratio(bv0_pos, bv1_pos, pv0_pos)
+                    if aspect >= min_aspect_ratio * 0.5:
+                        new_faces.append([bv0, bv1, pv0])
+                        triangle_aspects.append(aspect)
+                    else:
+                        thin_avoided += 1
+                    continue
+                if pv0 == pv1:
+                    aspect = _compute_triangle_aspect_ratio(bv0_pos, bv1_pos, pv0_pos)
+                    if aspect >= min_aspect_ratio * 0.5:
+                        new_faces.append([bv0, bv1, pv0])
+                        triangle_aspects.append(aspect)
+                    else:
+                        thin_avoided += 1
+                    continue
+                
+                # Full quad - choose better diagonal
+                aspect1 = _compute_triangle_aspect_ratio(bv0_pos, bv1_pos, pv1_pos)
+                aspect2 = _compute_triangle_aspect_ratio(bv0_pos, pv1_pos, pv0_pos)
+                aspect3 = _compute_triangle_aspect_ratio(bv0_pos, bv1_pos, pv0_pos)
+                aspect4 = _compute_triangle_aspect_ratio(bv1_pos, pv1_pos, pv0_pos)
+                
+                min_diag1 = min(aspect1, aspect2)
+                min_diag2 = min(aspect3, aspect4)
+                
+                if min_diag1 >= min_diag2:
+                    # Use diagonal 1: bv0-pv1
+                    if aspect1 >= min_aspect_ratio * 0.3:
+                        new_faces.append([bv0, bv1, pv1])
+                        triangle_aspects.append(aspect1)
+                    else:
+                        thin_avoided += 1
+                    if aspect2 >= min_aspect_ratio * 0.3:
+                        new_faces.append([bv0, pv1, pv0])
+                        triangle_aspects.append(aspect2)
+                    else:
+                        thin_avoided += 1
+                else:
+                    # Use diagonal 2: bv1-pv0
+                    if aspect3 >= min_aspect_ratio * 0.3:
+                        new_faces.append([bv0, bv1, pv0])
+                        triangle_aspects.append(aspect3)
+                    else:
+                        thin_avoided += 1
+                    if aspect4 >= min_aspect_ratio * 0.3:
+                        new_faces.append([bv1, pv1, pv0])
+                        triangle_aspects.append(aspect4)
+                    else:
+                        thin_avoided += 1
+    
+    result.gap_vertices_added = len(new_vertices)
+    result.gap_faces_added = len(new_faces)
+    result.edges_subdivided = edges_subdivided
+    result.thin_triangles_avoided = thin_avoided
+    
+    if len(gap_distances) > 0:
+        result.avg_gap_distance = float(np.mean(gap_distances))
+        result.max_gap_distance = float(np.max(gap_distances))
+    
+    if len(triangle_aspects) > 0:
+        result.min_triangle_aspect_ratio = float(np.min(triangle_aspects))
+        result.avg_triangle_aspect_ratio = float(np.mean(triangle_aspects))
+    
+    if len(new_faces) == 0 and len(new_vertices) == 0:
+        logger.info("No gap geometry needed - boundaries already on part surface")
+        result.mesh = trimesh.Trimesh(vertices=np.array(vertices), faces=np.array(faces), process=False)
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    # Combine mesh
+    if len(new_vertices) > 0:
+        combined_vertices = np.vstack([np.array(vertices), np.array(new_vertices)])
+    else:
+        combined_vertices = np.array(vertices)
+    
+    if len(new_faces) > 0:
+        combined_faces = np.vstack([np.array(faces), np.array(new_faces, dtype=np.int64)])
+    else:
+        combined_faces = np.array(faces)
+    
+    combined_mesh = trimesh.Trimesh(
+        vertices=combined_vertices,
+        faces=combined_faces,
+        process=False
+    )
+    
+    combined_mesh.fix_normals()
+    
+    result.mesh = combined_mesh
+    result.processing_time_ms = (time.time() - start) * 1000
+    
+    logger.info(f"Gap closing: added {result.gap_faces_added} faces, "
+                f"{result.gap_vertices_added} vertices, "
+                f"subdivided {result.edges_subdivided} edges, "
+                f"avoided {result.thin_triangles_avoided} thin triangles, "
+                f"avg gap: {result.avg_gap_distance:.4f}mm, "
+                f"aspect ratio: min={result.min_triangle_aspect_ratio:.3f}, avg={result.avg_triangle_aspect_ratio:.3f} "
+                f"in {result.processing_time_ms:.1f}ms")
+    
+    return result
+
+
+# =============================================================================
+# REMAINING HOLE FILLING WITH FAN TRIANGULATION
+# =============================================================================
+
+def fill_remaining_holes_with_fans(
+    mesh: trimesh.Trimesh,
+    max_hole_perimeter: float = None
+) -> Tuple[trimesh.Trimesh, int]:
+    """
+    Fill any remaining small holes using fan triangulation from centroid.
+    
+    This is a final cleanup step after gap closing to handle any small holes
+    that weren't fully closed by the projection-based approach.
+    
+    Args:
+        mesh: The mesh with potential holes
+        max_hole_perimeter: Maximum hole perimeter to fill (auto-computed if None)
+    
+    Returns:
+        Tuple of (filled_mesh, holes_filled_count)
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh, 0
+    
+    vertices = list(mesh.vertices)
+    faces = list(mesh.faces)
+    n_orig_verts = len(vertices)
+    
+    if max_hole_perimeter is None:
+        mesh_scale = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
+        max_hole_perimeter = mesh_scale * 0.3  # 30% of mesh scale
+    
+    # Find boundary edges
+    edge_to_faces = {}
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i+1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            if edge_key not in edge_to_faces:
+                edge_to_faces[edge_key] = []
+            edge_to_faces[edge_key].append(fi)
+    
+    boundary_edges = [(v0, v1) for (v0, v1), flist in edge_to_faces.items() if len(flist) == 1]
+    
+    if len(boundary_edges) == 0:
+        return mesh, 0
+    
+    # Build boundary loops
+    boundary_loops = _build_boundary_chains(np.array(boundary_edges, dtype=np.int64))
+    
+    new_vertices = []
+    new_faces = []
+    holes_filled = 0
+    
+    for loop_verts, is_closed in boundary_loops:
+        if not is_closed or len(loop_verts) < 3:
+            continue
+        
+        # Compute perimeter
+        loop_positions = np.array([vertices[v] for v in loop_verts])
+        perimeter = 0.0
+        for i in range(len(loop_verts)):
+            next_i = (i + 1) % len(loop_verts)
+            perimeter += np.linalg.norm(loop_positions[next_i] - loop_positions[i])
+        
+        if perimeter > max_hole_perimeter:
+            continue
+        
+        # Create centroid vertex
+        centroid = np.mean(loop_positions, axis=0)
+        centroid_idx = n_orig_verts + len(new_vertices)
+        new_vertices.append(centroid.tolist())
+        
+        # Create fan triangles
+        for i in range(len(loop_verts)):
+            next_i = (i + 1) % len(loop_verts)
+            new_faces.append([loop_verts[i], loop_verts[next_i], centroid_idx])
+        
+        holes_filled += 1
+    
+    if holes_filled == 0:
+        return mesh, 0
+    
+    # Combine
+    combined_vertices = np.vstack([np.array(vertices), np.array(new_vertices)])
+    combined_faces = np.vstack([np.array(faces), np.array(new_faces, dtype=np.int64)])
+    
+    filled_mesh = trimesh.Trimesh(
+        vertices=combined_vertices,
+        faces=combined_faces,
+        process=False
+    )
+    filled_mesh.fix_normals()
+    
+    logger.info(f"Fan triangulation: filled {holes_filled} remaining holes")
+    
+    return filled_mesh, holes_filled
+
+
+# =============================================================================
+# LEGACY FLANGE CREATION (kept for compatibility)
+# =============================================================================
+
+@dataclass
+class FlangeCreationResult:
+    """Result of creating a flange to connect membrane boundary to part surface."""
+    mesh: Optional[trimesh.Trimesh] = None
+    
+    # Statistics
+    boundary_loops_found: int = 0
+    inner_boundary_loops: int = 0
+    flange_faces_added: int = 0
+    flange_vertices_added: int = 0
+    
+    # Average gap distance before flange
+    avg_gap_distance: float = 0.0
+    max_gap_distance: float = 0.0
+    
+    # Timing
+    processing_time_ms: float = 0.0
+
+
+def create_inner_boundary_flange(
+    membrane_mesh: trimesh.Trimesh,
+    part_mesh: trimesh.Trimesh,
+    vertex_boundary_type: Optional[np.ndarray] = None,
+    max_flange_width: float = None,
+    min_flange_width: float = 0.01
+) -> FlangeCreationResult:
+    """
+    Create a flange of triangles that connects the membrane's inner boundary to the part surface.
+    
+    NOTE: This is now a wrapper around close_membrane_gaps_robust() for better results.
+    
+    Args:
+        membrane_mesh: The membrane mesh with boundary edges
+        part_mesh: The part/object surface to connect to
+        vertex_boundary_type: Optional array of boundary types (-1=inner, 0=interior, 1/2=outer)
+        max_flange_width: Maximum allowed flange width (auto-computed if None)
+        min_flange_width: Minimum flange width to create triangles for
+    
+    Returns:
+        FlangeCreationResult with the combined mesh
+    """
+    # Use the new robust implementation
+    gap_result = close_membrane_gaps_robust(
+        membrane_mesh=membrane_mesh,
+        part_mesh=part_mesh,
+        vertex_boundary_type=vertex_boundary_type,
+        max_gap_distance=max_flange_width,
+        min_gap_distance=min_flange_width
+    )
+    
+    # Also fill any remaining small holes
+    if gap_result.mesh is not None:
+        filled_mesh, holes_filled = fill_remaining_holes_with_fans(gap_result.mesh)
+        if filled_mesh is not None:
+            gap_result.mesh = filled_mesh
+    
+    # Convert to legacy result format
+    result = FlangeCreationResult()
+    result.mesh = gap_result.mesh
+    result.boundary_loops_found = gap_result.boundary_loops_found
+    result.inner_boundary_loops = gap_result.inner_boundary_loops
+    result.flange_faces_added = gap_result.gap_faces_added
+    result.flange_vertices_added = gap_result.gap_vertices_added
+    result.avg_gap_distance = gap_result.avg_gap_distance
+    result.max_gap_distance = gap_result.max_gap_distance
+    result.processing_time_ms = gap_result.processing_time_ms
     
     return result
 

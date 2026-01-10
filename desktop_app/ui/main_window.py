@@ -1813,6 +1813,84 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             else:
                 self.progress.emit("WARNING: No vertex_boundary_type available - will use distance-based classification")
             
+            # === Step 3.25: Snap inner boundary vertices to part surface ===
+            # Per paper Section 4.3: "The triangulated surface C is bounded by 
+            # construction by the object surface mesh M and the external boundary ∂H."
+            # 
+            # IMPORTANT: We DON'T create fill triangles here (they cause self-intersections).
+            # Instead, we snap membrane boundary vertices that are marked as "inner boundary"
+            # (vertex_boundary_type == -1) directly to the part surface. This ensures the
+            # membrane touches the part without creating overlapping geometry.
+            # 
+            # The actual watertight connection will be handled during mold creation when
+            # we Boolean-intersect the membrane with the part.
+            
+            self.progress.emit("Snapping inner boundary vertices to part surface...")
+            snap_start = time.time()
+            
+            # Only snap vertices marked as inner boundary (type -1) to the part surface
+            if current_boundary_type is not None:
+                inner_boundary_mask = current_boundary_type == -1
+                n_inner = np.sum(inner_boundary_mask)
+                
+                if n_inner > 0 and self.part_mesh is not None:
+                    # Find boundary edges and vertices
+                    edge_to_faces = {}
+                    for fi, face in enumerate(current_mesh.faces):
+                        for i in range(3):
+                            v0, v1 = int(face[i]), int(face[(i+1) % 3])
+                            edge_key = (min(v0, v1), max(v0, v1))
+                            if edge_key not in edge_to_faces:
+                                edge_to_faces[edge_key] = []
+                            edge_to_faces[edge_key].append(fi)
+                    
+                    boundary_verts = set()
+                    for (v0, v1), flist in edge_to_faces.items():
+                        if len(flist) == 1:  # Boundary edge
+                            boundary_verts.add(v0)
+                            boundary_verts.add(v1)
+                    
+                    # Find inner boundary vertices that are also mesh boundary vertices
+                    inner_boundary_indices = [v for v in boundary_verts 
+                                             if v < len(current_boundary_type) and current_boundary_type[v] == -1]
+                    
+                    if len(inner_boundary_indices) > 0:
+                        vertices = np.array(current_mesh.vertices, dtype=np.float64)
+                        inner_positions = vertices[inner_boundary_indices]
+                        
+                        # Snap to closest point on part surface
+                        closest_pts, distances, _ = trimesh.proximity.closest_point(self.part_mesh, inner_positions)
+                        
+                        # Only snap vertices that are within a reasonable distance
+                        # (don't snap vertices that are far from the part - they may be interior)
+                        mesh_scale = np.linalg.norm(current_mesh.bounds[1] - current_mesh.bounds[0])
+                        max_snap_dist = mesh_scale * 0.1  # 10% of mesh scale
+                        
+                        snap_mask = distances < max_snap_dist
+                        n_snapped = np.sum(snap_mask)
+                        
+                        for i, vi in enumerate(inner_boundary_indices):
+                            if snap_mask[i]:
+                                vertices[vi] = closest_pts[i]
+                        
+                        # Update mesh with snapped vertices
+                        current_mesh = trimesh.Trimesh(
+                            vertices=vertices,
+                            faces=current_mesh.faces,
+                            process=False
+                        )
+                        
+                        snap_time_ms = (time.time() - snap_start) * 1000
+                        avg_dist = distances[snap_mask].mean() if n_snapped > 0 else 0
+                        self.progress.emit(f"Snapped {n_snapped}/{len(inner_boundary_indices)} inner boundary vertices "
+                                          f"to part (avg dist: {avg_dist:.4f}mm) in {snap_time_ms:.0f}ms")
+                    else:
+                        self.progress.emit("No inner boundary vertices found to snap")
+                else:
+                    self.progress.emit("No inner boundary vertices or no part mesh")
+            else:
+                self.progress.emit("No vertex_boundary_type - skipping boundary snap")
+            
             # === Step 3.5: Remove small boundary loops (holes < 4mm perimeter) ===
             from core.parting_surface import remove_small_boundary_loops, PartingSurfaceResult
             
@@ -1904,27 +1982,34 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                 else:
                     self.progress.emit("Smoothing returned no mesh, using unsmoothed")
             
-            # === Step 5: Remove orphan islands (small disconnected regions) ===
-            # Per paper: Surface should be continuous. Small disconnected fragments
-            # are artifacts that should be removed.
-            from core.surface_propagation import remove_isolated_islands
-            from core.parting_surface import PRIMARY_MIN_ISLAND_TRIANGLES
+            # === Step 5: Comprehensive component cleanup ===
+            # Keep only main membrane, remove small/disconnected/intersecting fragments
+            from core.parting_surface import cleanup_membrane_components
             
-            self.progress.emit(f"Removing orphan islands (< {PRIMARY_MIN_ISLAND_TRIANGLES} triangles)...")
-            island_start = time.time()
+            self.progress.emit("Cleaning up membrane components (keeping main membrane)...")
+            cleanup_start = time.time()
             
-            cleaned_mesh, islands_removed, tris_removed = remove_isolated_islands(
+            cleanup_result = cleanup_membrane_components(
                 current_mesh,
-                min_triangles=PRIMARY_MIN_ISLAND_TRIANGLES
+                part_mesh=self.part_mesh,
+                min_area_fraction=0.02,  # Remove components < 2% of main area
+                min_face_count=20,       # Remove components < 20 faces
+                remove_intersecting=True
             )
             
-            island_time_ms = (time.time() - island_start) * 1000
+            cleanup_time_ms = (time.time() - cleanup_start) * 1000
             
-            if islands_removed > 0:
-                self.progress.emit(f"Removed {islands_removed} orphan islands ({tris_removed} triangles) in {island_time_ms:.0f}ms")
-                current_mesh = cleaned_mesh
+            if cleanup_result.components_removed > 0:
+                self.progress.emit(f"Removed {cleanup_result.components_removed} extra components "
+                                  f"({cleanup_result.faces_removed} faces): "
+                                  f"size={cleanup_result.removed_by_size}, "
+                                  f"area={cleanup_result.removed_by_area}, "
+                                  f"intersecting={cleanup_result.removed_by_intersection}, "
+                                  f"far={cleanup_result.removed_by_distance} "
+                                  f"in {cleanup_time_ms:.0f}ms")
+                current_mesh = cleanup_result.mesh
             else:
-                self.progress.emit(f"No orphan islands found ({island_time_ms:.0f}ms)")
+                self.progress.emit(f"Single main component found ({cleanup_time_ms:.0f}ms)")
             
             # === Step 6: Fill tubular sections (thin elongated boundary loops) ===
             from core.parting_surface import fill_tubular_sections
@@ -1961,18 +2046,116 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             # === Step 8: Detect and repair self-folding geometry ===
             from core.parting_surface import repair_self_folding
             
-            self.progress.emit("Checking for self-folding geometry...")
+            self.progress.emit("Checking for self-folding and self-intersecting geometry...")
             fold_start = time.time()
             
-            fold_result = repair_self_folding(current_mesh, remove_intersecting=False)
+            # Enable remove_intersecting=True to also remove self-intersecting faces
+            fold_result = repair_self_folding(
+                current_mesh, 
+                remove_intersecting=True,  # Also detect and remove self-intersecting faces
+                unfold_iterations=5,       # Number of local smoothing iterations
+                unfold_strength=0.3        # Smoothing strength (0-1)
+            )
             fold_time_ms = (time.time() - fold_start) * 1000
             
-            if fold_result.self_folding_detected:
-                self.progress.emit(f"Self-folding detected: fixed {fold_result.flipped_faces_fixed} normal issues "
+            if fold_result.self_folding_detected or fold_result.faces_removed_for_intersection > 0:
+                self.progress.emit(f"Self-folding repair: fixed {fold_result.flipped_faces_fixed} normals, "
+                                  f"removed {fold_result.faces_removed_for_intersection} problem faces "
                                   f"in {fold_time_ms:.0f}ms")
                 current_mesh = fold_result.mesh
             else:
-                self.progress.emit(f"No self-folding detected ({fold_time_ms:.0f}ms)")
+                self.progress.emit(f"No self-folding/self-intersection detected ({fold_time_ms:.0f}ms)")
+            
+            # === Step 9: Create inner boundary flange to close gaps with part ===
+            # This is the final step to ensure watertight connection between the
+            # membrane's inner boundary and the part surface for CSG operations.
+            # Now uses robust gap closing with quality-controlled triangulation.
+            from core.parting_surface import create_inner_boundary_flange
+            
+            self.progress.emit("Closing gaps between membrane and part (quality-controlled)...")
+            flange_start = time.time()
+            
+            flange_result = create_inner_boundary_flange(
+                current_mesh,
+                self.part_mesh,
+                vertex_boundary_type=current_boundary_type,
+                max_flange_width=None,  # Auto-compute based on mesh scale
+                min_flange_width=0.001  # 1 micron minimum (tighter tolerance)
+            )
+            flange_time_ms = (time.time() - flange_start) * 1000
+            
+            if flange_result.flange_faces_added > 0:
+                self.progress.emit(f"Gap closing: {flange_result.flange_faces_added} faces, "
+                                  f"{flange_result.flange_vertices_added} verts, "
+                                  f"avg gap: {flange_result.avg_gap_distance:.3f}mm, "
+                                  f"max gap: {flange_result.max_gap_distance:.3f}mm "
+                                  f"in {flange_time_ms:.0f}ms")
+                current_mesh = flange_result.mesh
+            else:
+                self.progress.emit(f"No gaps to close ({flange_time_ms:.0f}ms)")
+            
+            # === Step 10: Final component cleanup ===
+            # Remove any small fragments or intersecting pieces created by gap closing
+            self.progress.emit("Final cleanup (removing any remaining fragments)...")
+            final_cleanup_start = time.time()
+            
+            final_cleanup_result = cleanup_membrane_components(
+                current_mesh,
+                part_mesh=self.part_mesh,
+                min_area_fraction=0.01,  # More aggressive: remove < 1% of main
+                min_face_count=10,       # Remove very small fragments
+                remove_intersecting=True
+            )
+            final_cleanup_time_ms = (time.time() - final_cleanup_start) * 1000
+            
+            if final_cleanup_result.components_removed > 0:
+                self.progress.emit(f"Final cleanup: removed {final_cleanup_result.components_removed} fragments "
+                                  f"({final_cleanup_result.faces_removed} faces) in {final_cleanup_time_ms:.0f}ms")
+                current_mesh = final_cleanup_result.mesh
+            else:
+                self.progress.emit(f"No fragments to clean ({final_cleanup_time_ms:.0f}ms)")
+            
+            # === Step 11: Mesh quality improvement (fix thin triangles) ===
+            self.progress.emit("Improving mesh quality (fixing thin triangles)...")
+            quality_start = time.time()
+            
+            from core.parting_surface import improve_mesh_quality
+            
+            quality_result = improve_mesh_quality(
+                current_mesh,
+                min_aspect_ratio=0.15,
+                max_iterations=3,
+                collapse_thin_triangles=True
+            )
+            quality_time_ms = (time.time() - quality_start) * 1000
+            
+            total_removed = (quality_result.degenerate_removed + quality_result.duplicate_removed + 
+                            quality_result.ear_removed + quality_result.non_manifold_removed + 
+                            quality_result.vertex_only_removed + quality_result.tiny_removed)
+            
+            if quality_result.edges_collapsed > 0 or total_removed > 0:
+                # Build removal summary (only show non-zero counts)
+                removals = []
+                if quality_result.degenerate_removed > 0:
+                    removals.append(f"{quality_result.degenerate_removed} degen")
+                if quality_result.duplicate_removed > 0:
+                    removals.append(f"{quality_result.duplicate_removed} dup")
+                if quality_result.ear_removed > 0:
+                    removals.append(f"{quality_result.ear_removed} ear")
+                if quality_result.non_manifold_removed > 0:
+                    removals.append(f"{quality_result.non_manifold_removed} non-manifold")
+                if quality_result.vertex_only_removed > 0:
+                    removals.append(f"{quality_result.vertex_only_removed} vertex-only")
+                if quality_result.tiny_removed > 0:
+                    removals.append(f"{quality_result.tiny_removed} tiny")
+                
+                removal_str = f", removed: {', '.join(removals)}" if removals else ""
+                self.progress.emit(f"Quality: collapsed {quality_result.edges_collapsed} edges{removal_str}, "
+                                  f"aspect {quality_result.min_aspect_before:.3f} → {quality_result.min_aspect_after:.3f} "
+                                  f"({quality_time_ms:.0f}ms)")
+                current_mesh = quality_result.mesh
+            else:
+                self.progress.emit(f"Mesh quality already good ({quality_time_ms:.0f}ms)")
             
             # Set final result
             result.mesh = current_mesh
@@ -2291,6 +2474,75 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
                 result.mesh = current_mesh
                 result.num_vertices = len(current_mesh.vertices)
                 result.num_faces = len(current_mesh.faces)
+            
+            # === Step 6: Create inner boundary flange to close gaps with part ===
+            # This ensures watertight connection for CSG operations
+            # Now uses robust gap closing with quality-controlled triangulation.
+            from core.parting_surface import create_inner_boundary_flange
+            
+            self.progress.emit("Closing gaps between membrane and part (quality-controlled)...")
+            flange_start = time.time()
+            
+            flange_result = create_inner_boundary_flange(
+                result.mesh,
+                self.part_mesh,
+                vertex_boundary_type=None,  # Will use distance-based detection
+                max_flange_width=None,
+                min_flange_width=0.001  # 1 micron minimum (tighter tolerance)
+            )
+            flange_time_ms = (time.time() - flange_start) * 1000
+            
+            if flange_result.flange_faces_added > 0:
+                self.progress.emit(f"Gap closing: {flange_result.flange_faces_added} faces, "
+                                  f"{flange_result.flange_vertices_added} verts, "
+                                  f"avg gap: {flange_result.avg_gap_distance:.3f}mm")
+                result.mesh = flange_result.mesh
+                result.num_vertices = len(result.mesh.vertices)
+                result.num_faces = len(result.mesh.faces)
+            
+            # === Mesh quality improvement (fix thin triangles) ===
+            self.progress.emit("Improving mesh quality (fixing thin triangles)...")
+            quality_start = time.time()
+            
+            from core.parting_surface import improve_mesh_quality
+            
+            quality_result = improve_mesh_quality(
+                result.mesh,
+                min_aspect_ratio=0.15,
+                max_iterations=3,
+                collapse_thin_triangles=True
+            )
+            quality_time_ms = (time.time() - quality_start) * 1000
+            
+            total_removed = (quality_result.degenerate_removed + quality_result.duplicate_removed + 
+                            quality_result.ear_removed + quality_result.non_manifold_removed + 
+                            quality_result.vertex_only_removed + quality_result.tiny_removed)
+            
+            if quality_result.edges_collapsed > 0 or total_removed > 0:
+                # Build removal summary (only show non-zero counts)
+                removals = []
+                if quality_result.degenerate_removed > 0:
+                    removals.append(f"{quality_result.degenerate_removed} degen")
+                if quality_result.duplicate_removed > 0:
+                    removals.append(f"{quality_result.duplicate_removed} dup")
+                if quality_result.ear_removed > 0:
+                    removals.append(f"{quality_result.ear_removed} ear")
+                if quality_result.non_manifold_removed > 0:
+                    removals.append(f"{quality_result.non_manifold_removed} non-manifold")
+                if quality_result.vertex_only_removed > 0:
+                    removals.append(f"{quality_result.vertex_only_removed} vertex-only")
+                if quality_result.tiny_removed > 0:
+                    removals.append(f"{quality_result.tiny_removed} tiny")
+                
+                removal_str = f", removed: {', '.join(removals)}" if removals else ""
+                self.progress.emit(f"Quality: collapsed {quality_result.edges_collapsed} edges{removal_str}, "
+                                  f"aspect {quality_result.min_aspect_before:.3f} → {quality_result.min_aspect_after:.3f} "
+                                  f"({quality_time_ms:.0f}ms)")
+                result.mesh = quality_result.mesh
+                result.num_vertices = len(result.mesh.vertices)
+                result.num_faces = len(result.mesh.faces)
+            else:
+                self.progress.emit(f"Mesh quality already good ({quality_time_ms:.0f}ms)")
             
             result.total_time_ms = (time.time() - total_start) * 1000
             
@@ -3307,6 +3559,9 @@ class DisplayOptionsPanel(QFrame):
     show_primary_parting_surface_changed = pyqtSignal(bool)  # Toggle primary parting surface (blue)
     show_secondary_parting_surface_changed = pyqtSignal(bool)  # Toggle secondary parting surface (red)
     
+    # Triangle debug signal
+    triangle_debug_mode_changed = pyqtSignal(bool)  # Toggle triangle debug mode for membrane analysis
+    
     # Must match MeshViewer.BACKGROUND_COLOR for rounded corners to blend
     VIEWER_BG = "#1a1a1a"  # Matches React frontend BACKGROUND_COLOR
     
@@ -3508,6 +3763,14 @@ class DisplayOptionsPanel(QFrame):
         self.show_secondary_parting_surface_cb.hide()
         layout.addWidget(self.show_secondary_parting_surface_cb)
         
+        # Triangle debug mode checkbox
+        self.triangle_debug_cb = QCheckBox('🔍 Debug Triangles')
+        self.triangle_debug_cb.setChecked(False)
+        self.triangle_debug_cb.setToolTip('Click on triangles to analyze them in the console')
+        self.triangle_debug_cb.stateChanged.connect(lambda s: self.triangle_debug_mode_changed.emit(s == Qt.CheckState.Checked.value))
+        self.triangle_debug_cb.hide()
+        layout.addWidget(self.triangle_debug_cb)
+        
         self.adjustSize()
         self.hide()
     
@@ -3604,9 +3867,12 @@ class DisplayOptionsPanel(QFrame):
         if show_any:
             self.parting_surface_separator.show()
             self.parting_surface_label.show()
+            self.triangle_debug_cb.show()  # Show debug checkbox when any surface is visible
         else:
             self.parting_surface_separator.hide()
             self.parting_surface_label.hide()
+            self.triangle_debug_cb.hide()
+            self.triangle_debug_cb.setChecked(False)  # Reset when hiding
         
         if show_primary:
             self.show_primary_parting_surface_cb.show()
@@ -4027,8 +4293,40 @@ class MainWindow(QMainWindow):
         self.display_options.show_secondary_parting_surface_changed.connect(
             lambda show: self.mesh_viewer.set_secondary_parting_surface_visible(show)
         )
+        self.display_options.triangle_debug_mode_changed.connect(
+            self._on_triangle_debug_mode_changed
+        )
         
         return wrapper
+    
+    def _on_triangle_debug_mode_changed(self, enabled: bool):
+        """Handle triangle debug mode toggle."""
+        # Get the current parting surface mesh and part mesh
+        parting_mesh = None
+        vertex_boundary_type = None
+        
+        # Try to get the primary parting surface
+        if self._parting_surface_result is not None and hasattr(self._parting_surface_result, 'mesh'):
+            parting_mesh = self._parting_surface_result.mesh
+            # Try to get vertex boundary type if available
+            if hasattr(self._parting_surface_result, 'vertex_boundary_type'):
+                vertex_boundary_type = self._parting_surface_result.vertex_boundary_type
+        
+        # Get the part mesh (original imported mesh)
+        part_mesh = self._current_mesh
+        
+        # Enable/disable triangle debug mode in the mesh viewer
+        self.mesh_viewer.set_triangle_debug_mode(
+            enabled=enabled,
+            mesh=parting_mesh,
+            vertex_boundary_type=vertex_boundary_type,
+            part_mesh=part_mesh
+        )
+        
+        if enabled:
+            logger.info("🔍 Triangle debug mode enabled - click on triangles to analyze them")
+        else:
+            logger.info("Triangle debug mode disabled")
     
     def _clear_context_layout(self):
         """Clear all widgets from context layout."""

@@ -175,6 +175,12 @@ class MeshViewer(QWidget):
         self._tet_result_ref = None  # Reference to tet result for escape label analysis
         self._parting_surface_result_ref = None  # Reference to parting surface result for vertex_to_edge mapping
         
+        # Triangle debug mode for membrane analysis
+        self._triangle_debug_mode = False
+        self._selected_triangle_actor = None  # Currently selected triangle highlight
+        self._triangle_debug_mesh_ref = None  # Reference to the mesh being debugged
+        self._triangle_debug_boundary_type_ref = None  # Vertex boundary types for debug
+        
         self._setup_ui()
     
     def _setup_ui(self):
@@ -4314,3 +4320,379 @@ class MeshViewer(QWidget):
     def edge_debug_mode(self) -> bool:
         """Check if edge debug mode is enabled."""
         return self._edge_debug_mode
+
+    # =========================================================================
+    # TRIANGLE DEBUG MODE - For analyzing bad triangles in membranes
+    # =========================================================================
+    
+    def set_triangle_debug_mode(self, enabled: bool, mesh: trimesh.Trimesh = None, 
+                                 vertex_boundary_type: np.ndarray = None,
+                                 part_mesh: trimesh.Trimesh = None):
+        """
+        Enable/disable triangle debug mode for membrane analysis.
+        
+        When enabled, clicking on a triangle will log detailed information about it
+        including vertex positions, edge lengths, aspect ratio, neighbors, and more.
+        
+        Args:
+            enabled: Whether to enable triangle debug mode
+            mesh: The membrane mesh to debug (uses current parting surface if None)
+            vertex_boundary_type: Optional array of boundary types for vertices
+            part_mesh: Optional part mesh for distance calculations
+        """
+        self._triangle_debug_mode = enabled
+        
+        if enabled:
+            # Store references
+            if mesh is not None:
+                self._triangle_debug_mesh_ref = mesh
+            elif self._parting_surface_mesh is not None:
+                self._triangle_debug_mesh_ref = self._parting_surface_mesh
+            else:
+                logger.warning("No mesh available for triangle debug mode")
+                self._triangle_debug_mode = False
+                return
+            
+            self._triangle_debug_boundary_type_ref = vertex_boundary_type
+            if part_mesh is not None:
+                self._part_mesh_ref = part_mesh
+            
+            # Enable cell picking
+            self._enable_triangle_picking()
+            logger.info("🔍 Triangle debug mode ENABLED - Click on triangles to analyze them")
+            print("\n" + "="*70)
+            print("🔍 TRIANGLE DEBUG MODE ENABLED")
+            print("="*70)
+            print("Click on any triangle in the membrane to see detailed analysis.")
+            print("This will help identify problematic triangles.")
+            print("="*70 + "\n")
+        else:
+            # Disable picking and clear visualization
+            self._disable_triangle_picking()
+            self._clear_selected_triangle()
+            self._triangle_debug_mesh_ref = None
+            self._triangle_debug_boundary_type_ref = None
+            logger.info("Triangle debug mode DISABLED")
+    
+    def _enable_triangle_picking(self):
+        """Enable point picking for triangle selection (more reliable than cell picking)."""
+        try:
+            # Use point picking - we'll find the nearest triangle ourselves
+            # This is more reliable than cell picking which can pick from any mesh
+            self.plotter.enable_point_picking(
+                callback=self._on_point_picked_for_triangle,
+                show_message=True,
+                color='yellow',
+                point_size=15,
+                show_point=True,
+                tolerance=0.025,
+                pickable_window=True,  # Pick anywhere in window
+            )
+            logger.debug("Triangle picking enabled (point-based)")
+            print("🎯 Click anywhere on the membrane to select a triangle")
+        except Exception as e:
+            logger.error(f"Failed to enable triangle picking: {e}")
+    
+    def _on_point_picked_for_triangle(self, point):
+        """Handle point pick and find nearest triangle in the debug mesh."""
+        if point is None or self._triangle_debug_mesh_ref is None:
+            logger.debug("No point or no mesh reference")
+            return
+        
+        picked_point = np.array(point)
+        mesh = self._triangle_debug_mesh_ref
+        
+        # Find the nearest triangle by centroid distance
+        centroids = mesh.triangles_center
+        distances = np.linalg.norm(centroids - picked_point, axis=1)
+        cell_id = int(np.argmin(distances))
+        
+        min_dist = distances[cell_id]
+        logger.debug(f"Picked point {picked_point}, nearest triangle {cell_id} at distance {min_dist:.4f}")
+        
+        # Call the triangle analysis with this cell ID
+        self._analyze_triangle(cell_id)
+    
+    def _disable_triangle_picking(self):
+        """Disable cell picking."""
+        try:
+            self.plotter.disable_picking()
+            logger.debug("Triangle picking disabled")
+        except Exception as e:
+            logger.debug(f"Could not disable picking: {e}")
+    
+    def _clear_selected_triangle(self):
+        """Clear the selected triangle highlight."""
+        if self._selected_triangle_actor is not None:
+            try:
+                self.plotter.remove_actor(self._selected_triangle_actor)
+            except Exception:
+                pass
+            self._selected_triangle_actor = None
+    
+    def _compute_triangle_aspect_ratio(self, v0: np.ndarray, v1: np.ndarray, v2: np.ndarray) -> float:
+        """Compute aspect ratio of a triangle (0 = degenerate, 1 = equilateral)."""
+        a = np.linalg.norm(v1 - v0)
+        b = np.linalg.norm(v2 - v1)
+        c = np.linalg.norm(v0 - v2)
+        
+        if a < 1e-10 or b < 1e-10 or c < 1e-10:
+            return 0.0
+        
+        s = (a + b + c) / 2
+        area_sq = s * (s - a) * (s - b) * (s - c)
+        if area_sq <= 0:
+            return 0.0
+        area = np.sqrt(area_sq)
+        
+        ratio = (4 * area * area) / (s * a * b * c)
+        return min(1.0, ratio * 2)
+    
+    def _find_neighbor_faces(self, mesh: trimesh.Trimesh, face_idx: int) -> List[int]:
+        """Find indices of faces that share an edge with the given face."""
+        if mesh is None or face_idx >= len(mesh.faces):
+            return []
+        
+        target_face = mesh.faces[face_idx]
+        target_edges = set()
+        for i in range(3):
+            v0, v1 = target_face[i], target_face[(i + 1) % 3]
+            target_edges.add((min(v0, v1), max(v0, v1)))
+        
+        neighbors = []
+        for fi, face in enumerate(mesh.faces):
+            if fi == face_idx:
+                continue
+            for i in range(3):
+                v0, v1 = face[i], face[(i + 1) % 3]
+                edge = (min(v0, v1), max(v0, v1))
+                if edge in target_edges:
+                    neighbors.append(fi)
+                    break
+        
+        return neighbors
+    
+    def _on_triangle_picked(self, picked_cell):
+        """Handle cell pick event - analyze the picked triangle."""
+        if picked_cell is None or self._triangle_debug_mesh_ref is None:
+            return
+        
+        mesh = self._triangle_debug_mesh_ref
+        
+        # Get picked cell info
+        try:
+            # picked_cell is a pyvista object with cell info
+            if hasattr(picked_cell, 'cell_data'):
+                # Get cell ID from the picked result
+                cell_id = picked_cell.get('original_cell_ids', [0])[0] if isinstance(picked_cell, dict) else 0
+            else:
+                # Try to find the cell by position
+                cell_id = self._find_nearest_triangle(picked_cell)
+        except Exception:
+            cell_id = self._find_nearest_triangle(picked_cell)
+        
+        if cell_id is None or cell_id >= len(mesh.faces):
+            logger.warning(f"Invalid cell ID: {cell_id}")
+            return
+        
+        self._analyze_triangle(cell_id)
+    
+    def _analyze_triangle(self, cell_id: int):
+        """Analyze and display detailed info about a triangle."""
+        mesh = self._triangle_debug_mesh_ref
+        
+        if mesh is None or cell_id >= len(mesh.faces):
+            logger.warning(f"Invalid cell ID: {cell_id}")
+            return
+        
+        # Get triangle data
+        face = mesh.faces[cell_id]
+        v0_idx, v1_idx, v2_idx = face[0], face[1], face[2]
+        v0 = mesh.vertices[v0_idx]
+        v1 = mesh.vertices[v1_idx]
+        v2 = mesh.vertices[v2_idx]
+        
+        # Compute properties
+        edge_a = np.linalg.norm(v1 - v0)
+        edge_b = np.linalg.norm(v2 - v1)
+        edge_c = np.linalg.norm(v0 - v2)
+        
+        centroid = (v0 + v1 + v2) / 3
+        normal = np.cross(v1 - v0, v2 - v0)
+        normal_len = np.linalg.norm(normal)
+        if normal_len > 1e-10:
+            normal = normal / normal_len
+        
+        area = normal_len / 2
+        aspect_ratio = self._compute_triangle_aspect_ratio(v0, v1, v2)
+        
+        # Find neighbors
+        neighbors = self._find_neighbor_faces(mesh, cell_id)
+        
+        # Check if it's a boundary triangle (has edge with only one face)
+        is_boundary = len(neighbors) < 3
+        
+        # Highlight the selected triangle
+        self._highlight_selected_triangle(v0, v1, v2)
+        
+        # Print detailed debug info
+        print("\n" + "="*70)
+        print("🔺 TRIANGLE DEBUG ANALYSIS")
+        print("="*70)
+        print(f"Face Index: {cell_id}")
+        print(f"Vertex Indices: [{v0_idx}, {v1_idx}, {v2_idx}]")
+        print(f"\n📍 VERTEX POSITIONS:")
+        print(f"   V0 [{v0_idx}]: [{v0[0]:.6f}, {v0[1]:.6f}, {v0[2]:.6f}]")
+        print(f"   V1 [{v1_idx}]: [{v1[0]:.6f}, {v1[1]:.6f}, {v1[2]:.6f}]")
+        print(f"   V2 [{v2_idx}]: [{v2[0]:.6f}, {v2[1]:.6f}, {v2[2]:.6f}]")
+        
+        print(f"\n📐 EDGE LENGTHS:")
+        print(f"   Edge V0→V1: {edge_a:.6f}")
+        print(f"   Edge V1→V2: {edge_b:.6f}")
+        print(f"   Edge V2→V0: {edge_c:.6f}")
+        print(f"   Min edge: {min(edge_a, edge_b, edge_c):.6f}")
+        print(f"   Max edge: {max(edge_a, edge_b, edge_c):.6f}")
+        print(f"   Edge ratio (max/min): {max(edge_a, edge_b, edge_c) / max(min(edge_a, edge_b, edge_c), 1e-10):.2f}")
+        
+        print(f"\n📊 QUALITY METRICS:")
+        print(f"   Area: {area:.8f}")
+        print(f"   Aspect Ratio: {aspect_ratio:.4f} (1.0 = equilateral, 0.0 = degenerate)")
+        print(f"   Centroid: [{centroid[0]:.6f}, {centroid[1]:.6f}, {centroid[2]:.6f}]")
+        print(f"   Normal: [{normal[0]:.6f}, {normal[1]:.6f}, {normal[2]:.6f}]")
+        
+        # Quality assessment
+        quality_status = "✅ GOOD" if aspect_ratio > 0.3 else ("⚠️ POOR" if aspect_ratio > 0.1 else "❌ BAD")
+        print(f"   Quality: {quality_status}")
+        
+        print(f"\n🔗 CONNECTIVITY:")
+        print(f"   Neighbor faces: {neighbors}")
+        print(f"   Number of neighbors: {len(neighbors)}")
+        print(f"   Is boundary triangle: {'YES' if is_boundary else 'NO'}")
+        
+        # Vertex boundary types if available
+        if self._triangle_debug_boundary_type_ref is not None:
+            bt = self._triangle_debug_boundary_type_ref
+            print(f"\n🏷️ VERTEX BOUNDARY TYPES:")
+            for vi, v_idx in enumerate([v0_idx, v1_idx, v2_idx]):
+                if v_idx < len(bt):
+                    btype = bt[v_idx]
+                    btype_name = {-1: "INNER (part)", 0: "INTERIOR", 1: "OUTER (H1)", 2: "OUTER (H2)"}.get(btype, f"UNKNOWN ({btype})")
+                    print(f"   V{vi} [{v_idx}]: {btype_name}")
+        
+        # Distance to part if available
+        if self._part_mesh_ref is not None:
+            try:
+                pts = np.array([v0, v1, v2, centroid])
+                _, distances, _ = trimesh.proximity.closest_point(self._part_mesh_ref, pts)
+                print(f"\n📏 DISTANCE TO PART MESH:")
+                print(f"   V0 distance: {distances[0]:.6f}")
+                print(f"   V1 distance: {distances[1]:.6f}")
+                print(f"   V2 distance: {distances[2]:.6f}")
+                print(f"   Centroid distance: {distances[3]:.6f}")
+            except Exception as e:
+                print(f"\n📏 DISTANCE TO PART: Error computing - {e}")
+        
+        # Analyze potential issues
+        print(f"\n🔎 POTENTIAL ISSUES:")
+        issues_found = False
+        
+        if aspect_ratio < 0.1:
+            print(f"   ❌ Very thin/degenerate triangle (aspect ratio {aspect_ratio:.4f} < 0.1)")
+            issues_found = True
+        elif aspect_ratio < 0.2:
+            print(f"   ⚠️ Thin triangle (aspect ratio {aspect_ratio:.4f} < 0.2)")
+            issues_found = True
+        
+        edge_ratio = max(edge_a, edge_b, edge_c) / max(min(edge_a, edge_b, edge_c), 1e-10)
+        if edge_ratio > 10:
+            print(f"   ❌ Extreme edge length ratio ({edge_ratio:.1f}:1)")
+            issues_found = True
+        elif edge_ratio > 5:
+            print(f"   ⚠️ High edge length ratio ({edge_ratio:.1f}:1)")
+            issues_found = True
+        
+        if area < 1e-8:
+            print(f"   ❌ Near-zero area ({area:.2e})")
+            issues_found = True
+        
+        if is_boundary and len(neighbors) == 0:
+            print(f"   ❌ Isolated triangle (no neighbors)")
+            issues_found = True
+        
+        if not issues_found:
+            print(f"   ✅ No obvious issues detected")
+        
+        print("="*70 + "\n")
+        
+        # Also log to logger
+        logger.info(f"Triangle {cell_id} analyzed: aspect={aspect_ratio:.4f}, area={area:.6f}, "
+                   f"edges=[{edge_a:.4f}, {edge_b:.4f}, {edge_c:.4f}], neighbors={len(neighbors)}")
+    
+    def _find_nearest_triangle(self, picked_info) -> Optional[int]:
+        """Find the nearest triangle to a picked point."""
+        if self._triangle_debug_mesh_ref is None:
+            return None
+        
+        mesh = self._triangle_debug_mesh_ref
+        
+        try:
+            # Get the picked point coordinates
+            if hasattr(picked_info, 'points') and len(picked_info.points) > 0:
+                picked_point = np.array(picked_info.points[0])
+            elif hasattr(picked_info, 'center'):
+                picked_point = np.array(picked_info.center)
+            elif isinstance(picked_info, np.ndarray):
+                picked_point = picked_info
+            else:
+                logger.warning(f"Could not extract point from picked_info: {type(picked_info)}")
+                return None
+            
+            # Compute centroids of all triangles
+            centroids = mesh.triangles_center
+            
+            # Find nearest centroid
+            distances = np.linalg.norm(centroids - picked_point, axis=1)
+            nearest_idx = np.argmin(distances)
+            
+            return int(nearest_idx)
+            
+        except Exception as e:
+            logger.error(f"Error finding nearest triangle: {e}")
+            return None
+    
+    def _highlight_selected_triangle(self, v0: np.ndarray, v1: np.ndarray, v2: np.ndarray):
+        """Highlight the selected triangle."""
+        # Clear previous selection
+        self._clear_selected_triangle()
+        
+        try:
+            # Create a mesh for just this triangle
+            vertices = np.array([v0, v1, v2])
+            faces = np.array([[3, 0, 1, 2]])  # PyVista format: count followed by indices
+            
+            tri_mesh = pv.PolyData(vertices, faces)
+            
+            self._selected_triangle_actor = self.plotter.add_mesh(
+                tri_mesh,
+                color='magenta',
+                opacity=0.8,
+                style='surface',
+                show_edges=True,
+                edge_color='yellow',
+                line_width=4,
+            )
+            
+            # Also add spheres at vertices for visibility
+            for i, v in enumerate([v0, v1, v2]):
+                sphere = pv.Sphere(radius=0.5, center=v)
+                self.plotter.add_mesh(sphere, color=['red', 'green', 'blue'][i], opacity=0.8)
+            
+            self.plotter.update()
+            
+        except Exception as e:
+            logger.error(f"Error highlighting triangle: {e}")
+    
+    @property
+    def triangle_debug_mode(self) -> bool:
+        """Check if triangle debug mode is enabled."""
+        return self._triangle_debug_mode
