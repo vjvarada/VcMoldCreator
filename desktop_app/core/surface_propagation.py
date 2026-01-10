@@ -770,9 +770,11 @@ def smooth_membrane_with_boundary_reprojection(
             
             # STEP 1: Propagate from already-classified vertices to their patch neighbors
             # This uses the boundary chain topology rather than distance
+            # Use CONVERGENCE-BASED stopping: continue until no changes occur
+            # Maximum rounds is set very high as a safety limit only
             propagated_count = 0
             changed = True
-            max_propagation_rounds = 10  # Prevent infinite loop
+            max_propagation_rounds = len(boundary_verts)  # Worst case: propagate through entire chain
             propagation_round = 0
             
             while changed and propagation_round < max_propagation_rounds:
@@ -786,9 +788,9 @@ def smooth_membrane_with_boundary_reprojection(
                     neighbors = boundary_adjacency.get(vi, set())
                     neighbor_types = [boundary_surface.get(n) for n in neighbors if n in boundary_surface]
                     
-                    # Count non-patch classifications
-                    part_neighbors = sum(1 for t in neighbor_types if t in ('part', 'closest_part'))
-                    hull_neighbors = sum(1 for t in neighbor_types if t in ('hull', 'closest_hull'))
+                    # Count non-patch classifications (including propagated ones)
+                    part_neighbors = sum(1 for t in neighbor_types if t in ('part', 'closest_part', 'propagated_part'))
+                    hull_neighbors = sum(1 for t in neighbor_types if t in ('hull', 'closest_hull', 'propagated_hull'))
                     
                     # If ALL classified neighbors agree, propagate that classification
                     if part_neighbors > 0 and hull_neighbors == 0:
@@ -801,7 +803,8 @@ def smooth_membrane_with_boundary_reprojection(
                         propagated_count += 1
                     # If neighbors disagree (mixed), leave as 'patch' for distance fallback
             
-            logger.info(f"Propagation classified {propagated_count} patch vertices in {propagation_round} rounds")
+            logger.info(f"Propagation classified {propagated_count} patch vertices in {propagation_round} rounds "
+                       f"(converged: {not changed or propagation_round < max_propagation_rounds})")
             
             # STEP 2: For remaining 'patch' vertices, use distance-based fallback
             remaining_patches = [vi for vi in boundary_verts if boundary_surface.get(vi) == 'patch']

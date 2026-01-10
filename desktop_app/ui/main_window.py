@@ -1687,6 +1687,9 @@ class ComprehensiveSurfaceResult:
     smooth_iterations: int = 0
     damping_factor: float = 0.5
     
+    # Extension faces (yellow for debugging)
+    fill_face_indices: Optional[np.ndarray] = None
+    
     # Timing
     extraction_time_ms: float = 0.0
     repair_time_ms: float = 0.0
@@ -1698,12 +1701,12 @@ class ComprehensivePrimarySurfaceWorker(QThread):
     """
     Background worker for primary surface processing.
     
-    Performs per paper Section 4.3-4.4:
-    1. Extract surface using Marching Tetrahedra (membrane meshing)
-    2. Clean surface (merge vertices, remove degenerates)
-    3. Smooth surface with boundary re-projection to M and ∂H (membrane smoothing)
+    Implements paper Sections 4.3-4.4:
+    - Section 4.3 (Membrane Meshing): Extract surface using Marching Tetrahedra
+    - Section 4.4 (Membrane Smoothing): Two-phase Laplacian smoothing with 
+      boundary re-projection to part mesh M (inner) and hull mesh ∂H (outer)
     
-    The surface is "bounded by construction" by M and ∂H - no gap filling needed.
+    The surface is "bounded by construction" by M and ∂H.
     """
     
     progress = pyqtSignal(str)
@@ -1719,8 +1722,8 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             tet_result: TetrahedralMeshResult with primary cut edges
             part_mesh: Original part mesh for boundary re-projection (M)
             hull_mesh: Hull mesh for boundary re-projection (∂H)
-            smooth_iterations: Number of smoothing iterations
-            damping_factor: Smoothing damping factor (0.5 per paper)
+            smooth_iterations: Number of smoothing iterations (per paper: use damping)
+            damping_factor: Smoothing damping factor (0.5 per paper Section 4.4)
         """
         super().__init__()
         self.tet_result = tet_result
@@ -1733,7 +1736,7 @@ class ComprehensivePrimarySurfaceWorker(QThread):
         try:
             from core.parting_surface import (
                 extract_parting_surface_from_tet_result,
-                repair_parting_surface_with_part
+                repair_parting_surface
             )
             from core.surface_propagation import smooth_membrane_with_boundary_reprojection
             from core.tetrahedral_mesh import prepare_parting_surface_data
@@ -1745,13 +1748,23 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             
             total_start = time.time()
             
-            # === Step 1: Prepare data structures if needed ===
+            # =====================================================================
+            # STEP 1: Prepare data structures if needed
+            # =====================================================================
             if self.tet_result.tet_edge_indices is None:
                 self.progress.emit("Building edge index maps...")
                 self.tet_result = prepare_parting_surface_data(self.tet_result)
             
-            # === Step 2: Extract surface using Marching Tetrahedra ===
-            self.progress.emit("Extracting primary surface with Marching Tetrahedra...")
+            # =====================================================================
+            # STEP 2: MEMBRANE MESHING (Paper Section 4.3)
+            # 
+            # "We extend the classical marching tetrahedra algorithm to include the 
+            # additional cases needed to generate consistent non-manifold surfaces"
+            #
+            # The surface is bounded by construction by M and ∂H - cut points on
+            # edges touching boundaries are placed ON those boundaries.
+            # =====================================================================
+            self.progress.emit("Section 4.3: Extracting membrane with Marching Tetrahedra...")
             extraction_start = time.time()
             
             extraction_result = extract_parting_surface_from_tet_result(
@@ -1765,8 +1778,6 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             result.extraction_time_ms = (time.time() - extraction_start) * 1000
             result.num_tets_processed = extraction_result.num_tets_processed
             result.num_tets_contributing = extraction_result.num_tets_contributing
-            
-            # Store vertex_to_edge mapping for debugging
             result.vertex_to_edge = extraction_result.vertex_to_edge
             
             if extraction_result.mesh is None or extraction_result.num_faces == 0:
@@ -1775,21 +1786,29 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                 self.complete.emit(result)
                 return
             
-            self.progress.emit(f"Extracted: {extraction_result.num_vertices:,} verts, {extraction_result.num_faces:,} faces")
+            self.progress.emit(f"Extracted: {extraction_result.num_vertices:,} verts, "
+                             f"{extraction_result.num_faces:,} faces "
+                             f"from {extraction_result.num_tets_contributing} tets")
             
-            # === Step 3: Clean surface (merge vertices, remove degenerates) ===
-            self.progress.emit("Cleaning surface...")
+            # =====================================================================
+            # STEP 3: CLEAN SURFACE (merge duplicate vertices, remove degenerates)
+            # 
+            # Per paper: "the resulting mesh C is inevitably affected by the quality
+            # and density of the tetrahedral tessellation"
+            # =====================================================================
+            self.progress.emit("Cleaning membrane (merge vertices, remove degenerates)...")
             repair_start = time.time()
             
-            repaired_result = repair_parting_surface_with_part(
+            repaired_result = repair_parting_surface(
                 extraction_result,
-                self.part_mesh
+                merge_vertices=True,
+                merge_threshold=1e-8
             )
             
             result.repair_time_ms = (time.time() - repair_start) * 1000
             
             if repaired_result.mesh is None:
-                self.progress.emit("Surface cleaning failed")
+                self.progress.emit("Surface cleaning failed - using unrepaired")
                 result.mesh = extraction_result.mesh
                 result.num_vertices = extraction_result.num_vertices
                 result.num_faces = extraction_result.num_faces
@@ -1797,168 +1816,47 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                 self.complete.emit(result)
                 return
             
-            self.progress.emit(f"Cleaned: {repaired_result.num_vertices:,} verts, {repaired_result.num_faces:,} faces")
-            
-            # Current mesh after cleaning
             current_mesh = repaired_result.mesh
-            
-            # Track vertex_boundary_type through the pipeline (per paper Section 4.4)
-            # This ensures proper inner/outer boundary re-projection during smoothing
             current_boundary_type = repaired_result.vertex_boundary_type
+            
+            self.progress.emit(f"Cleaned: {repaired_result.num_vertices:,} verts, "
+                             f"{repaired_result.num_faces:,} faces")
+            
+            # Log boundary type info for debugging
             if current_boundary_type is not None:
                 n_part = np.sum(current_boundary_type == -1)
                 n_hull = np.sum(current_boundary_type == 1) + np.sum(current_boundary_type == 2)
                 n_interior = np.sum(current_boundary_type == 0)
-                self.progress.emit(f"Boundary types preserved: {n_part} part (inner), {n_hull} hull (outer), {n_interior} interior")
-            else:
-                self.progress.emit("WARNING: No vertex_boundary_type available - will use distance-based classification")
+                self.progress.emit(f"Boundary classification: {n_part} inner (M), "
+                                 f"{n_hull} outer (∂H), {n_interior} interior")
             
-            # === Step 3.25: Snap inner boundary vertices to part surface ===
-            # Per paper Section 4.3: "The triangulated surface C is bounded by 
-            # construction by the object surface mesh M and the external boundary ∂H."
+            # =====================================================================
+            # STEP 4: MEMBRANE SMOOTHING (Paper Section 4.4)
             # 
-            # IMPORTANT: We DON'T create fill triangles here (they cause self-intersections).
-            # Instead, we snap membrane boundary vertices that are marked as "inner boundary"
-            # (vertex_boundary_type == -1) directly to the part surface. This ensures the
-            # membrane touches the part without creating overlapping geometry.
-            # 
-            # The actual watertight connection will be handled during mold creation when
-            # we Boolean-intersect the membrane with the part.
-            
-            self.progress.emit("Snapping inner boundary vertices to part surface...")
-            snap_start = time.time()
-            
-            # Only snap vertices marked as inner boundary (type -1) to the part surface
-            if current_boundary_type is not None:
-                inner_boundary_mask = current_boundary_type == -1
-                n_inner = np.sum(inner_boundary_mask)
-                
-                if n_inner > 0 and self.part_mesh is not None:
-                    # Find boundary edges and vertices
-                    edge_to_faces = {}
-                    for fi, face in enumerate(current_mesh.faces):
-                        for i in range(3):
-                            v0, v1 = int(face[i]), int(face[(i+1) % 3])
-                            edge_key = (min(v0, v1), max(v0, v1))
-                            if edge_key not in edge_to_faces:
-                                edge_to_faces[edge_key] = []
-                            edge_to_faces[edge_key].append(fi)
-                    
-                    boundary_verts = set()
-                    for (v0, v1), flist in edge_to_faces.items():
-                        if len(flist) == 1:  # Boundary edge
-                            boundary_verts.add(v0)
-                            boundary_verts.add(v1)
-                    
-                    # Find inner boundary vertices that are also mesh boundary vertices
-                    inner_boundary_indices = [v for v in boundary_verts 
-                                             if v < len(current_boundary_type) and current_boundary_type[v] == -1]
-                    
-                    if len(inner_boundary_indices) > 0:
-                        vertices = np.array(current_mesh.vertices, dtype=np.float64)
-                        inner_positions = vertices[inner_boundary_indices]
-                        
-                        # Snap to closest point on part surface
-                        closest_pts, distances, _ = trimesh.proximity.closest_point(self.part_mesh, inner_positions)
-                        
-                        # Only snap vertices that are within a reasonable distance
-                        # (don't snap vertices that are far from the part - they may be interior)
-                        mesh_scale = np.linalg.norm(current_mesh.bounds[1] - current_mesh.bounds[0])
-                        max_snap_dist = mesh_scale * 0.1  # 10% of mesh scale
-                        
-                        snap_mask = distances < max_snap_dist
-                        n_snapped = np.sum(snap_mask)
-                        
-                        for i, vi in enumerate(inner_boundary_indices):
-                            if snap_mask[i]:
-                                vertices[vi] = closest_pts[i]
-                        
-                        # Update mesh with snapped vertices
-                        current_mesh = trimesh.Trimesh(
-                            vertices=vertices,
-                            faces=current_mesh.faces,
-                            process=False
-                        )
-                        
-                        snap_time_ms = (time.time() - snap_start) * 1000
-                        avg_dist = distances[snap_mask].mean() if n_snapped > 0 else 0
-                        self.progress.emit(f"Snapped {n_snapped}/{len(inner_boundary_indices)} inner boundary vertices "
-                                          f"to part (avg dist: {avg_dist:.4f}mm) in {snap_time_ms:.0f}ms")
-                    else:
-                        self.progress.emit("No inner boundary vertices found to snap")
-                else:
-                    self.progress.emit("No inner boundary vertices or no part mesh")
-            else:
-                self.progress.emit("No vertex_boundary_type - skipping boundary snap")
-            
-            # === Step 3.5: Remove small boundary loops (holes < 4mm perimeter) ===
-            from core.parting_surface import remove_small_boundary_loops, PartingSurfaceResult
-            
-            self.progress.emit("Removing small holes (< 4mm perimeter)...")
-            hole_removal_start = time.time()
-            
-            # Wrap current mesh in PartingSurfaceResult for the function
-            # Include vertex_boundary_type so it can be extended for new centroid vertices
-            temp_surface = PartingSurfaceResult(
-                mesh=current_mesh,
-                vertices=np.array(current_mesh.vertices),
-                faces=np.array(current_mesh.faces),
-                vertex_boundary_type=current_boundary_type,
-                num_vertices=len(current_mesh.vertices),
-                num_faces=len(current_mesh.faces)
-            )
-            
-            hole_result = remove_small_boundary_loops(
-                temp_surface,
-                min_perimeter=4.0,  # 4mm minimum perimeter
-                fill_holes=True,
-                smooth_fill=True,
-                smooth_iterations=2
-            )
-            
-            hole_removal_time_ms = (time.time() - hole_removal_start) * 1000
-            
-            if hole_result.holes_filled > 0:
-                self.progress.emit(f"Filled {hole_result.holes_filled} small holes ({hole_removal_time_ms:.0f}ms)")
-                current_mesh = hole_result.mesh
-                
-                # Extend boundary_type for new centroid vertices (they are interior, type 0)
-                if current_boundary_type is not None and hole_result.new_centroid_indices is not None:
-                    new_verts = len(current_mesh.vertices)
-                    old_verts = len(current_boundary_type)
-                    if new_verts > old_verts:
-                        # Extend with interior type (0) for new centroids
-                        extended = np.zeros(new_verts, dtype=np.int8)
-                        extended[:old_verts] = current_boundary_type
-                        current_boundary_type = extended
-                        self.progress.emit(f"Extended boundary_type for {new_verts - old_verts} new centroid vertices")
-            else:
-                self.progress.emit(f"No small holes found ({hole_removal_time_ms:.0f}ms)")
-            
-            # === Step 4: Smooth surface with boundary re-projection ===
-            # Per paper Section 4.4: "The triangulated surface C encoding the cut layout 
-            # is composed using a set of patches that are interconnected by chains of 
-            # non-manifold edges that are bounded by construction by the object surface 
-            # mesh M and the external boundary ∂H."
+            # "We perform a Laplacian smoothing that preserves both the boundaries 
+            # between the different patches composing C and the boundaries between 
+            # C and the object M or the boundary ∂H."
             #
-            # IMPORTANT: Per paper, boundary re-projection must use the ORIGINAL surface
-            # that each vertex belonged to, NOT the closest surface by distance.
-            # - Inner boundary (on part M): re-project to part mesh M
-            # - Outer boundary (on hull ∂H): re-project to hull mesh ∂H
+            # TWO-PHASE SMOOTHING:
+            # Phase 1: Smooth boundary polyline vertices, re-project to M or ∂H
+            # Phase 2: Smooth interior vertices with fixed boundary
             #
-            # This is tracked via vertex_boundary_type from extraction.
-            
+            # "Each smoothing step is performed using a damping factor (0.5 in our 
+            # experiments) to ensure a proper convergence to the final solution."
+            # =====================================================================
             if self.smooth_iterations > 0:
-                self.progress.emit(f"Smoothing surface ({self.smooth_iterations} iterations, λ={self.damping_factor})...")
-                
-                # Log which meshes are available for boundary reprojection
-                if self.hull_mesh is not None:
-                    self.progress.emit(f"Hull mesh for ∂H reprojection: {len(self.hull_mesh.faces)} faces")
-                else:
-                    self.progress.emit("WARNING: No hull mesh for boundary re-projection!")
+                self.progress.emit(f"Section 4.4: Two-phase smoothing ({self.smooth_iterations} iters, "
+                                 f"λ={self.damping_factor})...")
                 
                 if self.part_mesh is not None:
-                    self.progress.emit(f"Part mesh for M reprojection: {len(self.part_mesh.faces)} faces")
+                    self.progress.emit(f"  Part mesh M: {len(self.part_mesh.faces)} faces")
+                else:
+                    self.progress.emit("  WARNING: No part mesh M for inner boundary re-projection!")
+                
+                if self.hull_mesh is not None:
+                    self.progress.emit(f"  Hull mesh ∂H: {len(self.hull_mesh.faces)} faces")
+                else:
+                    self.progress.emit("  WARNING: No hull mesh ∂H for outer boundary re-projection!")
                 
                 smoothing_start = time.time()
                 
@@ -1969,8 +1867,8 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                     primary_mesh=None,  # No primary for primary surface smoothing
                     iterations=self.smooth_iterations,
                     damping_factor=self.damping_factor,
-                    excluded_vertices=None,  # No excluded vertices - smooth everything
-                    vertex_boundary_type=current_boundary_type  # Use tracked boundary types
+                    excluded_vertices=None,
+                    vertex_boundary_type=current_boundary_type
                 )
                 
                 result.smoothing_time_ms = (time.time() - smoothing_start) * 1000
@@ -1979,185 +1877,20 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                 
                 if smoothing_result.mesh is not None:
                     current_mesh = smoothing_result.mesh
+                    self.progress.emit(f"Smoothed: {result.boundary_vertices} boundary verts, "
+                                     f"{result.interior_vertices} interior verts")
                 else:
-                    self.progress.emit("Smoothing returned no mesh, using unsmoothed")
+                    self.progress.emit("Smoothing returned no mesh - using unsmoothed")
             
-            # === Step 5: Comprehensive component cleanup ===
-            # Keep only main membrane, remove small/disconnected/intersecting fragments
-            from core.parting_surface import cleanup_membrane_components
+            # =====================================================================
+            # STEP 5: Fix normals for consistent orientation
+            # =====================================================================
+            self.progress.emit("Fixing surface normals...")
+            current_mesh.fix_normals()
             
-            self.progress.emit("Cleaning up membrane components (keeping main membrane)...")
-            cleanup_start = time.time()
-            
-            cleanup_result = cleanup_membrane_components(
-                current_mesh,
-                part_mesh=self.part_mesh,
-                min_area_fraction=0.02,  # Remove components < 2% of main area
-                min_face_count=20,       # Remove components < 20 faces
-                remove_intersecting=True
-            )
-            
-            cleanup_time_ms = (time.time() - cleanup_start) * 1000
-            
-            if cleanup_result.components_removed > 0:
-                self.progress.emit(f"Removed {cleanup_result.components_removed} extra components "
-                                  f"({cleanup_result.faces_removed} faces): "
-                                  f"size={cleanup_result.removed_by_size}, "
-                                  f"area={cleanup_result.removed_by_area}, "
-                                  f"intersecting={cleanup_result.removed_by_intersection}, "
-                                  f"far={cleanup_result.removed_by_distance} "
-                                  f"in {cleanup_time_ms:.0f}ms")
-                current_mesh = cleanup_result.mesh
-            else:
-                self.progress.emit(f"Single main component found ({cleanup_time_ms:.0f}ms)")
-            
-            # === Step 6: Fill tubular sections (thin elongated boundary loops) ===
-            from core.parting_surface import fill_tubular_sections
-            
-            self.progress.emit("Detecting and filling tubular sections...")
-            tubular_start = time.time()
-            
-            tubular_result = fill_tubular_sections(current_mesh)
-            tubular_time_ms = (time.time() - tubular_start) * 1000
-            
-            if tubular_result.tubular_sections_filled > 0:
-                self.progress.emit(f"Filled {tubular_result.tubular_sections_filled} tubular sections "
-                                  f"({tubular_result.fill_faces_added} faces) in {tubular_time_ms:.0f}ms")
-                current_mesh = tubular_result.mesh
-            else:
-                self.progress.emit(f"No tubular sections found ({tubular_time_ms:.0f}ms)")
-            
-            # === Step 7: Remove thin flat sections (degenerate elongated regions) ===
-            from core.parting_surface import remove_thin_flat_sections
-            
-            self.progress.emit("Detecting and removing thin flat sections...")
-            thin_start = time.time()
-            
-            thin_result = remove_thin_flat_sections(current_mesh)
-            thin_time_ms = (time.time() - thin_start) * 1000
-            
-            if thin_result.thin_sections_removed > 0:
-                self.progress.emit(f"Removed {thin_result.thin_sections_removed} thin sections "
-                                  f"({thin_result.faces_removed} faces) in {thin_time_ms:.0f}ms")
-                current_mesh = thin_result.mesh
-            else:
-                self.progress.emit(f"No thin flat sections found ({thin_time_ms:.0f}ms)")
-            
-            # === Step 8: Detect and repair self-folding geometry ===
-            from core.parting_surface import repair_self_folding
-            
-            self.progress.emit("Checking for self-folding and self-intersecting geometry...")
-            fold_start = time.time()
-            
-            # Enable remove_intersecting=True to also remove self-intersecting faces
-            fold_result = repair_self_folding(
-                current_mesh, 
-                remove_intersecting=True,  # Also detect and remove self-intersecting faces
-                unfold_iterations=5,       # Number of local smoothing iterations
-                unfold_strength=0.3        # Smoothing strength (0-1)
-            )
-            fold_time_ms = (time.time() - fold_start) * 1000
-            
-            if fold_result.self_folding_detected or fold_result.faces_removed_for_intersection > 0:
-                self.progress.emit(f"Self-folding repair: fixed {fold_result.flipped_faces_fixed} normals, "
-                                  f"removed {fold_result.faces_removed_for_intersection} problem faces "
-                                  f"in {fold_time_ms:.0f}ms")
-                current_mesh = fold_result.mesh
-            else:
-                self.progress.emit(f"No self-folding/self-intersection detected ({fold_time_ms:.0f}ms)")
-            
-            # === Step 9: Create inner boundary flange to close gaps with part ===
-            # This is the final step to ensure watertight connection between the
-            # membrane's inner boundary and the part surface for CSG operations.
-            # Now uses robust gap closing with quality-controlled triangulation.
-            from core.parting_surface import create_inner_boundary_flange
-            
-            self.progress.emit("Closing gaps between membrane and part (quality-controlled)...")
-            flange_start = time.time()
-            
-            flange_result = create_inner_boundary_flange(
-                current_mesh,
-                self.part_mesh,
-                vertex_boundary_type=current_boundary_type,
-                max_flange_width=None,  # Auto-compute based on mesh scale
-                min_flange_width=0.001  # 1 micron minimum (tighter tolerance)
-            )
-            flange_time_ms = (time.time() - flange_start) * 1000
-            
-            if flange_result.flange_faces_added > 0:
-                self.progress.emit(f"Gap closing: {flange_result.flange_faces_added} faces, "
-                                  f"{flange_result.flange_vertices_added} verts, "
-                                  f"avg gap: {flange_result.avg_gap_distance:.3f}mm, "
-                                  f"max gap: {flange_result.max_gap_distance:.3f}mm "
-                                  f"in {flange_time_ms:.0f}ms")
-                current_mesh = flange_result.mesh
-            else:
-                self.progress.emit(f"No gaps to close ({flange_time_ms:.0f}ms)")
-            
-            # === Step 10: Final component cleanup ===
-            # Remove any small fragments or intersecting pieces created by gap closing
-            self.progress.emit("Final cleanup (removing any remaining fragments)...")
-            final_cleanup_start = time.time()
-            
-            final_cleanup_result = cleanup_membrane_components(
-                current_mesh,
-                part_mesh=self.part_mesh,
-                min_area_fraction=0.01,  # More aggressive: remove < 1% of main
-                min_face_count=10,       # Remove very small fragments
-                remove_intersecting=True
-            )
-            final_cleanup_time_ms = (time.time() - final_cleanup_start) * 1000
-            
-            if final_cleanup_result.components_removed > 0:
-                self.progress.emit(f"Final cleanup: removed {final_cleanup_result.components_removed} fragments "
-                                  f"({final_cleanup_result.faces_removed} faces) in {final_cleanup_time_ms:.0f}ms")
-                current_mesh = final_cleanup_result.mesh
-            else:
-                self.progress.emit(f"No fragments to clean ({final_cleanup_time_ms:.0f}ms)")
-            
-            # === Step 11: Mesh quality improvement (fix thin triangles) ===
-            self.progress.emit("Improving mesh quality (fixing thin triangles)...")
-            quality_start = time.time()
-            
-            from core.parting_surface import improve_mesh_quality
-            
-            quality_result = improve_mesh_quality(
-                current_mesh,
-                min_aspect_ratio=0.15,
-                max_iterations=3,
-                collapse_thin_triangles=True
-            )
-            quality_time_ms = (time.time() - quality_start) * 1000
-            
-            total_removed = (quality_result.degenerate_removed + quality_result.duplicate_removed + 
-                            quality_result.ear_removed + quality_result.non_manifold_removed + 
-                            quality_result.vertex_only_removed + quality_result.tiny_removed)
-            
-            if quality_result.edges_collapsed > 0 or total_removed > 0:
-                # Build removal summary (only show non-zero counts)
-                removals = []
-                if quality_result.degenerate_removed > 0:
-                    removals.append(f"{quality_result.degenerate_removed} degen")
-                if quality_result.duplicate_removed > 0:
-                    removals.append(f"{quality_result.duplicate_removed} dup")
-                if quality_result.ear_removed > 0:
-                    removals.append(f"{quality_result.ear_removed} ear")
-                if quality_result.non_manifold_removed > 0:
-                    removals.append(f"{quality_result.non_manifold_removed} non-manifold")
-                if quality_result.vertex_only_removed > 0:
-                    removals.append(f"{quality_result.vertex_only_removed} vertex-only")
-                if quality_result.tiny_removed > 0:
-                    removals.append(f"{quality_result.tiny_removed} tiny")
-                
-                removal_str = f", removed: {', '.join(removals)}" if removals else ""
-                self.progress.emit(f"Quality: collapsed {quality_result.edges_collapsed} edges{removal_str}, "
-                                  f"aspect {quality_result.min_aspect_before:.3f} → {quality_result.min_aspect_after:.3f} "
-                                  f"({quality_time_ms:.0f}ms)")
-                current_mesh = quality_result.mesh
-            else:
-                self.progress.emit(f"Mesh quality already good ({quality_time_ms:.0f}ms)")
-            
-            # Set final result
+            # =====================================================================
+            # FINALIZE: Set result and emit completion
+            # =====================================================================
             result.mesh = current_mesh
             result.num_vertices = len(current_mesh.vertices)
             result.num_faces = len(current_mesh.faces)
@@ -3539,14 +3272,12 @@ class DisplayOptionsPanel(QFrame):
     hide_tet_mesh_changed = pyqtSignal(bool)  # Toggle tetrahedral mesh visibility
     hide_mold_halves_changed = pyqtSignal(bool)  # Toggle mold halves visibility (both)
     hide_outer_boundary_changed = pyqtSignal(bool)  # Toggle outer boundary (H1/H2/boundary zone)
+    hide_inner_boundary_changed = pyqtSignal(bool)  # Toggle inner boundary (part cavity, blue)
 
     
     # Edge weight visualization signals
-    show_edge_weights_changed = pyqtSignal(bool)  # Toggle edge weight visualization
     show_interior_edges_changed = pyqtSignal(bool)  # Toggle interior edges
-    show_boundary_edges_changed = pyqtSignal(bool)  # Toggle boundary edges
-    show_original_tet_changed = pyqtSignal(bool)  # Toggle original tet mesh
-    show_inflated_boundary_changed = pyqtSignal(bool)  # Toggle inflated boundary
+    show_boundary_edges_changed = pyqtSignal(bool)  # Toggle boundary edges (H1/H2 only)
     
     # Dijkstra result signal
     show_dijkstra_result_changed = pyqtSignal(bool)  # Toggle Dijkstra result visualization
@@ -3665,6 +3396,12 @@ class DisplayOptionsPanel(QFrame):
         self.hide_outer_boundary_cb.hide()
         layout.addWidget(self.hide_outer_boundary_cb)
         
+        # Hide inner boundary checkbox (part cavity surface, blue)
+        self.hide_inner_boundary_cb = QCheckBox('  Inner Boundary')
+        self.hide_inner_boundary_cb.setChecked(False)  # Not hidden by default
+        self.hide_inner_boundary_cb.stateChanged.connect(lambda s: self.hide_inner_boundary_changed.emit(s == Qt.CheckState.Checked.value))
+        self.hide_inner_boundary_cb.hide()
+        layout.addWidget(self.hide_inner_boundary_cb)
 
         
         # Separator for edge weight options
@@ -3680,40 +3417,32 @@ class DisplayOptionsPanel(QFrame):
         self.edge_weight_label.hide()
         layout.addWidget(self.edge_weight_label)
         
-        # Show edge weight visualization checkbox
-        self.show_edge_weights_cb = QCheckBox('Edge Weight Vis.')
-        self.show_edge_weights_cb.setChecked(True)
-        self.show_edge_weights_cb.stateChanged.connect(lambda s: self.show_edge_weights_changed.emit(s == Qt.CheckState.Checked.value))
-        self.show_edge_weights_cb.hide()
-        layout.addWidget(self.show_edge_weights_cb)
-        
         # Show interior edges checkbox
-        self.show_interior_edges_cb = QCheckBox('  Interior Edges')
+        self.show_interior_edges_cb = QCheckBox('Interior Edges')
         self.show_interior_edges_cb.setChecked(True)
         self.show_interior_edges_cb.stateChanged.connect(lambda s: self.show_interior_edges_changed.emit(s == Qt.CheckState.Checked.value))
         self.show_interior_edges_cb.hide()
         layout.addWidget(self.show_interior_edges_cb)
         
-        # Show boundary edges checkbox
-        self.show_boundary_edges_cb = QCheckBox('  Boundary Edges')
+        # Show boundary edges checkbox (H1/H2 only, not inner boundary)
+        self.show_boundary_edges_cb = QCheckBox('Boundary Edges')
         self.show_boundary_edges_cb.setChecked(True)
         self.show_boundary_edges_cb.stateChanged.connect(lambda s: self.show_boundary_edges_changed.emit(s == Qt.CheckState.Checked.value))
         self.show_boundary_edges_cb.hide()
         layout.addWidget(self.show_boundary_edges_cb)
         
-        # Show original tet mesh checkbox
-        self.show_original_tet_cb = QCheckBox('Original Tet Mesh')
-        self.show_original_tet_cb.setChecked(False)
-        self.show_original_tet_cb.stateChanged.connect(lambda s: self.show_original_tet_changed.emit(s == Qt.CheckState.Checked.value))
-        self.show_original_tet_cb.hide()
-        layout.addWidget(self.show_original_tet_cb)
+        # Separator for Dijkstra options
+        self.dijkstra_separator = QFrame()
+        self.dijkstra_separator.setFixedHeight(1)
+        self.dijkstra_separator.setStyleSheet("background-color: #3a3f47;")
+        self.dijkstra_separator.hide()
+        layout.addWidget(self.dijkstra_separator)
         
-        # Show inflated boundary checkbox
-        self.show_inflated_boundary_cb = QCheckBox('Inflated Boundary')
-        self.show_inflated_boundary_cb.setChecked(True)
-        self.show_inflated_boundary_cb.stateChanged.connect(lambda s: self.show_inflated_boundary_changed.emit(s == Qt.CheckState.Checked.value))
-        self.show_inflated_boundary_cb.hide()
-        layout.addWidget(self.show_inflated_boundary_cb)
+        # Dijkstra section label
+        self.dijkstra_label = QLabel('Dijkstra Labeling')
+        self.dijkstra_label.setStyleSheet("font-size: 10px; font-weight: bold; padding-top: 4px; color: rgba(255, 255, 255, 0.7);")
+        self.dijkstra_label.hide()
+        layout.addWidget(self.dijkstra_label)
         
         # Dijkstra result checkbox
         self.show_dijkstra_result_cb = QCheckBox('Dijkstra Result')
@@ -3728,6 +3457,19 @@ class DisplayOptionsPanel(QFrame):
         self.show_dijkstra_h1h2_cb.stateChanged.connect(lambda s: self.show_dijkstra_h1h2_changed.emit(s == Qt.CheckState.Checked.value))
         self.show_dijkstra_h1h2_cb.hide()
         layout.addWidget(self.show_dijkstra_h1h2_cb)
+        
+        # Separator for Secondary cuts options
+        self.secondary_cuts_separator = QFrame()
+        self.secondary_cuts_separator.setFixedHeight(1)
+        self.secondary_cuts_separator.setStyleSheet("background-color: #3a3f47;")
+        self.secondary_cuts_separator.hide()
+        layout.addWidget(self.secondary_cuts_separator)
+        
+        # Secondary cuts section label
+        self.secondary_cuts_label = QLabel('Secondary Cuts')
+        self.secondary_cuts_label.setStyleSheet("font-size: 10px; font-weight: bold; padding-top: 4px; color: rgba(255, 255, 255, 0.7);")
+        self.secondary_cuts_label.hide()
+        layout.addWidget(self.secondary_cuts_label)
         
         # Secondary cuts checkbox
         self.show_secondary_cuts_cb = QCheckBox('Secondary Cuts (Red)')
@@ -3806,11 +3548,14 @@ class DisplayOptionsPanel(QFrame):
         if show:
             self.mold_boundary_label.show()
             self.hide_outer_boundary_cb.show()
-            # Reset to showing outer boundary
+            self.hide_inner_boundary_cb.show()
+            # Reset to showing both boundaries
             self.hide_outer_boundary_cb.setChecked(False)
+            self.hide_inner_boundary_cb.setChecked(False)
         else:
             self.mold_boundary_label.hide()
             self.hide_outer_boundary_cb.hide()
+            self.hide_inner_boundary_cb.hide()
         self.adjustSize()
     
     def show_edge_weight_options(self, show: bool = True):
@@ -3818,35 +3563,33 @@ class DisplayOptionsPanel(QFrame):
         if show:
             self.edge_weight_separator.show()
             self.edge_weight_label.show()
-            self.show_edge_weights_cb.show()
             self.show_interior_edges_cb.show()
             self.show_boundary_edges_cb.show()
-            self.show_original_tet_cb.show()
-            self.show_inflated_boundary_cb.show()
-            # Reset to defaults
-            self.show_edge_weights_cb.setChecked(True)
+            # Ensure checkboxes are checked and emit signals to sync visibility
             self.show_interior_edges_cb.setChecked(True)
             self.show_boundary_edges_cb.setChecked(True)
-            self.show_original_tet_cb.setChecked(False)
-            self.show_inflated_boundary_cb.setChecked(True)
+            # Explicitly emit signals in case setChecked didn't trigger them
+            self.show_interior_edges_changed.emit(True)
+            self.show_boundary_edges_changed.emit(True)
         else:
             self.edge_weight_separator.hide()
             self.edge_weight_label.hide()
-            self.show_edge_weights_cb.hide()
             self.show_interior_edges_cb.hide()
             self.show_boundary_edges_cb.hide()
-            self.show_original_tet_cb.hide()
-            self.show_inflated_boundary_cb.hide()
         self.adjustSize()
     
     def show_dijkstra_result_option(self, show: bool = True):
         """Show or hide the Dijkstra result visibility checkboxes."""
         if show:
+            self.dijkstra_separator.show()
+            self.dijkstra_label.show()
             self.show_dijkstra_result_cb.show()
             self.show_dijkstra_result_cb.setChecked(True)  # Reset to showing result
             self.show_dijkstra_h1h2_cb.show()
             self.show_dijkstra_h1h2_cb.setChecked(True)  # Reset to showing H1/H2 edges
         else:
+            self.dijkstra_separator.hide()
+            self.dijkstra_label.hide()
             self.show_dijkstra_result_cb.hide()
             self.show_dijkstra_h1h2_cb.hide()
         self.adjustSize()
@@ -3854,9 +3597,13 @@ class DisplayOptionsPanel(QFrame):
     def show_secondary_cuts_option(self, show: bool = True):
         """Show or hide the secondary cuts visibility checkbox."""
         if show:
+            self.secondary_cuts_separator.show()
+            self.secondary_cuts_label.show()
             self.show_secondary_cuts_cb.show()
             self.show_secondary_cuts_cb.setChecked(True)  # Reset to showing cuts
         else:
+            self.secondary_cuts_separator.hide()
+            self.secondary_cuts_label.hide()
             self.show_secondary_cuts_cb.hide()
         self.adjustSize()
     
@@ -4261,22 +4008,14 @@ class MainWindow(QMainWindow):
         self.display_options.hide_tet_mesh_changed.connect(self._on_hide_tet_mesh_changed)
         self.display_options.hide_mold_halves_changed.connect(self._on_hide_mold_halves_changed)
         self.display_options.hide_outer_boundary_changed.connect(self._on_hide_outer_boundary_changed)
+        self.display_options.hide_inner_boundary_changed.connect(self._on_hide_inner_boundary_changed)
         
         # Edge weight visibility signals
-        self.display_options.show_edge_weights_changed.connect(
-            lambda show: self.mesh_viewer.set_edge_weights_visible(show)
-        )
         self.display_options.show_interior_edges_changed.connect(
             lambda show: self.mesh_viewer.set_tet_interior_visible(show)
         )
         self.display_options.show_boundary_edges_changed.connect(
             lambda show: self.mesh_viewer.set_tet_boundary_visible(show)
-        )
-        self.display_options.show_original_tet_changed.connect(
-            lambda show: self.mesh_viewer.set_original_tet_visible(show)
-        )
-        self.display_options.show_inflated_boundary_changed.connect(
-            lambda show: self.mesh_viewer.set_inflated_boundary_visible(show)
         )
         self.display_options.show_dijkstra_result_changed.connect(
             lambda show: self.mesh_viewer.set_dijkstra_visible(show)
@@ -5594,9 +5333,6 @@ class MainWindow(QMainWindow):
                         edge_boundary_labels=self._tet_result.edge_boundary_labels,
                         colormap='coolwarm'
                     )
-                    # Show original tet mesh if available
-                    if hasattr(self._tet_result, 'vertices_original') and self._tet_result.vertices_original is not None:
-                        self.mesh_viewer.set_original_tetrahedral_mesh(self._tet_result.vertices_original, self._tet_result.edges)
                     # Show edge weight options
                     self.display_options.show_edge_weight_options(True)
                 
@@ -5609,7 +5345,8 @@ class MainWindow(QMainWindow):
                             self._tet_result.seed_escape_labels,
                             boundary_mesh=None,
                             interior_distances=getattr(self._tet_result, 'seed_distances', None),
-                            tet_edges=self._tet_result.edges
+                            tet_edges=self._tet_result.edges,
+                            boundary_labels=getattr(self._tet_result, 'boundary_labels', None)
                         )
                         self.display_options.show_dijkstra_result_option(True)
                     
@@ -5732,6 +5469,12 @@ class MainWindow(QMainWindow):
         if self.mesh_viewer:
             self.mesh_viewer.set_outer_boundary_visible(not hide)
             logger.debug(f"Outer boundary visibility changed: hide={hide}")
+    
+    def _on_hide_inner_boundary_changed(self, hide: bool):
+        """Handle hide inner boundary checkbox change (part cavity surface, blue)."""
+        if self.mesh_viewer:
+            self.mesh_viewer.set_inner_boundary_visible(not hide)
+            logger.debug(f"Inner boundary visibility changed: hide={hide}")
     
     # =========================================================================
     # MOLD HALVES STEP
@@ -6751,18 +6494,14 @@ class MainWindow(QMainWindow):
         logger.info(f"R distance visualized: R={r_value:.4f}")
     
     def _on_mesh_inflated(self, result: TetrahedralMeshResult):
-        """Handle mesh inflation complete - visualize the inflated boundary mesh."""
+        """Handle mesh inflation complete."""
         logger.info(f"Mesh inflated: {result.num_vertices} vertices, {result.num_boundary_faces} boundary faces")
         
         # Update stored result
         self._tet_result = result
         
-        # Display the inflated boundary mesh
+        # Update stats display (inflated boundary is used for calculations, not visualization)
         if result.boundary_mesh is not None:
-            # Set the inflated boundary mesh as a surface visualization
-            self.mesh_viewer.set_inflated_boundary_mesh(result.boundary_mesh)
-            
-            # Update stats display
             if hasattr(self, 'edge_weights_stats') and self.edge_weights_stats is not None:
                 try:
                     self.edge_weights_stats.add_header('🔄 Mesh Inflated', Colors.SUCCESS)
@@ -6771,7 +6510,7 @@ class MainWindow(QMainWindow):
                 except RuntimeError:
                     pass
         
-        logger.info("Inflated boundary mesh displayed")
+        logger.info("Mesh inflation complete")
     
     def _on_boundary_classified(self, classification_result):
         """Handle boundary mesh classification result."""
@@ -6845,13 +6584,6 @@ class MainWindow(QMainWindow):
                 edge_boundary_labels=result.edge_boundary_labels,
                 colormap='coolwarm'  # Blue (low weight) to Red (high weight)
             )
-            
-            # Also store original (non-inflated) tetrahedral mesh for visualization
-            if result.vertices_original is not None:
-                logger.info(f"Setting original tet mesh with {len(result.vertices_original)} vertices")
-                self.mesh_viewer.set_original_tetrahedral_mesh(result.vertices_original, result.edges)
-            else:
-                logger.warning("No original vertices available for original tet mesh visualization")
             
             logger.info(f"Edge weights computed: range [{result.edge_weights.min():.4f}, {result.edge_weights.max():.4f}]")
             
@@ -7097,13 +6829,6 @@ class MainWindow(QMainWindow):
         self.dijkstra_progress_label.setText("Initializing...")
         self.dijkstra_stats.hide()
         
-        # Also set original tet mesh for visualization
-        if self._tet_result.vertices_original is not None:
-            self.mesh_viewer.set_original_tetrahedral_mesh(
-                self._tet_result.vertices_original,
-                self._tet_result.edges
-            )
-        
         # Start worker
         self._dijkstra_worker = DijkstraWorker(self._tet_result)
         self._dijkstra_worker.progress.connect(self._on_dijkstra_progress)
@@ -7133,13 +6858,15 @@ class MainWindow(QMainWindow):
         
         # Show interior vertices colored by their escape labels as edges
         # Pass tet edges so we can show ALL interior edges (not just surface edges)
+        # Also pass boundary_labels so we can show edges connecting to H1/H2 boundary
         self.mesh_viewer.set_dijkstra_result(
             vertices_for_viz,
             result.seed_vertex_indices,
             result.seed_escape_labels,
             boundary_mesh_for_viz,
             result.seed_distances,
-            result.edges  # Pass tet edges to find all interior edges
+            result.edges,  # Pass tet edges to find all interior edges
+            result.boundary_labels  # Pass boundary labels for H1/H2 boundary edges
         )
         
         # Show Dijkstra result option in display panel

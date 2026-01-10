@@ -40,7 +40,7 @@ class MeshViewer(QWidget):
     - Orbit controls (rotate, pan, zoom)
     - Parting direction arrows
     - Visibility painting for mold analysis
-    - Cell/toon shading with feature edges (not triangle edges)
+    - Standard shading with feature edges
     """
     
     # Colors for light theme
@@ -78,7 +78,7 @@ class MeshViewer(QWidget):
         self._actor = None
         self._grid_actor = None
         self._scale_actors = []  # List of scale ruler actors
-        self._show_edges = True  # Feature edges on by default for cel shading
+        self._show_edges = False  # Feature edges off by default (no cel shading)
         self._current_color = self.MESH_COLOR
         self._feature_edges_actor = None  # Separate actor for feature edges
         self._silhouette_actor = None     # Dynamic silhouette edges (view-dependent)
@@ -119,6 +119,8 @@ class MeshViewer(QWidget):
         self._mold_halves_visible = True
         self._mold_halves_edges_actor = None  # Outer boundary edges (H1/H2/boundary)
         self._outer_boundary_visible = True  # Visibility for outer boundary
+        self._inner_boundary_actor = None  # Inner boundary mesh (adjacent to part)
+        self._inner_boundary_visible = True  # Visibility for inner boundary
         
         # Part surface reference visualization (for debugging)
         self._part_surface_actor = None
@@ -131,11 +133,6 @@ class MeshViewer(QWidget):
         self._tet_visible = True
         self._tet_interior_visible = True
         self._tet_boundary_visible = True
-        self._edge_weights_visible = True  # Show/hide edge weight coloring
-        
-        # Original (non-inflated) tetrahedral mesh visualization
-        self._tet_original_actor = None
-        self._tet_original_visible = False
         
         # Dijkstra result visualization (tetrahedra colored by escape label)
         self._dijkstra_actor = None  # H1/H2 edges (green/orange)
@@ -303,38 +300,77 @@ class MeshViewer(QWidget):
     
     def _setup_lighting(self):
         """
-        Set up lighting for cell/toon shading style.
-        
-        Uses simplified lighting for a flatter, more stylized look:
-        - Single strong directional light for clear shadows
-        - High ambient to reduce harsh shadows
+        Set up soft, even lighting for good model visibility.
+        Uses balanced fill lights from all directions for minimal shadows.
         """
         if not PYVISTA_AVAILABLE:
             return
-            
+        
         # Remove default lights
         self.plotter.remove_all_lights()
         
-        # Single main directional light for cell shading
-        # Positioned to create clear, readable shadows
+        # Use balanced lighting from multiple directions for soft shadows
+        # All lights at higher intensity for brighter scene
+        
+        # Front-top-right
         light1 = pv.Light(
-            position=(1, 1, 1.5),  # Slightly from above
+            position=(10, 10, 10),
             focal_point=(0, 0, 0),
             color='white',
-            intensity=1.0,  # Strong main light
+            intensity=0.8,
         )
-        light1.positional = False  # Directional light
+        light1.positional = False
         self.plotter.add_light(light1)
         
-        # Subtle fill light to soften shadows (optional for cell shading)
+        # Back-top-left
         light2 = pv.Light(
-            position=(-0.5, -0.5, 0.5),
+            position=(-10, 10, -10),
             focal_point=(0, 0, 0),
             color='white',
-            intensity=0.3,  # Subtle fill
+            intensity=0.8,
         )
         light2.positional = False
         self.plotter.add_light(light2)
+        
+        # Front-bottom-left
+        light3 = pv.Light(
+            position=(-10, -5, 10),
+            focal_point=(0, 0, 0),
+            color='white',
+            intensity=0.8,
+        )
+        light3.positional = False
+        self.plotter.add_light(light3)
+        
+        # Back-bottom-right
+        light4 = pv.Light(
+            position=(10, -5, -10),
+            focal_point=(0, 0, 0),
+            color='white',
+            intensity=0.8,
+        )
+        light4.positional = False
+        self.plotter.add_light(light4)
+        
+        # Top light
+        light5 = pv.Light(
+            position=(0, 15, 0),
+            focal_point=(0, 0, 0),
+            color='white',
+            intensity=0.7,
+        )
+        light5.positional = False
+        self.plotter.add_light(light5)
+        
+        # Bottom fill
+        light6 = pv.Light(
+            position=(0, -10, 0),
+            focal_point=(0, 0, 0),
+            color='white',
+            intensity=0.7,
+        )
+        light6.positional = False
+        self.plotter.add_light(light6)
     
     def _add_grid_plane(self, mesh_bounds=None):
         """
@@ -610,7 +646,7 @@ class MeshViewer(QWidget):
         logger.info("Mesh rendered successfully")
     
     def _render_mesh(self):
-        """Render the current mesh with cell/toon shading style."""
+        """Render the current mesh with fixture-view style shading."""
         if not PYVISTA_AVAILABLE or self._pv_mesh is None:
             return
         
@@ -623,36 +659,21 @@ class MeshViewer(QWidget):
         self._hull_actor = None
         self._original_hull_actor = None
         
-        # Re-setup lighting after clear
+        # Set up lighting after clear
         self._setup_lighting()
         
-        # Add the mesh with cell/toon shading style:
-        # - Flat shading for sharp facets
-        # - High ambient, moderate diffuse, no specular
-        # - NO triangle edges (we add feature edges separately)
+        # Add the mesh with fixture-view style material properties
+        # roughness=0.6, metalness=0.1 matches the DEFAULT_MATERIAL_CONFIG
         self._actor = self.plotter.add_mesh(
             self._pv_mesh,
             color=self._current_color,
-            smooth_shading=False,      # Flat shading for cell/toon look
-            show_edges=False,          # Don't show triangle edges
+            pbr=True,
+            metallic=0.1,              # Low metallic for plastic/resin look
+            roughness=0.6,             # Higher roughness = less shiny
+            smooth_shading=True,
+            show_edges=False,
             opacity=1.0,
-            # Cell shading material properties
-            ambient=0.5,               # High ambient for flatter look
-            diffuse=0.5,               # Moderate diffuse
-            specular=0.0,              # No specular for toon style
-            specular_power=1,
-            render_points_as_spheres=False,
-            render_lines_as_tubes=False,
         )
-        
-        # Set flat interpolation for cell shading effect
-        if self._actor is not None:
-            prop = self._actor.GetProperty()
-            if prop:
-                prop.SetInterpolationToFlat()
-        
-        # Add feature edges (silhouette + crease edges) for cel shading outline
-        self._add_feature_edges()
         
         # Add grid plane (like Three.js GridHelper)
         if self._pv_mesh is not None:
@@ -714,15 +735,14 @@ class MeshViewer(QWidget):
                 pv_hull,
                 color=self.HULL_COLOR,
                 opacity=self.HULL_OPACITY,
+                pbr=True,
+                metallic=0.1,
+                roughness=0.6,
                 smooth_shading=True,
                 show_edges=False,
                 style='surface',
-                render_points_as_spheres=False,
             )
             if self._hull_actor is not None:
-                prop = self._hull_actor.GetProperty()
-                if prop:
-                    prop.SetInterpolationToPhong()
                 # Restore visibility state
                 self._hull_actor.SetVisibility(self._hull_visible)
     
@@ -942,6 +962,8 @@ class MeshViewer(QWidget):
         self._mold_halves_actor = None
         self._mold_halves_visible = True
         self._mold_halves_edges_actor = None
+        self._inner_boundary_actor = None
+        self._inner_boundary_visible = True
         
         # Reset part surface reference state
         self._part_surface_actor = None
@@ -954,11 +976,6 @@ class MeshViewer(QWidget):
         self._tet_visible = True
         self._tet_interior_visible = True
         self._tet_boundary_visible = True
-        self._edge_weights_visible = True
-        
-        # Reset original tet mesh state
-        self._tet_original_actor = None
-        self._tet_original_visible = False
         
         # Reset Dijkstra visualization state
         self._dijkstra_actor = None
@@ -1112,8 +1129,7 @@ class MeshViewer(QWidget):
         Add parting direction arrows to the viewer.
         
         Creates two arrows at the mesh center showing the optimal
-        parting directions for a two-piece mold. Uses cell/toon shading
-        for a cleaner, more stylized look.
+        parting directions for a two-piece mold.
         
         Args:
             d1: Primary direction (3,) unit vector - shown in green
@@ -1169,25 +1185,17 @@ class MeshViewer(QWidget):
             shaft_resolution=16,
         )
         
-        # Apply cell/toon shading style - flat shading with edge emphasis
+        # Add D1 arrow with PBR shading
         actor1 = self.plotter.add_mesh(
             arrow1,
             color=self.PARTING_D1_COLOR,
             opacity=1.0,
-            smooth_shading=False,  # Flat shading for cell/toon look
+            pbr=True,
+            metallic=0.1,
+            roughness=0.6,
+            smooth_shading=True,
             show_edges=False,
-            ambient=0.4,      # Higher ambient for flatter look
-            diffuse=0.6,      # Lower diffuse
-            specular=0.0,     # No specular for toon style
         )
-        # Set flat interpolation for cell shading effect
-        if actor1 is not None:
-            prop = actor1.GetProperty()
-            if prop:
-                prop.SetInterpolationToFlat()
-                prop.SetEdgeVisibility(True)
-                prop.SetEdgeColor(0.0, 0.6, 0.0)  # Darker green edge
-                prop.SetLineWidth(1.5)
         self._arrow_actors.append(actor1)
         
         # Create D2 arrow (orange) - Secondary direction
@@ -1202,24 +1210,17 @@ class MeshViewer(QWidget):
             shaft_resolution=16,
         )
         
-        # Apply cell/toon shading style
+        # Add D2 arrow with PBR shading
         actor2 = self.plotter.add_mesh(
             arrow2,
             color=self.PARTING_D2_COLOR,
             opacity=1.0,
-            smooth_shading=False,  # Flat shading for cell/toon look
+            pbr=True,
+            metallic=0.1,
+            roughness=0.6,
+            smooth_shading=True,
             show_edges=False,
-            ambient=0.4,
-            diffuse=0.6,
-            specular=0.0,
         )
-        if actor2 is not None:
-            prop = actor2.GetProperty()
-            if prop:
-                prop.SetInterpolationToFlat()
-                prop.SetEdgeVisibility(True)
-                prop.SetEdgeColor(0.8, 0.3, 0.0)  # Darker orange edge
-                prop.SetLineWidth(1.5)
         self._arrow_actors.append(actor2)
         
         # Add labels at arrow tips
@@ -1369,19 +1370,12 @@ class MeshViewer(QWidget):
             arrow1,
             color=self.POURING_S1_COLOR,
             opacity=1.0,
-            smooth_shading=False,
+            pbr=True,
+            metallic=0.1,
+            roughness=0.6,
+            smooth_shading=True,
             show_edges=False,
-            ambient=0.4,
-            diffuse=0.6,
-            specular=0.0,
         )
-        if actor1 is not None:
-            prop = actor1.GetProperty()
-            if prop:
-                prop.SetInterpolationToFlat()
-                prop.SetEdgeVisibility(True)
-                prop.SetEdgeColor(0.0, 0.6, 0.6)
-                prop.SetLineWidth(1.5)
         self._pouring_arrow_actors.append(actor1)
         
         # Create Silicone 2 arrow (Magenta)
@@ -1400,19 +1394,12 @@ class MeshViewer(QWidget):
             arrow2,
             color=self.POURING_S2_COLOR,
             opacity=1.0,
-            smooth_shading=False,
+            pbr=True,
+            metallic=0.1,
+            roughness=0.6,
+            smooth_shading=True,
             show_edges=False,
-            ambient=0.4,
-            diffuse=0.6,
-            specular=0.0,
         )
-        if actor2 is not None:
-            prop = actor2.GetProperty()
-            if prop:
-                prop.SetInterpolationToFlat()
-                prop.SetEdgeVisibility(True)
-                prop.SetEdgeColor(0.6, 0.2, 0.6)
-                prop.SetLineWidth(1.5)
         self._pouring_arrow_actors.append(actor2)
         
         # Create Resin arrow (Red)
@@ -1431,19 +1418,12 @@ class MeshViewer(QWidget):
             arrow3,
             color=self.POURING_RESIN_COLOR,
             opacity=1.0,
-            smooth_shading=False,
+            pbr=True,
+            metallic=0.1,
+            roughness=0.6,
+            smooth_shading=True,
             show_edges=False,
-            ambient=0.4,
-            diffuse=0.6,
-            specular=0.0,
         )
-        if actor3 is not None:
-            prop = actor3.GetProperty()
-            if prop:
-                prop.SetInterpolationToFlat()
-                prop.SetEdgeVisibility(True)
-                prop.SetEdgeColor(0.6, 0.2, 0.2)
-                prop.SetLineWidth(1.5)
         self._pouring_arrow_actors.append(actor3)
         
         # Add labels at arrow tips
@@ -1556,11 +1536,11 @@ class MeshViewer(QWidget):
             spheres,
             color='yellow',
             opacity=1.0,
+            pbr=True,
+            metallic=0.1,
+            roughness=0.6,
             smooth_shading=True,
             show_edges=False,
-            ambient=0.3,
-            diffuse=0.7,
-            specular=0.3,
         )
         
         self._resin_maxima_actor = actor
@@ -1647,11 +1627,11 @@ class MeshViewer(QWidget):
             sphere,
             color='red',
             opacity=1.0,
+            pbr=True,
+            metallic=0.1,
+            roughness=0.6,
             smooth_shading=True,
             show_edges=False,
-            ambient=0.3,
-            diffuse=0.7,
-            specular=0.5,
         )
         
         self._resin_global_max_actor = actor
@@ -1742,13 +1722,13 @@ class MeshViewer(QWidget):
                 h1_pv,
                 color=self.POURING_S1_COLOR,  # Cyan
                 opacity=0.9,
-                smooth_shading=False,
+                pbr=True,
+                metallic=0.1,
+                roughness=0.6,
+                smooth_shading=True,
                 show_edges=True,
                 edge_color='#006666',
                 line_width=0.5,
-                ambient=0.4,
-                diffuse=0.6,
-                specular=0.0,
             )
             logger.info(f"Added H1 split mesh: {len(h1_mesh.faces)} faces (cyan)")
         
@@ -1759,13 +1739,13 @@ class MeshViewer(QWidget):
                 h2_pv,
                 color=self.POURING_S2_COLOR,  # Magenta
                 opacity=0.9,
-                smooth_shading=False,
+                pbr=True,
+                metallic=0.1,
+                roughness=0.6,
+                smooth_shading=True,
                 show_edges=True,
                 edge_color='#660066',
                 line_width=0.5,
-                ambient=0.4,
-                diffuse=0.6,
-                specular=0.0,
             )
             logger.info(f"Added H2 split mesh: {len(h2_mesh.faces)} faces (magenta)")
         
@@ -1886,43 +1866,33 @@ class MeshViewer(QWidget):
                 pass
             self._feature_edges_actor = None
         
-        # Add mesh with appropriate coloring
+        # Add mesh with appropriate coloring using PBR
         if use_colors and 'colors' in self._pv_mesh.cell_data:
             self._actor = self.plotter.add_mesh(
                 self._pv_mesh,
                 scalars='colors',
                 rgb=True,
-                smooth_shading=False,
+                pbr=True,
+                metallic=0.1,
+                roughness=0.6,
+                smooth_shading=True,
                 show_edges=False,
                 opacity=1.0,
-                ambient=0.5,
-                diffuse=0.5,
-                specular=0.0,
-                specular_power=1,
             )
+            # Skip feature edges when showing per-cell colors (avoid cell-shaded look)
         else:
             self._actor = self.plotter.add_mesh(
                 self._pv_mesh,
                 color=self._current_color,
-                smooth_shading=False,
+                pbr=True,
+                metallic=0.1,
+                roughness=0.6,
+                smooth_shading=True,
                 show_edges=False,
                 opacity=1.0,
-                ambient=0.5,
-                diffuse=0.5,
-                specular=0.0,
-                specular_power=1,
-                render_points_as_spheres=False,
-                render_lines_as_tubes=False,
             )
-        
-        # Set flat interpolation for cell shading effect
-        if self._actor is not None:
-            prop = self._actor.GetProperty()
-            if prop:
-                prop.SetInterpolationToFlat()
-        
-        # Re-add feature edges
-        self._add_feature_edges()
+            # Re-add feature edges for solid color mesh
+            self._add_feature_edges()
         
         self.plotter.update()
     
@@ -1985,29 +1955,20 @@ class MeshViewer(QWidget):
         # Re-setup lighting after clear
         self._setup_lighting()
         
-        # Add mesh with cell colors and cell/toon shading
-        # NO triangle edges - we add feature edges separately
+        # Add mesh with cell colors using PBR shading
         self._actor = self.plotter.add_mesh(
             self._pv_mesh,
             scalars='colors',
             rgb=True,
-            smooth_shading=False,      # Flat shading for cell/toon look
-            show_edges=False,          # Don't show triangle edges
+            pbr=True,
+            metallic=0.1,
+            roughness=0.6,
+            smooth_shading=True,
+            show_edges=False,
             opacity=1.0,
-            ambient=0.5,               # High ambient for flatter look
-            diffuse=0.5,               # Moderate diffuse
-            specular=0.0,              # No specular for toon style
-            specular_power=1,
         )
         
-        # Set flat interpolation for cell shading
-        if self._actor is not None:
-            prop = self._actor.GetProperty()
-            if prop:
-                prop.SetInterpolationToFlat()
-        
-        # Add feature edges for cel shading outline
-        self._add_feature_edges()
+        # Skip feature edges when showing per-cell colors (avoid cell-shaded look)
         
         # Re-add grid and scale rulers
         if self._pv_mesh is not None:
@@ -2130,22 +2091,18 @@ class MeshViewer(QWidget):
                 pass
             self._original_hull_actor = None
         
-        # Add inflated hull mesh (semi-transparent)
+        # Add inflated hull mesh (semi-transparent) with PBR
         self._hull_actor = self.plotter.add_mesh(
             pv_hull,
             color=self.HULL_COLOR,
             opacity=self.HULL_OPACITY,
+            pbr=True,
+            metallic=0.1,
+            roughness=0.6,
             smooth_shading=True,
             show_edges=False,
             style='surface',
-            render_points_as_spheres=False,
         )
-        
-        # Make hull render behind the main mesh
-        if self._hull_actor is not None:
-            prop = self._hull_actor.GetProperty()
-            if prop:
-                prop.SetInterpolationToPhong()
         
         # Optionally add original hull wireframe
         if original_hull is not None and len(original_hull.vertices) > 0:
@@ -2295,6 +2252,14 @@ class MeshViewer(QWidget):
             except Exception:
                 pass
             self._mold_halves_edges_actor = None
+        
+        # Remove inner boundary actor if exists
+        if self._inner_boundary_actor is not None:
+            try:
+                self.plotter.remove_actor(self._inner_boundary_actor)
+            except Exception:
+                pass
+            self._inner_boundary_actor = None
         
         # Remove part surface reference if exists
         if self._part_surface_actor is not None:
@@ -2480,8 +2445,53 @@ class MeshViewer(QWidget):
         if self._mold_halves_edges_actor is not None:
             self._mold_halves_edges_actor.SetVisibility(self._outer_boundary_visible)
         
+        # =====================================================================
+        # STEP 4: Create inner boundary visualization (blue edges)
+        # This shows the mold cavity edges adjacent to the part
+        # =====================================================================
+        
+        if n_inner_faces > 0:
+            # Build edges from inner boundary faces (similar to outer boundary)
+            inner_edge_set = set()
+            for face_idx in inner_set:
+                face = boundary_faces[face_idx]
+                v0, v1, v2 = face
+                inner_edge_set.add((min(v0, v1), max(v0, v1)))
+                inner_edge_set.add((min(v1, v2), max(v1, v2)))
+                inner_edge_set.add((min(v2, v0), max(v2, v0)))
+            
+            inner_edges = np.array(list(inner_edge_set)) if inner_edge_set else np.empty((0, 2), dtype=np.int64)
+            n_inner_edges = len(inner_edges)
+            
+            if n_inner_edges > 0:
+                # Create edge cells for inner boundary
+                inner_cells = np.empty((n_inner_edges, 3), dtype=np.int64)
+                inner_cells[:, 0] = 2
+                inner_cells[:, 1] = inner_edges[:, 0]
+                inner_cells[:, 2] = inner_edges[:, 1]
+                inner_cell_types = np.full(n_inner_edges, 3, dtype=np.uint8)  # VTK_LINE
+                
+                inner_edge_grid = pv.UnstructuredGrid(inner_cells.ravel(), inner_cell_types, boundary_vertices)
+                
+                # Add inner boundary edges as blue lines
+                self._inner_boundary_actor = self.plotter.add_mesh(
+                    inner_edge_grid,
+                    color='#2196F3',  # Blue color
+                    line_width=3,
+                    show_edges=False,
+                )
+                
+                if self._inner_boundary_actor is not None:
+                    self._inner_boundary_actor.SetVisibility(self._inner_boundary_visible)
+                
+                logger.info(f"Added inner boundary visualization: {n_inner_edges} edges (blue)")
+            else:
+                logger.info("No inner boundary edges to display")
+        else:
+            logger.info("No inner boundary faces to display")
+        
         self.plotter.update()
-        logger.info(f"Applied tet classification: {n_boundary_edges} outer hull boundary edges (excluded {n_inner_faces} inner faces)")
+        logger.info(f"Applied tet classification: {n_boundary_edges} outer hull edges, {n_inner_faces} inner boundary faces")
     
     def show_part_surface_reference(self, part_mesh: 'trimesh.Trimesh'):
         """
@@ -2534,10 +2544,12 @@ class MeshViewer(QWidget):
             self.plotter.update()
     
     def set_mold_halves_visible(self, visible: bool):
-        """Set visibility of mold halves classification (outer boundary)."""
+        """Set visibility of mold halves classification (both outer and inner boundary)."""
         self._mold_halves_visible = visible
         if self._mold_halves_edges_actor is not None:
             self._mold_halves_edges_actor.SetVisibility(visible)
+        if self._inner_boundary_actor is not None:
+            self._inner_boundary_actor.SetVisibility(visible)
         self.plotter.update()
     
     def set_outer_boundary_visible(self, visible: bool):
@@ -2547,10 +2559,17 @@ class MeshViewer(QWidget):
             self._mold_halves_edges_actor.SetVisibility(visible)
         self.plotter.update()
     
+    def set_inner_boundary_visible(self, visible: bool):
+        """Set visibility of inner boundary surface (adjacent to part, blue)."""
+        self._inner_boundary_visible = visible
+        if self._inner_boundary_actor is not None:
+            self._inner_boundary_actor.SetVisibility(visible)
+        self.plotter.update()
+    
     @property
     def has_mold_halves(self) -> bool:
         """Check if mold halves classification is displayed."""
-        return self._mold_halves_edges_actor is not None
+        return self._mold_halves_edges_actor is not None or self._inner_boundary_actor is not None
 
     # ========================================================================
     # TETRAHEDRAL MESH VISUALIZATION
@@ -2587,6 +2606,10 @@ class MeshViewer(QWidget):
         
         # Remove existing tet mesh actors
         self.clear_tetrahedral_mesh()
+        
+        # Reset visibility flags to True for newly created edges
+        self._tet_interior_visible = True
+        self._tet_boundary_visible = True
         
         n_edges = len(edges)
         
@@ -2676,75 +2699,69 @@ class MeshViewer(QWidget):
                         render_lines_as_tubes=False,
                     )
             
-            # === BOUNDARY EDGES: Colored by mold half ===
+            # === BOUNDARY EDGES: H1/H2 only (inner boundary already shown in mold halves step) ===
             if n_boundary > 0:
                 boundary_edges = edges[boundary_mask]
                 boundary_labels = edge_boundary_labels[boundary_mask]
                 
-                # Create RGBA colors for each boundary edge
-                # H1 = green, H2 = orange, inner = dark gray, mixed = light gray
-                boundary_colors = np.zeros((n_boundary, 4), dtype=np.uint8)
+                # Only show H1 and H2 edges (skip inner boundary and mixed - already in mold halves step)
+                h1h2_mask = (boundary_labels == 1) | (boundary_labels == 2)
                 
-                # H1 edges (label=1): Green
-                h1_mask = boundary_labels == 1
-                boundary_colors[h1_mask] = [76, 175, 80, 255]  # #4CAF50
-                
-                # H2 edges (label=2): Orange
-                h2_mask = boundary_labels == 2
-                boundary_colors[h2_mask] = [255, 152, 0, 255]  # #FF9800
-                
-                # Inner boundary edges (label=-1): Dark gray
-                inner_mask = boundary_labels == -1
-                boundary_colors[inner_mask] = [80, 80, 80, 255]  # #505050
-                
-                # Mixed boundary edges (label=-2): Light gray
-                mixed_mask = boundary_labels == -2
-                boundary_colors[mixed_mask] = [180, 180, 180, 255]  # #B4B4B4
-                
-                # Unclassified (label=0 but still in boundary mask somehow): Gray
-                unclass_mask = boundary_labels == 0
-                boundary_colors[unclass_mask] = [150, 150, 150, 255]
-                
-                # Build PyVista PolyData for boundary edges
-                # Use the new cells format for PyVista
-                boundary_mesh = pv.PolyData()
-                boundary_mesh.points = vertices.astype(np.float32)
-                
-                # Create cells array: for lines, each cell is [2, v0, v1]
-                cells = np.column_stack([
-                    np.full(n_boundary, 2, dtype=np.int64),
-                    boundary_edges[:, 0],
-                    boundary_edges[:, 1]
-                ]).ravel()
-                
-                # Set lines using the lines property with proper format
-                boundary_mesh.lines = cells
-                
-                logger.debug(f"Boundary mesh: {boundary_mesh.n_cells} cells, {len(boundary_colors)} colors")
-                
-                # Verify cell count matches colors
-                if boundary_mesh.n_cells == len(boundary_colors):
-                    boundary_mesh.cell_data['colors'] = boundary_colors
+                if np.any(h1h2_mask):
+                    h1h2_edges = boundary_edges[h1h2_mask]
+                    h1h2_labels = boundary_labels[h1h2_mask]
+                    n_h1h2 = len(h1h2_edges)
                     
-                    self._tet_boundary_actor = self.plotter.add_mesh(
-                        boundary_mesh,
-                        scalars='colors',
-                        rgb=True,
-                        line_width=2.5,  # Slightly thicker for boundary
-                        render_lines_as_tubes=False,
-                        show_scalar_bar=False,
-                    )
-                else:
-                    logger.warning(
-                        f"Cell count mismatch: {boundary_mesh.n_cells} cells vs {len(boundary_colors)} colors. "
-                        "Showing boundary edges without mold half coloring."
-                    )
-                    self._tet_boundary_actor = self.plotter.add_mesh(
-                        boundary_mesh,
-                        color='#888888',
-                        line_width=2.5,
-                        render_lines_as_tubes=False,
-                    )
+                    # Create RGBA colors for H1/H2 edges
+                    boundary_colors = np.zeros((n_h1h2, 4), dtype=np.uint8)
+                    
+                    # H1 edges (label=1): Green
+                    h1_mask = h1h2_labels == 1
+                    boundary_colors[h1_mask] = [76, 175, 80, 255]  # #4CAF50
+                    
+                    # H2 edges (label=2): Orange
+                    h2_mask = h1h2_labels == 2
+                    boundary_colors[h2_mask] = [255, 152, 0, 255]  # #FF9800
+                    
+                    # Build PyVista PolyData for boundary edges
+                    boundary_mesh = pv.PolyData()
+                    boundary_mesh.points = vertices.astype(np.float32)
+                    
+                    # Create cells array: for lines, each cell is [2, v0, v1]
+                    cells = np.column_stack([
+                        np.full(n_h1h2, 2, dtype=np.int64),
+                        h1h2_edges[:, 0],
+                        h1h2_edges[:, 1]
+                    ]).ravel()
+                    
+                    # Set lines using the lines property with proper format
+                    boundary_mesh.lines = cells
+                    
+                    logger.debug(f"Boundary mesh (H1/H2 only): {boundary_mesh.n_cells} cells, {len(boundary_colors)} colors")
+                    
+                    # Verify cell count matches colors
+                    if boundary_mesh.n_cells == len(boundary_colors):
+                        boundary_mesh.cell_data['colors'] = boundary_colors
+                        
+                        self._tet_boundary_actor = self.plotter.add_mesh(
+                            boundary_mesh,
+                            scalars='colors',
+                            rgb=True,
+                            line_width=2.5,  # Slightly thicker for boundary
+                            render_lines_as_tubes=False,
+                            show_scalar_bar=False,
+                        )
+                    else:
+                        logger.warning(
+                            f"Cell count mismatch: {boundary_mesh.n_cells} cells vs {len(boundary_colors)} colors. "
+                            "Showing boundary edges without mold half coloring."
+                        )
+                        self._tet_boundary_actor = self.plotter.add_mesh(
+                            boundary_mesh,
+                            color='#888888',
+                            line_width=2.5,
+                            render_lines_as_tubes=False,
+                        )
         else:
             # No boundary labels - show all edges colored by weight (original behavior)
             mesh = pv.PolyData()
@@ -2894,22 +2911,19 @@ class MeshViewer(QWidget):
         # Use a distinct color for inflated boundary - golden/amber
         inflated_color = "#ffaa00"  # Golden amber
         
-        # Add with cell shading style (flat interpolation, low specular)
+        # Add with PBR shading
         self._inflated_boundary_actor = self.plotter.add_mesh(
             pv_mesh,
             color=inflated_color,
             opacity=0.6,
+            pbr=True,
+            metallic=0.1,
+            roughness=0.6,
             show_edges=False,
-            smooth_shading=False,  # Flat shading for cell/toon style
-            ambient=0.4,
-            diffuse=0.6,
-            specular=0.0,
+            smooth_shading=True,
         )
         
-        # Configure actor properties for cell shading
         if self._inflated_boundary_actor is not None:
-            prop = self._inflated_boundary_actor.GetProperty()
-            prop.SetInterpolationToFlat()
             self._inflated_boundary_actor.SetVisibility(self._inflated_boundary_visible)
         
         self.plotter.update()
@@ -3044,112 +3058,6 @@ class MeshViewer(QWidget):
         return self._r_line_actor is not None
 
     # ========================================================================
-    # EDGE WEIGHTS VISIBILITY
-    # ========================================================================
-    
-    def set_edge_weights_visible(self, visible: bool):
-        """Set visibility of edge weight visualization (interior and boundary edges)."""
-        self._edge_weights_visible = visible
-        
-        if self._tet_interior_actor is not None:
-            self._tet_interior_actor.SetVisibility(visible)
-        if self._tet_boundary_actor is not None:
-            self._tet_boundary_actor.SetVisibility(visible)
-        
-        self.plotter.update()
-    
-    @property
-    def edge_weights_visible(self) -> bool:
-        """Check if edge weights are visible."""
-        return self._edge_weights_visible
-    
-    @property
-    def has_edge_weights(self) -> bool:
-        """Check if edge weight visualization exists."""
-        return self._tet_interior_actor is not None or self._tet_boundary_actor is not None
-
-    # ========================================================================
-    # ORIGINAL TETRAHEDRAL MESH VISUALIZATION
-    # ========================================================================
-    
-    def set_original_tetrahedral_mesh(
-        self,
-        vertices: np.ndarray,
-        edges: np.ndarray
-    ):
-        """
-        Display the original (non-inflated) tetrahedral mesh edges.
-        
-        Args:
-            vertices: (N, 3) original vertex positions
-            edges: (E, 2) edge vertex indices
-        """
-        if not PYVISTA_AVAILABLE:
-            return
-        
-        # Remove existing actor
-        self.clear_original_tetrahedral_mesh()
-        
-        n_edges = len(edges)
-        logger.info(f"Setting original tetrahedral mesh: {len(vertices)} verts, {n_edges} edges")
-        
-        # Build PyVista PolyData for edges
-        mesh = pv.PolyData()
-        mesh.points = vertices.astype(np.float32)
-        
-        # Create cells array: for lines, each cell is [2, v0, v1]
-        cells = np.column_stack([
-            np.full(n_edges, 2, dtype=np.int64),
-            edges[:, 0],
-            edges[:, 1]
-        ]).ravel()
-        
-        mesh.lines = cells
-        
-        self._tet_original_actor = self.plotter.add_mesh(
-            mesh,
-            color='#666666',  # Gray for original
-            line_width=1.0,
-            render_lines_as_tubes=False,
-            opacity=0.5
-        )
-        
-        # Initially hidden
-        self._tet_original_actor.SetVisibility(self._tet_original_visible)
-        
-        self.plotter.update()
-    
-    def clear_original_tetrahedral_mesh(self):
-        """Remove original tetrahedral mesh visualization."""
-        if not PYVISTA_AVAILABLE:
-            return
-        
-        if self._tet_original_actor is not None:
-            try:
-                self.plotter.remove_actor(self._tet_original_actor)
-            except Exception:
-                pass
-            self._tet_original_actor = None
-    
-    def set_original_tet_visible(self, visible: bool):
-        """Set visibility of original tetrahedral mesh."""
-        self._tet_original_visible = visible
-        
-        if self._tet_original_actor is not None:
-            self._tet_original_actor.SetVisibility(visible)
-            self.plotter.update()
-    
-    @property
-    def original_tet_visible(self) -> bool:
-        """Check if original tet mesh is visible."""
-        return self._tet_original_visible
-    
-    @property
-    def has_original_tet(self) -> bool:
-        """Check if original tet mesh exists."""
-        return self._tet_original_actor is not None
-
-    # ========================================================================
     # DIJKSTRA RESULT VISUALIZATION
     # ========================================================================
     
@@ -3160,17 +3068,18 @@ class MeshViewer(QWidget):
         interior_escape_labels: np.ndarray,
         boundary_mesh: 'trimesh.Trimesh' = None,
         interior_distances: np.ndarray = None,
-        tet_edges: np.ndarray = None
+        tet_edges: np.ndarray = None,
+        boundary_labels: np.ndarray = None
     ):
         """
         Display Dijkstra results as colored edges for ALL interior vertices.
         
-        Shows all interior edges (edges where both vertices are interior - not on H1/H2)
+        Shows all interior edges (edges where at least one vertex is interior)
         colored by which boundary (H1 or H2) each vertex walks to via the shortest weighted path.
         
         Edge colors:
-        - Green: both endpoints walk to H1
-        - Orange: both endpoints walk to H2  
+        - Green: both endpoints walk to H1, or interior connects to H1 boundary
+        - Orange: both endpoints walk to H2, or interior connects to H2 boundary  
         - Yellow: endpoints walk to opposite boundaries (parting surface passes through)
         - Gray: one or both endpoints unreachable
         
@@ -3181,6 +3090,7 @@ class MeshViewer(QWidget):
             boundary_mesh: The tetrahedral boundary mesh (fallback for edge extraction)
             interior_distances: (I,) optional distances to boundary
             tet_edges: (E, 2) tetrahedral mesh edges - used to find all interior edges
+            boundary_labels: (N,) vertex boundary labels: 1=H1, 2=H2, -1=inner, 0=interior
         """
         if not PYVISTA_AVAILABLE:
             return
@@ -3208,16 +3118,39 @@ class MeshViewer(QWidget):
         # Get interior vertex set for fast lookup
         interior_set = set(interior_vertex_indices.tolist())
         
-        # Build edges connecting interior vertices
+        # Build H1/H2 boundary sets if boundary_labels provided
+        h1_boundary_set = set()
+        h2_boundary_set = set()
+        if boundary_labels is not None:
+            h1_boundary_set = set(np.where(boundary_labels == 1)[0].tolist())
+            h2_boundary_set = set(np.where(boundary_labels == 2)[0].tolist())
+            logger.info(f"Boundary sets: H1={len(h1_boundary_set)}, H2={len(h2_boundary_set)}")
+        
+        # Build edges connecting interior vertices (including edges to boundary)
         # Use tetrahedral mesh edges if provided, otherwise fall back to boundary mesh
-        edge_set = set()
+        interior_edge_set = set()  # Edges where BOTH vertices are interior
+        boundary_edge_list = []  # Edges connecting interior to H1/H2 boundary
         
         if tet_edges is not None:
-            # Use all tet edges where BOTH vertices are interior
             for v0, v1 in tet_edges:
-                if v0 in interior_set and v1 in interior_set:
-                    edge_set.add((min(v0, v1), max(v0, v1)))
-            logger.info(f"Found {len(edge_set)} interior edges from {len(tet_edges)} tet edges")
+                v0_interior = v0 in interior_set
+                v1_interior = v1 in interior_set
+                v0_h1 = v0 in h1_boundary_set
+                v0_h2 = v0 in h2_boundary_set
+                v1_h1 = v1 in h1_boundary_set
+                v1_h2 = v1 in h2_boundary_set
+                
+                if v0_interior and v1_interior:
+                    # Both interior - add to interior edges
+                    interior_edge_set.add((min(v0, v1), max(v0, v1)))
+                elif v0_interior and (v1_h1 or v1_h2):
+                    # v0 interior, v1 on H1/H2 boundary
+                    boundary_edge_list.append((v0, v1, 1 if v1_h1 else 2))
+                elif v1_interior and (v0_h1 or v0_h2):
+                    # v1 interior, v0 on H1/H2 boundary
+                    boundary_edge_list.append((v1, v0, 1 if v0_h1 else 2))
+            
+            logger.info(f"Found {len(interior_edge_set)} interior-interior edges, {len(boundary_edge_list)} interior-boundary edges")
         elif boundary_mesh is not None:
             # Fallback: use boundary mesh faces
             from scipy.spatial import cKDTree
@@ -3236,43 +3169,59 @@ class MeshViewer(QWidget):
                 # Check each edge of this face
                 for va, vb in [(tet_v0, tet_v1), (tet_v1, tet_v2), (tet_v2, tet_v0)]:
                     if va in interior_set and vb in interior_set:
-                        edge_set.add((min(va, vb), max(va, vb)))
+                        interior_edge_set.add((min(va, vb), max(va, vb)))
         
-        edges = np.array(list(edge_set)) if edge_set else np.empty((0, 2), dtype=np.int64)
+        interior_edges = np.array(list(interior_edge_set)) if interior_edge_set else np.empty((0, 2), dtype=np.int64)
         
-        n_edges = len(edges)
-        logger.info(f"Found {n_edges} edges between interior vertices")
+        n_interior_edges = len(interior_edges)
+        n_boundary_edges = len(boundary_edge_list)
+        logger.info(f"Total edges to visualize: {n_interior_edges} interior + {n_boundary_edges} boundary-connected")
+        
+        h1h2_edges = []  # Green and orange edges
+        primary_cut_edges = []  # Yellow edges
+        h1h2_colors = []
+        
+        # Process interior-interior edges
+        for v0, v1 in interior_edges:
+            l0 = vertex_escape_labels[v0]
+            l1 = vertex_escape_labels[v1]
+            
+            # Classify edge
+            if (l0 == 1 and l1 == 2) or (l0 == 2 and l1 == 1):
+                # Yellow - primary cut (interface between H1 and H2)
+                primary_cut_edges.append((v0, v1))
+            elif l0 == 1 and l1 == 1:
+                h1h2_edges.append((v0, v1))
+                h1h2_colors.append([76, 175, 80])  # Green - both walk to H1
+            elif l0 == 2 and l1 == 2:
+                h1h2_edges.append((v0, v1))
+                h1h2_colors.append([255, 152, 0])  # Orange - both walk to H2
+            elif l0 == 1 or l1 == 1:
+                h1h2_edges.append((v0, v1))
+                h1h2_colors.append([76, 175, 80])  # Green - at least one walks to H1
+            elif l0 == 2 or l1 == 2:
+                h1h2_edges.append((v0, v1))
+                h1h2_colors.append([255, 152, 0])  # Orange - at least one walks to H2
+            else:
+                h1h2_edges.append((v0, v1))
+                h1h2_colors.append([150, 150, 150])  # Gray - unreachable
+        
+        # Process interior-to-boundary edges
+        for interior_v, boundary_v, boundary_type in boundary_edge_list:
+            escape_label = vertex_escape_labels[interior_v]
+            
+            if boundary_type == 1:
+                # Edge connects to H1 boundary
+                h1h2_edges.append((interior_v, boundary_v))
+                h1h2_colors.append([76, 175, 80])  # Green
+            else:
+                # Edge connects to H2 boundary
+                h1h2_edges.append((interior_v, boundary_v))
+                h1h2_colors.append([255, 152, 0])  # Orange
+        
+        n_edges = len(h1h2_edges) + len(primary_cut_edges)
         
         if n_edges > 0:
-            # Separate edges into H1/H2 edges and primary cut (yellow) edges
-            h1h2_edges = []  # Green and orange edges
-            primary_cut_edges = []  # Yellow edges
-            h1h2_colors = []
-            
-            for i, (v0, v1) in enumerate(edges):
-                l0 = vertex_escape_labels[v0]
-                l1 = vertex_escape_labels[v1]
-                
-                # Classify edge
-                if (l0 == 1 and l1 == 2) or (l0 == 2 and l1 == 1):
-                    # Yellow - primary cut (interface between H1 and H2)
-                    primary_cut_edges.append((v0, v1))
-                elif l0 == 1 and l1 == 1:
-                    h1h2_edges.append((v0, v1))
-                    h1h2_colors.append([76, 175, 80])  # Green - both walk to H1
-                elif l0 == 2 and l1 == 2:
-                    h1h2_edges.append((v0, v1))
-                    h1h2_colors.append([255, 152, 0])  # Orange - both walk to H2
-                elif l0 == 1 or l1 == 1:
-                    h1h2_edges.append((v0, v1))
-                    h1h2_colors.append([76, 175, 80])  # Green - at least one walks to H1
-                elif l0 == 2 or l1 == 2:
-                    h1h2_edges.append((v0, v1))
-                    h1h2_colors.append([255, 152, 0])  # Orange - at least one walks to H2
-                else:
-                    h1h2_edges.append((v0, v1))
-                    h1h2_colors.append([150, 150, 150])  # Gray - unreachable
-            
             # Create actor for H1/H2 edges (green/orange/gray)
             if len(h1h2_edges) > 0:
                 h1h2_edges_arr = np.array(h1h2_edges)
@@ -3573,6 +3522,9 @@ class MeshViewer(QWidget):
                     pv_main,
                     color=self.PARTING_SURFACE_COLOR,
                     opacity=self.PARTING_SURFACE_OPACITY,
+                    pbr=True,
+                    metallic=0.1,
+                    roughness=0.6,
                     smooth_shading=True,
                     show_edges=True,
                     edge_color='#1166cc',
@@ -3592,6 +3544,9 @@ class MeshViewer(QWidget):
                     pv_fill,
                     color=self.GAP_FILL_COLOR,
                     opacity=self.GAP_FILL_OPACITY,
+                    pbr=True,
+                    metallic=0.1,
+                    roughness=0.6,
                     smooth_shading=True,
                     show_edges=True,
                     edge_color='#cc9900',  # Darker yellow for edges
@@ -3606,20 +3561,15 @@ class MeshViewer(QWidget):
                 pv_surface,
                 color=self.PARTING_SURFACE_COLOR,
                 opacity=self.PARTING_SURFACE_OPACITY,
+                pbr=True,
+                metallic=0.1,
+                roughness=0.6,
                 smooth_shading=True,
                 show_edges=True,
                 edge_color='#1166cc',
                 line_width=1,
                 style='surface',
             )
-        
-        # Set up rendering properties for better visibility
-        if self._parting_surface_actor is not None:
-            prop = self._parting_surface_actor.GetProperty()
-            if prop:
-                prop.SetInterpolationToPhong()
-                prop.SetAmbient(0.3)
-                prop.SetDiffuse(0.7)
         
         self.plotter.update()
         logger.info(f"Parting surface displayed: {len(parting_mesh.vertices)} vertices, {len(parting_mesh.faces)} faces")
@@ -3749,6 +3699,9 @@ class MeshViewer(QWidget):
                     pv_main,
                     color=self.SECONDARY_PARTING_SURFACE_COLOR,
                     opacity=self.SECONDARY_PARTING_SURFACE_OPACITY,
+                    pbr=True,
+                    metallic=0.1,
+                    roughness=0.6,
                     smooth_shading=True,
                     show_edges=True,
                     edge_color='#cc2222',
@@ -3768,6 +3721,9 @@ class MeshViewer(QWidget):
                     pv_fill,
                     color=self.SECONDARY_GAP_FILL_COLOR,
                     opacity=self.SECONDARY_GAP_FILL_OPACITY,
+                    pbr=True,
+                    metallic=0.1,
+                    roughness=0.6,
                     smooth_shading=True,
                     show_edges=True,
                     edge_color='#cc7700',  # Darker orange for edges
@@ -3783,21 +3739,15 @@ class MeshViewer(QWidget):
                 pv_surface,
                 color=self.SECONDARY_PARTING_SURFACE_COLOR,
                 opacity=self.SECONDARY_PARTING_SURFACE_OPACITY,
+                pbr=True,
+                metallic=0.1,
+                roughness=0.6,
                 smooth_shading=True,
                 show_edges=True,
                 edge_color='#cc2222',  # Darker red for edges
                 line_width=1,
                 style='surface',
-                render_points_as_spheres=False,
             )
-        
-        # Set up rendering properties for better visibility
-        if self._secondary_parting_surface_actor is not None:
-            prop = self._secondary_parting_surface_actor.GetProperty()
-            if prop:
-                prop.SetInterpolationToPhong()
-                prop.SetAmbient(0.3)
-                prop.SetDiffuse(0.7)
         
         self.plotter.update()
         logger.info(f"Secondary parting surface displayed: {len(parting_mesh.vertices)} vertices, {len(parting_mesh.faces)} faces")

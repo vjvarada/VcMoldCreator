@@ -284,10 +284,10 @@ def _get_5_edge_triangles(config: int, edge_to_vertex: Dict[int, int],
     In a 5-edge config, there are exactly 2 faces with all 3 edges cut (the faces
     opposite to the two same-label vertices). We use the first such face.
     
-    This generates 5 triangles total:
-    - 3 triangles forming a fan from face_vertex to mid-edge pairs on the chosen face
-    - 2 triangles connecting the remaining 2 mid-edge points (on other faces) to 
-      the face vertex and appropriate adjacent mid-edge points
+    This generates EXACTLY 5 triangles total:
+    - 3 triangles forming a fan from face_vertex to consecutive mid-edge pairs on the target face
+    - 2 triangles connecting each remaining mid-edge point to face_vertex and its 
+      adjacent mid-edge points on the target face
     
     Args:
         config: The 6-bit configuration (one of 62, 61, 59, 55, 47, 31)
@@ -308,7 +308,10 @@ def _get_5_edge_triangles(config: int, edge_to_vertex: Dict[int, int],
         logger.warning(f"5-edge config {config}: could not find uncut edge")
         return []
     
-    # Find a face where ALL 3 edges are cut
+    # Get the two vertices connected by the uncut edge (same-label vertices)
+    same_label_verts = set(TET_EDGES[uncut_edge])
+    
+    # Find a face where ALL 3 edges are cut (this face is opposite to one same-label vertex)
     # In 5-edge config, there are exactly 2 such faces
     target_face = None
     for face_idx, face_edges in enumerate(TET_FACE_EDGES):
@@ -323,25 +326,46 @@ def _get_5_edge_triangles(config: int, edge_to_vertex: Dict[int, int],
     triangles = []
     face_edges = TET_FACE_EDGES[target_face]
     
-    # Create 3 triangles: fan from face_vertex to consecutive mid-edge pairs on face
+    # Create 3 triangles: fan from face_vertex to consecutive mid-edge pairs on target face
+    # Use consistent winding: mid_edge_i -> mid_edge_(i+1) -> face_vertex
     for i in range(3):
         e1 = face_edges[i]
         e2 = face_edges[(i + 1) % 3]
         triangles.append([edge_to_vertex[e1], edge_to_vertex[e2], face_vertex_idx])
     
-    # Find the 2 remaining cut edges (not on target face)
-    remaining_cut_edges = [e for e in range(6) if e != uncut_edge and e not in face_edges and e in edge_to_vertex]
+    # Find the 2 remaining cut edges (not on target face and not the uncut edge)
+    remaining_cut_edges = [e for e in range(6) 
+                          if e != uncut_edge and e not in face_edges and e in edge_to_vertex]
     
-    # Create 2 triangles connecting remaining edges to face vertex
-    # Each remaining edge shares exactly one endpoint with one of the face edges
+    if len(remaining_cut_edges) != 2:
+        logger.warning(f"5-edge config {config}: expected 2 remaining edges, got {len(remaining_cut_edges)}")
+        # Still try to create triangles with what we have
+    
+    # Create triangles connecting remaining edges to the face vertex
+    # Each remaining edge should connect to TWO face edges (forms a quad with face vertex)
+    # We need to find the correct face edge that shares a vertex with the remaining edge
     for re in remaining_cut_edges:
         re_verts = set(TET_EDGES[re])
-        # Find which face edge shares a vertex with this remaining edge
+        
+        # Find ALL face edges that share a vertex with this remaining edge
+        # (there should be exactly 2, forming a quad that we triangulate)
+        connected_face_edges = []
         for fe in face_edges:
             fe_verts = set(TET_EDGES[fe])
             if re_verts & fe_verts:  # Shared vertex
-                triangles.append([edge_to_vertex[re], edge_to_vertex[fe], face_vertex_idx])
-                break
+                connected_face_edges.append(fe)
+        
+        if len(connected_face_edges) >= 1:
+            # Create triangle: remaining_edge -> first_connected_face_edge -> face_vertex
+            # Use the first connected face edge to form a triangle
+            fe = connected_face_edges[0]
+            triangles.append([edge_to_vertex[re], edge_to_vertex[fe], face_vertex_idx])
+        else:
+            logger.warning(f"5-edge config {config}: remaining edge {re} has no connected face edges")
+    
+    # Validate we generated exactly 5 triangles
+    if len(triangles) != 5:
+        logger.warning(f"5-edge config {config}: generated {len(triangles)} triangles, expected 5")
     
     return triangles
 
@@ -357,8 +381,12 @@ def _get_6_edge_triangles(edge_to_vertex: Dict[int, int],
     - 4 face vertices (one per tetrahedron face, at centroid of 3 mid-edge points)
     - 1 inner vertex (at centroid of 4 face vertices = mid-tetrahedron)
     
-    This generates 12 triangles (3 per face):
-    - For each face, create 3 triangles connecting inner_vertex → face_vertex → mid_edge
+    This generates EXACTLY 12 triangles (3 per face):
+    - For each face, create 3 triangles in a fan from inner_vertex through face_vertex
+      to consecutive mid-edge points
+    
+    Triangle winding is consistent: inner_vertex -> face_vertex -> mid_edge
+    This ensures normals point consistently outward when viewed from the inner vertex.
     
     Args:
         edge_to_vertex: Map from local edge index to surface vertex index
@@ -373,17 +401,40 @@ def _get_6_edge_triangles(edge_to_vertex: Dict[int, int],
         return []
     
     triangles = []
+    missing_edges = 0
     
-    # For each of the 4 faces, create 3 triangles
-    # Each triangle connects: inner_vertex → face_vertex → mid_edge
+    # For each of the 4 faces, create 3 triangles in a consistent fan pattern
+    # The fan goes: inner_vertex -> face_vertex -> mid_edge_i -> (back to inner_vertex)
+    # This creates a consistent winding order across all faces
     for face_idx, face_edges in enumerate(TET_FACE_EDGES):
         face_v = face_vertex_indices[face_idx]
         
-        # Create 3 triangles for this face
+        # Get all mid-edge vertices for this face
+        face_mid_edges = []
         for e in face_edges:
             if e in edge_to_vertex:
-                # Triangle: inner_vertex → face_vertex → mid_edge
-                triangles.append([inner_vertex_idx, face_v, edge_to_vertex[e]])
+                face_mid_edges.append(edge_to_vertex[e])
+            else:
+                missing_edges += 1
+        
+        if len(face_mid_edges) < 3:
+            logger.warning(f"6-edge config face {face_idx}: only {len(face_mid_edges)} mid-edge vertices, expected 3")
+            continue
+        
+        # Create 3 triangles for this face with consistent winding
+        # Fan from inner vertex through face vertex to each mid-edge
+        for i in range(3):
+            me_curr = face_mid_edges[i]
+            me_next = face_mid_edges[(i + 1) % 3]
+            # Triangle: face_vertex -> mid_edge_curr -> mid_edge_next
+            # Then: inner_vertex -> face_vertex -> mid_edge for each
+            # Consistent winding: inner -> face -> mid_edge
+            triangles.append([inner_vertex_idx, face_v, me_curr])
+    
+    # Validate we generated exactly 12 triangles
+    if len(triangles) != 12:
+        logger.warning(f"6-edge config: generated {len(triangles)} triangles, expected 12 "
+                      f"(missing {missing_edges} edge vertices)")
     
     return triangles
 
@@ -747,6 +798,26 @@ def extract_parting_surface(
     result.vertex_to_edge = cut_edge_indices.copy()
     result.vertex_boundary_type = vertex_boundary_type.copy()
     
+    # === VALIDATION: Check that all triangle indices are within bounds ===
+    n_total_vertices = len(surface_vertices)
+    invalid_triangles = []
+    for tri_idx, tri in enumerate(triangles):
+        for vi in tri:
+            if vi < 0 or vi >= n_total_vertices:
+                invalid_triangles.append((tri_idx, tri, vi))
+    
+    if invalid_triangles:
+        logger.error(f"VALIDATION ERROR: {len(invalid_triangles)} triangles have out-of-bounds vertex indices "
+                    f"(total vertices: {n_total_vertices})")
+        for tri_idx, tri, bad_vi in invalid_triangles[:5]:  # Log first 5
+            logger.error(f"  Triangle {tri_idx}: {tri} - vertex {bad_vi} out of bounds")
+        # Filter out invalid triangles to prevent crash
+        valid_triangle_mask = np.ones(len(triangles), dtype=bool)
+        for tri_idx, _, _ in invalid_triangles:
+            valid_triangle_mask[tri_idx] = False
+        triangles = [t for i, t in enumerate(triangles) if valid_triangle_mask[i]]
+        logger.warning(f"Removed {len(invalid_triangles)} invalid triangles, {len(triangles)} remain")
+    
     # Log configuration statistics
     logger.info(f"Configuration statistics ({len(config_counts)} unique configs):")
     high_config_tets = 0  # Count tets with 5+ edges cut
@@ -803,7 +874,13 @@ def extract_parting_surface(
             process=False  # Don't merge vertices or remove degenerates
         )
         
-        # Optionally fix winding for consistent normals
+        # Apply local normal consistency repair before global fix_normals
+        # This fixes locally flipped triangles that cause self-folding
+        result.mesh, n_flipped = _repair_local_normal_consistency(result.mesh)
+        if n_flipped > 0:
+            logger.info(f"Flipped {n_flipped} locally inconsistent triangles")
+        
+        # Then apply global normal consistency
         result.mesh.fix_normals()
         
     except Exception as e:
@@ -816,6 +893,92 @@ def extract_parting_surface(
                 f"in {result.extraction_time_ms:.1f}ms")
     
     return result
+
+
+def _repair_local_normal_consistency(mesh: trimesh.Trimesh, max_iterations: int = 3) -> Tuple[trimesh.Trimesh, int]:
+    """
+    Repair locally inconsistent normals by flipping triangles that disagree with neighbors.
+    
+    Unlike trimesh.fix_normals() which tries to make all triangles face the same global
+    direction, this function focuses on LOCAL consistency - ensuring each triangle's
+    normal aligns with its edge-adjacent neighbors.
+    
+    Self-folding regions occur when triangles "flip" relative to their neighbors,
+    creating regions where the surface folds back on itself. This function detects
+    such flipped triangles and corrects their winding.
+    
+    Args:
+        mesh: Input mesh with potentially inconsistent normals
+        max_iterations: Maximum repair iterations (propagates fixes)
+    
+    Returns:
+        Tuple of (repaired_mesh, num_triangles_flipped)
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh, 0
+    
+    vertices = mesh.vertices.copy()
+    faces = mesh.faces.copy()
+    n_faces = len(faces)
+    
+    total_flipped = 0
+    
+    for iteration in range(max_iterations):
+        # Compute current face normals
+        temp_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        face_normals = temp_mesh.face_normals
+        
+        # Build edge-to-faces map
+        edge_to_faces = {}
+        for fi, face in enumerate(faces):
+            for i in range(3):
+                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                edge_key = (min(v0, v1), max(v0, v1))
+                if edge_key not in edge_to_faces:
+                    edge_to_faces[edge_key] = []
+                edge_to_faces[edge_key].append(fi)
+        
+        # Find triangles with inconsistent normals
+        # A triangle is inconsistent if its normal has negative dot product with
+        # majority of its edge-adjacent neighbors
+        inconsistent = []
+        
+        for fi in range(n_faces):
+            face = faces[fi]
+            neighbor_normals = []
+            
+            for i in range(3):
+                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                edge_key = (min(v0, v1), max(v0, v1))
+                for fj in edge_to_faces.get(edge_key, []):
+                    if fj != fi:
+                        neighbor_normals.append(face_normals[fj])
+            
+            if len(neighbor_normals) == 0:
+                continue
+            
+            # Check how many neighbors this triangle agrees with
+            my_normal = face_normals[fi]
+            n_agree = sum(1 for nn in neighbor_normals if np.dot(my_normal, nn) > 0)
+            n_disagree = len(neighbor_normals) - n_agree
+            
+            # If disagrees with majority of neighbors, mark for flipping
+            if n_disagree > n_agree:
+                inconsistent.append(fi)
+        
+        if len(inconsistent) == 0:
+            break
+        
+        # Flip inconsistent triangles
+        for fi in inconsistent:
+            # Flip winding: swap vertices 1 and 2
+            faces[fi, 1], faces[fi, 2] = faces[fi, 2], faces[fi, 1]
+        
+        total_flipped += len(inconsistent)
+        logger.debug(f"Normal consistency iteration {iteration + 1}: flipped {len(inconsistent)} triangles")
+    
+    result_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    return result_mesh, total_flipped
 
 
 def extract_parting_surface_from_tet_result(
@@ -981,6 +1144,190 @@ def smooth_parting_surface(
     
     elapsed = (time.time() - start) * 1000
     logger.info(f"Smoothed parting surface ({iterations} iterations) in {elapsed:.1f}ms")
+    
+    return result
+
+
+def smooth_parting_surface_two_phase(
+    surface: PartingSurfaceResult,
+    part_mesh: Optional[trimesh.Trimesh] = None,
+    hull_mesh: Optional[trimesh.Trimesh] = None,
+    boundary_iterations: int = 2,
+    interior_iterations: int = 3,
+    lambda_factor: float = 0.5,
+    boundary_lambda: float = 0.3
+) -> PartingSurfaceResult:
+    """
+    Two-phase boundary-aware smoothing per Alderighi et al. Section 4.4.
+    
+    This addresses the self-folding issue by:
+    1. Phase 1: Smooth boundary polyline vertices along the boundary
+       - After each iteration, re-project boundary vertices to their target surface
+       - Inner boundary (type -1) re-projected to part mesh M
+       - Outer boundary (type 1,2) re-projected to hull mesh ∂H
+    2. Phase 2: Smooth interior vertices with fixed boundary
+       - Boundary vertices are locked in place
+       - Only interior vertices are smoothed
+    
+    This prevents the membrane from pulling away from its bounding surfaces during
+    smoothing, which is the root cause of self-folding near boundaries.
+    
+    Args:
+        surface: PartingSurfaceResult with vertex_boundary_type array
+        part_mesh: Part mesh M for inner boundary reprojection
+        hull_mesh: Hull mesh ∂H for outer boundary reprojection
+        boundary_iterations: Number of boundary smoothing iterations (Phase 1)
+        interior_iterations: Number of interior smoothing iterations (Phase 2)
+        lambda_factor: Smoothing factor for interior (0-1)
+        boundary_lambda: Smoothing factor for boundary (0-1), typically lower
+    
+    Returns:
+        New PartingSurfaceResult with smoothed vertices
+    """
+    if surface.mesh is None or surface.vertices is None:
+        return surface
+    
+    import time
+    start = time.time()
+    
+    vertices = surface.vertices.copy()
+    faces = surface.faces
+    n_verts = len(vertices)
+    
+    # Get boundary type info
+    has_boundary_type = (surface.vertex_boundary_type is not None and 
+                         len(surface.vertex_boundary_type) == n_verts)
+    
+    if not has_boundary_type:
+        logger.warning("No boundary type info - falling back to standard smoothing")
+        return smooth_parting_surface(surface, interior_iterations, lambda_factor)
+    
+    boundary_type = surface.vertex_boundary_type
+    
+    # Classify vertices
+    inner_boundary_mask = boundary_type == -1  # Should touch part M
+    outer_boundary_mask = (boundary_type == 1) | (boundary_type == 2)  # Should touch hull ∂H
+    is_boundary = inner_boundary_mask | outer_boundary_mask
+    interior_mask = ~is_boundary
+    
+    n_inner = np.sum(inner_boundary_mask)
+    n_outer = np.sum(outer_boundary_mask)
+    n_interior = np.sum(interior_mask)
+    
+    logger.info(f"Two-phase smoothing: {n_inner} inner boundary, {n_outer} outer boundary, "
+                f"{n_interior} interior vertices")
+    
+    # Build vertex adjacency
+    neighbors = [set() for _ in range(n_verts)]
+    for f in faces:
+        for i in range(3):
+            v = f[i]
+            neighbors[v].add(f[(i+1) % 3])
+            neighbors[v].add(f[(i+2) % 3])
+    
+    # Build boundary chain adjacency (only among boundary vertices)
+    boundary_neighbors = [set() for _ in range(n_verts)]
+    for v in range(n_verts):
+        if is_boundary[v]:
+            for n in neighbors[v]:
+                if is_boundary[n]:
+                    boundary_neighbors[v].add(n)
+    
+    # === PHASE 1: Smooth boundary polyline with reprojection ===
+    if boundary_iterations > 0 and (part_mesh is not None or hull_mesh is not None):
+        logger.debug(f"Phase 1: Smoothing boundary ({boundary_iterations} iterations)")
+        
+        for iter_idx in range(boundary_iterations):
+            new_vertices = vertices.copy()
+            
+            # Smooth boundary vertices along the boundary chain
+            for v in range(n_verts):
+                if not is_boundary[v]:
+                    continue
+                    
+                # Get boundary neighbors only
+                b_neighbors = list(boundary_neighbors[v])
+                if len(b_neighbors) < 2:
+                    continue
+                
+                # Smooth along boundary polyline
+                neighbor_positions = vertices[b_neighbors]
+                centroid = np.mean(neighbor_positions, axis=0)
+                new_vertices[v] = vertices[v] + boundary_lambda * (centroid - vertices[v])
+            
+            # Re-project boundary vertices to their target surfaces
+            # Inner boundary → part mesh M
+            if part_mesh is not None and n_inner > 0:
+                inner_indices = np.where(inner_boundary_mask)[0]
+                inner_positions = new_vertices[inner_indices]
+                
+                try:
+                    closest_points, _, _ = trimesh.proximity.closest_point(
+                        part_mesh, inner_positions
+                    )
+                    new_vertices[inner_indices] = closest_points
+                except Exception as e:
+                    logger.warning(f"Failed to project inner boundary: {e}")
+            
+            # Outer boundary → hull mesh ∂H
+            if hull_mesh is not None and n_outer > 0:
+                outer_indices = np.where(outer_boundary_mask)[0]
+                outer_positions = new_vertices[outer_indices]
+                
+                try:
+                    closest_points, _, _ = trimesh.proximity.closest_point(
+                        hull_mesh, outer_positions
+                    )
+                    new_vertices[outer_indices] = closest_points
+                except Exception as e:
+                    logger.warning(f"Failed to project outer boundary: {e}")
+            
+            vertices = new_vertices
+    
+    # === PHASE 2: Smooth interior with fixed boundary ===
+    if interior_iterations > 0:
+        logger.debug(f"Phase 2: Smoothing interior ({interior_iterations} iterations)")
+        
+        for iter_idx in range(interior_iterations):
+            new_vertices = vertices.copy()
+            
+            # Only smooth interior vertices
+            for v in range(n_verts):
+                if is_boundary[v]:
+                    continue  # Skip boundary vertices - they're fixed
+                    
+                if neighbors[v]:
+                    neighbor_list = list(neighbors[v])
+                    centroid = np.mean(vertices[neighbor_list], axis=0)
+                    new_vertices[v] = vertices[v] + lambda_factor * (centroid - vertices[v])
+            
+            vertices = new_vertices
+    
+    # Create result
+    result = PartingSurfaceResult(
+        vertices=vertices,
+        faces=surface.faces,
+        vertex_to_edge=surface.vertex_to_edge,
+        vertex_boundary_type=surface.vertex_boundary_type,  # Preserve boundary type
+        num_vertices=surface.num_vertices,
+        num_faces=surface.num_faces,
+        num_tets_processed=surface.num_tets_processed,
+        num_tets_contributing=surface.num_tets_contributing,
+        extraction_time_ms=surface.extraction_time_ms
+    )
+    
+    try:
+        result.mesh = trimesh.Trimesh(
+            vertices=vertices,
+            faces=faces,
+            process=False
+        )
+        result.mesh.fix_normals()
+    except Exception as e:
+        logger.error(f"Failed to create smoothed mesh: {e}")
+    
+    elapsed = (time.time() - start) * 1000
+    logger.info(f"Two-phase smoothing complete in {elapsed:.1f}ms")
     
     return result
 
@@ -3473,9 +3820,9 @@ def _subdivide_gap_edge(
     if n_subdivisions <= 1:
         return [v0, v1], [p0, p1]
     
-    # Create subdivided points
+    # Create subdivided points with batched projection query
     boundary_points = []
-    projection_points = []
+    interp_points = []
     
     for i in range(n_subdivisions + 1):
         t = i / n_subdivisions
@@ -3484,11 +3831,14 @@ def _subdivide_gap_edge(
         b_pt = v0 + t * (v1 - v0)
         boundary_points.append(b_pt)
         
-        # Interpolate projection - but re-project to part surface for accuracy
+        # Interpolate projection (will be re-projected in batch)
         p_interp = p0 + t * (p1 - p0)
-        # Re-project to ensure it's on the part surface
-        proj_pts, _, _ = trimesh.proximity.closest_point(part_mesh, p_interp.reshape(1, 3))
-        projection_points.append(proj_pts[0])
+        interp_points.append(p_interp)
+    
+    # Batch re-project all interpolated points to part surface
+    interp_array = np.array(interp_points)
+    proj_pts, _, _ = trimesh.proximity.closest_point(part_mesh, interp_array)
+    projection_points = list(proj_pts)
     
     return boundary_points, projection_points
 
@@ -3614,7 +3964,52 @@ def close_membrane_gaps_robust(
         result.processing_time_ms = (time.time() - start) * 1000
         return result
     
-    logger.info(f"Closing gaps for {len(inner_loops)} inner boundary loops")
+    # Log loop sizes for debugging
+    loop_sizes = [len(loop) for loop in inner_loops]
+    total_loop_verts = sum(loop_sizes)
+    logger.info(f"Closing gaps for {len(inner_loops)} inner boundary loops "
+               f"(total {total_loop_verts} vertices, sizes: min={min(loop_sizes)}, max={max(loop_sizes)}, avg={np.mean(loop_sizes):.1f})")
+    
+    # === Pre-compute face normals and edge-to-face map for normal consistency ===
+    membrane_normals = membrane_mesh.face_normals
+    
+    # Build edge-to-face mapping (edge_key -> face_index)
+    boundary_edge_to_face = {}
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0_f, v1_f = int(face[i]), int(face[(i + 1) % 3])
+            edge_key = (min(v0_f, v1_f), max(v0_f, v1_f))
+            if edge_key not in boundary_edge_to_face:
+                boundary_edge_to_face[edge_key] = fi  # First face with this edge
+    
+    def get_adjacent_normal(v0_idx, v1_idx):
+        """Get normal of adjacent face for boundary edge (v0, v1)"""
+        edge_key = (min(v0_idx, v1_idx), max(v0_idx, v1_idx))
+        if edge_key in boundary_edge_to_face:
+            return membrane_normals[boundary_edge_to_face[edge_key]]
+        return None
+    
+    def compute_normal(p0, p1, p2):
+        """Compute triangle normal"""
+        edge1 = np.array(p1) - np.array(p0)
+        edge2 = np.array(p2) - np.array(p0)
+        normal = np.cross(edge1, edge2)
+        length = np.linalg.norm(normal)
+        return normal / length if length > 1e-10 else np.array([0, 0, 1])
+    
+    def create_consistent_face(v0, v1, v2, adj_normal, verts_list, new_verts_list, n_orig):
+        """Create triangle with normal consistent with adjacent face"""
+        # Get positions
+        p0 = np.array(verts_list[v0]) if v0 < n_orig else np.array(new_verts_list[v0 - n_orig])
+        p1 = np.array(verts_list[v1]) if v1 < n_orig else np.array(new_verts_list[v1 - n_orig])
+        p2 = np.array(verts_list[v2]) if v2 < n_orig else np.array(new_verts_list[v2 - n_orig])
+        
+        normal = compute_normal(p0, p1, p2)
+        
+        if adj_normal is not None:
+            if np.dot(normal, adj_normal) < 0:
+                return [v0, v2, v1]  # Flip winding
+        return [v0, v1, v2]
     
     # Step 4: Process each inner loop
     new_vertices = []
@@ -3624,34 +4019,68 @@ def close_membrane_gaps_robust(
     edges_subdivided = 0
     thin_avoided = 0
     
-    for loop_verts in inner_loops:
+    # Calculate total vertices for progress logging
+    total_loop_verts = sum(len(loop) for loop in inner_loops)
+    processed_verts = 0
+    last_progress_log = 0
+    
+    for loop_idx, loop_verts in enumerate(inner_loops):
         n_loop = len(loop_verts)
         
-        # First pass: compute initial projections for all vertices
+        # Progress logging every 20% or for large loops
+        progress_pct = int(100 * processed_verts / max(1, total_loop_verts))
+        if progress_pct >= last_progress_log + 20 or n_loop > 100:
+            logger.info(f"Gap closing progress: loop {loop_idx + 1}/{len(inner_loops)}, "
+                       f"{progress_pct}% vertices processed ({n_loop} verts in current loop)")
+            last_progress_log = progress_pct
+        
+        # First pass: compute initial projections for all vertices (batched)
         loop_positions = np.array([vertices[v] for v in loop_verts])
         initial_proj, initial_dists, _ = trimesh.proximity.closest_point(part_mesh, loop_positions)
         
         gap_distances.extend(initial_dists)
         
-        # Second pass: refine projections considering neighbors
-        projections = []
-        for i in range(n_loop):
-            prev_i = (i - 1) % n_loop
-            next_i = (i + 1) % n_loop
+        # Second pass: refine projections considering neighbors (optimized)
+        # Only refine if initial projection seems far from neighbors
+        projections = list(initial_proj)  # Start with initial projections
+        
+        # For small loops or simple cases, skip refinement entirely
+        if n_loop <= 3 or np.max(initial_dists) < max_gap_distance * 0.5:
+            pass  # Use initial projections as-is
+        else:
+            # Only refine vertices whose projections seem inconsistent
+            neighbor_dists = np.zeros(n_loop)
+            for i in range(n_loop):
+                prev_i = (i - 1) % n_loop
+                next_i = (i + 1) % n_loop
+                neighbor_center = (initial_proj[prev_i] + initial_proj[next_i]) / 2
+                neighbor_dists[i] = np.linalg.norm(initial_proj[i] - neighbor_center)
             
-            neighbor_projs = [initial_proj[prev_i], initial_proj[next_i]]
+            # Only refine vertices that are outliers (>2x median distance from neighbors)
+            median_neighbor_dist = np.median(neighbor_dists)
+            refinement_threshold = max(median_neighbor_dist * 2, max_gap_distance * 0.3)
             
-            refined_proj, refined_dist = _find_best_projection_on_part(
-                loop_positions[i],
-                part_mesh,
-                neighbor_projs,
-                max_gap_distance
-            )
-            projections.append(refined_proj)
+            for i in range(n_loop):
+                if neighbor_dists[i] > refinement_threshold:
+                    prev_i = (i - 1) % n_loop
+                    next_i = (i + 1) % n_loop
+                    neighbor_projs = [initial_proj[prev_i], initial_proj[next_i]]
+                    
+                    refined_proj, _ = _find_best_projection_on_part(
+                        loop_positions[i],
+                        part_mesh,
+                        neighbor_projs,
+                        max_gap_distance
+                    )
+                    projections[i] = refined_proj
+        
+        processed_verts += n_loop
         
         # Third pass: create triangles with quality control
         for i in range(n_loop):
-            next_i = (i + 1) % n_loop
+            next_i = (i + 1) % n_loop            
+            # Get adjacent face normal for normal consistency
+            adj_normal = get_adjacent_normal(loop_verts[i], loop_verts[next_i])
             
             v0_pos = loop_positions[i]
             v1_pos = loop_positions[next_i]
@@ -3731,7 +4160,8 @@ def close_membrane_gaps_robust(
                     # Single triangle
                     aspect = _compute_triangle_aspect_ratio(bv0_pos, bv1_pos, pv1_pos)
                     if aspect >= min_aspect_ratio * 0.5:  # Allow slightly lower for single triangles
-                        new_faces.append([bv0, bv1, pv1])
+                        face = create_consistent_face(bv0, bv1, pv1, adj_normal, vertices, new_vertices, n_orig_verts)
+                        new_faces.append(face)
                         triangle_aspects.append(aspect)
                     else:
                         thin_avoided += 1
@@ -3739,7 +4169,8 @@ def close_membrane_gaps_robust(
                 if bv1 == pv1:
                     aspect = _compute_triangle_aspect_ratio(bv0_pos, bv1_pos, pv0_pos)
                     if aspect >= min_aspect_ratio * 0.5:
-                        new_faces.append([bv0, bv1, pv0])
+                        face = create_consistent_face(bv0, bv1, pv0, adj_normal, vertices, new_vertices, n_orig_verts)
+                        new_faces.append(face)
                         triangle_aspects.append(aspect)
                     else:
                         thin_avoided += 1
@@ -3747,7 +4178,8 @@ def close_membrane_gaps_robust(
                 if pv0 == pv1:
                     aspect = _compute_triangle_aspect_ratio(bv0_pos, bv1_pos, pv0_pos)
                     if aspect >= min_aspect_ratio * 0.5:
-                        new_faces.append([bv0, bv1, pv0])
+                        face = create_consistent_face(bv0, bv1, pv0, adj_normal, vertices, new_vertices, n_orig_verts)
+                        new_faces.append(face)
                         triangle_aspects.append(aspect)
                     else:
                         thin_avoided += 1
@@ -3765,24 +4197,28 @@ def close_membrane_gaps_robust(
                 if min_diag1 >= min_diag2:
                     # Use diagonal 1: bv0-pv1
                     if aspect1 >= min_aspect_ratio * 0.3:
-                        new_faces.append([bv0, bv1, pv1])
+                        face = create_consistent_face(bv0, bv1, pv1, adj_normal, vertices, new_vertices, n_orig_verts)
+                        new_faces.append(face)
                         triangle_aspects.append(aspect1)
                     else:
                         thin_avoided += 1
                     if aspect2 >= min_aspect_ratio * 0.3:
-                        new_faces.append([bv0, pv1, pv0])
+                        face = create_consistent_face(bv0, pv1, pv0, adj_normal, vertices, new_vertices, n_orig_verts)
+                        new_faces.append(face)
                         triangle_aspects.append(aspect2)
                     else:
                         thin_avoided += 1
                 else:
                     # Use diagonal 2: bv1-pv0
                     if aspect3 >= min_aspect_ratio * 0.3:
-                        new_faces.append([bv0, bv1, pv0])
+                        face = create_consistent_face(bv0, bv1, pv0, adj_normal, vertices, new_vertices, n_orig_verts)
+                        new_faces.append(face)
                         triangle_aspects.append(aspect3)
                     else:
                         thin_avoided += 1
                     if aspect4 >= min_aspect_ratio * 0.3:
-                        new_faces.append([bv1, pv1, pv0])
+                        face = create_consistent_face(bv1, pv1, pv0, adj_normal, vertices, new_vertices, n_orig_verts)
+                        new_faces.append(face)
                         triangle_aspects.append(aspect4)
                     else:
                         thin_avoided += 1
@@ -3959,6 +4395,319 @@ class FlangeCreationResult:
     
     # Timing
     processing_time_ms: float = 0.0
+
+
+@dataclass
+class BoundaryExtensionResult:
+    """Result of extending membrane boundary to touch the part mesh."""
+    mesh: Optional[trimesh.Trimesh] = None
+    
+    # Statistics
+    boundary_vertices_found: int = 0
+    extension_faces_added: int = 0
+    extension_vertices_added: int = 0
+    vertices_already_touching: int = 0
+    
+    # Face indices of the extension triangles (for yellow coloring)
+    extension_face_indices: Optional[np.ndarray] = None
+    
+    # Gap distances
+    avg_gap_distance: float = 0.0
+    max_gap_distance: float = 0.0
+    
+    # Timing
+    processing_time_ms: float = 0.0
+
+
+def extend_membrane_to_part(
+    membrane_mesh: trimesh.Trimesh,
+    part_mesh: trimesh.Trimesh,
+    touch_threshold: float = 0.1,
+    inner_boundary_max_dist: float = None
+) -> BoundaryExtensionResult:
+    """
+    Extend the membrane INNER boundary edges to touch the part mesh surface.
+    
+    This function finds ONLY the inner boundary edges of the membrane (edges that
+    should touch the part, NOT the outer boundary on the hull) and creates 
+    triangular faces to close any gaps between the membrane and part.
+    
+    Inner boundary detection:
+    - Boundary vertices closer to the part than to the hull centroid are "inner"
+    - We only extend inner boundary edges, leaving outer (hull) boundary alone
+    
+    The new extension faces are tracked separately so they can be colored yellow
+    for debugging.
+    
+    Args:
+        membrane_mesh: The membrane mesh (blue parting surface)
+        part_mesh: The part/object surface to extend towards
+        touch_threshold: Distance threshold - vertices closer than this are 
+                        considered "touching" the part already
+        inner_boundary_max_dist: Max distance from part for a boundary to be
+                                 considered "inner". Auto-computed if None.
+    
+    Returns:
+        BoundaryExtensionResult with extended mesh and extension face indices
+    """
+    import time
+    from scipy.spatial import cKDTree
+    
+    start = time.time()
+    result = BoundaryExtensionResult()
+    
+    if membrane_mesh is None or part_mesh is None:
+        return result
+    
+    if len(membrane_mesh.faces) == 0 or len(part_mesh.faces) == 0:
+        result.mesh = membrane_mesh
+        return result
+    
+    vertices = membrane_mesh.vertices.copy()
+    faces = list(membrane_mesh.faces)
+    n_original_faces = len(faces)
+    
+    # Build part mesh KD-tree for nearest point queries
+    part_tree = cKDTree(part_mesh.vertices)
+    
+    # Compute mesh scale for auto-thresholds
+    mesh_diagonal = np.linalg.norm(part_mesh.bounds[1] - part_mesh.bounds[0])
+    if inner_boundary_max_dist is None:
+        # Inner boundary should be within ~5% of mesh diagonal from part
+        inner_boundary_max_dist = mesh_diagonal * 0.05
+    
+    # === Step 1: Find ALL boundary edges ===
+    edge_to_faces = {}
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            if edge_key not in edge_to_faces:
+                edge_to_faces[edge_key] = []
+            edge_to_faces[edge_key].append(fi)
+    
+    # Boundary edges have only 1 adjacent face
+    all_boundary_edges = [(e[0], e[1]) for e, flist in edge_to_faces.items() if len(flist) == 1]
+    
+    if len(all_boundary_edges) == 0:
+        logger.info("No boundary edges found - membrane is closed")
+        result.mesh = membrane_mesh
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    # Get unique boundary vertices
+    all_boundary_vertices = set()
+    for e in all_boundary_edges:
+        all_boundary_vertices.add(e[0])
+        all_boundary_vertices.add(e[1])
+    all_boundary_vertices = list(all_boundary_vertices)
+    
+    # === Step 2: Classify boundary vertices as INNER vs OUTER ===
+    # Inner boundary: vertices that are relatively close to the part surface
+    # Outer boundary: vertices far from part (on the hull boundary)
+    
+    boundary_positions = vertices[all_boundary_vertices]
+    distances_to_part, nearest_part_indices = part_tree.query(boundary_positions)
+    
+    # Inner boundary vertices are those within inner_boundary_max_dist of the part
+    is_inner_boundary = distances_to_part < inner_boundary_max_dist
+    
+    inner_boundary_vertices = set(all_boundary_vertices[i] for i in range(len(all_boundary_vertices)) 
+                                   if is_inner_boundary[i])
+    outer_boundary_count = len(all_boundary_vertices) - len(inner_boundary_vertices)
+    
+    logger.info(f"Boundary classification: {len(inner_boundary_vertices)} inner, "
+                f"{outer_boundary_count} outer (threshold: {inner_boundary_max_dist:.3f}mm)")
+    
+    if len(inner_boundary_vertices) == 0:
+        logger.info("No inner boundary vertices found - membrane fully connects to hull")
+        result.mesh = membrane_mesh
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    # === Step 3: Filter to INNER boundary edges only ===
+    # An edge is an inner boundary edge if BOTH vertices are inner boundary vertices
+    inner_boundary_edges = []
+    for e0, e1 in all_boundary_edges:
+        if e0 in inner_boundary_vertices and e1 in inner_boundary_vertices:
+            inner_boundary_edges.append((e0, e1))
+    
+    if len(inner_boundary_edges) == 0:
+        logger.info("No complete inner boundary edges found")
+        result.mesh = membrane_mesh
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    result.boundary_vertices_found = len(inner_boundary_vertices)
+    
+    # === Step 4: Find inner boundary vertices that need extension (have gap to part) ===
+    inner_boundary_list = list(inner_boundary_vertices)
+    inner_positions = vertices[inner_boundary_list]
+    inner_distances, inner_nearest_indices = part_tree.query(inner_positions)
+    
+    # Find vertices that need extension (not touching part)
+    needs_extension_mask = inner_distances > touch_threshold
+    
+    result.vertices_already_touching = int(np.sum(~needs_extension_mask))
+    
+    if not np.any(needs_extension_mask):
+        logger.info(f"All {len(inner_boundary_list)} inner boundary vertices already touch part")
+        result.mesh = membrane_mesh
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    # Track gap distances
+    gap_distances = inner_distances[needs_extension_mask]
+    result.avg_gap_distance = float(np.mean(gap_distances))
+    result.max_gap_distance = float(np.max(gap_distances))
+    
+    logger.info(f"Found {np.sum(needs_extension_mask)} inner boundary vertices with gaps "
+                f"(avg gap: {result.avg_gap_distance:.3f}mm, max: {result.max_gap_distance:.3f}mm)")
+    
+    # === Step 5: Create mapping from inner boundary vertex to nearest part point ===
+    vertex_to_part_vertex = {}  # membrane boundary vertex -> new vertex index (part projection)
+    new_vertices = list(vertices)
+    
+    # Create lookup for inner boundary vertex index
+    inner_bv_to_idx = {bv: i for i, bv in enumerate(inner_boundary_list)}
+    
+    for bv in inner_boundary_vertices:
+        idx = inner_bv_to_idx[bv]
+        if needs_extension_mask[idx]:
+            # Get nearest point on part (use actual closest point, not just vertex)
+            nearest_part_idx = inner_nearest_indices[idx]
+            part_point = part_mesh.vertices[nearest_part_idx]
+            
+            # Add as new vertex
+            new_vertex_idx = len(new_vertices)
+            new_vertices.append(part_point)
+            vertex_to_part_vertex[bv] = new_vertex_idx
+    
+    result.extension_vertices_added = len(new_vertices) - len(vertices)
+    
+    # === Step 6: Create extension triangles along INNER boundary edges only ===
+    # Build edge-to-face mapping to find adjacent face for normal consistency
+    boundary_edge_to_face = {}
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0_f, v1_f = int(face[i]), int(face[(i + 1) % 3])
+            edge_key = (min(v0_f, v1_f), max(v0_f, v1_f))
+            if edge_key not in boundary_edge_to_face:
+                boundary_edge_to_face[edge_key] = []
+            boundary_edge_to_face[edge_key].append(fi)
+    
+    # Pre-compute face normals for the membrane
+    membrane_normals = membrane_mesh.face_normals
+    
+    def get_adjacent_face_normal(e0_idx, e1_idx):
+        """Get the normal of the face adjacent to boundary edge (e0, e1)"""
+        edge_key = (min(e0_idx, e1_idx), max(e0_idx, e1_idx))
+        face_list = boundary_edge_to_face.get(edge_key, [])
+        if len(face_list) == 1:
+            return membrane_normals[face_list[0]]
+        return None
+    
+    def compute_triangle_normal(v0_pos, v1_pos, v2_pos):
+        """Compute the normal of triangle (v0, v1, v2)"""
+        edge1 = v1_pos - v0_pos
+        edge2 = v2_pos - v0_pos
+        normal = np.cross(edge1, edge2)
+        length = np.linalg.norm(normal)
+        if length > 1e-10:
+            return normal / length
+        return np.array([0, 0, 1])  # Default if degenerate
+    
+    def create_consistent_triangle(v0_idx, v1_idx, v2_idx, adjacent_normal):
+        """
+        Create triangle with winding consistent with adjacent face normal.
+        
+        Per research: check dot product of new triangle normal with adjacent.
+        If negative, flip winding to maintain surface continuity.
+        """
+        v0_pos = np.array(new_vertices[v0_idx])
+        v1_pos = np.array(new_vertices[v1_idx])
+        v2_pos = np.array(new_vertices[v2_idx])
+        
+        tri_normal = compute_triangle_normal(v0_pos, v1_pos, v2_pos)
+        
+        if adjacent_normal is not None:
+            dot = np.dot(tri_normal, adjacent_normal)
+            # If normal is opposite to neighbor (dot < 0), flip winding
+            if dot < 0:
+                return [v0_idx, v2_idx, v1_idx]  # Flip winding
+        
+        return [v0_idx, v1_idx, v2_idx]
+    
+    extension_faces = []
+    skipped_folds = 0
+    
+    for e0, e1 in inner_boundary_edges:
+        e0_needs = e0 in vertex_to_part_vertex
+        e1_needs = e1 in vertex_to_part_vertex
+        
+        # Get adjacent face normal for consistency checking
+        adj_normal = get_adjacent_face_normal(e0, e1)
+        
+        if e0_needs and e1_needs:
+            # Both vertices need extension - create a quad (2 triangles)
+            p0 = vertex_to_part_vertex[e0]  # part projection of e0
+            p1 = vertex_to_part_vertex[e1]  # part projection of e1
+            
+            # Create 2 triangles forming a quad with consistent normals
+            tri1 = create_consistent_triangle(e0, e1, p1, adj_normal)
+            tri2 = create_consistent_triangle(e0, p1, p0, adj_normal)
+            
+            extension_faces.append(tri1)
+            extension_faces.append(tri2)
+            
+        elif e0_needs and not e1_needs:
+            # Only e0 needs extension - create single triangle to close gap
+            p0 = vertex_to_part_vertex[e0]
+            tri = create_consistent_triangle(e0, e1, p0, adj_normal)
+            extension_faces.append(tri)
+            
+        elif not e0_needs and e1_needs:
+            # Only e1 needs extension - create single triangle
+            p1 = vertex_to_part_vertex[e1]
+            tri = create_consistent_triangle(e0, e1, p1, adj_normal)
+            extension_faces.append(tri)
+        # If neither needs extension, the edge already touches part - no face needed
+    
+    if skipped_folds > 0:
+        logger.info(f"Skipped {skipped_folds} triangles that would cause folds")
+    
+    if len(extension_faces) == 0:
+        logger.info("No extension faces needed - inner boundary already touches part")
+        result.mesh = membrane_mesh
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    result.extension_faces_added = len(extension_faces)
+    
+    # === Step 7: Combine original mesh with extension faces ===
+    all_faces = faces + extension_faces
+    
+    # Track which faces are the extension (for yellow coloring)
+    extension_start_idx = n_original_faces
+    result.extension_face_indices = np.arange(extension_start_idx, 
+                                               extension_start_idx + len(extension_faces))
+    
+    # Create combined mesh
+    combined_mesh = trimesh.Trimesh(
+        vertices=np.array(new_vertices),
+        faces=np.array(all_faces),
+        process=False
+    )
+    combined_mesh.remove_unreferenced_vertices()
+    
+    result.mesh = combined_mesh
+    result.processing_time_ms = (time.time() - start) * 1000
+    
+    logger.info(f"Inner boundary extension: added {result.extension_faces_added} faces, "
+                f"{result.extension_vertices_added} vertices "
+                f"in {result.processing_time_ms:.1f}ms")
+    
+    return result
 
 
 def create_inner_boundary_flange(

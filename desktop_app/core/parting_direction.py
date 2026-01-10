@@ -47,16 +47,6 @@ except ImportError:
 # CONSTANTS
 # ============================================================================
 
-# Colors for visualization (matching React frontend)
-class PartingColors:
-    """Colors for parting direction visualization (hex strings)."""
-    D1 = "#00ff00"           # Green - Primary direction
-    D2 = "#ff6600"           # Orange - Secondary direction
-    NEUTRAL = "#888888"      # Gray - Not visible from either
-    OVERLAP = "#ffff00"      # Yellow - Visible from both
-    MESH_DEFAULT = "#00aaff" # Light blue - Original mesh color
-
-
 # RGB values for vertex painting (0-1 range)
 PAINT_COLORS = {
     'D1': np.array([0.0, 1.0, 0.0]),        # Green

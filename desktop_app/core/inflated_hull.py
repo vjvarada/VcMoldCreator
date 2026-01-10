@@ -282,24 +282,7 @@ def validate_manifold(mesh: trimesh.Trimesh) -> ManifoldValidation:
     """
     # Get edge info
     edges = mesh.edges_unique
-    edge_face_count = mesh.edges_unique_length
     total_edge_count = len(edges) if edges is not None else 0
-    
-    # Count boundary edges (edges with only 1 adjacent face)
-    # and non-manifold edges (edges with 3+ adjacent faces)
-    boundary_edge_count = 0
-    non_manifold_edge_count = 0
-    
-    if mesh.face_adjacency_edges is not None:
-        # Build edge to face count mapping
-        edge_face_counts = {}
-        for i, edge in enumerate(mesh.face_adjacency_edges):
-            edge_key = tuple(sorted(edge))
-            edge_face_counts[edge_key] = edge_face_counts.get(edge_key, 0) + 1
-        
-        for edge_key, count in edge_face_counts.items():
-            # Each adjacency entry means 2 faces share that edge
-            pass  # trimesh handles this differently
     
     # Use trimesh's built-in checks
     is_closed = mesh.is_watertight
@@ -311,8 +294,8 @@ def validate_manifold(mesh: trimesh.Trimesh) -> ManifoldValidation:
     return ManifoldValidation(
         is_closed=is_closed,
         is_manifold=is_manifold,
-        boundary_edge_count=boundary_edge_count,
-        non_manifold_edge_count=non_manifold_edge_count,
+        boundary_edge_count=0,  # trimesh handles this internally
+        non_manifold_edge_count=0,  # trimesh handles this internally
         total_edge_count=total_edge_count,
         euler_characteristic=euler_characteristic
     )
@@ -436,27 +419,3 @@ def generate_inflated_hull(
         manifold_validation=manifold_validation,
         offset=offset
     )
-
-
-def compute_mesh_bounding_info(mesh: trimesh.Trimesh) -> dict:
-    """
-    Compute bounding box information for a mesh.
-    
-    Args:
-        mesh: Input mesh
-        
-    Returns:
-        Dictionary with bounds, dimensions, and center
-    """
-    bounds = mesh.bounds
-    dimensions = bounds[1] - bounds[0]
-    center = (bounds[0] + bounds[1]) / 2
-    
-    return {
-        'bounds': bounds,
-        'min': bounds[0],
-        'max': bounds[1],
-        'dimensions': dimensions,
-        'center': center,
-        'volume': mesh.volume if mesh.is_watertight else None
-    }

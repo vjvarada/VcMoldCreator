@@ -7,14 +7,13 @@ from core.mesh_analysis import (
     build_vertex_neighbors,
     build_face_neighbors,
 )
-from core.mesh_repair import MeshRepairer, MeshRepairResult
+from core.mesh_repair import MeshRepairer, MeshRepairResult, is_meshlib_available
 from core.parting_direction import (
     find_parting_directions,
     compute_visibility_paint,
     get_face_colors,
     PartingDirectionResult,
     VisibilityPaintData,
-    PartingColors,
 )
 from core.pouring_direction import (
     PouringDirectionResult as PouringDirResult,
@@ -32,13 +31,10 @@ from core.inflated_hull import (
     validate_manifold,
     InflatedHullResult,
     ManifoldValidation,
-    DEFAULT_INFLATION_PERCENT,
 )
 from core.mold_half_classification import (
     classify_mold_halves,
-    get_mold_half_face_colors,
     MoldHalfClassificationResult,
-    MoldHalfColors,
 )
 from core.tetrahedral_mesh import (
     generate_tetrahedral_mesh,
@@ -51,8 +47,6 @@ from core.tetrahedral_mesh import (
     compute_distances_to_mesh,
     build_vertex_adjacency,
     build_edge_index_map,
-    compute_edge_weights,
-    compute_edge_costs,
     prepare_parting_surface_data,
     build_edge_to_index_map,
     build_tet_edge_indices,
@@ -82,6 +76,7 @@ __all__ = [
     'MeshDiagnostics',
     'MeshRepairer',
     'MeshRepairResult',
+    'is_meshlib_available',
     # Mesh analysis utilities
     'compute_height_field',
     'build_vertex_neighbors',
@@ -92,7 +87,6 @@ __all__ = [
     'get_face_colors',
     'PartingDirectionResult',
     'VisibilityPaintData',
-    'PartingColors',
     # Pouring direction
     'find_mold_aware_pouring_directions',
     'MoldAwarePouringDirections',
@@ -108,12 +102,9 @@ __all__ = [
     'validate_manifold',
     'InflatedHullResult',
     'ManifoldValidation',
-    'DEFAULT_INFLATION_PERCENT',
     # Mold half classification
     'classify_mold_halves',
-    'get_mold_half_face_colors',
     'MoldHalfClassificationResult',
-    'MoldHalfColors',
     # Tetrahedral mesh
     'generate_tetrahedral_mesh',
     'tetrahedralize_mesh',
@@ -122,8 +113,6 @@ __all__ = [
     'compute_distances_to_mesh',
     'build_vertex_adjacency',
     'build_edge_index_map',
-    'compute_edge_weights',
-    'compute_edge_costs',
     'prepare_parting_surface_data',
     'build_edge_to_index_map',
     'build_tet_edge_indices',
