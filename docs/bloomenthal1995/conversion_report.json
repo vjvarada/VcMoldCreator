@@ -1,0 +1,17 @@
+{
+  "source": "bloomenthal1995.pdf",
+  "converted_at": "2026-01-10T12:37:31.494049",
+  "pages": 8,
+  "complexity": "complex",
+  "backend": "mineru",
+  "mineru_backend": "pipeline",
+  "has_math": true,
+  "has_tables": true,
+  "has_images": true,
+  "output_folder": "c:\\Users\\VijayRaghavVarada\\Documents\\Github\\PDF to Markdown\\output\\bloomenthal1995",
+  "files": {
+    "markdown": "bloomenthal1995.md",
+    "images": "images/",
+    "report": "conversion_report.json"
+  }
+}

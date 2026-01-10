@@ -1,0 +1,17 @@
+{
+  "source": "computing-the-separating-surface-for-segmented-data.pdf",
+  "converted_at": "2026-01-10T12:22:17.653230",
+  "pages": 5,
+  "complexity": "moderate",
+  "backend": "mineru",
+  "mineru_backend": "pipeline",
+  "has_math": true,
+  "has_tables": false,
+  "has_images": true,
+  "output_folder": "c:\\Users\\VijayRaghavVarada\\Documents\\Github\\PDF to Markdown\\output\\computing-the-separating-surface-for-segmented-data",
+  "files": {
+    "markdown": "computing-the-separating-surface-for-segmented-data.md",
+    "images": "images/",
+    "report": "conversion_report.json"
+  }
+}
