@@ -712,12 +712,17 @@ def smooth_membrane_with_boundary_reprojection(
     # Classify boundary vertices: which surface do they belong to?
     # Per paper Section 4.4: re-project to "the original surface ... they belonged to originally"
     # 
-    # NEW (correct): Use vertex_boundary_type from extraction if available
+    # Use vertex_boundary_type from extraction if available:
     #   -1 = on part surface M (INNER boundary) → re-project to part
-    #    0 = interior (no boundary constraint)
+    #    0 = interior midpoint OR boundary zone vertex on hull
     #   1/2 = on hull boundary ∂H (OUTER boundary) → re-project to hull
     #
-    # FALLBACK (old): Distance-based classification (may cause issues)
+    # IMPORTANT: The boundary zone (label 0 on tet boundary) is still part of the 
+    # hull surface ∂H, just not classified as H1 or H2. Membrane boundary vertices
+    # with type 0 that are on the membrane boundary should be re-projected to hull
+    # since the boundary zone is ON the hull, not interior.
+    #
+    # FALLBACK: Distance-based classification for unclassified vertices
     
     boundary_surface = {}  # vertex index -> 'part', 'hull', 'primary', or 'patch'
     
@@ -730,7 +735,7 @@ def smooth_membrane_with_boundary_reprojection(
     )
     
     if use_boundary_type_classification:
-        # === NEW CORRECT CLASSIFICATION ===
+        # === CLASSIFICATION FROM EXTRACTION ===
         # Use the vertex_boundary_type from extraction (per paper Section 4.4)
         logger.info("Using vertex_boundary_type for boundary classification (per paper Section 4.4)")
         
@@ -740,12 +745,19 @@ def smooth_membrane_with_boundary_reprojection(
                 # INNER boundary - originally on part surface M
                 boundary_surface[vi] = 'part'
             elif bt in (1, 2):
-                # OUTER boundary - originally on hull boundary ∂H
+                # OUTER boundary - originally on hull boundary ∂H (H1 or H2)
+                boundary_surface[vi] = 'hull'
+            elif bt == 0:
+                # Type 0 = either:
+                # 1. Interior midpoint of an edge where both tet verts were interior/boundary zone
+                # 2. Boundary zone vertex on hull (grey zone between H1 and H2)
+                #
+                # Since this vertex is on the MEMBRANE BOUNDARY (not interior), it should
+                # be re-projected to the hull. The boundary zone is ON the hull surface,
+                # not inside the volume. Mark as hull for re-projection.
                 boundary_surface[vi] = 'hull'
             else:
-                # Interior vertex that somehow became a boundary vertex
-                # This can happen with gap-fill triangles or mesh modifications
-                # Fall back to distance-based classification for these
+                # Unexpected value - use fallback
                 boundary_surface[vi] = 'patch'
         
         part_count = sum(1 for s in boundary_surface.values() if s == 'part')
@@ -753,7 +765,7 @@ def smooth_membrane_with_boundary_reprojection(
         patch_count = sum(1 for s in boundary_surface.values() if s == 'patch')
         
         logger.info(f"Boundary classification (from extraction): {part_count} to part (inner), "
-                   f"{hull_count} to hull (outer), {patch_count} patch (needs fallback)")
+                   f"{hull_count} to hull (outer, including boundary zone), {patch_count} patch (needs fallback)")
         
         # For 'patch' vertices, use NEIGHBOR PROPAGATION first, then distance as last resort
         # This is important because the inflated hull CONTAINS the part mesh, so interior-

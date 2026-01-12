@@ -1707,6 +1707,11 @@ class ComprehensivePrimarySurfaceWorker(QThread):
       boundary re-projection to part mesh M (inner) and hull mesh ∂H (outer)
     
     The surface is "bounded by construction" by M and ∂H.
+    
+    NOTE: We use the TETRAHEDRAL BOUNDARY surfaces for re-projection, not the
+    original input meshes. This ensures exact alignment since membrane vertices
+    come from cut points on tetrahedral edges, which are bounded by the tet
+    boundary faces by construction.
     """
     
     progress = pyqtSignal(str)
@@ -1714,16 +1719,20 @@ class ComprehensivePrimarySurfaceWorker(QThread):
     error = pyqtSignal(str)
     
     def __init__(self, tet_result, part_mesh=None, hull_mesh=None,
-                 smooth_iterations: int = 5, damping_factor: float = 0.5):
+                 smooth_iterations: int = 5, damping_factor: float = 0.5,
+                 use_tet_boundaries: bool = True):
         """
         Initialize primary surface worker.
         
         Args:
             tet_result: TetrahedralMeshResult with primary cut edges
-            part_mesh: Original part mesh for boundary re-projection (M)
-            hull_mesh: Hull mesh for boundary re-projection (∂H)
+            part_mesh: Original part mesh (fallback if tet boundaries unavailable)
+            hull_mesh: Hull mesh (fallback if tet boundaries unavailable)
             smooth_iterations: Number of smoothing iterations (per paper: use damping)
             damping_factor: Smoothing damping factor (0.5 per paper Section 4.4)
+            use_tet_boundaries: If True (default), use tetrahedral boundary surfaces
+                               for re-projection instead of original input meshes.
+                               This ensures exact alignment with the membrane.
         """
         super().__init__()
         self.tet_result = tet_result
@@ -1731,6 +1740,7 @@ class ComprehensivePrimarySurfaceWorker(QThread):
         self.hull_mesh = hull_mesh
         self.smooth_iterations = smooth_iterations
         self.damping_factor = damping_factor
+        self.use_tet_boundaries = use_tet_boundaries
     
     def run(self):
         try:
@@ -1739,7 +1749,7 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                 repair_parting_surface
             )
             from core.surface_propagation import smooth_membrane_with_boundary_reprojection
-            from core.tetrahedral_mesh import prepare_parting_surface_data
+            from core.tetrahedral_mesh import prepare_parting_surface_data, extract_labeled_boundary_meshes
             import time
             
             result = ComprehensiveSurfaceResult()
@@ -1754,6 +1764,36 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             if self.tet_result.tet_edge_indices is None:
                 self.progress.emit("Building edge index maps...")
                 self.tet_result = prepare_parting_surface_data(self.tet_result)
+            
+            # =====================================================================
+            # STEP 1.5: Extract tetrahedral boundary meshes for re-projection
+            # 
+            # Using tet boundaries ensures exact alignment since membrane vertices
+            # come from cut points on tet edges, which lie ON tet boundary faces.
+            # =====================================================================
+            inner_tet_boundary = None
+            outer_tet_boundary = None
+            
+            if self.use_tet_boundaries:
+                self.progress.emit("Extracting tetrahedral boundary meshes...")
+                inner_tet_boundary, outer_tet_boundary = extract_labeled_boundary_meshes(
+                    self.tet_result,
+                    use_original=True  # Use non-inflated vertices for consistency
+                )
+                
+                if inner_tet_boundary is not None:
+                    self.progress.emit(f"  Inner boundary (tet part M): {len(inner_tet_boundary.faces)} faces")
+                else:
+                    self.progress.emit("  WARNING: No inner tet boundary - will use fallback part mesh")
+                
+                if outer_tet_boundary is not None:
+                    self.progress.emit(f"  Outer boundary (tet hull ∂H): {len(outer_tet_boundary.faces)} faces")
+                else:
+                    self.progress.emit("  WARNING: No outer tet boundary - will use fallback hull mesh")
+            
+            # Determine which meshes to use for re-projection
+            part_mesh_for_reprojection = inner_tet_boundary if inner_tet_boundary is not None else self.part_mesh
+            hull_mesh_for_reprojection = outer_tet_boundary if outer_tet_boundary is not None else self.hull_mesh
             
             # =====================================================================
             # STEP 2: MEMBRANE MESHING (Paper Section 4.3)
@@ -1843,18 +1883,25 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             #
             # "Each smoothing step is performed using a damping factor (0.5 in our 
             # experiments) to ensure a proper convergence to the final solution."
+            #
+            # NOTE: We use TETRAHEDRAL BOUNDARY surfaces for re-projection to ensure
+            # exact alignment. The membrane vertices are generated from cut points
+            # on tet edges, which lie on tet boundary faces by construction.
             # =====================================================================
             if self.smooth_iterations > 0:
                 self.progress.emit(f"Section 4.4: Two-phase smoothing ({self.smooth_iterations} iters, "
                                  f"λ={self.damping_factor})...")
                 
-                if self.part_mesh is not None:
-                    self.progress.emit(f"  Part mesh M: {len(self.part_mesh.faces)} faces")
+                # Log which meshes we're using for re-projection
+                if part_mesh_for_reprojection is not None:
+                    src = "tet boundary" if part_mesh_for_reprojection is inner_tet_boundary else "original"
+                    self.progress.emit(f"  Part mesh M ({src}): {len(part_mesh_for_reprojection.faces)} faces")
                 else:
                     self.progress.emit("  WARNING: No part mesh M for inner boundary re-projection!")
                 
-                if self.hull_mesh is not None:
-                    self.progress.emit(f"  Hull mesh ∂H: {len(self.hull_mesh.faces)} faces")
+                if hull_mesh_for_reprojection is not None:
+                    src = "tet boundary" if hull_mesh_for_reprojection is outer_tet_boundary else "original"
+                    self.progress.emit(f"  Hull mesh ∂H ({src}): {len(hull_mesh_for_reprojection.faces)} faces")
                 else:
                     self.progress.emit("  WARNING: No hull mesh ∂H for outer boundary re-projection!")
                 
@@ -1862,8 +1909,8 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                 
                 smoothing_result = smooth_membrane_with_boundary_reprojection(
                     current_mesh,
-                    part_mesh=self.part_mesh,
-                    hull_mesh=self.hull_mesh,
+                    part_mesh=part_mesh_for_reprojection,
+                    hull_mesh=hull_mesh_for_reprojection,
                     primary_mesh=None,  # No primary for primary surface smoothing
                     iterations=self.smooth_iterations,
                     damping_factor=self.damping_factor,

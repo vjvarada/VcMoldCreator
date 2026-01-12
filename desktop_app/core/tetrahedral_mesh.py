@@ -322,6 +322,155 @@ def filter_tetrahedra_outside_part(
     return filtered_vertices, filtered_tetrahedra
 
 
+def extract_labeled_boundary_meshes(
+    tet_result: 'TetrahedralMeshResult',
+    use_original: bool = True
+) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh]]:
+    """
+    Extract separate boundary meshes for inner (part) and outer (hull) boundaries.
+    
+    This is useful for membrane smoothing where we want to re-project boundary
+    vertices to the TETRAHEDRAL boundary surfaces rather than the original
+    input meshes. This ensures exact alignment since the membrane vertices
+    come from cut points on tetrahedral edges.
+    
+    Boundary labels:
+    - -1 = part surface (inner boundary M)
+    -  0 = boundary zone (grey zone between H1 and H2 on hull, OR interior)
+    -  1 = H1 (hull half 1)
+    -  2 = H2 (hull half 2)
+    
+    For the OUTER boundary mesh, we include ALL hull faces:
+    - Faces where ALL vertices are on hull (label in {0, 1, 2} AND not on part)
+    - This includes H1, H2, AND the grey boundary zone between them
+    
+    Args:
+        tet_result: TetrahedralMeshResult with boundary_labels
+        use_original: If True, use non-inflated vertices (vertices_original)
+                     If False, use current (possibly inflated) vertices
+    
+    Returns:
+        Tuple of (inner_boundary_mesh, outer_boundary_mesh)
+        - inner_boundary_mesh: Faces where all vertices have boundary_labels == -1 (part surface M)
+        - outer_boundary_mesh: Faces on hull ∂H (H1 + H2 + boundary zone, excludes part surface)
+        Either can be None if no such faces exist.
+    """
+    if tet_result.boundary_labels is None:
+        logger.warning("No boundary_labels available - cannot extract labeled boundary meshes")
+        return None, None
+    
+    if tet_result.boundary_mesh is None:
+        logger.warning("No boundary_mesh available")
+        return None, None
+    
+    # Choose vertex positions
+    if use_original and tet_result.boundary_mesh_original is not None:
+        boundary_mesh = tet_result.boundary_mesh_original
+        logger.debug("Using original (non-inflated) boundary mesh")
+    else:
+        boundary_mesh = tet_result.boundary_mesh
+        logger.debug("Using current (possibly inflated) boundary mesh")
+    
+    vertices = np.array(boundary_mesh.vertices, dtype=np.float64)
+    faces = np.array(boundary_mesh.faces, dtype=np.int64)
+    
+    # Get boundary labels for boundary mesh vertices
+    # Note: boundary_mesh vertices are a subset of tet_result.vertices
+    # We need to map boundary mesh vertex indices to tet vertex indices
+    
+    # Build mapping from boundary mesh vertices to tet vertices using spatial matching
+    from scipy.spatial import cKDTree
+    
+    if use_original and tet_result.vertices_original is not None:
+        tet_verts = tet_result.vertices_original
+    else:
+        tet_verts = tet_result.vertices
+    
+    tet_tree = cKDTree(tet_verts)
+    _, tet_indices = tet_tree.query(vertices, k=1)
+    
+    # Get boundary labels for each boundary mesh vertex
+    vertex_labels = tet_result.boundary_labels[tet_indices]
+    
+    # Also need to know which vertices are actually ON the boundary surface
+    # (not interior). Use boundary_vertices mask from tet_result.
+    if tet_result.boundary_vertices is not None:
+        is_on_boundary = tet_result.boundary_vertices[tet_indices]
+    else:
+        # If no boundary_vertices mask, assume all boundary_mesh vertices are on boundary
+        is_on_boundary = np.ones(len(vertices), dtype=bool)
+    
+    # Classify faces by their vertex labels
+    face_v0_labels = vertex_labels[faces[:, 0]]
+    face_v1_labels = vertex_labels[faces[:, 1]]
+    face_v2_labels = vertex_labels[faces[:, 2]]
+    
+    # Inner boundary: all 3 vertices on part surface (label == -1)
+    inner_mask = (face_v0_labels == -1) & (face_v1_labels == -1) & (face_v2_labels == -1)
+    
+    # Outer boundary: all 3 vertices are NOT on part surface (label != -1)
+    # This includes H1 (1), H2 (2), AND boundary zone (0) vertices that are on hull
+    # A vertex with label 0 could be interior OR boundary zone - but since we're 
+    # iterating over boundary_mesh faces, all vertices are guaranteed to be on boundary
+    outer_v0 = face_v0_labels != -1  # Not on part surface
+    outer_v1 = face_v1_labels != -1  # Not on part surface
+    outer_v2 = face_v2_labels != -1  # Not on part surface
+    outer_mask = outer_v0 & outer_v1 & outer_v2
+    
+    inner_mesh = None
+    outer_mesh = None
+    
+    # Extract inner boundary mesh (part surface M)
+    inner_faces = faces[inner_mask]
+    if len(inner_faces) > 0:
+        # Get unique vertices used by inner faces
+        inner_verts_used = np.unique(inner_faces.ravel())
+        inner_vert_remap = np.full(len(vertices), -1, dtype=np.int64)
+        inner_vert_remap[inner_verts_used] = np.arange(len(inner_verts_used))
+        
+        inner_mesh = trimesh.Trimesh(
+            vertices=vertices[inner_verts_used],
+            faces=inner_vert_remap[inner_faces],
+            process=False
+        )
+        inner_mesh.fix_normals()
+        logger.info(f"Extracted inner boundary (part M): {len(inner_mesh.vertices)} verts, {len(inner_mesh.faces)} faces")
+    else:
+        logger.warning("No inner boundary faces found (label == -1)")
+    
+    # Extract outer boundary mesh (hull ∂H = H1 + H2 + boundary zone)
+    outer_faces = faces[outer_mask]
+    if len(outer_faces) > 0:
+        # Get unique vertices used by outer faces
+        outer_verts_used = np.unique(outer_faces.ravel())
+        outer_vert_remap = np.full(len(vertices), -1, dtype=np.int64)
+        outer_vert_remap[outer_verts_used] = np.arange(len(outer_verts_used))
+        
+        outer_mesh = trimesh.Trimesh(
+            vertices=vertices[outer_verts_used],
+            faces=outer_vert_remap[outer_faces],
+            process=False
+        )
+        outer_mesh.fix_normals()
+        
+        # Log breakdown of outer boundary
+        outer_vertex_labels = vertex_labels[outer_verts_used]
+        n_h1 = np.sum(outer_vertex_labels == 1)
+        n_h2 = np.sum(outer_vertex_labels == 2)
+        n_zone = np.sum(outer_vertex_labels == 0)
+        logger.info(f"Extracted outer boundary (hull ∂H): {len(outer_mesh.vertices)} verts "
+                   f"({n_h1} H1, {n_h2} H2, {n_zone} boundary zone), {len(outer_mesh.faces)} faces")
+    else:
+        logger.warning("No outer boundary faces found")
+    
+    # Log faces that have mixed part/hull vertices (seam faces - should be rare)
+    n_mixed = len(faces) - np.sum(inner_mask) - np.sum(outer_mask)
+    if n_mixed > 0:
+        logger.debug(f"{n_mixed} boundary faces have mixed part/hull vertices (seam faces)")
+    
+    return inner_mesh, outer_mesh
+
+
 def extract_boundary_surface(
     vertices: np.ndarray,
     tetrahedra: np.ndarray
