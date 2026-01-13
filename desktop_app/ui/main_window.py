@@ -1872,28 +1872,28 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             
             # =====================================================================
             # STEP 3.5: REMOVE ON-SURFACE DEGENERATE TRIANGLES
-            # 
-            # Remove triangles where all 3 vertices AND centroid lie on the part 
-            # mesh surface. These are artifacts from marching tetrahedra extraction
-            # that lie flat on M rather than spanning from it. They can cause issues
-            # during smoothing by pulling nearby vertices onto the part surface.
             # =====================================================================
-            self.progress.emit("Removing on-surface degenerate triangles...")
-            
-            from core.surface_propagation import remove_on_surface_triangles
-            
-            current_mesh, n_removed, current_boundary_type = remove_on_surface_triangles(
-                current_mesh,
-                part_mesh=part_mesh_for_reprojection,
-                tolerance_fraction=0.0005,  # 0.05% of mesh scale - very tight
-                vertex_boundary_type=current_boundary_type
-            )
-            
-            if n_removed > 0:
-                self.progress.emit(f"  Removed {n_removed} on-surface triangles, "
-                                 f"now {len(current_mesh.faces):,} faces")
-            else:
-                self.progress.emit("  No on-surface degenerate triangles found")
+            # STEP 3.5: DISABLED - Keep all triangles including on-surface ones
+            # 
+            # Previously removed triangles where all 3 vertices AND centroid lie on  
+            # the part mesh surface. This is now disabled per user request.
+            # =====================================================================
+            # self.progress.emit("Removing on-surface degenerate triangles...")
+            # 
+            # from core.surface_propagation import remove_on_surface_triangles
+            # 
+            # current_mesh, n_removed, current_boundary_type = remove_on_surface_triangles(
+            #     current_mesh,
+            #     part_mesh=part_mesh_for_reprojection,
+            #     tolerance_fraction=0.0005,  # 0.05% of mesh scale - very tight
+            #     vertex_boundary_type=current_boundary_type
+            # )
+            # 
+            # if n_removed > 0:
+            #     self.progress.emit(f"  Removed {n_removed} on-surface triangles, "
+            #                      f"now {len(current_mesh.faces):,} faces")
+            # else:
+            #     self.progress.emit("  No on-surface degenerate triangles found")
             
             # =====================================================================
             # STEP 4: MEMBRANE SMOOTHING (Paper Section 4.4)
