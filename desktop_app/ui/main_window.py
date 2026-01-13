@@ -85,8 +85,8 @@ STEPS = [
     {'id': Step.MOLD_HALVES, 'icon': '🎨', 'title': 'Mold Halves', 'description': 'Classify tetrahedral boundary into H₁ and H₂ mold halves'},
     {'id': Step.EDGE_WEIGHTS, 'icon': '⚖️', 'title': 'Edge Weights', 'description': 'Compute edge weights based on distance to part surface'},
     {'id': Step.DIJKSTRA, 'icon': '🛤️', 'title': 'Dijkstra Walk', 'description': 'Find shortest paths from part surface to mold halves'},
-    {'id': Step.SECONDARY_CUTS, 'icon': '✂️', 'title': 'Secondary Cuts', 'description': 'Detect secondary cutting edges where membrane intersects part'},
     {'id': Step.PARTING_SURFACE, 'icon': '🔲', 'title': 'Primary Surface', 'description': 'Generate, repair and smooth the primary parting surface'},
+    {'id': Step.SECONDARY_CUTS, 'icon': '✂️', 'title': 'Secondary Cuts', 'description': 'Detect secondary cutting edges where membrane intersects part'},
     {'id': Step.SECONDARY_SURFACE, 'icon': '🔴', 'title': 'Secondary Surface', 'description': 'Generate, propagate and smooth secondary parting surfaces'},
     {'id': Step.POURING, 'icon': '🧪', 'title': 'Pouring Directions', 'description': 'Optimize silicone/resin pouring directions for each mold half'},
 ]
@@ -3340,6 +3340,9 @@ class DisplayOptionsPanel(QFrame):
     # Triangle debug signal
     triangle_debug_mode_changed = pyqtSignal(bool)  # Toggle triangle debug mode for membrane analysis
     
+    # Feature classification debug signal
+    show_feature_debug_changed = pyqtSignal(bool)  # Toggle sharp edge/corner visualization
+    
     # Must match MeshViewer.BACKGROUND_COLOR for rounded corners to blend
     VIEWER_BG = "#1a1a1a"  # Matches React frontend BACKGROUND_COLOR
     
@@ -3560,6 +3563,23 @@ class DisplayOptionsPanel(QFrame):
         self.triangle_debug_cb.hide()
         layout.addWidget(self.triangle_debug_cb)
         
+        # Feature classification debug checkbox
+        self.show_feature_debug_cb = QCheckBox('🔍 Feature Debug')
+        self.show_feature_debug_cb.setChecked(False)
+        self.show_feature_debug_cb.setToolTip(
+            'Show sharp edge/corner feature classification:\n'
+            '- Yellow lines: Sharp edges\n'
+            '- Red spheres: Corners\n'
+            '- Green/Blue/Magenta: Membrane boundary vertices'
+        )
+        self.show_feature_debug_cb.stateChanged.connect(self._on_feature_debug_changed)
+        self.show_feature_debug_cb.hide()
+        layout.addWidget(self.show_feature_debug_cb)
+        
+        # Store reference to feature debug data (set externally)
+        self._feature_debug_data = None
+        self._mesh_viewer = None
+        
         self.adjustSize()
         self.hide()
     
@@ -3662,11 +3682,14 @@ class DisplayOptionsPanel(QFrame):
             self.parting_surface_separator.show()
             self.parting_surface_label.show()
             self.triangle_debug_cb.show()  # Show debug checkbox when any surface is visible
+            self.show_feature_debug_cb.show()  # Show feature debug checkbox
         else:
             self.parting_surface_separator.hide()
             self.parting_surface_label.hide()
             self.triangle_debug_cb.hide()
             self.triangle_debug_cb.setChecked(False)  # Reset when hiding
+            self.show_feature_debug_cb.hide()
+            self.show_feature_debug_cb.setChecked(False)  # Reset when hiding
         
         if show_primary:
             self.show_primary_parting_surface_cb.show()
@@ -3680,6 +3703,25 @@ class DisplayOptionsPanel(QFrame):
         else:
             self.show_secondary_parting_surface_cb.hide()
         
+        self.adjustSize()
+    
+    def _on_feature_debug_changed(self, state):
+        """Handle feature debug checkbox state change."""
+        show = state == Qt.CheckState.Checked.value
+        self.show_feature_debug_changed.emit(show)
+    
+    def set_feature_debug_context(self, mesh_viewer, feature_debug_data):
+        """Set the context for feature debug visualization."""
+        self._mesh_viewer = mesh_viewer
+        self._feature_debug_data = feature_debug_data
+    
+    def show_feature_debug_option(self, show: bool = True):
+        """Show or hide the feature debug checkbox."""
+        if show:
+            self.show_feature_debug_cb.show()
+        else:
+            self.show_feature_debug_cb.hide()
+            self.show_feature_debug_cb.setChecked(False)
         self.adjustSize()
 
 
@@ -4082,6 +4124,9 @@ class MainWindow(QMainWindow):
         self.display_options.triangle_debug_mode_changed.connect(
             self._on_triangle_debug_mode_changed
         )
+        self.display_options.show_feature_debug_changed.connect(
+            self._on_feature_debug_changed
+        )
         
         return wrapper
     
@@ -4113,6 +4158,40 @@ class MainWindow(QMainWindow):
             logger.info("🔍 Triangle debug mode enabled - click on triangles to analyze them")
         else:
             logger.info("Triangle debug mode disabled")
+    
+    def _on_feature_debug_changed(self, enabled: bool):
+        """Handle feature debug visualization toggle from display options."""
+        if enabled:
+            # Generate and show feature debug visualization
+            if self._current_mesh is None:
+                logger.warning("No part mesh loaded - cannot show feature debug")
+                return
+            
+            if self._parting_surface_result is None or self._parting_surface_result.mesh is None:
+                logger.warning("No parting surface generated - cannot show feature debug")
+                return
+            
+            try:
+                from core.surface_propagation import get_feature_debug_visualization
+                
+                # Get debug visualization data
+                debug_data = get_feature_debug_visualization(
+                    target_mesh=self._current_mesh,
+                    membrane_mesh=self._parting_surface_result.mesh
+                )
+                
+                if debug_data is not None:
+                    self.mesh_viewer.show_feature_debug_visualization(debug_data)
+                    logger.info("🔍 Feature debug visualization enabled")
+                else:
+                    logger.warning("Failed to generate feature debug data")
+                    
+            except Exception as e:
+                logger.exception(f"Error showing feature debug visualization: {e}")
+        else:
+            # Remove feature debug visualization
+            self.mesh_viewer.remove_feature_debug_visualization()
+            logger.info("Feature debug visualization disabled")
     
     def _clear_context_layout(self):
         """Clear all widgets from context layout."""
@@ -5353,14 +5432,12 @@ class MainWindow(QMainWindow):
                 self.mesh_viewer.set_hull_mesh(self._hull_result.mesh)
                 self.display_options.show_hull_option(True)
         
-        # Restore mold halves result
+        # Restore mold halves result (visualization applied later after tet_result is restored)
         if session.get('mold_halves_result'):
             from core.mold_half_classification import MoldHalfClassificationResult
             self._mold_halves_result = dict_to_result(session['mold_halves_result'], MoldHalfClassificationResult)
             self._boundary_zone_threshold = session.get('boundary_zone_threshold', 0.15)
-            if self._mold_halves_result and hasattr(self._mold_halves_result, 'classification') and self._mold_halves_result.classification is not None:
-                # Update viewer with mold halves colors
-                self.display_options.show_mold_halves_option(True)
+            # Note: Visualization is applied after tet_result is restored below
         
         # Restore tet result
         if session.get('tet_result'):
@@ -5382,6 +5459,20 @@ class MainWindow(QMainWindow):
                     )
                     # Show edge weight options
                     self.display_options.show_edge_weight_options(True)
+                
+                # Restore mold halves visualization if we have both tet_result and mold_halves_result
+                # This must happen AFTER tet_result is restored since it needs tet data
+                if self._mold_halves_result is not None and hasattr(self._mold_halves_result, 'classification') and self._mold_halves_result.classification is not None:
+                    boundary_mesh = self._tet_result.boundary_mesh if hasattr(self._tet_result, 'boundary_mesh') else None
+                    self.mesh_viewer.apply_tet_mesh_classification(
+                        tet_vertices=self._tet_result.vertices,
+                        tet_edges=self._tet_result.edges,
+                        boundary_mesh=boundary_mesh,
+                        classification_result=self._mold_halves_result,
+                        part_mesh=self._current_mesh,
+                        seed_distance_threshold=None  # Auto-compute
+                    )
+                    self.display_options.show_mold_halves_option(True)
                 
                 # Restore Dijkstra visualization if results exist
                 if hasattr(self._tet_result, 'seed_escape_labels') and self._tet_result.seed_escape_labels is not None:
@@ -6922,9 +7013,9 @@ class MainWindow(QMainWindow):
         # Update step status
         self.step_buttons[Step.DIJKSTRA].set_status('completed')
         
-        # Unlock secondary cuts step
-        if Step.SECONDARY_CUTS in self.step_buttons:
-            self.step_buttons[Step.SECONDARY_CUTS].set_status('ready')
+        # Unlock primary surface step (reordered: primary surface comes before secondary cuts)
+        if Step.PARTING_SURFACE in self.step_buttons:
+            self.step_buttons[Step.PARTING_SURFACE].set_status('ready')
         
         n_h1 = np.sum(result.seed_escape_labels == 1)
         n_h2 = np.sum(result.seed_escape_labels == 2)
@@ -7237,7 +7328,7 @@ class MainWindow(QMainWindow):
     
     def _setup_secondary_cuts_step(self):
         """Setup the secondary cuts step UI."""
-        # Check prerequisites
+        # Check prerequisites - now requires primary surface to be complete
         if self._tet_result is None or self._tet_result.seed_escape_paths is None:
             no_dijkstra_label = QLabel("⚠️ Please run Dijkstra first.")
             no_dijkstra_label.setStyleSheet(f"""
@@ -7250,6 +7341,20 @@ class MainWindow(QMainWindow):
             """)
             no_dijkstra_label.setWordWrap(True)
             self.context_layout.addWidget(no_dijkstra_label)
+            return
+        
+        if self._primary_smoothing_result is None or self._primary_smoothing_result.mesh is None:
+            no_primary_label = QLabel("⚠️ Please generate Primary Surface first.")
+            no_primary_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_primary_label.setWordWrap(True)
+            self.context_layout.addWidget(no_primary_label)
             return
         
         # Description section
@@ -7570,9 +7675,9 @@ class MainWindow(QMainWindow):
         # Update step status
         self.step_buttons[Step.SECONDARY_CUTS].set_status('completed')
         
-        # Unlock parting surface step
-        if Step.PARTING_SURFACE in self.step_buttons:
-            self.step_buttons[Step.PARTING_SURFACE].set_status('ready')
+        # Unlock secondary surface step (reordered: secondary cuts now comes after primary surface)
+        if Step.SECONDARY_SURFACE in self.step_buttons:
+            self.step_buttons[Step.SECONDARY_SURFACE].set_status('ready')
         
         n_secondary = len(result.secondary_cut_edges) if result.secondary_cut_edges else 0
         logger.info(f"Secondary cuts complete: {n_secondary} secondary cutting edges found")
@@ -7607,10 +7712,10 @@ class MainWindow(QMainWindow):
     
     def _setup_parting_surface_step(self):
         """Setup the parting surface step UI."""
-        # Check prerequisites
-        if self._tet_result is None or self._tet_result.secondary_cut_edges is None:
-            no_secondary_label = QLabel("⚠️ Please run Secondary Cuts first.")
-            no_secondary_label.setStyleSheet(f"""
+        # Check prerequisites - now requires Dijkstra results (not secondary cuts)
+        if self._tet_result is None or self._tet_result.seed_escape_paths is None:
+            no_dijkstra_label = QLabel("⚠️ Please run Dijkstra first.")
+            no_dijkstra_label.setStyleSheet(f"""
                 color: {Colors.WARNING};
                 font-size: 13px;
                 padding: 12px;
@@ -7618,8 +7723,8 @@ class MainWindow(QMainWindow):
                 border: 1px solid {Colors.WARNING};
                 border-radius: 6px;
             """)
-            no_secondary_label.setWordWrap(True)
-            self.context_layout.addWidget(no_secondary_label)
+            no_dijkstra_label.setWordWrap(True)
+            self.context_layout.addWidget(no_dijkstra_label)
             return
         
         # Description section
@@ -7880,11 +7985,11 @@ class MainWindow(QMainWindow):
         # Visualize the parting surface
         self._visualize_parting_surface(result)
         
-        # Mark step complete and unlock secondary surface step
+        # Mark step complete and unlock secondary cuts step (reordered: secondary cuts now comes after primary surface)
         if Step.PARTING_SURFACE in self.step_buttons:
             self.step_buttons[Step.PARTING_SURFACE].set_status('completed')
-        if Step.SECONDARY_SURFACE in self.step_buttons:
-            self.step_buttons[Step.SECONDARY_SURFACE].set_status('available')
+        if Step.SECONDARY_CUTS in self.step_buttons:
+            self.step_buttons[Step.SECONDARY_CUTS].set_status('ready')
     
     def _on_parting_surface_error(self, error_msg: str):
         """Handle parting surface generation error."""

@@ -35,6 +35,10 @@ EDGE_WEIGHT_EPSILON = 0.25  # Minimum edge weight to prevent division issues
 # Minimum triangle area threshold (as fraction of median area)
 MIN_TRIANGLE_AREA_FRACTION = 0.01  # Triangles with area < 1% of median are considered degenerate
 
+# Feature detection thresholds for sharp edge/corner classification
+SHARP_EDGE_ANGLE_THRESHOLD = 30.0  # degrees - edges sharper than this are classified as "sharp"
+CORNER_SHARP_EDGE_COUNT = 2        # A vertex with >= this many sharp edges meeting is a "corner"
+
 
 # =============================================================================
 # DATA CLASSES
@@ -94,6 +98,127 @@ class SmoothingResult:
     
     # Timing
     total_time_ms: float = 0.0
+
+
+@dataclass
+class FeatureDebugVisualization:
+    """Debug visualization data for sharp edge/corner feature classification."""
+    
+    # Target mesh (part or hull) feature data
+    target_mesh_vertices: Optional[np.ndarray] = None       # (N, 3) vertex positions
+    target_feature_types: Optional[np.ndarray] = None       # (N,) 0=smooth, 1=sharp_edge, 2=corner
+    target_sharp_edges: Optional[List[Tuple[int, int]]] = None  # List of (v0, v1) edge indices
+    
+    # Membrane boundary vertex data  
+    membrane_boundary_positions: Optional[np.ndarray] = None  # (M, 3) boundary vertex positions
+    membrane_boundary_projected_types: Optional[np.ndarray] = None  # (M,) feature type each projects to
+    membrane_boundary_nearest_target: Optional[np.ndarray] = None  # (M,) nearest target vertex index
+
+
+def get_feature_debug_visualization(
+    target_mesh: trimesh.Trimesh,
+    membrane_mesh: trimesh.Trimesh,
+    membrane_boundary_indices: np.ndarray = None,
+    angle_threshold: float = SHARP_EDGE_ANGLE_THRESHOLD
+) -> FeatureDebugVisualization:
+    """
+    Generate debug visualization data for feature classification.
+    
+    This function returns data needed to visualize:
+    1. Which vertices on the target mesh are classified as sharp edges vs corners
+    2. Which membrane boundary vertices will be projected to these features
+    
+    Args:
+        target_mesh: The target mesh (part or hull) to classify features on
+        membrane_mesh: The membrane mesh being smoothed
+        membrane_boundary_indices: Indices of membrane boundary vertices (computed if not provided)
+        angle_threshold: Dihedral angle threshold for sharp edge detection
+        
+    Returns:
+        FeatureDebugVisualization with all data needed for visualization
+    """
+    from scipy.spatial import cKDTree
+    
+    debug = FeatureDebugVisualization()
+    
+    if target_mesh is None or len(target_mesh.faces) == 0:
+        return debug
+    
+    # Classify target mesh vertices
+    feature_types, sharp_edge_info = classify_mesh_vertex_features(
+        target_mesh, angle_threshold
+    )
+    
+    debug.target_mesh_vertices = target_mesh.vertices.copy()
+    debug.target_feature_types = feature_types
+    
+    # Extract sharp edges from the target mesh
+    sharp_edges = []
+    edge_to_faces = {}
+    for fi, face in enumerate(target_mesh.faces):
+        for i in range(3):
+            v0, v1 = face[i], face[(i+1) % 3]
+            edge = (min(v0, v1), max(v0, v1))
+            if edge not in edge_to_faces:
+                edge_to_faces[edge] = []
+            edge_to_faces[edge].append(fi)
+    
+    for edge, face_indices in edge_to_faces.items():
+        if len(face_indices) != 2:
+            # Boundary edge - treat as sharp
+            sharp_edges.append(edge)
+            continue
+        
+        n0 = target_mesh.face_normals[face_indices[0]]
+        n1 = target_mesh.face_normals[face_indices[1]]
+        dot = np.clip(np.dot(n0, n1), -1.0, 1.0)
+        angle_deg = np.degrees(np.arccos(dot))
+        
+        if angle_deg > angle_threshold:
+            sharp_edges.append(edge)
+    
+    debug.target_sharp_edges = sharp_edges
+    
+    # Compute membrane boundary indices if not provided
+    if membrane_mesh is not None and membrane_boundary_indices is None:
+        # Find boundary vertices by looking at edges that appear in only one face
+        edge_count = {}
+        for face in membrane_mesh.faces:
+            for i in range(3):
+                v0, v1 = face[i], face[(i+1) % 3]
+                edge = (min(v0, v1), max(v0, v1))
+                edge_count[edge] = edge_count.get(edge, 0) + 1
+        
+        boundary_verts = set()
+        for edge, count in edge_count.items():
+            if count == 1:  # Boundary edge
+                boundary_verts.add(edge[0])
+                boundary_verts.add(edge[1])
+        
+        membrane_boundary_indices = np.array(list(boundary_verts), dtype=np.int64)
+        logger.info(f"Feature debug: Computed {len(membrane_boundary_indices)} membrane boundary vertices")
+    
+    # Map membrane boundary vertices to target mesh features
+    if membrane_mesh is not None and membrane_boundary_indices is not None and len(membrane_boundary_indices) > 0:
+        target_kdtree = cKDTree(target_mesh.vertices)
+        
+        boundary_positions = membrane_mesh.vertices[membrane_boundary_indices]
+        _, nearest_target_indices = target_kdtree.query(boundary_positions)
+        
+        # Get feature type for each membrane boundary vertex based on nearest target
+        projected_types = feature_types[nearest_target_indices]
+        
+        debug.membrane_boundary_positions = boundary_positions.copy()
+        debug.membrane_boundary_projected_types = projected_types
+        debug.membrane_boundary_nearest_target = nearest_target_indices
+        
+        logger.info(
+            f"Feature debug: {np.sum(projected_types == 0)} smooth, "
+            f"{np.sum(projected_types == 1)} sharp edge, "
+            f"{np.sum(projected_types == 2)} corner membrane boundary vertices"
+        )
+    
+    return debug
 
 
 # =============================================================================
@@ -196,6 +321,286 @@ def find_boundary_edges(mesh: trimesh.Trimesh) -> List[Tuple[int, int]]:
     boundary_edges = [edge for edge, count in edge_face_count.items() if count == 1]
     
     return boundary_edges
+
+
+# =============================================================================
+# FEATURE DETECTION FOR SHARP EDGES/CORNERS
+# =============================================================================
+
+def classify_mesh_vertex_features(
+    mesh: trimesh.Trimesh,
+    angle_threshold: float = SHARP_EDGE_ANGLE_THRESHOLD
+) -> Tuple[np.ndarray, dict]:
+    """
+    Classify mesh vertices as smooth, sharp_edge, or corner.
+    
+    This is used for feature-preserving smoothing where:
+    - Corner vertices should NOT be smoothed (keep fixed)
+    - Sharp edge vertices should only move along the edge direction
+    - Smooth vertices can use normal Laplacian smoothing + surface reprojection
+    
+    Args:
+        mesh: Input trimesh
+        angle_threshold: Dihedral angle (degrees) above which an edge is considered sharp
+    
+    Returns:
+        Tuple of:
+        - vertex_feature_type: Array with values 'smooth'=0, 'sharp_edge'=1, 'corner'=2
+        - sharp_edge_info: Dict mapping vertex index to list of (neighbor_vertex, edge_direction)
+                          for sharp edge vertices, so they can be projected along the edge
+    """
+    n_verts = len(mesh.vertices)
+    vertex_feature_type = np.zeros(n_verts, dtype=np.int8)  # 0=smooth, 1=sharp_edge, 2=corner
+    sharp_edge_info = {}
+    
+    if mesh is None or len(mesh.faces) == 0:
+        return vertex_feature_type, sharp_edge_info
+    
+    # Build edge -> faces adjacency
+    edge_to_faces = {}
+    for fi, face in enumerate(mesh.faces):
+        for i in range(3):
+            v0, v1 = face[i], face[(i+1) % 3]
+            edge = (min(v0, v1), max(v0, v1))
+            if edge not in edge_to_faces:
+                edge_to_faces[edge] = []
+            edge_to_faces[edge].append(fi)
+    
+    # Find sharp edges by checking dihedral angle
+    sharp_edges = set()
+    for edge, face_indices in edge_to_faces.items():
+        if len(face_indices) != 2:
+            # Boundary edge - treat as sharp
+            sharp_edges.add(edge)
+            continue
+        
+        # Get face normals
+        n0 = mesh.face_normals[face_indices[0]]
+        n1 = mesh.face_normals[face_indices[1]]
+        
+        # Compute dihedral angle
+        dot = np.clip(np.dot(n0, n1), -1.0, 1.0)
+        angle_deg = np.degrees(np.arccos(dot))
+        
+        if angle_deg > angle_threshold:
+            sharp_edges.add(edge)
+    
+    # Count sharp edges meeting at each vertex
+    vertex_sharp_edge_count = np.zeros(n_verts, dtype=np.int32)
+    vertex_sharp_neighbors = {i: [] for i in range(n_verts)}
+    
+    for edge in sharp_edges:
+        v0, v1 = edge
+        vertex_sharp_edge_count[v0] += 1
+        vertex_sharp_edge_count[v1] += 1
+        
+        # Store the neighbor and edge direction for sharp edge vertices
+        edge_dir = mesh.vertices[v1] - mesh.vertices[v0]
+        edge_dir_norm = edge_dir / (np.linalg.norm(edge_dir) + 1e-10)
+        
+        vertex_sharp_neighbors[v0].append((v1, edge_dir_norm))
+        vertex_sharp_neighbors[v1].append((v0, -edge_dir_norm))
+    
+    # Classify vertices
+    for vi in range(n_verts):
+        count = vertex_sharp_edge_count[vi]
+        if count >= CORNER_SHARP_EDGE_COUNT:
+            # Corner: where multiple sharp edges meet
+            vertex_feature_type[vi] = 2  # corner
+        elif count == 1:
+            # On a sharp edge (but not a corner)
+            vertex_feature_type[vi] = 1  # sharp_edge
+            sharp_edge_info[vi] = vertex_sharp_neighbors[vi]
+        # else: smooth (remains 0)
+    
+    n_smooth = np.sum(vertex_feature_type == 0)
+    n_sharp = np.sum(vertex_feature_type == 1)
+    n_corner = np.sum(vertex_feature_type == 2)
+    logger.debug(f"Feature classification: {n_smooth} smooth, {n_sharp} sharp edge, {n_corner} corner")
+    
+    return vertex_feature_type, sharp_edge_info
+
+
+def project_to_sharp_edge(
+    vertex_pos: np.ndarray,
+    edge_start: np.ndarray,
+    edge_end: np.ndarray
+) -> np.ndarray:
+    """
+    Project a point onto a line segment (sharp edge).
+    
+    This is used for sharp edge reprojection where we constrain
+    the vertex to move only along the edge, not off it.
+    
+    Args:
+        vertex_pos: Current vertex position (3,)
+        edge_start: Start point of the edge (3,)
+        edge_end: End point of the edge (3,)
+    
+    Returns:
+        Projected position on the edge segment (3,)
+    """
+    edge_vec = edge_end - edge_start
+    edge_len_sq = np.dot(edge_vec, edge_vec)
+    
+    if edge_len_sq < 1e-12:
+        # Degenerate edge - return start point
+        return edge_start.copy()
+    
+    # Project onto line and clamp to segment
+    t = np.dot(vertex_pos - edge_start, edge_vec) / edge_len_sq
+    t = np.clip(t, 0.0, 1.0)
+    
+    return edge_start + t * edge_vec
+
+
+def reproject_with_feature_awareness(
+    vertices: np.ndarray,
+    boundary_indices: np.ndarray,
+    target_mesh: trimesh.Trimesh,
+    feature_types: np.ndarray,
+    sharp_edge_info: dict,
+    search_radius: Optional[float] = None
+) -> np.ndarray:
+    """
+    Re-project boundary vertices to target mesh with feature-awareness.
+    
+    For smooth regions: use nearest-point projection (standard)
+    For sharp edges: project along the edge direction only
+    For corners: keep fixed (no projection)
+    
+    This prevents vertices from jumping across concave features during smoothing.
+    
+    Args:
+        vertices: (N, 3) all mesh vertices (membrane mesh)
+        boundary_indices: Indices of boundary vertices to reproject (membrane mesh indices)
+        target_mesh: The target mesh to project onto (part/hull mesh)
+        feature_types: Per-vertex feature type for TARGET MESH (0=smooth, 1=sharp_edge, 2=corner)
+        sharp_edge_info: Dict from classify_mesh_vertex_features (for target mesh)
+        search_radius: Optional max search distance (auto-computed if None)
+    
+    Returns:
+        Updated vertices array (modified in place and returned)
+    """
+    from trimesh.proximity import ProximityQuery
+    from scipy.spatial import cKDTree
+    
+    if target_mesh is None or len(target_mesh.faces) == 0:
+        return vertices
+    
+    if len(boundary_indices) == 0:
+        return vertices
+    
+    proximity = ProximityQuery(target_mesh)
+    
+    # Auto-compute search radius if not provided
+    if search_radius is None:
+        mesh_scale = np.linalg.norm(target_mesh.bounds[1] - target_mesh.bounds[0])
+        search_radius = mesh_scale * 0.1  # 10% of mesh size
+    
+    # Build KD-tree for target mesh vertices to find nearest target vertex for each membrane vertex
+    target_kdtree = cKDTree(target_mesh.vertices)
+    
+    # For each membrane boundary vertex, find its nearest target mesh vertex
+    # to determine which feature type applies
+    boundary_positions = vertices[boundary_indices]
+    _, nearest_target_indices = target_kdtree.query(boundary_positions)
+    
+    # Also build a KD-tree of ONLY corner vertices for radius-based corner detection
+    # This handles cases where the membrane vertex is slightly offset from the corner
+    corner_mask = (feature_types == 2)
+    corner_target_indices = np.where(corner_mask)[0]
+    corner_detection_radius = search_radius * 0.3  # Use 30% of search radius for corner detection
+    
+    corner_kdtree = None
+    if len(corner_target_indices) > 0:
+        corner_positions = target_mesh.vertices[corner_target_indices]
+        corner_kdtree = cKDTree(corner_positions)
+    
+    # Separate membrane vertices by the feature type of their nearest target vertex
+    # IMPORTANT: Use radius-based corner detection to avoid misclassifying vertices
+    # that are slightly offset from corners as "sharp_edge" vertices
+    smooth_indices = []
+    sharp_edge_indices = []
+    corner_indices = []
+    
+    for i, vi in enumerate(boundary_indices):
+        pos = boundary_positions[i]
+        
+        # First, check if this vertex is within radius of ANY corner
+        # This takes priority over nearest-vertex classification
+        if corner_kdtree is not None:
+            corner_dist, _ = corner_kdtree.query(pos)
+            if corner_dist < corner_detection_radius:
+                corner_indices.append(vi)
+                continue
+        
+        # Not near a corner - use nearest vertex classification
+        target_vi = nearest_target_indices[i]
+        ft = feature_types[target_vi]
+        if ft == 0:  # smooth
+            smooth_indices.append(vi)
+        elif ft == 1:  # sharp_edge
+            sharp_edge_indices.append(vi)
+        elif ft == 2:  # corner (nearest is corner)
+            corner_indices.append(vi)
+    
+    # === Smooth vertices: standard nearest-point with bounded search ===
+    if len(smooth_indices) > 0:
+        smooth_indices_arr = np.array(smooth_indices, dtype=np.int64)
+        smooth_positions = vertices[smooth_indices_arr]
+        closest_pts, distances, _ = proximity.on_surface(smooth_positions)
+        
+        # Only apply projection if within search radius
+        within_radius = distances < search_radius
+        vertices[smooth_indices_arr[within_radius]] = closest_pts[within_radius]
+    
+    # === Sharp edge vertices: project to nearest point ON an edge ===
+    # OPTIMIZED: Use vectorized edge distance computation instead of O(E) loop per vertex
+    if len(sharp_edge_indices) > 0:
+        # Get target mesh edges
+        target_edges = target_mesh.edges_unique
+        edge_starts = target_mesh.vertices[target_edges[:, 0]]  # (E, 3)
+        edge_ends = target_mesh.vertices[target_edges[:, 1]]    # (E, 3)
+        edge_midpoints = (edge_starts + edge_ends) / 2          # (E, 3)
+        
+        # Build KD-tree of edge midpoints for fast spatial lookup
+        from scipy.spatial import cKDTree
+        edge_midpoint_tree = cKDTree(edge_midpoints)
+        
+        # For each sharp edge vertex, find nearby edges and pick the closest
+        sharp_positions = vertices[sharp_edge_indices]
+        
+        # Query k nearest edge midpoints (edges within reasonable distance)
+        k_neighbors = min(50, len(target_edges))  # Check up to 50 nearby edges
+        _, nearby_edge_indices = edge_midpoint_tree.query(sharp_positions, k=k_neighbors)
+        
+        # Vectorized projection for all sharp edge vertices
+        for i, vi in enumerate(sharp_edge_indices):
+            pos = vertices[vi]
+            candidate_edges = nearby_edge_indices[i] if k_neighbors > 1 else [nearby_edge_indices[i]]
+            
+            best_dist = np.inf
+            best_proj = pos.copy()
+            
+            for edge_idx in candidate_edges:
+                proj = project_to_sharp_edge(pos, edge_starts[edge_idx], edge_ends[edge_idx])
+                dist = np.linalg.norm(proj - pos)
+                
+                if dist < best_dist:
+                    best_dist = dist
+                    best_proj = proj
+            
+            if best_dist < search_radius:
+                vertices[vi] = best_proj
+    
+    # === Corner vertices: keep fixed (no projection) ===
+    # Corners should not be smoothed or reprojected
+    n_corner = len(corner_indices)
+    if n_corner > 0:
+        logger.debug(f"Keeping {n_corner} corner vertices fixed (no reprojection)")
+    
+    return vertices
 
 
 def find_boundary_vertices(mesh: trimesh.Trimesh) -> Set[int]:
@@ -985,6 +1390,117 @@ def smooth_membrane_with_boundary_reprojection(
     logger.info(f"Batched re-projection: {len(part_boundary_indices)} part, "
                f"{len(hull_boundary_indices)} hull, {len(primary_boundary_indices)} primary")
     
+    # === Feature detection for target meshes (for feature-aware reprojection) ===
+    # This handles sharp concave edges where standard nearest-point projection can
+    # jump to the wrong side of the feature. We detect sharp edges/corners on each
+    # target mesh and use edge-based projection for sharp features.
+    part_feature_types = None
+    part_sharp_edge_info = None
+    hull_feature_types = None
+    hull_sharp_edge_info = None
+    primary_feature_types = None
+    primary_sharp_edge_info = None
+    
+    if part_mesh is not None and len(part_mesh.faces) > 0:
+        part_feature_types, part_sharp_edge_info = classify_mesh_vertex_features(part_mesh)
+        n_sharp = np.sum(part_feature_types == 1)
+        n_corner = np.sum(part_feature_types == 2)
+        if n_sharp > 0 or n_corner > 0:
+            logger.info(f"Part mesh features: {n_sharp} sharp edge verts, {n_corner} corners")
+    
+    if hull_mesh is not None and len(hull_mesh.faces) > 0:
+        hull_feature_types, hull_sharp_edge_info = classify_mesh_vertex_features(hull_mesh)
+        n_sharp = np.sum(hull_feature_types == 1)
+        n_corner = np.sum(hull_feature_types == 2)
+        if n_sharp > 0 or n_corner > 0:
+            logger.info(f"Hull mesh features: {n_sharp} sharp edge verts, {n_corner} corners")
+    
+    if primary_mesh is not None and len(primary_mesh.faces) > 0:
+        primary_feature_types, primary_sharp_edge_info = classify_mesh_vertex_features(primary_mesh)
+        n_sharp = np.sum(primary_feature_types == 1)
+        n_corner = np.sum(primary_feature_types == 2)
+        if n_sharp > 0 or n_corner > 0:
+            logger.info(f"Primary mesh features: {n_sharp} sharp edge verts, {n_corner} corners")
+    
+    # Compute bounded search radius for reprojection
+    search_radius = mesh_scale * MAX_REPROJECT_DISTANCE_FRACTION
+    
+    # === Pre-compute corner vertices that should be kept fixed ===
+    # Per paper Section 4.4: corners should be "kept fixed" during smoothing
+    # We identify membrane boundary vertices that correspond to corners on the target mesh
+    # and exclude them from BOTH boundary smoothing AND interior smoothing
+    corner_vertex_set = set()
+    
+    # Tolerance for corner detection - if a membrane vertex is within this distance
+    # of ANY corner vertex on the target mesh, treat it as a corner vertex
+    # This handles cases where the membrane boundary is slightly offset from the exact corner
+    corner_detection_radius = mesh_scale * 0.03  # 3% of mesh size
+    
+    def identify_corner_membrane_vertices(membrane_indices, target_mesh, feature_types):
+        """Find membrane boundary vertices near target mesh corners.
+        
+        Uses a radius-based search to find membrane vertices that are near ANY corner
+        on the target mesh, not just those whose single nearest vertex is a corner.
+        This handles cases where the membrane is slightly offset from the corner.
+        """
+        if len(membrane_indices) == 0 or target_mesh is None or feature_types is None:
+            return set()
+        
+        from scipy.spatial import cKDTree
+        
+        # Find all corner vertices on the target mesh
+        corner_mask = (feature_types == 2)
+        corner_indices = np.where(corner_mask)[0]
+        
+        if len(corner_indices) == 0:
+            return set()
+        
+        # Build KD-tree of only the corner positions
+        corner_positions = target_mesh.vertices[corner_indices]
+        corner_kdtree = cKDTree(corner_positions)
+        
+        corner_verts = set()
+        membrane_positions = vertices[membrane_indices]
+        
+        # For each membrane vertex, check if ANY corner is within the detection radius
+        distances, _ = corner_kdtree.query(membrane_positions)
+        
+        for i, vi in enumerate(membrane_indices):
+            if distances[i] < corner_detection_radius:
+                corner_verts.add(vi)
+        
+        return corner_verts
+    
+    # Find corners for each target mesh
+    if part_feature_types is not None and len(part_boundary_indices) > 0:
+        part_corners = identify_corner_membrane_vertices(
+            part_boundary_indices, part_mesh, part_feature_types
+        )
+        corner_vertex_set.update(part_corners)
+        if part_corners:
+            logger.info(f"Found {len(part_corners)} membrane vertices at part mesh corners (will be kept fixed)")
+    
+    if hull_feature_types is not None and len(hull_boundary_indices) > 0:
+        hull_corners = identify_corner_membrane_vertices(
+            hull_boundary_indices, hull_mesh, hull_feature_types
+        )
+        corner_vertex_set.update(hull_corners)
+        if hull_corners:
+            logger.info(f"Found {len(hull_corners)} membrane vertices at hull mesh corners (will be kept fixed)")
+    
+    if primary_feature_types is not None and len(primary_boundary_indices) > 0:
+        primary_corners = identify_corner_membrane_vertices(
+            primary_boundary_indices, primary_mesh, primary_feature_types
+        )
+        corner_vertex_set.update(primary_corners)
+        if primary_corners:
+            logger.info(f"Found {len(primary_corners)} membrane vertices at primary mesh corners (will be kept fixed)")
+    
+    # Add corner vertices to excluded set (they won't be smoothed at all)
+    excluded_set.update(corner_vertex_set)
+    if corner_vertex_set:
+        logger.info(f"Total {len(corner_vertex_set)} corner vertices excluded from smoothing")
+    
     # Alternating smoothing iterations per paper Section 4.4:
     # "The smoothing is performed by alternating two main steps:
     #  1. First we smooth the polyline that includes the boundary vertices only.
@@ -1024,24 +1540,65 @@ def smooth_membrane_with_boundary_reprojection(
         # === Step 2: Re-project boundary vertices onto target surfaces ===
         # Per paper: "After this smooth step, we re-project those vertices onto the 
         # original surface of M or the external boundary ∂H"
+        #
+        # We use feature-aware reprojection to handle sharp concave edges:
+        # - For sharp edges: project to nearest edge (1D) instead of surface (2D)
+        # - For corners: keep fixed (don't reproject)
+        # - For smooth regions: use standard nearest-point projection
         
-        # Re-project to part mesh M (batched)
-        if len(part_boundary_indices) > 0 and part_proximity is not None:
-            part_positions = vertices[part_boundary_indices]
-            closest_pts, _, _ = part_proximity.on_surface(part_positions)
-            vertices[part_boundary_indices] = closest_pts
+        # Re-project to part mesh M (with feature awareness)
+        if len(part_boundary_indices) > 0 and part_mesh is not None:
+            if part_feature_types is not None:
+                # Use feature-aware reprojection for sharp edges/corners
+                vertices = reproject_with_feature_awareness(
+                    vertices=vertices,
+                    boundary_indices=part_boundary_indices,
+                    target_mesh=part_mesh,
+                    feature_types=part_feature_types,
+                    sharp_edge_info=part_sharp_edge_info,
+                    search_radius=search_radius
+                )
+            elif part_proximity is not None:
+                # Fallback to standard reprojection
+                part_positions = vertices[part_boundary_indices]
+                closest_pts, _, _ = part_proximity.on_surface(part_positions)
+                vertices[part_boundary_indices] = closest_pts
         
-        # Re-project to hull mesh ∂H (batched)
-        if len(hull_boundary_indices) > 0 and hull_proximity is not None:
-            hull_positions = vertices[hull_boundary_indices]
-            closest_pts, _, _ = hull_proximity.on_surface(hull_positions)
-            vertices[hull_boundary_indices] = closest_pts
+        # Re-project to hull mesh ∂H (with feature awareness)
+        if len(hull_boundary_indices) > 0 and hull_mesh is not None:
+            if hull_feature_types is not None:
+                # Use feature-aware reprojection for sharp edges/corners
+                vertices = reproject_with_feature_awareness(
+                    vertices=vertices,
+                    boundary_indices=hull_boundary_indices,
+                    target_mesh=hull_mesh,
+                    feature_types=hull_feature_types,
+                    sharp_edge_info=hull_sharp_edge_info,
+                    search_radius=search_radius
+                )
+            elif hull_proximity is not None:
+                # Fallback to standard reprojection
+                hull_positions = vertices[hull_boundary_indices]
+                closest_pts, _, _ = hull_proximity.on_surface(hull_positions)
+                vertices[hull_boundary_indices] = closest_pts
         
-        # Re-project to primary mesh (for secondary surfaces)
-        if len(primary_boundary_indices) > 0 and primary_proximity is not None:
-            primary_positions = vertices[primary_boundary_indices]
-            closest_pts, _, _ = primary_proximity.on_surface(primary_positions)
-            vertices[primary_boundary_indices] = closest_pts
+        # Re-project to primary mesh (for secondary surfaces, with feature awareness)
+        if len(primary_boundary_indices) > 0 and primary_mesh is not None:
+            if primary_feature_types is not None:
+                # Use feature-aware reprojection for sharp edges/corners
+                vertices = reproject_with_feature_awareness(
+                    vertices=vertices,
+                    boundary_indices=primary_boundary_indices,
+                    target_mesh=primary_mesh,
+                    feature_types=primary_feature_types,
+                    sharp_edge_info=primary_sharp_edge_info,
+                    search_radius=search_radius
+                )
+            elif primary_proximity is not None:
+                # Fallback to standard reprojection
+                primary_positions = vertices[primary_boundary_indices]
+                closest_pts, _, _ = primary_proximity.on_surface(primary_positions)
+                vertices[primary_boundary_indices] = closest_pts
         
         # === Step 3: Smooth interior vertices (boundary vertices now fixed) ===
         # Per paper: "Then, we smooth all the interior vertices, keeping the ones 

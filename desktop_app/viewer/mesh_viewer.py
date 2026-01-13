@@ -178,6 +178,15 @@ class MeshViewer(QWidget):
         self._triangle_debug_mesh_ref = None  # Reference to the mesh being debugged
         self._triangle_debug_boundary_type_ref = None  # Vertex boundary types for debug
         
+        # Feature debug visualization (sharp edges/corners)
+        self._feature_debug_sharp_edges_actor = None  # Lines showing sharp edges on target mesh
+        self._feature_debug_corners_actor = None  # Spheres at corner vertices
+        self._feature_debug_sharp_edge_verts_actor = None  # Spheres at sharp edge vertices
+        self._feature_debug_membrane_smooth_actor = None  # Membrane boundary verts -> smooth (green)
+        self._feature_debug_membrane_edge_actor = None  # Membrane boundary verts -> sharp edge (blue)
+        self._feature_debug_membrane_corner_actor = None  # Membrane boundary verts -> corner (red)
+        self._feature_debug_visible = True
+        
         self._setup_ui()
     
     def _setup_ui(self):
@@ -1799,6 +1808,239 @@ class MeshViewer(QWidget):
         # Toggle main mesh visibility opposite to split meshes
         if self._actor is not None:
             self._actor.SetVisibility(not visible)
+        
+        self.plotter.update()
+
+    # =========================================================================
+    # FEATURE DEBUG VISUALIZATION (Sharp Edges / Corners)
+    # =========================================================================
+    
+    def show_feature_debug_visualization(
+        self,
+        debug_data,  # FeatureDebugVisualization from surface_propagation
+        sphere_radius: Optional[float] = None
+    ):
+        """
+        Show debug visualization for sharp edge/corner feature classification.
+        
+        This displays:
+        1. Sharp edges on the target mesh as thick lines
+        2. Corner vertices as red spheres
+        3. Sharp edge vertices as blue spheres
+        4. Membrane boundary vertices colored by their projection type:
+           - Green: will use smooth surface projection
+           - Blue: will use sharp edge projection
+           - Red: corner (will be kept fixed)
+        
+        Args:
+            debug_data: FeatureDebugVisualization from get_feature_debug_visualization()
+            sphere_radius: Optional radius for marker spheres
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        # Remove existing debug visualization
+        self.remove_feature_debug_visualization()
+        
+        if debug_data is None:
+            return
+        
+        # Calculate sphere radius based on mesh bounds
+        # Make spheres just slightly thicker than the edge lines
+        if sphere_radius is None and self._pv_mesh is not None:
+            bounds = self._pv_mesh.bounds
+            size = np.array([
+                bounds[1] - bounds[0],
+                bounds[3] - bounds[2],
+                bounds[5] - bounds[4],
+            ])
+            max_size = np.max(size)
+            sphere_radius = max_size * 0.0015  # 0.15% of mesh size - just slightly larger than edge lines
+        elif sphere_radius is None:
+            sphere_radius = 0.1  # Fallback (smaller)
+        
+        # === 1. Draw sharp edges as thick lines (use efficient line construction) ===
+        if debug_data.target_sharp_edges and debug_data.target_mesh_vertices is not None:
+            # Build lines efficiently using cells array
+            n_edges = len(debug_data.target_sharp_edges)
+            if n_edges > 0:
+                # Collect unique vertices used in edges
+                edge_array = np.array(debug_data.target_sharp_edges)
+                points = debug_data.target_mesh_vertices[edge_array.flatten()].reshape(-1, 3)
+                
+                # Build cells: [2, 0, 1, 2, 2, 3, ...] for line segments
+                cells = np.zeros((n_edges, 3), dtype=np.int64)
+                cells[:, 0] = 2  # Each line has 2 points
+                cells[:, 1] = np.arange(0, n_edges * 2, 2)  # Start indices
+                cells[:, 2] = np.arange(1, n_edges * 2 + 1, 2)  # End indices
+                
+                lines = pv.PolyData(points, lines=cells.flatten())
+                
+                self._feature_debug_sharp_edges_actor = self.plotter.add_mesh(
+                    lines,
+                    color='yellow',
+                    line_width=4,
+                    render_lines_as_tubes=True,
+                )
+                logger.info(f"Added {n_edges} sharp edge lines")
+        
+        # === 2. Draw corner vertices (red spheres) using glyphs ===
+        if debug_data.target_feature_types is not None and debug_data.target_mesh_vertices is not None:
+            corner_mask = debug_data.target_feature_types == 2
+            corner_positions = debug_data.target_mesh_vertices[corner_mask]
+            
+            if len(corner_positions) > 0:
+                # Use glyph for efficient sphere rendering
+                corner_cloud = pv.PolyData(corner_positions)
+                corner_glyphs = corner_cloud.glyph(
+                    geom=pv.Sphere(radius=sphere_radius * 1.5),
+                    scale=False,
+                    orient=False
+                )
+                
+                self._feature_debug_corners_actor = self.plotter.add_mesh(
+                    corner_glyphs,
+                    color='red',
+                    opacity=1.0,
+                )
+                logger.info(f"Added {len(corner_positions)} corner spheres (red)")
+        
+        # === 3. Draw sharp edge vertices (cyan spheres) using glyphs ===
+        if debug_data.target_feature_types is not None and debug_data.target_mesh_vertices is not None:
+            edge_mask = debug_data.target_feature_types == 1
+            edge_positions = debug_data.target_mesh_vertices[edge_mask]
+            
+            if len(edge_positions) > 0:
+                edge_cloud = pv.PolyData(edge_positions)
+                edge_glyphs = edge_cloud.glyph(
+                    geom=pv.Sphere(radius=sphere_radius),
+                    scale=False,
+                    orient=False
+                )
+                
+                self._feature_debug_sharp_edge_verts_actor = self.plotter.add_mesh(
+                    edge_glyphs,
+                    color='cyan',
+                    opacity=0.8,
+                )
+                logger.info(f"Added {len(edge_positions)} sharp edge vertex spheres (cyan)")
+        
+        # === 4. Draw membrane boundary vertices by projection type (using glyphs) ===
+        if debug_data.membrane_boundary_positions is not None and debug_data.membrane_boundary_projected_types is not None:
+            positions = debug_data.membrane_boundary_positions
+            types = debug_data.membrane_boundary_projected_types
+            
+            membrane_radius = sphere_radius * 1.2
+            
+            # Smooth (green) - normal projection
+            smooth_mask = types == 0
+            if np.sum(smooth_mask) > 0:
+                smooth_positions = positions[smooth_mask]
+                smooth_cloud = pv.PolyData(smooth_positions)
+                smooth_glyphs = smooth_cloud.glyph(
+                    geom=pv.Sphere(radius=membrane_radius),
+                    scale=False,
+                    orient=False
+                )
+                
+                self._feature_debug_membrane_smooth_actor = self.plotter.add_mesh(
+                    smooth_glyphs,
+                    color='lime',
+                    opacity=0.9,
+                )
+                logger.info(f"Added {np.sum(smooth_mask)} membrane smooth spheres (green)")
+            
+            # Sharp edge (blue) - edge projection
+            edge_mask = types == 1
+            if np.sum(edge_mask) > 0:
+                edge_positions = positions[edge_mask]
+                edge_cloud = pv.PolyData(edge_positions)
+                edge_glyphs = edge_cloud.glyph(
+                    geom=pv.Sphere(radius=membrane_radius),
+                    scale=False,
+                    orient=False
+                )
+                
+                self._feature_debug_membrane_edge_actor = self.plotter.add_mesh(
+                    edge_glyphs,
+                    color='blue',
+                    opacity=0.9,
+                )
+                logger.info(f"Added {np.sum(edge_mask)} membrane edge spheres (blue)")
+            
+            # Corner (magenta) - fixed (no projection)
+            corner_mask = types == 2
+            if np.sum(corner_mask) > 0:
+                corner_positions = positions[corner_mask]
+                corner_cloud = pv.PolyData(corner_positions)
+                corner_glyphs = corner_cloud.glyph(
+                    geom=pv.Sphere(radius=membrane_radius * 1.3),
+                    scale=False,
+                    orient=False
+                )
+                
+                self._feature_debug_membrane_corner_actor = self.plotter.add_mesh(
+                    corner_glyphs,
+                    color='magenta',
+                    opacity=0.9,
+                )
+                logger.info(f"Added {np.sum(corner_mask)} membrane corner spheres (magenta)")
+        
+        self._feature_debug_visible = True
+        self.plotter.update()
+    
+    def remove_feature_debug_visualization(self):
+        """Remove all feature debug visualization actors."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        actors = [
+            self._feature_debug_sharp_edges_actor,
+            self._feature_debug_corners_actor,
+            self._feature_debug_sharp_edge_verts_actor,
+            self._feature_debug_membrane_smooth_actor,
+            self._feature_debug_membrane_edge_actor,
+            self._feature_debug_membrane_corner_actor,
+        ]
+        
+        for actor in actors:
+            if actor is not None:
+                try:
+                    self.plotter.remove_actor(actor)
+                except Exception:
+                    pass
+        
+        self._feature_debug_sharp_edges_actor = None
+        self._feature_debug_corners_actor = None
+        self._feature_debug_sharp_edge_verts_actor = None
+        self._feature_debug_membrane_smooth_actor = None
+        self._feature_debug_membrane_edge_actor = None
+        self._feature_debug_membrane_corner_actor = None
+        
+        self.plotter.update()
+    
+    def set_feature_debug_visible(self, visible: bool):
+        """Toggle visibility of feature debug visualization."""
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        self._feature_debug_visible = visible
+        
+        actors = [
+            self._feature_debug_sharp_edges_actor,
+            self._feature_debug_corners_actor,
+            self._feature_debug_sharp_edge_verts_actor,
+            self._feature_debug_membrane_smooth_actor,
+            self._feature_debug_membrane_edge_actor,
+            self._feature_debug_membrane_corner_actor,
+        ]
+        
+        for actor in actors:
+            if actor is not None:
+                try:
+                    actor.SetVisibility(visible)
+                except Exception:
+                    pass
         
         self.plotter.update()
 
