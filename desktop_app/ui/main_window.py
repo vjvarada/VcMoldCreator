@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QFileDialog, QScrollArea, QCheckBox,
     QPlainTextEdit, QSplitter, QDialog, QSlider, QSpinBox,
     QRadioButton, QButtonGroup, QGroupBox, QSizePolicy,
-    QDoubleSpinBox
+    QDoubleSpinBox, QApplication
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
@@ -1937,11 +1937,17 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                              f"{repaired_result.num_faces:,} faces")
             
             # Log boundary type info for debugging
+            # Type -2 = inner-inner midpoints (on part M but not reprojected)
+            # Type -1 = inner boundary (on part M, reprojected)
+            # Type 0 = interior
+            # Type 1,2 = outer boundary (on hull ∂H)
             if current_boundary_type is not None:
                 n_part = np.sum(current_boundary_type == -1)
+                n_part_midpoint = np.sum(current_boundary_type == -2)
                 n_hull = np.sum(current_boundary_type == 1) + np.sum(current_boundary_type == 2)
                 n_interior = np.sum(current_boundary_type == 0)
-                self.progress.emit(f"Boundary classification: {n_part} inner (M), "
+                self.progress.emit(f"Boundary classification: {n_part} inner (M reproject), "
+                                 f"{n_part_midpoint} inner midpoint (M no-reproject), "
                                  f"{n_hull} outer (∂H), {n_interior} interior")
             
             # =====================================================================
@@ -2451,6 +2457,7 @@ class PartingSurfaceWorker(QThread):
             from core.parting_surface import (
                 extract_parting_surface_from_tet_result,
                 smooth_parting_surface,
+                smooth_parting_surface_two_phase,
                 repair_parting_surface,
                 repair_parting_surface_with_part
             )
@@ -2488,10 +2495,22 @@ class PartingSurfaceWorker(QThread):
                 else:
                     result = repair_parting_surface(result, merge_vertices=True)
             
-            # Step 4: Optional smoothing
+            # Step 4: Optional smoothing (use two-phase for boundary-aware smoothing)
+            # The two-phase smoother properly handles:
+            # - Type -1 vertices: reproject to part mesh M
+            # - Type -2 vertices: NO reprojection (inner-inner midpoints must stay on edge line)
+            # - Type 1,2 vertices: reproject to hull mesh ∂H
             if self.smooth_iterations > 0 and result.mesh is not None:
                 self.progress.emit(f"Smoothing surface ({self.smooth_iterations} iterations)...")
-                result = smooth_parting_surface(result, iterations=self.smooth_iterations)
+                result = smooth_parting_surface_two_phase(
+                    result,
+                    part_mesh=self.part_mesh,
+                    hull_mesh=None,  # TODO: Pass hull mesh when available
+                    boundary_iterations=min(2, self.smooth_iterations),
+                    interior_iterations=self.smooth_iterations,
+                    lambda_factor=0.5,
+                    boundary_lambda=0.3
+                )
             
             elapsed = (time.time() - start_time) * 1000
             
@@ -5151,7 +5170,17 @@ class MainWindow(QMainWindow):
         self._mold_halves_result = None
         
         # Clear tetrahedral mesh results
-        self._tet_mesh_result = None
+        self._tet_result = None
+        
+        # Clear parting surface results
+        self._parting_surface_result = None
+        self._primary_smoothing_result = None
+        
+        # Clear secondary surface results
+        self._secondary_parting_surface_result = None
+        self._propagation_result = None
+        self._secondary_smoothing_result = None
+        self._secondary_surface_result = None
         
         # Reset current mesh
         self._current_mesh = None
@@ -5312,6 +5341,9 @@ class MainWindow(QMainWindow):
                     data[key] = mesh_to_dict(value)
                 elif isinstance(value, np.ndarray):
                     data[key] = value.copy()
+                elif isinstance(value, set):
+                    # Convert sets to lists with a marker for deserialization
+                    data[key] = {'__set__': True, 'values': list(value)}
                 elif isinstance(value, (int, float, str, bool, type(None), list, tuple)):
                     data[key] = value
                 elif isinstance(value, dict):
@@ -5391,25 +5423,54 @@ class MainWindow(QMainWindow):
             if data is None:
                 return None
             
-            # Process data - convert mesh dicts back to trimesh objects
+            # Process data - convert mesh dicts back to trimesh objects, sets back from lists
             processed_data = {}
             for key, value in data.items():
                 if isinstance(value, dict) and 'vertices' in value and 'faces' in value:
                     # This is a mesh
                     processed_data[key] = dict_to_mesh(value)
+                elif isinstance(value, dict) and value.get('__set__'):
+                    # This is a set that was serialized as a list
+                    processed_data[key] = set(value['values'])
                 else:
                     processed_data[key] = value
             
             # Try to create instance using **kwargs if it's a dataclass
             if is_dataclass(result_class):
-                # Get the field names for this dataclass
-                field_names = {f.name for f in fields(result_class)}
+                # Get the field info for this dataclass
+                field_info = {f.name: f for f in fields(result_class)}
+                field_names = set(field_info.keys())
+                
                 # Filter to only include valid fields
                 valid_data = {k: v for k, v in processed_data.items() if k in field_names}
+                
+                # Add default values for missing required fields based on type hints
+                for fname, finfo in field_info.items():
+                    if fname not in valid_data:
+                        # Provide sensible defaults for missing fields
+                        ftype = finfo.type
+                        ftype_str = str(ftype)
+                        if 'Set' in ftype_str or ftype_str == "<class 'set'>":
+                            valid_data[fname] = set()
+                        elif 'Dict' in ftype_str or ftype_str == "<class 'dict'>":
+                            valid_data[fname] = {}
+                        elif 'List' in ftype_str or ftype_str == "<class 'list'>":
+                            valid_data[fname] = []
+                        elif ftype == int:
+                            valid_data[fname] = 0
+                        elif ftype == float:
+                            valid_data[fname] = 0.0
+                        elif ftype == bool:
+                            valid_data[fname] = False
+                        elif ftype == str:
+                            valid_data[fname] = ''
+                        # For Optional types or others, leave them out and let defaults handle it
+                
                 try:
                     return result_class(**valid_data)
-                except TypeError:
-                    # If that fails, try creating with defaults and setting attrs
+                except TypeError as e:
+                    # If that fails, log and try fallback
+                    logger.warning(f"Failed to create {result_class.__name__}: {e}")
                     pass
             
             # Fallback: create empty instance and set attributes
@@ -5443,6 +5504,13 @@ class MainWindow(QMainWindow):
                         len(self._current_mesh.faces),
                         0  # Size not stored
                     )
+                # Re-analyze mesh to restore diagnostics
+                try:
+                    from core.mesh_analysis import MeshAnalyzer
+                    analyzer = MeshAnalyzer(self._current_mesh)
+                    self._current_diagnostics = analyzer.analyze()
+                except Exception as e:
+                    logger.warning(f"Failed to re-analyze mesh on load: {e}")
         
         # Restore parting result
         if session.get('parting_result'):
@@ -5471,9 +5539,10 @@ class MainWindow(QMainWindow):
             from core.mold_half_classification import MoldHalfClassificationResult
             self._mold_halves_result = dict_to_result(session['mold_halves_result'], MoldHalfClassificationResult)
             self._boundary_zone_threshold = session.get('boundary_zone_threshold', 0.15)
-            if self._mold_halves_result and hasattr(self._mold_halves_result, 'classification') and self._mold_halves_result.classification is not None:
+            if self._mold_halves_result and hasattr(self._mold_halves_result, 'h1_triangles'):
                 # Update viewer with mold halves colors
                 self.display_options.show_mold_halves_option(True)
+                # Note: Actual visualization will be applied after tet_result is restored
         
         # Restore tet result
         if session.get('tet_result'):
@@ -5512,7 +5581,26 @@ class MainWindow(QMainWindow):
                     
                     # Show secondary cuts if they exist
                     if hasattr(self._tet_result, 'secondary_cut_edges') and self._tet_result.secondary_cut_edges is not None:
+                        # Restore secondary cuts visualization
+                        vertices_for_viz = self._tet_result.vertices_original if self._tet_result.vertices_original is not None else self._tet_result.vertices
+                        self.mesh_viewer.set_secondary_cuts(
+                            vertices_for_viz,
+                            self._tet_result.secondary_cut_edges
+                        )
                         self.display_options.show_secondary_cuts_option(True)
+                
+                # Restore mold halves visualization if both tet_result and mold_halves_result exist
+                if self._mold_halves_result is not None and hasattr(self._mold_halves_result, 'h1_triangles'):
+                    boundary_mesh = self._tet_result.boundary_mesh
+                    if boundary_mesh is not None:
+                        self.mesh_viewer.apply_tet_mesh_classification(
+                            tet_vertices=self._tet_result.vertices,
+                            tet_edges=self._tet_result.edges,
+                            boundary_mesh=boundary_mesh,
+                            classification_result=self._mold_halves_result,
+                            part_mesh=self._current_mesh,
+                            seed_distance_threshold=None
+                        )
         
         # Restore parting surface results
         if session.get('parting_surface_result'):
@@ -5536,7 +5624,32 @@ class MainWindow(QMainWindow):
             self.mesh_viewer.set_parting_surface(self._parting_surface_result.mesh)
             self.display_options.show_parting_surface_options(show_primary=True)
         
-        # Restore secondary surface results
+        # Restore secondary surface intermediate results (needed for re-running pipeline steps)
+        if session.get('secondary_parting_surface_result'):
+            self._secondary_parting_surface_result = type('Result', (), session['secondary_parting_surface_result'])()
+            for k, v in session['secondary_parting_surface_result'].items():
+                if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
+                    setattr(self._secondary_parting_surface_result, k, dict_to_mesh(v))
+                else:
+                    setattr(self._secondary_parting_surface_result, k, v)
+        
+        if session.get('propagation_result'):
+            self._propagation_result = type('Result', (), session['propagation_result'])()
+            for k, v in session['propagation_result'].items():
+                if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
+                    setattr(self._propagation_result, k, dict_to_mesh(v))
+                else:
+                    setattr(self._propagation_result, k, v)
+        
+        if session.get('secondary_smoothing_result'):
+            self._secondary_smoothing_result = type('Result', (), session['secondary_smoothing_result'])()
+            for k, v in session['secondary_smoothing_result'].items():
+                if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
+                    setattr(self._secondary_smoothing_result, k, dict_to_mesh(v))
+                else:
+                    setattr(self._secondary_smoothing_result, k, v)
+        
+        # Restore secondary surface final result
         if session.get('secondary_surface_result'):
             self._secondary_surface_result = type('Result', (), session['secondary_surface_result'])()
             for k, v in session['secondary_surface_result'].items():
@@ -7832,6 +7945,125 @@ class MainWindow(QMainWindow):
         
         self.context_layout.addWidget(smooth_group)
         
+        # Debug mode group - step-by-step smoothing per paper Section 4.4
+        debug_group = QGroupBox("Debug: Step-by-Step Smoothing")
+        debug_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.WARNING};
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+                background-color: rgba(255, 180, 0, 0.05);
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+                color: {Colors.WARNING};
+            }}
+            QGroupBox QLabel {{
+                color: {Colors.DARK};
+                font-size: 11px;
+            }}
+            QGroupBox QPushButton {{
+                background-color: {Colors.LIGHT};
+                color: {Colors.DARK};
+                border: 1px solid {Colors.WARNING};
+                border-radius: 4px;
+                padding: 8px 12px;
+                font-size: 12px;
+                text-align: left;
+            }}
+            QGroupBox QPushButton:hover {{
+                background-color: {Colors.WARNING};
+                color: {Colors.DARK};
+            }}
+            QGroupBox QPushButton:disabled {{
+                background-color: {Colors.GRAY_LIGHT};
+                color: {Colors.GRAY};
+                border-color: {Colors.GRAY_LIGHT};
+            }}
+        """)
+        debug_layout = QVBoxLayout(debug_group)
+        debug_layout.setContentsMargins(12, 12, 12, 12)
+        debug_layout.setSpacing(8)
+        
+        debug_info = QLabel(
+            "Per paper Section 4.4, ONE iteration =\n"
+            "1. Smooth boundary polyline\n"
+            "2. Reproject boundary to M or ∂H\n"
+            "3. Smooth interior (boundary fixed)"
+        )
+        debug_info.setWordWrap(True)
+        debug_layout.addWidget(debug_info)
+        
+        # Option: Use tangent-constrained smoothing for part boundary vertices
+        self.debug_tangent_smooth_checkbox = QCheckBox("Tangent-constrained smoothing (anti-peel fix)")
+        self.debug_tangent_smooth_checkbox.setToolTip(
+            "If checked, part-boundary vertices are smoothed along the tangent plane of M\n"
+            "to prevent them from peeling away. This is NOT in the paper but may help."
+        )
+        self.debug_tangent_smooth_checkbox.setChecked(False)
+        debug_layout.addWidget(self.debug_tangent_smooth_checkbox)
+        
+        # Extract only button (no smoothing)
+        self.debug_extract_btn = QPushButton("1️⃣ Extract Only (No Smooth)")
+        self.debug_extract_btn.setToolTip("Extract parting surface without any smoothing")
+        self.debug_extract_btn.clicked.connect(lambda: self._on_run_parting_surface_debug(step='extract'))
+        debug_layout.addWidget(self.debug_extract_btn)
+        
+        # Boundary smooth only (no reproject)
+        self.debug_boundary_smooth_btn = QPushButton("2️⃣ Boundary Smooth ONLY")
+        self.debug_boundary_smooth_btn.setToolTip("Apply Laplacian smoothing to boundary polyline (no reprojection)")
+        self.debug_boundary_smooth_btn.clicked.connect(lambda: self._on_run_parting_surface_debug(step='boundary_smooth'))
+        self.debug_boundary_smooth_btn.setEnabled(False)
+        debug_layout.addWidget(self.debug_boundary_smooth_btn)
+        
+        # Boundary reproject (separate step)
+        self.debug_boundary_reproject_btn = QPushButton("3️⃣ Reproject Boundary to M/∂H")
+        self.debug_boundary_reproject_btn.setToolTip("Reproject boundary vertices to part mesh M or hull ∂H")
+        self.debug_boundary_reproject_btn.clicked.connect(lambda: self._on_run_parting_surface_debug(step='boundary_reproject'))
+        self.debug_boundary_reproject_btn.setEnabled(False)
+        debug_layout.addWidget(self.debug_boundary_reproject_btn)
+        
+        # Single interior smooth iteration
+        self.debug_interior_smooth_btn = QPushButton("4️⃣ Interior Smooth (Boundary Fixed)")
+        self.debug_interior_smooth_btn.setToolTip("Apply Laplacian smoothing to interior vertices")
+        self.debug_interior_smooth_btn.clicked.connect(lambda: self._on_run_parting_surface_debug(step='interior_smooth'))
+        self.debug_interior_smooth_btn.setEnabled(False)
+        debug_layout.addWidget(self.debug_interior_smooth_btn)
+        
+        # Full iteration button - PAPER ALGORITHM (2→3→4)
+        self.debug_full_iteration_btn = QPushButton("🔄 Run 1 Paper Iteration (2→3→4)")
+        self.debug_full_iteration_btn.setToolTip("Run one iteration per paper: boundary smooth → boundary reproject → interior smooth")
+        self.debug_full_iteration_btn.clicked.connect(lambda: self._on_run_parting_surface_debug(step='full_iteration'))
+        self.debug_full_iteration_btn.setEnabled(False)
+        debug_layout.addWidget(self.debug_full_iteration_btn)
+        
+        # Run ALL iterations from spinbox
+        self.debug_run_all_btn = QPushButton("▶️ Run ALL Iterations (from spinbox)")
+        self.debug_run_all_btn.setToolTip("Run all N iterations as specified in 'Smooth iterations' spinbox above")
+        self.debug_run_all_btn.clicked.connect(lambda: self._on_run_parting_surface_debug(step='run_all'))
+        self.debug_run_all_btn.setEnabled(False)
+        debug_layout.addWidget(self.debug_run_all_btn)
+        
+        # Detect peeling triangles button
+        self.debug_detect_peeling_btn = QPushButton("🔍 Detect Peeling Triangles")
+        self.debug_detect_peeling_btn.setToolTip("Find triangles where all 3 vertices are on part boundary but centroid is far from part mesh")
+        self.debug_detect_peeling_btn.clicked.connect(lambda: self._on_run_parting_surface_debug(step='detect_peeling'))
+        self.debug_detect_peeling_btn.setEnabled(False)
+        debug_layout.addWidget(self.debug_detect_peeling_btn)
+        
+        # Debug status label
+        self.debug_status_label = QLabel("")
+        self.debug_status_label.setStyleSheet(f'color: {Colors.INFO}; font-size: 11px; font-weight: bold;')
+        debug_layout.addWidget(self.debug_status_label)
+        
+        self.context_layout.addWidget(debug_group)
+        
         # Compute button
         self.parting_surface_btn = QPushButton("🔲 Generate Parting Surface")
         self.parting_surface_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -8007,6 +8239,472 @@ class MainWindow(QMainWindow):
         self.parting_surface_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
         QMessageBox.critical(self, "Error", f"Parting surface generation failed:\n{error_msg}")
     
+    def _on_run_parting_surface_debug(self, step: str):
+        """
+        Run parting surface generation in debug/step-by-step mode.
+        
+        Per paper Section 4.4, smoothing alternates:
+        1. Smooth boundary polyline only (standard Laplacian)
+        2. Reproject boundary vertices to M or ∂H
+        3. Smooth interior vertices (boundary fixed)
+        4. Reproject interior-part vertices to M
+        
+        Args:
+            step: One of 'extract', 'boundary_smooth', 'boundary_reproject', 
+                  'interior_smooth', 'interior_reproject', 'full_iteration'
+        """
+        import time
+        import numpy as np
+        import trimesh
+        from core.parting_surface import extract_parting_surface_from_tet_result, repair_parting_surface
+        from core.tetrahedral_mesh import prepare_parting_surface_data, extract_labeled_boundary_meshes
+        from trimesh.proximity import ProximityQuery
+        from core.surface_propagation import find_boundary_edges
+        
+        if self._tet_result is None:
+            QMessageBox.warning(self, "Warning", "No tetrahedral mesh data available")
+            return
+        
+        hull_mesh = self._hull_result.mesh if self._hull_result is not None else None
+        part_mesh = self._current_mesh
+        damping_factor = getattr(self, 'primary_smooth_damping_spin', None)
+        damping_factor = damping_factor.value() if damping_factor else 0.5
+        
+        try:
+            if step == 'extract':
+                # Step 1: Extract only (no smoothing)
+                self.debug_status_label.setText("Extracting parting surface...")
+                QApplication.processEvents()
+                
+                # Prepare data if needed
+                if self._tet_result.tet_edge_indices is None:
+                    self._tet_result = prepare_parting_surface_data(self._tet_result)
+                
+                # Extract tet boundaries for reprojection
+                inner_tet_boundary, outer_tet_boundary = extract_labeled_boundary_meshes(
+                    self._tet_result, use_original=True
+                )
+                
+                # Extract the surface
+                start_time = time.time()
+                extraction_result = extract_parting_surface_from_tet_result(
+                    self._tet_result,
+                    use_original_vertices=True,
+                    prepare_data=False,
+                    cut_type='primary',
+                    extend_to_primary=False,
+                    part_mesh=part_mesh
+                )
+                extraction_time = (time.time() - start_time) * 1000
+                
+                if extraction_result.mesh is None:
+                    self.debug_status_label.setText("❌ No surface extracted")
+                    return
+                
+                # Repair (this preserves vertex_boundary_type through the repair)
+                repaired_result = repair_parting_surface(extraction_result)
+                
+                # Store for subsequent debug steps
+                # IMPORTANT: Use repaired_result.vertex_boundary_type because repair may
+                # change vertex indices (merge close vertices, remove unreferenced)
+                self._debug_parting_mesh = repaired_result.mesh.copy()
+                self._debug_vertex_boundary_type = repaired_result.vertex_boundary_type.copy() if repaired_result.vertex_boundary_type is not None else None
+                self._debug_part_mesh = inner_tet_boundary if inner_tet_boundary is not None else part_mesh
+                self._debug_hull_mesh = outer_tet_boundary if outer_tet_boundary is not None else hull_mesh
+                self._debug_smoothing_iteration = 0
+                
+                # Log boundary type distribution for debugging
+                if self._debug_vertex_boundary_type is not None:
+                    bt = self._debug_vertex_boundary_type
+                    part_count = np.sum(bt == -1)
+                    hull_count = np.sum(bt == 1) + np.sum(bt == 2)
+                    interior_count = np.sum(bt == 0)
+                    logger.info(f"Debug extract: vertex_boundary_type - {part_count} part (bt=-1), "
+                               f"{hull_count} hull (bt=1,2), {interior_count} interior (bt=0)")
+                
+                # Visualize
+                self.mesh_viewer.set_parting_surface(self._debug_parting_mesh)
+                self.display_options.show_parting_surface_options(show_primary=True)
+                
+                # Enable next debug buttons
+                self.debug_extract_btn.setEnabled(True)
+                self.debug_boundary_smooth_btn.setEnabled(True)
+                self.debug_boundary_reproject_btn.setEnabled(True)
+                self.debug_interior_smooth_btn.setEnabled(True)
+                self.debug_full_iteration_btn.setEnabled(True)
+                self.debug_run_all_btn.setEnabled(True)
+                self.debug_detect_peeling_btn.setEnabled(True)
+                
+                total_iters = self.primary_smooth_iterations_spin.value()
+                n_verts = len(self._debug_parting_mesh.vertices)
+                n_faces = len(self._debug_parting_mesh.faces)
+                self.debug_status_label.setText(f"✅ Extracted: {n_verts} verts, {n_faces} faces. Iteration 0/{total_iters}")
+                
+            elif step == 'boundary_smooth':
+                # Step 2: Boundary polyline smoothing ONLY (no reprojection)
+                # Per paper: "First we smooth the polyline that includes the boundary vertices only"
+                if not hasattr(self, '_debug_parting_mesh') or self._debug_parting_mesh is None:
+                    self.debug_status_label.setText("❌ Run 'Extract Only' first")
+                    return
+                
+                self.debug_status_label.setText("Smoothing boundary polyline...")
+                QApplication.processEvents()
+                
+                mesh = self._debug_parting_mesh
+                vertices = mesh.vertices.copy()
+                faces = mesh.faces
+                n_verts = len(vertices)
+                vertex_boundary_type = self._debug_vertex_boundary_type
+                
+                # Find boundary vertices
+                boundary_edges = find_boundary_edges(mesh)
+                boundary_verts = sorted(set(v for edge in boundary_edges for v in edge))
+                
+                # Build boundary adjacency (neighbors along boundary edges only)
+                boundary_neighbors = {v: set() for v in boundary_verts}
+                for v0, v1 in boundary_edges:
+                    boundary_neighbors[v0].add(v1)
+                    boundary_neighbors[v1].add(v0)
+                
+                # Separate part-boundary (bt=-1 or bt=-2) and hull-boundary vertices
+                # Type -1: placed AT a tet vertex on part M (should be reprojected)
+                # Type -2: midpoint of edge with both endpoints on part M (should NOT be reprojected)
+                part_boundary_set = set()
+                if vertex_boundary_type is not None:
+                    for vi in boundary_verts:
+                        if vi < len(vertex_boundary_type) and vertex_boundary_type[vi] in (-1, -2):
+                            part_boundary_set.add(vi)
+                
+                # Check if tangent-constrained smoothing is enabled
+                use_tangent_smooth = self.debug_tangent_smooth_checkbox.isChecked()
+                
+                # Build proximity query for tangent-constrained smoothing
+                part_proximity = None
+                if use_tangent_smooth and self._debug_part_mesh is not None:
+                    part_proximity = ProximityQuery(self._debug_part_mesh)
+                
+                logger.info(f"Debug boundary smooth: {len(boundary_verts)} boundary vertices, "
+                           f"{len(part_boundary_set)} on part, damping={damping_factor}, "
+                           f"tangent_smooth={use_tangent_smooth}")
+                
+                # Smoothing of boundary polyline
+                new_vertices = vertices.copy()
+                moved_count = 0
+                tangent_count = 0
+                
+                for vi in boundary_verts:
+                    neighbors = list(boundary_neighbors[vi])
+                    if len(neighbors) >= 2:
+                        # Standard Laplacian: average neighbor positions
+                        neighbor_positions = vertices[neighbors]
+                        avg_pos = neighbor_positions.mean(axis=0)
+                        smoothed_pos = vertices[vi] + damping_factor * (avg_pos - vertices[vi])
+                        
+                        # If tangent-constrained and vertex is on part boundary, project to tangent plane
+                        if use_tangent_smooth and vi in part_boundary_set and part_proximity is not None:
+                            # Get the closest point and face on part mesh for ORIGINAL position
+                            closest_pt, _, face_idx = part_proximity.on_surface([vertices[vi]])
+                            closest_pt = closest_pt[0]
+                            face_idx = face_idx[0]
+                            
+                            # Get face normal at the closest point
+                            face_normal = self._debug_part_mesh.face_normals[face_idx]
+                            
+                            # Project the smoothed displacement onto tangent plane
+                            displacement = smoothed_pos - vertices[vi]
+                            # Remove component along normal
+                            normal_component = np.dot(displacement, face_normal) * face_normal
+                            tangent_displacement = displacement - normal_component
+                            
+                            # Apply tangent-only displacement
+                            new_vertices[vi] = vertices[vi] + tangent_displacement
+                            tangent_count += 1
+                        else:
+                            new_vertices[vi] = smoothed_pos
+                        
+                        moved_count += 1
+                
+                vertices = new_vertices
+                
+                # Update mesh
+                self._debug_parting_mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+                
+                # Visualize
+                self.mesh_viewer.set_parting_surface(self._debug_parting_mesh)
+                
+                status_msg = f"✅ Boundary smooth: {moved_count}/{len(boundary_verts)} moved"
+                if use_tangent_smooth:
+                    status_msg += f" ({tangent_count} tangent-constrained)"
+                self.debug_status_label.setText(status_msg)
+                
+            elif step == 'boundary_reproject':
+                # Step 3: Reproject boundary vertices to M or ∂H
+                # Per paper: "After this smooth step, we re-project those vertices onto the 
+                # original surface of M or the external boundary ∂H"
+                if not hasattr(self, '_debug_parting_mesh') or self._debug_parting_mesh is None:
+                    self.debug_status_label.setText("❌ Run 'Extract Only' first")
+                    return
+                
+                self.debug_status_label.setText("Reprojecting boundary to M/∂H...")
+                QApplication.processEvents()
+                
+                mesh = self._debug_parting_mesh
+                vertices = mesh.vertices.copy()
+                faces = mesh.faces
+                n_verts = len(vertices)
+                vertex_boundary_type = self._debug_vertex_boundary_type
+                
+                # Find boundary vertices
+                boundary_edges = find_boundary_edges(mesh)
+                boundary_verts = sorted(set(v for edge in boundary_edges for v in edge))
+                
+                # Classify boundary vertices by their ORIGINAL surface (from extraction)
+                part_boundary_indices = []
+                hull_boundary_indices = []
+                if vertex_boundary_type is not None:
+                    for vi in boundary_verts:
+                        if vi < len(vertex_boundary_type):
+                            bt = vertex_boundary_type[vi]
+                            if bt == -1:
+                                # INNER boundary - originally on part surface M
+                                part_boundary_indices.append(vi)
+                            else:
+                                # bt == 0, 1, 2: OUTER boundary - on hull ∂H
+                                # (boundary zone bt=0 is ON the hull surface)
+                                hull_boundary_indices.append(vi)
+                else:
+                    logger.warning("No vertex_boundary_type - cannot classify boundary vertices")
+                
+                logger.info(f"Debug boundary reproject: {len(part_boundary_indices)} to part (bt=-1), "
+                           f"{len(hull_boundary_indices)} to hull (bt=0,1,2)")
+                
+                # Build proximity queries
+                part_proximity = ProximityQuery(self._debug_part_mesh) if self._debug_part_mesh is not None else None
+                hull_proximity = ProximityQuery(self._debug_hull_mesh) if self._debug_hull_mesh is not None else None
+                
+                # Reproject to part mesh M
+                part_max_dist = 0.0
+                if len(part_boundary_indices) > 0 and part_proximity is not None:
+                    part_positions = vertices[part_boundary_indices]
+                    closest_pts, dists, _ = part_proximity.on_surface(part_positions)
+                    vertices[part_boundary_indices] = closest_pts
+                    part_max_dist = dists.max()
+                    logger.info(f"Part reprojection: {len(part_boundary_indices)} verts, max dist = {dists.max():.6f}, mean = {dists.mean():.6f}")
+                
+                # Reproject to hull mesh ∂H
+                hull_max_dist = 0.0
+                if len(hull_boundary_indices) > 0 and hull_proximity is not None:
+                    hull_positions = vertices[hull_boundary_indices]
+                    closest_pts, dists, _ = hull_proximity.on_surface(hull_positions)
+                    vertices[hull_boundary_indices] = closest_pts
+                    hull_max_dist = dists.max()
+                    logger.info(f"Hull reprojection: {len(hull_boundary_indices)} verts, max dist = {dists.max():.6f}")
+                
+                # Update mesh
+                self._debug_parting_mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+                
+                # Visualize
+                self.mesh_viewer.set_parting_surface(self._debug_parting_mesh)
+                
+                self.debug_status_label.setText(
+                    f"✅ Reprojected: {len(part_boundary_indices)} to part (max {part_max_dist:.4f}), "
+                    f"{len(hull_boundary_indices)} to hull (max {hull_max_dist:.4f})"
+                )
+                
+            elif step == 'interior_smooth':
+                # Step 4: Interior smoothing with boundary fixed
+                # Per paper: "Then, we smooth all the interior vertices, keeping the ones 
+                # on the boundary fixed"
+                if not hasattr(self, '_debug_parting_mesh') or self._debug_parting_mesh is None:
+                    self.debug_status_label.setText("❌ Run 'Extract Only' first")
+                    return
+                
+                self.debug_status_label.setText("Smoothing interior vertices...")
+                QApplication.processEvents()
+                
+                mesh = self._debug_parting_mesh
+                vertices = mesh.vertices.copy()
+                faces = mesh.faces
+                n_verts = len(vertices)
+                
+                # Find boundary and interior vertices
+                boundary_edges = find_boundary_edges(mesh)
+                boundary_verts = set(v for edge in boundary_edges for v in edge)
+                interior_verts = [v for v in range(n_verts) if v not in boundary_verts]
+                
+                logger.info(f"Debug interior smooth: {len(interior_verts)} interior verts (boundary fixed: {len(boundary_verts)})")
+                
+                # Build vertex adjacency (all neighbors, not just boundary neighbors)
+                vertex_neighbors = [set() for _ in range(n_verts)]
+                for f in faces:
+                    for i in range(3):
+                        v = f[i]
+                        vertex_neighbors[v].add(f[(i+1) % 3])
+                        vertex_neighbors[v].add(f[(i+2) % 3])
+                
+                # Smooth interior vertices with standard Laplacian
+                new_vertices = vertices.copy()
+                moved_count = 0
+                for vi in interior_verts:
+                    neighbors = list(vertex_neighbors[vi])
+                    if neighbors:
+                        neighbor_positions = vertices[neighbors]
+                        avg_pos = neighbor_positions.mean(axis=0)
+                        new_vertices[vi] = vertices[vi] + damping_factor * (avg_pos - vertices[vi])
+                        moved_count += 1
+                
+                # Update mesh
+                self._debug_parting_mesh = trimesh.Trimesh(vertices=new_vertices, faces=faces)
+                
+                # Visualize
+                self.mesh_viewer.set_parting_surface(self._debug_parting_mesh)
+                
+                self.debug_status_label.setText(f"✅ Interior smooth: {moved_count}/{len(interior_verts)} vertices moved")
+                
+            elif step == 'full_iteration':
+                # Run ONE iteration per paper Section 4.4: boundary_smooth → boundary_reproject → interior_smooth
+                if not hasattr(self, '_debug_parting_mesh') or self._debug_parting_mesh is None:
+                    self.debug_status_label.setText("❌ Run 'Extract Only' first")
+                    return
+                
+                total_iters = self.primary_smooth_iterations_spin.value()
+                self._debug_smoothing_iteration += 1
+                self.debug_status_label.setText(f"Running iteration {self._debug_smoothing_iteration}/{total_iters}...")
+                QApplication.processEvents()
+                
+                # Run 3 sub-steps per paper
+                self._on_run_parting_surface_debug('boundary_smooth')
+                QApplication.processEvents()
+                self._on_run_parting_surface_debug('boundary_reproject')
+                QApplication.processEvents()
+                self._on_run_parting_surface_debug('interior_smooth')
+                QApplication.processEvents()
+                
+                self.debug_status_label.setText(f"✅ Iteration {self._debug_smoothing_iteration}/{total_iters} complete (2→3→4)")
+                
+            elif step == 'run_all':
+                # Run ALL iterations from spinbox
+                if not hasattr(self, '_debug_parting_mesh') or self._debug_parting_mesh is None:
+                    self.debug_status_label.setText("❌ Run 'Extract Only' first")
+                    return
+                
+                total_iters = self.primary_smooth_iterations_spin.value()
+                if total_iters == 0:
+                    self.debug_status_label.setText("ℹ️ Iterations set to 0, nothing to do")
+                    return
+                
+                # Reset iteration counter
+                self._debug_smoothing_iteration = 0
+                
+                for i in range(total_iters):
+                    self._debug_smoothing_iteration += 1
+                    self.debug_status_label.setText(f"Running iteration {self._debug_smoothing_iteration}/{total_iters}...")
+                    QApplication.processEvents()
+                    
+                    # Run 3 sub-steps per paper
+                    self._on_run_parting_surface_debug('boundary_smooth')
+                    QApplication.processEvents()
+                    self._on_run_parting_surface_debug('boundary_reproject')
+                    QApplication.processEvents()
+                    self._on_run_parting_surface_debug('interior_smooth')
+                    QApplication.processEvents()
+                
+                self.debug_status_label.setText(f"✅ All {total_iters} iterations complete!")
+                
+            elif step == 'detect_peeling':
+                # Detect triangles that are "peeling" off the part surface
+                # These are triangles where ALL 3 vertices are on part boundary (bt=-1)
+                # but the triangle centroid is far from the part mesh
+                if not hasattr(self, '_debug_parting_mesh') or self._debug_parting_mesh is None:
+                    self.debug_status_label.setText("❌ Run 'Extract Only' first")
+                    return
+                
+                self.debug_status_label.setText("Detecting peeling triangles...")
+                QApplication.processEvents()
+                
+                mesh = self._debug_parting_mesh
+                vertices = mesh.vertices
+                faces = mesh.faces
+                vertex_boundary_type = self._debug_vertex_boundary_type
+                
+                # Find boundary vertices
+                boundary_edges = find_boundary_edges(mesh)
+                boundary_verts = set(v for edge in boundary_edges for v in edge)
+                
+                # Find triangles where ALL 3 vertices are on part boundary (bt=-1 or bt=-2) AND on mesh boundary
+                # Type -1: placed AT a tet vertex on part M
+                # Type -2: midpoint of edge with both endpoints on part M
+                part_boundary_set = set()
+                if vertex_boundary_type is not None:
+                    for vi in boundary_verts:
+                        if vi < len(vertex_boundary_type) and vertex_boundary_type[vi] in (-1, -2):
+                            part_boundary_set.add(vi)
+                
+                # Build proximity query for part mesh
+                part_proximity = ProximityQuery(self._debug_part_mesh) if self._debug_part_mesh is not None else None
+                
+                if part_proximity is None:
+                    self.debug_status_label.setText("❌ No part mesh available")
+                    return
+                
+                # Find peeling triangles
+                peeling_faces = []
+                peeling_data = []
+                distance_threshold = 0.01  # Consider "peeling" if centroid > 1% of bbox diagonal from part
+                bbox_diag = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
+                abs_threshold = distance_threshold * bbox_diag
+                
+                for fi, face in enumerate(faces):
+                    v0, v1, v2 = face
+                    # Check if ALL 3 vertices are part-boundary vertices
+                    if v0 in part_boundary_set and v1 in part_boundary_set and v2 in part_boundary_set:
+                        # Compute triangle centroid
+                        centroid = vertices[face].mean(axis=0)
+                        
+                        # Measure distance from centroid to part mesh
+                        closest_pt, dist, _ = part_proximity.on_surface([centroid])
+                        dist = dist[0]
+                        
+                        if dist > abs_threshold:
+                            peeling_faces.append(fi)
+                            peeling_data.append({
+                                'face_idx': fi,
+                                'vertices': face.tolist(),
+                                'centroid': centroid,
+                                'centroid_dist': dist,
+                                'vertex_positions': vertices[face].tolist()
+                            })
+                
+                logger.info(f"Detect peeling: found {len(peeling_faces)} peeling triangles "
+                           f"(all 3 verts bt=-1, centroid dist > {abs_threshold:.4f})")
+                
+                # Store for debugging
+                self._debug_peeling_faces = peeling_faces
+                self._debug_peeling_data = peeling_data
+                
+                if len(peeling_faces) > 0:
+                    # Log details of worst offenders
+                    sorted_data = sorted(peeling_data, key=lambda x: x['centroid_dist'], reverse=True)
+                    logger.info("Top 5 worst peeling triangles:")
+                    for i, d in enumerate(sorted_data[:5]):
+                        logger.info(f"  #{i+1}: face {d['face_idx']}, centroid dist = {d['centroid_dist']:.6f}")
+                    
+                    # Visualize with peeling faces highlighted in red
+                    self.mesh_viewer.set_parting_surface(mesh, fill_face_indices=peeling_faces)
+                    
+                    max_dist = max(d['centroid_dist'] for d in peeling_data)
+                    self.debug_status_label.setText(
+                        f"⚠️ Found {len(peeling_faces)} peeling triangles! "
+                        f"Max centroid dist: {max_dist:.4f} (threshold: {abs_threshold:.4f})"
+                    )
+                else:
+                    self.debug_status_label.setText(f"✅ No peeling triangles found (threshold: {abs_threshold:.4f})")
+                
+        except Exception as e:
+            logger.exception(f"Debug parting surface error: {e}")
+            self.debug_status_label.setText(f"❌ Error: {str(e)[:50]}")
+            QMessageBox.critical(self, "Error", f"Debug step failed:\n{str(e)}")
+
     def _visualize_parting_surface(self, result):
         """Visualize the parting surface mesh in the viewer."""
         if result.mesh is None:

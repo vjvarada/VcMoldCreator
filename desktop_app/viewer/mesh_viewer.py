@@ -4933,10 +4933,97 @@ class MeshViewer(QWidget):
         if not issues_found:
             print(f"   ✅ No obvious issues detected - edge should connect to membrane")
         
+        # === TETRAHEDRA ANALYSIS: Why doesn't this edge generate triangles? ===
+        self._analyze_edge_tetrahedra(v0_idx, v1_idx, tet_result)
+        
         print("="*70 + "\n")
         
         logger.info(f"Edge {edge_idx} analyzed: v=[{v0_idx},{v1_idx}], bl=[{bl0},{bl1}], in_flags={in_cut_flags}, covered={parting_surface_covers_edge}")
     
+    def _analyze_edge_tetrahedra(self, v0_idx: int, v1_idx: int, tet_result):
+        """
+        Analyze all tetrahedra containing this edge to understand why no triangle was generated.
+        
+        This helps diagnose GAP issues where an edge is marked as cut but the marching
+        tetrahedra algorithm doesn't generate a triangle using that edge's midpoint.
+        """
+        from core.parting_surface import MARCHING_TET_TABLE, TET_EDGES
+        from core.tetrahedral_mesh import build_edge_to_index_map
+        
+        tetrahedra = tet_result.tetrahedra
+        edges = tet_result.edges
+        cut_edge_flags = tet_result.cut_edge_flags
+        tet_edge_indices = tet_result.tet_edge_indices
+        boundary_labels = tet_result.boundary_labels if hasattr(tet_result, 'boundary_labels') else None
+        
+        edge_to_index = build_edge_to_index_map(edges)
+        target_edge_key = (min(v0_idx, v1_idx), max(v0_idx, v1_idx))
+        target_edge_global = edge_to_index.get(target_edge_key, -1)
+        
+        if target_edge_global == -1:
+            print(f"\n🔬 TETRAHEDRA ANALYSIS: Edge not found in global edge list!")
+            return
+        
+        print(f"\n🔬 TETRAHEDRA ANALYSIS (Why no triangle on edge {target_edge_global}?):")
+        
+        # Find all tets containing this edge
+        containing_tets = []
+        for t_idx in range(len(tetrahedra)):
+            tet_edges = tet_edge_indices[t_idx]
+            if target_edge_global in tet_edges:
+                local_edge_idx = np.where(tet_edges == target_edge_global)[0][0]
+                containing_tets.append((t_idx, local_edge_idx))
+        
+        print(f"   Edge is in {len(containing_tets)} tetrahedra")
+        
+        for t_idx, local_edge in containing_tets:
+            tet = tetrahedra[t_idx]
+            tet_edges_global = tet_edge_indices[t_idx]
+            
+            # Build configuration for this tet
+            config = 0
+            cut_edge_local_indices = []
+            for local_e in range(6):
+                global_e = tet_edges_global[local_e]
+                if cut_edge_flags[global_e]:
+                    config |= (1 << local_e)
+                    cut_edge_local_indices.append(local_e)
+            
+            n_edges_cut = bin(config).count('1')
+            table_entry = MARCHING_TET_TABLE.get(config, [])
+            
+            # Check if this edge would be used in triangles
+            edge_used_in_triangle = False
+            if isinstance(table_entry, list):
+                for tri in table_entry:
+                    if local_edge in tri:
+                        edge_used_in_triangle = True
+                        break
+            elif table_entry == 'FACE_VERTEX':
+                # For 5-edge, check if target edge is one of the 5 cut edges
+                if local_edge in cut_edge_local_indices:
+                    edge_used_in_triangle = True  # It will be used via face vertex connections
+            elif table_entry == 'INNER_VERTEX':
+                edge_used_in_triangle = True  # All 6 edges are used
+            
+            # Get boundary labels for tet vertices
+            tet_bls = [boundary_labels[v] if boundary_labels is not None else '?' for v in tet]
+            bl_str = ','.join([str(bl) for bl in tet_bls])
+            
+            status_icon = '✓' if edge_used_in_triangle else '✗'
+            entry_type = 'FACE_V' if table_entry == 'FACE_VERTEX' else ('INNER_V' if table_entry == 'INNER_VERTEX' else f'{len(table_entry) if table_entry else 0}tri')
+            
+            print(f"   Tet {t_idx}: config={config:06b} ({n_edges_cut} cut), local_edge={local_edge}, "
+                  f"entry={entry_type}, used={status_icon}, tet_bls=[{bl_str}]")
+            
+            if not edge_used_in_triangle and n_edges_cut > 0:
+                print(f"      ⚠️ Edge NOT used by config {config}! Cut edges: {cut_edge_local_indices}")
+                # Show which triangles WERE generated
+                if isinstance(table_entry, list) and table_entry:
+                    print(f"      → Triangles use edges: {[list(tri) for tri in table_entry]}")
+                elif not table_entry:
+                    print(f"      → Config {config} generates NO triangles (not in table)")
+
     def _highlight_selected_primary_edge(self, v0: np.ndarray, v1: np.ndarray):
         """Highlight the selected primary cut edge."""
         # Clear previous selection

@@ -610,12 +610,15 @@ def smooth_membrane_with_boundary_reprojection(
     damping_factor: float = 0.5,
     excluded_vertices: Optional[np.ndarray] = None,
     use_fast_smoothing: bool = True,
-    vertex_boundary_type: Optional[np.ndarray] = None
+    vertex_boundary_type: Optional[np.ndarray] = None,
+    reproject_interior_to_part: bool = True,
+    edge_endpoint_0: Optional[np.ndarray] = None,
+    edge_endpoint_1: Optional[np.ndarray] = None
 ) -> SmoothingResult:
     """
     Smooth the membrane surface following the algorithm from Section 4.4 of the paper.
     
-    Per paper: "The smoothing is performed by alternating two main steps:
+    Per paper Section 4.4: "The smoothing is performed by alternating two main steps:
     1. First we smooth the polyline that includes the boundary vertices only.
        After this smooth step, we re-project those vertices onto the original
        surface of M or the external boundary ∂H, depending on which of the two
@@ -625,11 +628,19 @@ def smooth_membrane_with_boundary_reprojection(
     Each smoothing step is performed using a damping factor (0.5 in our experiments)
     to ensure a proper convergence to the final solution."
     
+    EXTENSION (not in paper): We optionally add a 4th step that re-projects interior
+    vertices that originated from the part surface (bt=-1) back to the part mesh.
+    This helps maintain contact between the membrane and the part surface.
+    
     IMPORTANT: The key phrase is "which of the two surfaces they belonged to ORIGINALLY".
     This means we must track vertex boundary origin during extraction, NOT re-classify
     by closest distance during smoothing:
     - INNER boundary vertices (on part surface M) must re-project to part M
     - OUTER boundary vertices (on hull boundary ∂H) must re-project to hull ∂H
+    
+    For type -2 vertices (inner-inner midpoints on concave/convex edges), we use
+    EDGE-CONSTRAINED smoothing: the vertex can slide along its original edge line
+    but not perpendicular to it. This handles concave edges correctly.
     
     Args:
         membrane_mesh: The triangulated cut surface C to smooth
@@ -641,10 +652,16 @@ def smooth_membrane_with_boundary_reprojection(
         excluded_vertices: Optional array of vertex indices to exclude from smoothing
                           (e.g., gap-fill vertices that should remain fixed)
         vertex_boundary_type: Array tracking original boundary type for each vertex
+                             -2 = inner-inner midpoint (edge-constrained smoothing)
                              -1 = on part surface M (INNER boundary, re-project to part)
                               0 = interior (no boundary constraint)
                               1/2 = on hull boundary ∂H (OUTER boundary, re-project to hull)
                              If None, falls back to distance-based classification
+        reproject_interior_to_part: If True, also re-project interior vertices with bt=-1
+                                   to part mesh after interior smoothing. This is our 
+                                   extension, not in the original paper. Default: True.
+        edge_endpoint_0: (V, 3) array of first edge endpoint for type -2 vertices
+        edge_endpoint_1: (V, 3) array of second edge endpoint for type -2 vertices
     
     Returns:
         SmoothingResult with smoothed mesh and statistics
@@ -741,7 +758,15 @@ def smooth_membrane_with_boundary_reprojection(
         
         for vi in boundary_verts:
             bt = vertex_boundary_type[vi]
-            if bt == -1:
+            if bt == -2:
+                # INNER-INNER MIDPOINT - midpoint of edge where BOTH endpoints touch part M
+                # These vertices should NOT be reprojected because:
+                # 1. They're already very close to part M (both endpoints are ON M)
+                # 2. Reprojecting to nearest surface point moves them OFF their edge line
+                # 3. On curved surfaces, this creates gaps in the membrane
+                # Mark as 'fixed' to exclude from reprojection entirely
+                boundary_surface[vi] = 'fixed'
+            elif bt == -1:
                 # INNER boundary - originally on part surface M
                 boundary_surface[vi] = 'part'
             elif bt in (1, 2):
@@ -762,10 +787,12 @@ def smooth_membrane_with_boundary_reprojection(
         
         part_count = sum(1 for s in boundary_surface.values() if s == 'part')
         hull_count = sum(1 for s in boundary_surface.values() if s == 'hull')
+        fixed_count = sum(1 for s in boundary_surface.values() if s == 'fixed')
         patch_count = sum(1 for s in boundary_surface.values() if s == 'patch')
         
         logger.info(f"Boundary classification (from extraction): {part_count} to part (inner), "
-                   f"{hull_count} to hull (outer, including boundary zone), {patch_count} patch (needs fallback)")
+                   f"{hull_count} to hull (outer, including boundary zone), "
+                   f"{fixed_count} fixed (inner-inner midpoint), {patch_count} patch (needs fallback)")
         
         # For 'patch' vertices, use NEIGHBOR PROPAGATION first, then distance as last resort
         # This is important because the inflated hull CONTAINS the part mesh, so interior-
@@ -966,21 +993,44 @@ def smooth_membrane_with_boundary_reprojection(
     part_boundary_indices = []
     hull_boundary_indices = []
     primary_boundary_indices = []
+    edge_constrained_indices = []  # Type -2: inner-inner midpoints (edge-constrained smoothing)
     
     for vi in boundary_verts:
         if vi in excluded_set:
             continue
         surface_type = boundary_surface.get(vi, 'patch')
-        if surface_type in ('part', 'closest_part', 'propagated_part'):
+        if surface_type == 'fixed':
+            # Type -2 vertices (inner-inner midpoints on concave/convex edges)
+            # Use EDGE-CONSTRAINED smoothing: vertex can slide along original edge
+            # but not perpendicular to it. This handles concave edges correctly.
+            edge_constrained_indices.append(vi)
+        elif surface_type in ('part', 'closest_part', 'propagated_part'):
             part_boundary_indices.append(vi)
         elif surface_type in ('hull', 'closest_hull', 'propagated_hull'):
             hull_boundary_indices.append(vi)
         elif surface_type in ('primary', 'closest_primary'):
             primary_boundary_indices.append(vi)
     
+    # Check if we have edge constraint data for edge-constrained smoothing
+    has_edge_constraints = (edge_endpoint_0 is not None and 
+                           edge_endpoint_1 is not None and
+                           len(edge_endpoint_0) == n_verts)
+    
+    # If no edge constraints available, fall back to excluding fixed vertices from smoothing
+    if len(edge_constrained_indices) > 0:
+        if has_edge_constraints:
+            logger.info(f"Using EDGE-CONSTRAINED smoothing for {len(edge_constrained_indices)} inner-inner midpoint vertices "
+                       f"(type -2: on concave/convex edges of part M)")
+        else:
+            logger.warning(f"No edge constraint data - excluding {len(edge_constrained_indices)} inner-inner midpoints from smoothing")
+            for vi in edge_constrained_indices:
+                excluded_set.add(vi)
+            edge_constrained_indices = []  # Clear since we're excluding them instead
+    
     part_boundary_indices = np.array(part_boundary_indices, dtype=np.int64)
     hull_boundary_indices = np.array(hull_boundary_indices, dtype=np.int64)
     primary_boundary_indices = np.array(primary_boundary_indices, dtype=np.int64)
+    edge_constrained_indices = np.array(edge_constrained_indices, dtype=np.int64)
     
     # NEW: Identify INTERIOR vertices that should be reprojected to part mesh
     # These are vertices created during inner-inner edge processing that ended up
@@ -1104,9 +1154,13 @@ def smooth_membrane_with_boundary_reprojection(
     # Update interior_verts - don't exclude part vertices, they need interior smoothing too
     # Only exclude vertices that were explicitly marked as gap-fill
     
-    logger.info(f"Batched re-projection: {len(part_boundary_indices)} part, "
+    logger.info(f"Batched re-projection: {len(part_boundary_indices)} part (reproject), "
                f"{len(hull_boundary_indices)} hull, {len(primary_boundary_indices)} primary, "
+               f"{len(edge_constrained_indices)} edge-constrained (type -2), "
                f"{len(interior_part_indices)} interior-part")
+    
+    # Build set of edge-constrained vertices for edge-constrained smoothing
+    edge_constrained_set = set(edge_constrained_indices.tolist()) if len(edge_constrained_indices) > 0 else set()
     
     # Build set of part-boundary vertices for surface-constrained smoothing
     part_boundary_set = set(part_boundary_indices.tolist()) if len(part_boundary_indices) > 0 else set()
@@ -1132,45 +1186,50 @@ def smooth_membrane_with_boundary_reprojection(
             )
         else:
             # === Python fallback: Step 1 - Smooth boundary vertices (polyline smoothing) ===
-            # Per paper Section 4.4: smooth boundary polyline, then reproject to original surface.
+            # Per paper Section 4.4: "First we smooth the polyline that includes the 
+            # boundary vertices only."
             # 
-            # For part-boundary vertices, we use SURFACE-CONSTRAINED smoothing:
-            # 1. Get the boundary neighbors
-            # 2. Project current vertex and neighbors onto part surface
-            # 3. Compute average of projected neighbor positions
-            # 4. Move towards that average (all operations are on the surface)
+            # IMPORTANT: Paper says to use standard Laplacian smoothing for the polyline,
+            # then re-project AFTER. NOT surface-constrained smoothing during the smooth step.
+            # This is a standard Laplacian smooth in 3D space for ALL boundary vertices.
+            # 
+            # EXTENSION: Type -2 vertices use EDGE-CONSTRAINED smoothing - they can slide
+            # along their original edge line but not perpendicular to it.
             new_vertices = vertices.copy()
             
             for vi in boundary_verts:
                 # Skip excluded vertices (gap-fill vertices, etc.)
                 if vi in excluded_set:
                     continue
-                    
+                
                 neighbors = list(boundary_neighbors[vi])
-                if len(neighbors) >= 2:
-                    neighbor_positions = vertices[neighbors]
+                if len(neighbors) < 2:
+                    continue
                     
-                    if vi in part_boundary_set and part_proximity is not None:
-                        # SURFACE-CONSTRAINED SMOOTHING for part-boundary vertices
-                        # Project NEIGHBORS onto the part surface first, then compute average
-                        # This keeps the smoothing geodesic-like on the surface
-                        projected_neighbors, _, _ = part_proximity.on_surface(neighbor_positions)
-                        avg_pos_on_surface = projected_neighbors.mean(axis=0)
-                        
-                        # Also project current vertex to ensure it's on surface
-                        current_on_surface, _, _ = part_proximity.on_surface(vertices[vi].reshape(1, 3))
-                        current_on_surface = current_on_surface[0]
-                        
-                        # Move towards average on surface
-                        new_vertices[vi] = current_on_surface + damping_factor * (avg_pos_on_surface - current_on_surface)
-                        
-                        # Final projection to ensure we stay exactly on surface
-                        final_pos, _, _ = part_proximity.on_surface(new_vertices[vi].reshape(1, 3))
-                        new_vertices[vi] = final_pos[0]
-                    else:
-                        # Standard 3D smoothing for hull-boundary and other vertices
-                        avg_pos = neighbor_positions.mean(axis=0)
-                        new_vertices[vi] = vertices[vi] + damping_factor * (avg_pos - vertices[vi])
+                neighbor_positions = vertices[neighbors]
+                avg_pos = neighbor_positions.mean(axis=0)
+                target = vertices[vi] + damping_factor * (avg_pos - vertices[vi])
+                
+                # For type -2 (edge-constrained) vertices: project onto original edge line
+                if vi in edge_constrained_set and has_edge_constraints:
+                    # Project target onto the original edge line
+                    p0 = edge_endpoint_0[vi]
+                    p1 = edge_endpoint_1[vi]
+                    edge_vec = p1 - p0
+                    edge_len_sq = np.dot(edge_vec, edge_vec)
+                    
+                    if edge_len_sq > 1e-12:
+                        # Project target onto edge line: t = ((target - p0) · edge_vec) / |edge_vec|²
+                        t = np.dot(target - p0, edge_vec) / edge_len_sq
+                        # Clamp t to [0, 1] to stay within edge segment
+                        t = np.clip(t, 0.0, 1.0)
+                        # Compute position on edge
+                        new_vertices[vi] = p0 + t * edge_vec
+                    # else: degenerate edge, skip
+                else:
+                    # Standard 3D Laplacian smoothing for ALL other boundary vertices
+                    # Reprojection happens in the next step
+                    new_vertices[vi] = target
             
             vertices = new_vertices
         
@@ -1219,12 +1278,15 @@ def smooth_membrane_with_boundary_reprojection(
         
         vertices = new_vertices
         
-        # === Step 4: Re-project interior vertices that should be on part mesh ===
+        # === Step 4 (EXTENSION - not in paper): Re-project interior vertices that should be on part mesh ===
         # These are inner-inner edge vertices (both tet verts on part surface) that
         # ended up as interior vertices in the parting surface mesh. They were
         # projected to the part mesh during extraction but drift during interior
         # smoothing. Re-project them to maintain contact with the part surface.
-        if len(interior_part_indices) > 0 and part_proximity is not None:
+        #
+        # NOTE: This step is OUR EXTENSION and is NOT described in the paper.
+        # The paper only describes: (1) boundary smooth, (2) boundary reproject, (3) interior smooth.
+        if reproject_interior_to_part and len(interior_part_indices) > 0 and part_proximity is not None:
             interior_part_positions = vertices[interior_part_indices]
             closest_pts, _, _ = part_proximity.on_surface(interior_part_positions)
             vertices[interior_part_indices] = closest_pts

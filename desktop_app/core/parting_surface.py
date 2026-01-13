@@ -461,12 +461,25 @@ class PartingSurfaceResult:
     vertex_to_edge: Optional[np.ndarray] = None
     
     # Boundary type for each vertex (per paper Section 4.3-4.4):
+    # -2 = inner-inner midpoint (both edge endpoints on part M) - NO reprojection!
+    #      These vertices are at midpoints of edges touching M at both ends.
+    #      Reprojecting them to nearest surface point moves them off the edge line.
     # -1 = placed on part surface M (INNER boundary - re-project to part)
+    #      These vertices are placed AT a tet vertex that's on M.
     #  0 = interior (midpoint - no boundary constraint)
     #  1 = placed on hull H1 boundary (OUTER boundary - re-project to hull)
     #  2 = placed on hull H2 boundary (OUTER boundary - re-project to hull)
     # This is used during smoothing to correctly re-project boundary vertices
     vertex_boundary_type: Optional[np.ndarray] = None
+    
+    # Edge constraint data for type -2 vertices (inner-inner midpoints)
+    # These vertices sit on edges of the part mesh and should be constrained
+    # to slide along the edge line during smoothing (not perpendicular to it).
+    # For non-type-2 vertices, these are None or contain placeholder values.
+    # edge_endpoint_0[i] = position of first endpoint of the edge that vertex i sits on
+    # edge_endpoint_1[i] = position of second endpoint of the edge that vertex i sits on
+    edge_endpoint_0: Optional[np.ndarray] = None  # (V, 3) first edge endpoint
+    edge_endpoint_1: Optional[np.ndarray] = None  # (V, 3) second edge endpoint
     
     # Statistics
     num_vertices: int = 0
@@ -563,15 +576,17 @@ def extract_parting_surface(
     #  2 = on hull H2 boundary (OUTER boundary - re-project to hull)
     vertex_boundary_type = np.zeros(len(cut_edge_indices), dtype=np.int8)
     
+    # Edge constraint data for type -2 vertices (inner-inner midpoints)
+    # For type -2 vertices, we store the edge endpoints so that during smoothing,
+    # the vertex can slide ALONG the edge line but not perpendicular to it.
+    # This allows smoothing while preventing the vertex from moving off the edge.
+    edge_endpoint_0 = np.zeros((len(cut_edge_indices), 3), dtype=np.float64)
+    edge_endpoint_1 = np.zeros((len(cut_edge_indices), 3), dtype=np.float64)
+    
     # Track statistics for logging
     n_part_boundary = 0   # Cut points placed on part surface M
     n_hull_boundary = 0   # Cut points placed on hull boundary ∂H
     n_midpoint = 0        # Cut points at edge midpoints (interior)
-    n_inner_inner_projected = 0  # Inner-inner edges projected to part mesh
-    
-    # Collect inner-inner edge midpoints for batch projection
-    inner_inner_indices = []  # Surface vertex indices that need projection
-    inner_inner_midpoints = []  # Their midpoint positions
     
     for i, e_idx in enumerate(cut_edge_indices):
         v0, v1 = edges[e_idx]
@@ -595,14 +610,23 @@ def extract_parting_surface(
                 vertex_boundary_type[i] = -1  # INNER boundary - re-project to part M
                 n_part_boundary += 1
             elif bl0 == -1 and bl1 == -1:
-                # BOTH on part surface → midpoint will be projected to part mesh if available
+                # BOTH on part surface → use midpoint, DON'T project to nearest surface point
+                # The midpoint is already close to M since both endpoints are on M.
+                # Projecting to nearest surface point can move the vertex OFF the edge line,
+                # which breaks mesh connectivity and creates gaps in the membrane.
+                # Mark as type -2 (inner-inner midpoint) to prevent reprojection during smoothing.
                 midpoint = 0.5 * (verts[v0] + verts[v1])
                 surface_vertices[i] = midpoint
-                vertex_boundary_type[i] = -1  # INNER boundary - on part M
+                vertex_boundary_type[i] = -2  # INNER-INNER MIDPOINT - NO reprojection!
+                # STORE EDGE ENDPOINTS for edge-constrained smoothing
+                # During smoothing, type -2 vertices can slide ALONG this edge but not off it.
+                # This handles concave edges correctly - midpoint stays on edge line.
+                edge_endpoint_0[i] = verts[v0]
+                edge_endpoint_1[i] = verts[v1]
                 n_part_boundary += 1
-                # Mark for projection if part_mesh is available
-                inner_inner_indices.append(i)
-                inner_inner_midpoints.append(midpoint)
+                # NOTE: Type -2 vertices should NOT be reprojected during smoothing.
+                # They are midpoints that must stay on their original edge line.
+                # Reprojecting them moves them to wrong locations on curved surfaces.
             # Check if either vertex is on hull boundary ∂H (boundary_label == 1 or 2)
             # If so, place cut point at that vertex to ensure surface is bounded by ∂H
             # Mark as OUTER boundary (type 1 or 2) for re-projection to hull during smoothing
@@ -640,29 +664,9 @@ def extract_parting_surface(
             vertex_boundary_type[i] = 0  # Interior - no boundary constraint
             n_midpoint += 1
     
-    # Project inner-inner edge midpoints onto part mesh if available
-    # This ensures cut points for edges where BOTH vertices are on the part surface
-    # are placed exactly ON the part surface (not floating at the midpoint)
-    if part_mesh is not None and len(inner_inner_indices) > 0:
-        inner_inner_midpoints_arr = np.array(inner_inner_midpoints)
-        try:
-            # Find closest points on part mesh
-            closest_pts, distances, _ = part_mesh.nearest.on_surface(inner_inner_midpoints_arr)
-            
-            # Update surface vertices with projected positions
-            for idx, surf_idx in enumerate(inner_inner_indices):
-                surface_vertices[surf_idx] = closest_pts[idx]
-            
-            n_inner_inner_projected = len(inner_inner_indices)
-            avg_dist = np.mean(distances)
-            max_dist = np.max(distances)
-            logger.info(f"Projected {n_inner_inner_projected} inner-inner edge midpoints onto part mesh "
-                       f"(avg dist={avg_dist:.6f}, max dist={max_dist:.6f})")
-        except Exception as e:
-            logger.warning(f"Failed to project inner-inner midpoints to part mesh: {e}")
-            n_inner_inner_projected = 0
-    elif len(inner_inner_indices) > 0:
-        logger.info(f"Found {len(inner_inner_indices)} inner-inner edges but no part mesh for projection")
+    # NOTE: We no longer project inner-inner edge midpoints to the part mesh.
+    # Such projection can move vertices off their original edge lines, creating gaps.
+    # The midpoint between two part-surface vertices is already very close to M.
     
     logger.info(f"Cut point placement: {n_part_boundary} on part M (inner), "
                 f"{n_hull_boundary} on hull ∂H (outer), {n_midpoint} midpoints (interior)")
@@ -826,12 +830,20 @@ def extract_parting_surface(
         dynamic_edge_indices = np.full(len(dynamic_vertices), -1, dtype=np.int64)
         cut_edge_indices = np.concatenate([cut_edge_indices, dynamic_edge_indices])
         
+        # Extend edge endpoint arrays (zeros for dynamic vertices - they aren't edge-constrained)
+        dynamic_edge_endpoint_0 = np.zeros((len(dynamic_vertices), 3), dtype=np.float64)
+        dynamic_edge_endpoint_1 = np.zeros((len(dynamic_vertices), 3), dtype=np.float64)
+        edge_endpoint_0 = np.vstack([edge_endpoint_0, dynamic_edge_endpoint_0])
+        edge_endpoint_1 = np.vstack([edge_endpoint_1, dynamic_edge_endpoint_1])
+        
         logger.info(f"Added {len(dynamic_vertices)} dynamic vertices "
                     f"({n_5edge_configs} 5-edge configs, {n_6edge_configs} 6-edge configs)")
     
     # Store extended arrays in result
     result.vertex_to_edge = cut_edge_indices.copy()
     result.vertex_boundary_type = vertex_boundary_type.copy()
+    result.edge_endpoint_0 = edge_endpoint_0.copy()
+    result.edge_endpoint_1 = edge_endpoint_1.copy()
     
     # === VALIDATION: Check that all triangle indices are within bounds ===
     n_total_vertices = len(surface_vertices)
@@ -1243,17 +1255,24 @@ def smooth_parting_surface_two_phase(
     boundary_type = surface.vertex_boundary_type
     
     # Classify vertices
-    inner_boundary_mask = boundary_type == -1  # Should touch part M
+    # Type -1: true inner boundary (placed AT a tet vertex on part M) - reproject to M
+    # Type -2: inner-inner midpoint (midpoint of edge with both endpoints on M) - NO reprojection!
+    # Type 1,2: outer boundary (placed AT a tet vertex on hull ∂H) - reproject to hull
+    # Type 0: interior vertex - no boundary constraint
+    inner_boundary_mask = boundary_type == -1  # Should touch part M (and be reprojected)
+    inner_inner_midpoint_mask = boundary_type == -2  # On part M but NO reprojection!
     outer_boundary_mask = (boundary_type == 1) | (boundary_type == 2)  # Should touch hull ∂H
-    is_boundary = inner_boundary_mask | outer_boundary_mask
+    is_boundary = inner_boundary_mask | inner_inner_midpoint_mask | outer_boundary_mask
     interior_mask = ~is_boundary
     
     n_inner = np.sum(inner_boundary_mask)
+    n_inner_inner = np.sum(inner_inner_midpoint_mask)
     n_outer = np.sum(outer_boundary_mask)
     n_interior = np.sum(interior_mask)
     
-    logger.info(f"Two-phase smoothing: {n_inner} inner boundary, {n_outer} outer boundary, "
-                f"{n_interior} interior vertices")
+    logger.info(f"Two-phase smoothing: {n_inner} inner boundary (reproject), "
+                f"{n_inner_inner} inner-inner midpoints (NO reproject), "
+                f"{n_outer} outer boundary, {n_interior} interior vertices")
     
     # Build vertex adjacency
     neighbors = [set() for _ in range(n_verts)]
@@ -1272,6 +1291,19 @@ def smooth_parting_surface_two_phase(
                     boundary_neighbors[v].add(n)
     
     # === PHASE 1: Smooth boundary polyline with reprojection ===
+    # Type -2 vertices (inner-inner midpoints) use EDGE-CONSTRAINED smoothing:
+    # They can slide ALONG their original edge line, but not perpendicular to it.
+    # This handles concave edges correctly - the midpoint stays on the edge line
+    # but can still participate in smoothing to improve mesh quality.
+    
+    # Get edge constraint data for type -2 vertices
+    has_edge_constraints = (surface.edge_endpoint_0 is not None and 
+                           surface.edge_endpoint_1 is not None and
+                           len(surface.edge_endpoint_0) == n_verts)
+    
+    if not has_edge_constraints and n_inner_inner > 0:
+        logger.warning(f"No edge constraint data for {n_inner_inner} inner-inner midpoints - they will be skipped")
+    
     if boundary_iterations > 0 and (part_mesh is not None or hull_mesh is not None):
         logger.debug(f"Phase 1: Smoothing boundary ({boundary_iterations} iterations)")
         
@@ -1282,8 +1314,43 @@ def smooth_parting_surface_two_phase(
             for v in range(n_verts):
                 if not is_boundary[v]:
                     continue
+                
+                # For type -2 (inner-inner midpoints): use EDGE-CONSTRAINED smoothing
+                # The vertex can slide along its original edge, but not off it.
+                if inner_inner_midpoint_mask[v]:
+                    if not has_edge_constraints:
+                        continue  # Skip if no edge data available
                     
-                # Get boundary neighbors only
+                    # Get boundary neighbors
+                    b_neighbors = list(boundary_neighbors[v])
+                    if len(b_neighbors) < 2:
+                        continue
+                    
+                    # Compute smoothed target position (standard Laplacian)
+                    neighbor_positions = vertices[b_neighbors]
+                    centroid = np.mean(neighbor_positions, axis=0)
+                    target = vertices[v] + boundary_lambda * (centroid - vertices[v])
+                    
+                    # Project target onto the original edge line
+                    # Edge is defined by endpoints p0, p1
+                    p0 = surface.edge_endpoint_0[v]
+                    p1 = surface.edge_endpoint_1[v]
+                    edge_vec = p1 - p0
+                    edge_len_sq = np.dot(edge_vec, edge_vec)
+                    
+                    if edge_len_sq > 1e-12:
+                        # Project target onto edge line: t = ((target - p0) · edge_vec) / |edge_vec|²
+                        t = np.dot(target - p0, edge_vec) / edge_len_sq
+                        # Clamp t to [0, 1] to stay within edge segment
+                        t = np.clip(t, 0.0, 1.0)
+                        # Compute position on edge
+                        new_vertices[v] = p0 + t * edge_vec
+                    else:
+                        # Degenerate edge (both endpoints same) - skip this vertex
+                        logger.debug(f"Skipping type -2 vertex {v} with degenerate edge (edge_len_sq={edge_len_sq:.2e})")
+                    continue
+                    
+                # Get boundary neighbors only (for non-type-2 vertices)
                 b_neighbors = list(boundary_neighbors[v])
                 if len(b_neighbors) < 2:
                     continue
@@ -1347,6 +1414,8 @@ def smooth_parting_surface_two_phase(
         faces=surface.faces,
         vertex_to_edge=surface.vertex_to_edge,
         vertex_boundary_type=surface.vertex_boundary_type,  # Preserve boundary type
+        edge_endpoint_0=surface.edge_endpoint_0,  # Preserve edge constraints
+        edge_endpoint_1=surface.edge_endpoint_1,  # Preserve edge constraints
         num_vertices=surface.num_vertices,
         num_faces=surface.num_faces,
         num_tets_processed=surface.num_tets_processed,
@@ -1409,6 +1478,13 @@ def repair_parting_surface(
         has_boundary_type = surface.vertex_boundary_type is not None and len(surface.vertex_boundary_type) == initial_verts
         current_boundary_type = surface.vertex_boundary_type.copy() if has_boundary_type else None
         
+        # Track edge endpoint data for type -2 vertices (edge-constrained smoothing)
+        has_edge_constraints = (surface.edge_endpoint_0 is not None and 
+                               surface.edge_endpoint_1 is not None and
+                               len(surface.edge_endpoint_0) == initial_verts)
+        current_edge_endpoint_0 = surface.edge_endpoint_0.copy() if has_edge_constraints else None
+        current_edge_endpoint_1 = surface.edge_endpoint_1.copy() if has_edge_constraints else None
+        
         # Step 1: Merge close vertices
         if merge_vertices:
             # Before merge, we need to track which vertices get merged
@@ -1426,6 +1502,8 @@ def repair_parting_surface(
             vertex_map = np.arange(len(vertices))  # Maps old indices to new indices
             new_vertices = []
             new_boundary_type = [] if has_boundary_type else None
+            new_edge_endpoint_0 = [] if has_edge_constraints else None
+            new_edge_endpoint_1 = [] if has_edge_constraints else None
             
             for i in range(len(vertices)):
                 if used[i]:
@@ -1442,23 +1520,48 @@ def repair_parting_surface(
                 new_vertices.append(vertices[i])
                 
                 # For boundary type, take the most "extreme" type from merged vertices
-                # Priority: 1/2 (hull/outer) > -1 (part/inner) > 0 (interior)
+                # Priority: -2 (inner-inner midpoint) > 1/2 (hull/outer) > -1 (part/inner) > 0 (interior)
                 # 
-                # IMPORTANT: Hull takes priority because for the PRIMARY parting surface,
+                # CRITICAL: Type -2 (inner-inner midpoint) takes HIGHEST priority because:
+                # 1. These vertices MUST stay on their original edge line
+                # 2. They require edge-constrained smoothing (can slide along edge, not off it)
+                # 3. If a type -2 merges with another type, it should KEEP being type -2
+                #
+                # Hull takes next priority because for the PRIMARY parting surface,
                 # we want the OUTER boundary to project to the hull ∂H, not the part M.
                 # If a part vertex and hull vertex are close enough to merge, they're
                 # at a seam edge and the outer boundary projection is more critical.
                 if has_boundary_type:
                     merged_types = [current_boundary_type[j] for j in neighbors]
-                    if 1 in merged_types or 2 in merged_types:
+                    if -2 in merged_types:
+                        # Inner-inner midpoint (type -2) - HIGHEST priority
+                        # Must preserve edge constraint behavior
+                        new_boundary_type.append(-2)
+                        # Also preserve edge endpoint data for the first type -2 vertex found
+                        if has_edge_constraints:
+                            for j in neighbors:
+                                if current_boundary_type[j] == -2:
+                                    new_edge_endpoint_0.append(current_edge_endpoint_0[j])
+                                    new_edge_endpoint_1.append(current_edge_endpoint_1[j])
+                                    break
+                        else:
+                            new_edge_endpoint_0.append(np.zeros(3))
+                            new_edge_endpoint_1.append(np.zeros(3))
+                    elif 1 in merged_types or 2 in merged_types:
                         # Outer boundary (hull) takes priority
                         hull_types = [t for t in merged_types if t in (1, 2)]
                         new_boundary_type.append(hull_types[0])
+                        new_edge_endpoint_0.append(np.zeros(3))
+                        new_edge_endpoint_1.append(np.zeros(3))
                     elif -1 in merged_types:
                         # Inner boundary (part)
                         new_boundary_type.append(-1)
+                        new_edge_endpoint_0.append(np.zeros(3))
+                        new_edge_endpoint_1.append(np.zeros(3))
                     else:
                         new_boundary_type.append(0)
+                        new_edge_endpoint_0.append(np.zeros(3))
+                        new_edge_endpoint_1.append(np.zeros(3))
             
             new_vertices = np.array(new_vertices)
             new_faces = vertex_map[faces]
@@ -1471,6 +1574,8 @@ def repair_parting_surface(
             
             mesh = trimesh.Trimesh(vertices=new_vertices, faces=new_faces)
             current_boundary_type = np.array(new_boundary_type, dtype=np.int8) if has_boundary_type else None
+            current_edge_endpoint_0 = np.array(new_edge_endpoint_0) if has_edge_constraints else None
+            current_edge_endpoint_1 = np.array(new_edge_endpoint_1) if has_edge_constraints else None
             
             logger.debug(f"Vertex merge: {initial_verts} -> {len(new_vertices)} vertices")
         
@@ -1481,7 +1586,7 @@ def repair_parting_surface(
                 vertices=mesh.vertices,
                 faces=mesh.faces[valid_faces]
             )
-            # Boundary type stays the same - only faces changed
+            # Boundary type and edge endpoints stay the same - only faces changed
         
         # Step 3: Remove very small triangles (potential self-intersection sources)
         if len(mesh.faces) > 0:
@@ -1497,7 +1602,7 @@ def repair_parting_surface(
                     faces=mesh.faces[valid_area_mask]
                 )
         
-        # Step 4: Remove unreferenced vertices (and update boundary type)
+        # Step 4: Remove unreferenced vertices (and update boundary type + edge endpoints)
         if len(mesh.faces) > 0:
             referenced = np.unique(mesh.faces.ravel())
             if len(referenced) < len(mesh.vertices):
@@ -1513,6 +1618,11 @@ def repair_parting_surface(
                 # Update boundary type to match new vertex indices
                 if has_boundary_type and current_boundary_type is not None:
                     current_boundary_type = current_boundary_type[referenced]
+                
+                # Update edge endpoints to match new vertex indices
+                if has_edge_constraints and current_edge_endpoint_0 is not None:
+                    current_edge_endpoint_0 = current_edge_endpoint_0[referenced]
+                    current_edge_endpoint_1 = current_edge_endpoint_1[referenced]
         
         result = PartingSurfaceResult(
             mesh=mesh,
@@ -1520,6 +1630,8 @@ def repair_parting_surface(
             faces=np.array(mesh.faces),
             vertex_to_edge=None,  # Invalidated by merge - mapping no longer valid
             vertex_boundary_type=current_boundary_type,  # PRESERVED through repair
+            edge_endpoint_0=current_edge_endpoint_0,  # PRESERVED for edge-constrained smoothing
+            edge_endpoint_1=current_edge_endpoint_1,  # PRESERVED for edge-constrained smoothing
             num_vertices=len(mesh.vertices),
             num_faces=len(mesh.faces),
             num_tets_processed=surface.num_tets_processed,
@@ -1533,7 +1645,9 @@ def repair_parting_surface(
         logger.info(f"Cleaned parting surface: merged {vert_diff} verts, removed {face_diff} faces in {elapsed:.1f}ms")
         if has_boundary_type:
             bt = result.vertex_boundary_type
+            n_type2 = np.sum(bt == -2)
             logger.info(f"Preserved boundary types: {np.sum(bt == -1)} part (inner), "
+                       f"{n_type2} inner-inner midpoint (edge-constrained), "
                        f"{np.sum(bt == 1) + np.sum(bt == 2)} hull (outer), {np.sum(bt == 0)} interior")
         
         return result
