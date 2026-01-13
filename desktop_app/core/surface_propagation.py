@@ -982,8 +982,134 @@ def smooth_membrane_with_boundary_reprojection(
     hull_boundary_indices = np.array(hull_boundary_indices, dtype=np.int64)
     primary_boundary_indices = np.array(primary_boundary_indices, dtype=np.int64)
     
+    # NEW: Identify INTERIOR vertices that should be reprojected to part mesh
+    # These are vertices created during inner-inner edge processing that ended up
+    # as interior vertices in the parting surface mesh, not on its boundary.
+    # They have vertex_boundary_type == -1 but are in interior_verts, not boundary_verts.
+    interior_part_indices = []
+    if vertex_boundary_type is not None and len(vertex_boundary_type) == n_verts:
+        for vi in interior_verts:
+            if vertex_boundary_type[vi] == -1:
+                interior_part_indices.append(vi)
+    interior_part_indices = np.array(interior_part_indices, dtype=np.int64)
+    
+    # NEW: Identify and REMOVE triangles that are LYING FLAT on the part mesh surface.
+    # These triangles:
+    # 1. Have all 3 vertices with bt == -1 (on part mesh)
+    # 2. Have all 3 vertices at distance ≈ 0 from part
+    # 3. Have their CENTROID also at distance ≈ 0 from part (this distinguishes flat triangles
+    #    from triangles that have vertices on part but extend perpendicular as a membrane)
+    #
+    # Triangles lying flat on the part overlap with the part surface and don't contribute 
+    # to the parting membrane - they should be filtered out.
+    part_contact_tolerance = mesh_scale * 0.001  # 0.1% of mesh scale
+    
+    triangles_to_remove = set()
+    if vertex_boundary_type is not None and len(vertex_boundary_type) == n_verts and part_proximity is not None:
+        # First, compute distance to part mesh for all vertices
+        _, all_dists, _ = part_proximity.on_surface(vertices)
+        
+        for fi, face in enumerate(faces):
+            v0, v1, v2 = face
+            bt0, bt1, bt2 = vertex_boundary_type[v0], vertex_boundary_type[v1], vertex_boundary_type[v2]
+            
+            # Check if all 3 vertices are on the part mesh (bt == -1)
+            if bt0 == -1 and bt1 == -1 and bt2 == -1:
+                # Check if all 3 vertices are very close to the part surface
+                d0, d1, d2 = all_dists[v0], all_dists[v1], all_dists[v2]
+                if d0 < part_contact_tolerance and d1 < part_contact_tolerance and d2 < part_contact_tolerance:
+                    # Also check if the CENTROID is close to the part surface
+                    # This distinguishes flat-lying triangles from perpendicular membrane triangles
+                    centroid = (vertices[v0] + vertices[v1] + vertices[v2]) / 3.0
+                    _, centroid_dist, _ = part_proximity.on_surface(centroid.reshape(1, 3))
+                    
+                    if centroid_dist[0] < part_contact_tolerance:
+                        # This triangle lies flat on the part surface - mark for removal
+                        triangles_to_remove.add(fi)
+        
+        if triangles_to_remove:
+            logger.info(f"Removing {len(triangles_to_remove)} triangles that lie flat on part mesh surface")
+            
+            # Filter out the triangles
+            keep_mask = np.ones(len(faces), dtype=bool)
+            keep_mask[list(triangles_to_remove)] = False
+            faces = faces[keep_mask]
+            
+            # Remove unreferenced vertices and update vertex_boundary_type
+            referenced_verts = np.unique(faces.ravel())
+            if len(referenced_verts) < n_verts:
+                old_to_new = np.full(n_verts, -1, dtype=np.int64)
+                old_to_new[referenced_verts] = np.arange(len(referenced_verts))
+                
+                vertices = vertices[referenced_verts]
+                faces = old_to_new[faces]
+                vertex_boundary_type = vertex_boundary_type[referenced_verts]
+                n_verts = len(vertices)
+                
+                # Update boundary_surface dictionary with new indices
+                new_boundary_surface = {}
+                for old_vi, surface_type in boundary_surface.items():
+                    if old_to_new[old_vi] >= 0:
+                        new_boundary_surface[int(old_to_new[old_vi])] = surface_type
+                boundary_surface = new_boundary_surface
+                
+                # Update boundary_verts, interior_verts, and indices
+                boundary_verts_old = set(boundary_verts)
+                boundary_verts = sorted([int(old_to_new[v]) for v in boundary_verts if old_to_new[v] >= 0])
+                interior_verts = [v for v in range(n_verts) if v not in set(boundary_verts) and v not in excluded_set]
+                
+                # Update part/hull/primary boundary indices
+                part_boundary_indices = np.array([old_to_new[v] for v in part_boundary_indices if old_to_new[v] >= 0], dtype=np.int64)
+                hull_boundary_indices = np.array([old_to_new[v] for v in hull_boundary_indices if old_to_new[v] >= 0], dtype=np.int64)
+                primary_boundary_indices = np.array([old_to_new[v] for v in primary_boundary_indices if old_to_new[v] >= 0], dtype=np.int64)
+                interior_part_indices = np.array([old_to_new[v] for v in interior_part_indices if old_to_new[v] >= 0], dtype=np.int64)
+                
+                # Rebuild boundary edges and neighbors using a temporary mesh
+                temp_mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+                boundary_edges = find_boundary_edges(temp_mesh)
+                boundary_verts = sorted(set(v for edge in boundary_edges for v in edge))
+                boundary_neighbors = {v: set() for v in boundary_verts}
+                for v0, v1 in boundary_edges:
+                    if v0 in boundary_neighbors:
+                        boundary_neighbors[v0].add(v1)
+                    if v1 in boundary_neighbors:
+                        boundary_neighbors[v1].add(v0)
+                
+                # Rebuild vertex_neighbors
+                vertex_neighbors = [set() for _ in range(n_verts)]
+                for f in faces:
+                    for i in range(3):
+                        v = f[i]
+                        vertex_neighbors[v].add(f[(i+1) % 3])
+                        vertex_neighbors[v].add(f[(i+2) % 3])
+                
+                # Update interior_verts based on new boundary_verts
+                interior_verts = [v for v in range(n_verts) if v not in set(boundary_verts) and v not in excluded_set]
+                
+                logger.info(f"After removing overlapping triangles: {n_verts} vertices, {len(faces)} faces, "
+                           f"{len(boundary_verts)} boundary verts")
+    
+    # NOTE: We no longer exclude part-contact vertices from smoothing.
+    # Instead, ALL part-boundary vertices are smoothed using SURFACE-CONSTRAINED smoothing,
+    # which keeps them on the part surface while smoothing the polyline.
+    # This ensures the polyline on the part mesh remains smooth.
+    
+    # Only exclude interior vertices that are completely surrounded by part-contact faces
+    # (these are truly interior to a flat contact patch, not on the polyline)
+    smoothing_excluded_vertices = set()
+    
+    # Don't add any vertices to excluded_set for smoothing purposes
+    # (gap-fill vertices from earlier are already in excluded_set if needed)
+    
+    # Update interior_verts - don't exclude part vertices, they need interior smoothing too
+    # Only exclude vertices that were explicitly marked as gap-fill
+    
     logger.info(f"Batched re-projection: {len(part_boundary_indices)} part, "
-               f"{len(hull_boundary_indices)} hull, {len(primary_boundary_indices)} primary")
+               f"{len(hull_boundary_indices)} hull, {len(primary_boundary_indices)} primary, "
+               f"{len(interior_part_indices)} interior-part")
+    
+    # Build set of part-boundary vertices for surface-constrained smoothing
+    part_boundary_set = set(part_boundary_indices.tolist()) if len(part_boundary_indices) > 0 else set()
     
     # Alternating smoothing iterations per paper Section 4.4:
     # "The smoothing is performed by alternating two main steps:
@@ -1006,18 +1132,45 @@ def smooth_membrane_with_boundary_reprojection(
             )
         else:
             # === Python fallback: Step 1 - Smooth boundary vertices (polyline smoothing) ===
+            # Per paper Section 4.4: smooth boundary polyline, then reproject to original surface.
+            # 
+            # For part-boundary vertices, we use SURFACE-CONSTRAINED smoothing:
+            # 1. Get the boundary neighbors
+            # 2. Project current vertex and neighbors onto part surface
+            # 3. Compute average of projected neighbor positions
+            # 4. Move towards that average (all operations are on the surface)
             new_vertices = vertices.copy()
             
             for vi in boundary_verts:
-                # Skip excluded vertices (gap-fill vertices)
+                # Skip excluded vertices (gap-fill vertices, etc.)
                 if vi in excluded_set:
                     continue
+                    
                 neighbors = list(boundary_neighbors[vi])
                 if len(neighbors) >= 2:
-                    # Average of neighbors along the boundary polyline
                     neighbor_positions = vertices[neighbors]
-                    avg_pos = neighbor_positions.mean(axis=0)
-                    new_vertices[vi] = vertices[vi] + damping_factor * (avg_pos - vertices[vi])
+                    
+                    if vi in part_boundary_set and part_proximity is not None:
+                        # SURFACE-CONSTRAINED SMOOTHING for part-boundary vertices
+                        # Project NEIGHBORS onto the part surface first, then compute average
+                        # This keeps the smoothing geodesic-like on the surface
+                        projected_neighbors, _, _ = part_proximity.on_surface(neighbor_positions)
+                        avg_pos_on_surface = projected_neighbors.mean(axis=0)
+                        
+                        # Also project current vertex to ensure it's on surface
+                        current_on_surface, _, _ = part_proximity.on_surface(vertices[vi].reshape(1, 3))
+                        current_on_surface = current_on_surface[0]
+                        
+                        # Move towards average on surface
+                        new_vertices[vi] = current_on_surface + damping_factor * (avg_pos_on_surface - current_on_surface)
+                        
+                        # Final projection to ensure we stay exactly on surface
+                        final_pos, _, _ = part_proximity.on_surface(new_vertices[vi].reshape(1, 3))
+                        new_vertices[vi] = final_pos[0]
+                    else:
+                        # Standard 3D smoothing for hull-boundary and other vertices
+                        avg_pos = neighbor_positions.mean(axis=0)
+                        new_vertices[vi] = vertices[vi] + damping_factor * (avg_pos - vertices[vi])
             
             vertices = new_vertices
         
@@ -1028,7 +1181,16 @@ def smooth_membrane_with_boundary_reprojection(
         # Re-project to part mesh M (batched)
         if len(part_boundary_indices) > 0 and part_proximity is not None:
             part_positions = vertices[part_boundary_indices]
-            closest_pts, _, _ = part_proximity.on_surface(part_positions)
+            closest_pts, dists, _ = part_proximity.on_surface(part_positions)
+            
+            # Log large movements that might cause degenerate triangles
+            if iteration == 0:
+                movements = np.linalg.norm(closest_pts - part_positions, axis=1)
+                large_moves = movements > 0.1
+                if np.any(large_moves):
+                    logger.debug(f"Part boundary reprojection: {np.sum(large_moves)} vertices moved > 0.1, "
+                               f"max move = {movements.max():.4f}")
+            
             vertices[part_boundary_indices] = closest_pts
         
         # Re-project to hull mesh ∂H (batched)
@@ -1057,6 +1219,16 @@ def smooth_membrane_with_boundary_reprojection(
         
         vertices = new_vertices
         
+        # === Step 4: Re-project interior vertices that should be on part mesh ===
+        # These are inner-inner edge vertices (both tet verts on part surface) that
+        # ended up as interior vertices in the parting surface mesh. They were
+        # projected to the part mesh during extraction but drift during interior
+        # smoothing. Re-project them to maintain contact with the part surface.
+        if len(interior_part_indices) > 0 and part_proximity is not None:
+            interior_part_positions = vertices[interior_part_indices]
+            closest_pts, _, _ = part_proximity.on_surface(interior_part_positions)
+            vertices[interior_part_indices] = closest_pts
+        
         if (iteration + 1) % 2 == 0:
             logger.debug(f"Smoothing iteration {iteration + 1}/{iterations} complete")
     
@@ -1065,8 +1237,31 @@ def smooth_membrane_with_boundary_reprojection(
     
     # Clean up any degenerate faces that might have been created
     valid_faces = smoothed_mesh.nondegenerate_faces()
-    if np.sum(~valid_faces) > 0:
-        logger.debug(f"Removing {np.sum(~valid_faces)} degenerate faces after smoothing")
+    n_degenerate = np.sum(~valid_faces)
+    if n_degenerate > 0:
+        logger.warning(f"Removing {n_degenerate} degenerate faces after smoothing")
+        
+        # Log details about degenerate faces for debugging
+        degenerate_indices = np.where(~valid_faces)[0]
+        for idx in degenerate_indices[:10]:  # Limit to first 10
+            face = faces[idx]
+            v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
+            edge_lengths = [
+                np.linalg.norm(v1 - v0),
+                np.linalg.norm(v2 - v1),
+                np.linalg.norm(v0 - v2)
+            ]
+            area = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0))
+            bt_info = ""
+            if vertex_boundary_type is not None:
+                bt_info = f", bt=[{vertex_boundary_type[face[0]]}, {vertex_boundary_type[face[1]]}, {vertex_boundary_type[face[2]]}]"
+            logger.warning(f"  Degenerate face {idx}: verts={face.tolist()}, "
+                          f"edges=[{edge_lengths[0]:.4f}, {edge_lengths[1]:.4f}, {edge_lengths[2]:.4f}], "
+                          f"area={area:.6f}{bt_info}")
+        
+        if n_degenerate > 10:
+            logger.warning(f"  ... and {n_degenerate - 10} more degenerate faces")
+        
         smoothed_mesh = trimesh.Trimesh(
             vertices=smoothed_mesh.vertices,
             faces=smoothed_mesh.faces[valid_faces]

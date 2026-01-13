@@ -228,38 +228,82 @@ def classify_tetrahedra(
     tet_vertices: np.ndarray,
     tetrahedra: np.ndarray,
     part_mesh: trimesh.Trimesh,
-    tolerance: float = 0.0
+    tolerance: float = 0.0,
+    method: str = 'vertex_majority'
 ) -> np.ndarray:
     """
     Classify each tetrahedron as inside or outside the part mesh.
     
-    Uses the centroid of each tetrahedron to determine if it's inside the part.
     Tetrahedra in the mold cavity (outside the part) are marked as True,
     tetrahedra inside the part are marked as False.
+    
+    Classification methods:
+    - 'centroid': Use centroid position (fast but inaccurate for boundary tets)
+    - 'vertex_any': Inside if ANY vertex is inside the part (conservative)
+    - 'vertex_majority': Inside if >50% of vertices are inside (balanced, recommended)
+    - 'vertex_all': Inside only if ALL vertices are inside (aggressive)
+    
+    The 'vertex_majority' method is recommended because it correctly handles
+    tetrahedra that straddle the part boundary, preventing spurious faces
+    from appearing in the inner boundary mesh.
     
     Args:
         tet_vertices: (N, 3) tetrahedral mesh vertices
         tetrahedra: (M, 4) tetrahedron vertex indices
         part_mesh: The original part mesh to check against
-        tolerance: Small positive value - centroids within this distance
-                   inside the part are also considered inside (default 0.0)
+        tolerance: Small positive value - for vertex methods, vertices within
+                   this distance of the surface are treated specially
+        method: Classification method - 'centroid', 'vertex_any', 'vertex_majority', or 'vertex_all'
     
     Returns:
         (M,) boolean array - True = outside part (mold cavity), False = inside part
     """
-    logger.info(f"Classifying {len(tetrahedra)} tetrahedra...")
+    logger.info(f"Classifying {len(tetrahedra)} tetrahedra using '{method}' method...")
     
-    # Compute tetrahedra centroids
-    centroids = tet_vertices[tetrahedra].mean(axis=1)  # (M, 3)
-    
-    # Check which centroids are inside the part mesh
-    # trimesh.contains returns True for points inside the mesh
-    inside_part = part_mesh.contains(centroids)
-    
-    # If tolerance > 0, also check distance to surface for points just outside
-    if tolerance > 0:
-        _, distances, _ = part_mesh.nearest.on_surface(centroids)
-        inside_part = inside_part & (distances > tolerance)
+    if method == 'centroid':
+        # Original centroid-based method
+        centroids = tet_vertices[tetrahedra].mean(axis=1)  # (M, 3)
+        inside_part = part_mesh.contains(centroids)
+        
+        if tolerance > 0:
+            _, distances, _ = part_mesh.nearest.on_surface(centroids)
+            inside_part = inside_part & (distances > tolerance)
+    else:
+        # Vertex-based methods: check containment for all vertices at once
+        unique_vert_indices = np.unique(tetrahedra.ravel())
+        all_verts_to_check = tet_vertices[unique_vert_indices]  # (U, 3)
+        
+        # Check which vertices are inside the part
+        vert_inside = part_mesh.contains(all_verts_to_check)  # (U,)
+        
+        # Map results back to original vertex indices
+        # Create full-size array for all tet vertices
+        vertex_inside_map = np.zeros(len(tet_vertices), dtype=bool)
+        vertex_inside_map[unique_vert_indices] = vert_inside
+        
+        # Get per-tet vertex inside counts
+        tet_verts_inside = vertex_inside_map[tetrahedra]  # (M, 4) bool
+        inside_count = np.sum(tet_verts_inside, axis=1)  # (M,) - count of inside vertices per tet
+        
+        if method == 'vertex_any':
+            # Inside if ANY vertex is inside the part
+            inside_part = inside_count >= 1
+        elif method == 'vertex_majority':
+            # Inside if >50% (i.e., >= 3 for 4 vertices) are inside
+            # This catches tets that straddle the boundary but have most mass inside
+            inside_part = inside_count >= 3
+        elif method == 'vertex_all':
+            # Inside only if ALL vertices are inside
+            inside_part = inside_count == 4
+        else:
+            raise ValueError(f"Unknown classification method: {method}")
+        
+        logger.debug(f"Vertex containment distribution: "
+                     f"0-inside={np.sum(inside_count==0)}, "
+                     f"1-inside={np.sum(inside_count==1)}, "
+                     f"2-inside={np.sum(inside_count==2)}, "
+                     f"3-inside={np.sum(inside_count==3)}, "
+                     f"4-inside={np.sum(inside_count==4)}")
     
     # Outside part = mold cavity
     outside_part = ~inside_part
@@ -275,7 +319,8 @@ def filter_tetrahedra_outside_part(
     tet_vertices: np.ndarray,
     tetrahedra: np.ndarray,
     part_mesh: trimesh.Trimesh,
-    tolerance: float = 0.0
+    tolerance: float = 0.0,
+    classification_method: str = 'vertex_majority'
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Filter out tetrahedra that are inside the part mesh.
@@ -289,6 +334,9 @@ def filter_tetrahedra_outside_part(
         part_mesh: The original part mesh to check against
         tolerance: Small positive value - centroids within this distance
                    inside the part are also removed (default 0.0)
+        classification_method: Method for classify_tetrahedra - 
+                              'vertex_majority' (default, recommended),
+                              'centroid', 'vertex_any', or 'vertex_all'
     
     Returns:
         Tuple of (filtered_vertices, filtered_tetrahedra)
@@ -297,7 +345,7 @@ def filter_tetrahedra_outside_part(
     logger.info(f"Filtering tetrahedra to build walk graph from mold cavity (tolerance={tolerance})...")
     
     # Use classify_tetrahedra to get the outside/inside mask
-    outside_mask = classify_tetrahedra(tet_vertices, tetrahedra, part_mesh, tolerance)
+    outside_mask = classify_tetrahedra(tet_vertices, tetrahedra, part_mesh, tolerance, method=classification_method)
     
     n_outside = np.sum(outside_mask)
     n_inside = len(tetrahedra) - n_outside
@@ -1760,29 +1808,243 @@ def identify_boundary_vertices(
     return boundary_mask
 
 
+def label_boundary_vertices_direct(
+    tet_vertices: np.ndarray,
+    boundary_mask: np.ndarray,
+    part_mesh: trimesh.Trimesh,
+    hull_mesh: trimesh.Trimesh,
+    d1: np.ndarray,
+    d2: np.ndarray,
+    inner_tolerance_fraction: float = 0.05,
+    use_gpu: bool = True,
+    original_vertices: np.ndarray = None
+) -> np.ndarray:
+    """
+    Label boundary vertices using DIRECT vertex proximity to part mesh.
+    
+    This is more robust than face-based classification because it doesn't require
+    ALL vertices of a face to be within tolerance - it directly checks each vertex.
+    
+    IMPORTANT: Uses ORIGINAL (non-inflated) vertex positions for inner boundary
+    detection, because inflation moves vertices away from the part surface and
+    would cause incorrect labeling.
+    
+    Algorithm:
+    1. Compute distance from each boundary vertex (using ORIGINAL positions) to part mesh
+    2. Vertices within tolerance → label as -1 (inner boundary / part surface)
+    3. Remaining boundary vertices → classify as H1 or H2 based on:
+       - Distance to hull mesh (must be on hull surface)
+       - Dot product with parting directions d1, d2
+    
+    Args:
+        tet_vertices: (N, 3) tetrahedral mesh vertices (current/inflated positions)
+        boundary_mask: (N,) boolean mask of boundary vertices  
+        part_mesh: Original part mesh (for inner boundary detection)
+        hull_mesh: Hull mesh (for H1/H2 classification)
+        d1: Primary parting direction (normalized)
+        d2: Secondary parting direction (normalized)
+        inner_tolerance_fraction: Fraction of mesh size for inner boundary tolerance (default 5%)
+        use_gpu: Whether to use GPU for distance computation
+        original_vertices: (N, 3) ORIGINAL (non-inflated) vertex positions.
+                          If provided, these are used for inner boundary detection.
+                          This is critical because inflation moves vertices away from the part.
+    
+    Returns:
+        (N,) int8 array: 0=interior/boundary zone, 1=H1, 2=H2, -1=inner boundary (part surface)
+    """
+    import time
+    start_time = time.time()
+    
+    labels = np.zeros(len(tet_vertices), dtype=np.int8)
+    
+    # Get boundary vertex indices
+    boundary_indices = np.where(boundary_mask)[0]
+    
+    if len(boundary_indices) == 0:
+        return labels
+    
+    # Use ORIGINAL vertices for inner boundary detection if available
+    # This is critical because inflation moves outer boundary vertices away from the part
+    if original_vertices is not None:
+        boundary_verts_for_part_check = original_vertices[boundary_indices]
+        logger.info("Using ORIGINAL (non-inflated) vertices for inner boundary detection")
+    else:
+        boundary_verts_for_part_check = tet_vertices[boundary_indices]
+        logger.warning("No original vertices provided - using current (possibly inflated) vertices")
+    
+    # Use current (inflated) vertices for H1/H2 classification
+    boundary_verts_current = tet_vertices[boundary_indices]
+    n_boundary = len(boundary_verts_for_part_check)
+    
+    # Compute mesh size for tolerance
+    bounds = part_mesh.bounds
+    mesh_size = np.linalg.norm(bounds[1] - bounds[0])
+    
+    # Compute a robust tolerance based on multiple factors:
+    # 1. Fraction of mesh size (5% default)
+    # 2. But also consider the typical tet edge length which affects how close
+    #    tet boundary vertices can get to the original part surface
+    base_tolerance = mesh_size * inner_tolerance_fraction
+    
+    # For robustness, use a minimum tolerance that accounts for tetrahedralization error
+    # fTetWild typically produces vertices within ~1-2% of edge length from original surface
+    # Use 0.2 as a minimum absolute tolerance for typical part sizes
+    min_tolerance = 0.2
+    inner_tolerance = max(base_tolerance, min_tolerance)
+    
+    logger.info(f"Direct vertex labeling: {n_boundary} boundary vertices")
+    logger.info(f"  mesh_size={mesh_size:.4f}, base_tolerance={base_tolerance:.4f}, inner_tolerance={inner_tolerance:.4f}")
+    
+    # Step 1: Compute distance from each boundary vertex to part mesh surface
+    if use_gpu and CUDA_AVAILABLE:
+        distances_to_part, _ = compute_distances_and_closest_points_gpu(boundary_verts_for_part_check, part_mesh)
+    else:
+        _, distances_to_part, _ = part_mesh.nearest.on_surface(boundary_verts_for_part_check)
+    
+    # Log distance statistics to help debug inner boundary detection
+    logger.info(f"  Distance to part surface: min={distances_to_part.min():.6f}, max={distances_to_part.max():.6f}, "
+                f"median={np.median(distances_to_part):.6f}")
+    
+    # Also compute distance to hull to help identify vertices in transition zone
+    _, distances_to_hull_all, _ = hull_mesh.nearest.on_surface(boundary_verts_for_part_check)
+    
+    # Step 2: Identify inner boundary vertices using a HYBRID approach:
+    # A vertex is on the inner boundary if:
+    # Option A: It's within the tolerance of the part surface, OR
+    # Option B: It's closer to the part surface than to the hull surface
+    #           (with some margin to avoid mis-labeling corner vertices)
+    # This hybrid approach catches vertices that are near the part but beyond the tolerance
+    
+    within_tolerance = distances_to_part < inner_tolerance
+    closer_to_part = distances_to_part < distances_to_hull_all * 0.5  # Much closer to part than hull
+    
+    # Combine: use tolerance check, but also catch vertices that are clearly closer to part
+    inner_mask = within_tolerance | (closer_to_part & (distances_to_part < inner_tolerance * 3))
+    n_inner = np.sum(inner_mask)
+    
+    # Log detailed statistics about inner boundary detection
+    n_within_tol = np.sum(within_tolerance)
+    n_closer_to_part = np.sum(closer_to_part)
+    n_added_by_hybrid = np.sum(inner_mask) - n_within_tol
+    logger.info(f"  Inner boundary detection: {n_within_tol} within tolerance, "
+                f"{n_closer_to_part} closer to part, {n_added_by_hybrid} added by hybrid check")
+    
+    # Log distribution of distances for debugging
+    if n_inner > 0:
+        inner_distances = distances_to_part[inner_mask]
+        logger.info(f"  Inner boundary vertices: {n_inner} (max distance={inner_distances.max():.6f})")
+    
+    outer_distances = distances_to_part[~inner_mask]
+    if len(outer_distances) > 0:
+        # Show how many vertices are "close but not close enough"
+        close_but_missed = np.sum((outer_distances > inner_tolerance) & (outer_distances < inner_tolerance * 2))
+        logger.info(f"  Outer boundary vertices: {len(outer_distances)} (min distance={outer_distances.min():.6f})")
+        if close_but_missed > 0:
+            logger.warning(f"  ⚠️ {close_but_missed} vertices are within 2x tolerance but not labeled as inner!")
+    
+    # Mark inner boundary vertices
+    inner_boundary_indices = boundary_indices[inner_mask]
+    labels[inner_boundary_indices] = -1
+    
+    # Step 3: For remaining boundary vertices, classify as H1 or H2
+    # These are vertices on the hull surface
+    outer_mask = ~inner_mask
+    outer_boundary_indices = boundary_indices[outer_mask]
+    outer_verts = boundary_verts_current[outer_mask]  # Use current positions for hull check
+    n_outer = len(outer_verts)
+    
+    if n_outer > 0:
+        # Compute vertex normals for outer vertices by finding closest point on hull
+        # and using the direction from hull to vertex
+        _, distances_to_hull, face_ids = hull_mesh.nearest.on_surface(outer_verts)
+        
+        # Get hull face normals at closest points
+        hull_normals = hull_mesh.face_normals[face_ids]
+        
+        # Classify based on alignment with parting directions
+        # Use the hull face normal to determine H1 vs H2
+        d1_normalized = d1 / np.linalg.norm(d1)
+        d2_normalized = d2 / np.linalg.norm(d2)
+        
+        align_d1 = np.dot(hull_normals, d1_normalized)  # (n_outer,)
+        align_d2 = np.dot(hull_normals, d2_normalized)  # (n_outer,)
+        
+        # H1 if more aligned with d1, H2 if more aligned with d2
+        h1_mask = align_d1 >= align_d2
+        h2_mask = ~h1_mask
+        
+        labels[outer_boundary_indices[h1_mask]] = 1
+        labels[outer_boundary_indices[h2_mask]] = 2
+        
+        n_h1 = np.sum(h1_mask)
+        n_h2 = np.sum(h2_mask)
+    else:
+        n_h1 = n_h2 = 0
+    
+    elapsed = (time.time() - start_time) * 1000
+    logger.info(f"Direct vertex labeling complete in {elapsed:.0f}ms: "
+                f"inner={n_inner}, H1={n_h1}, H2={n_h2}")
+    
+    return labels
+
+
 def label_boundary_from_classification(
     tet_vertices: np.ndarray,
     boundary_mask: np.ndarray,
     boundary_mesh: trimesh.Trimesh,
     classification_result,  # MoldHalfClassificationResult
-    hull_mesh: trimesh.Trimesh = None  # Not used but kept for backwards compatibility
+    hull_mesh: trimesh.Trimesh = None,  # For H1/H2 classification in direct mode
+    part_mesh: trimesh.Trimesh = None,  # For inner boundary detection in direct mode
+    d1: np.ndarray = None,  # Parting direction for direct mode
+    d2: np.ndarray = None,  # Parting direction for direct mode
+    use_direct_vertex_labeling: bool = True,  # Use direct method (recommended)
+    inner_tolerance_fraction: float = 0.05,  # Tolerance for inner boundary
+    original_vertices: np.ndarray = None  # ORIGINAL (non-inflated) vertices for inner boundary detection
 ) -> np.ndarray:
     """
     Label boundary vertices as H1, H2, or inner boundary based on mold half classification.
     
-    This function now works directly with the tetrahedral boundary mesh classification.
-    Face labels are propagated to vertices by majority voting from adjacent faces.
+    This function supports two modes:
+    1. DIRECT MODE (use_direct_vertex_labeling=True, recommended):
+       - Directly checks each vertex's distance to part mesh
+       - Uses ORIGINAL (non-inflated) vertex positions for inner boundary detection
+       - More robust - doesn't require all face vertices to be within tolerance
+       - Handles corners better where tet mesh may deviate from original surface
+    
+    2. FACE-BASED MODE (use_direct_vertex_labeling=False, legacy):
+       - Uses face classification and majority voting
+       - May miss vertices at corners where face classification fails
     
     Args:
-        tet_vertices: (N, 3) tetrahedral mesh vertices
+        tet_vertices: (N, 3) tetrahedral mesh vertices (current/inflated positions)
         boundary_mask: (N,) boolean mask of boundary vertices
         boundary_mesh: The tetrahedral boundary mesh (classification was done on this mesh)
         classification_result: Result from mold half classification on boundary_mesh
-        hull_mesh: Not used - kept for backwards compatibility
+        hull_mesh: Hull mesh (for H1/H2 classification in direct mode)
+        part_mesh: Part mesh (for inner boundary detection in direct mode)
+        d1: Primary parting direction (for direct mode)
+        d2: Secondary parting direction (for direct mode)
+        use_direct_vertex_labeling: If True, use direct vertex proximity (recommended)
+        inner_tolerance_fraction: Fraction of mesh size for inner boundary tolerance
+        original_vertices: (N, 3) ORIGINAL (non-inflated) vertex positions.
+                          CRITICAL: Used for inner boundary detection because inflation
+                          moves vertices away from the part surface.
     
     Returns:
         (N,) int8 array: 0=interior/boundary zone, 1=H1 boundary, 2=H2 boundary, -1=inner boundary (part surface)
     """
+    # Use direct vertex labeling if enabled and required parameters are available
+    if use_direct_vertex_labeling and part_mesh is not None and hull_mesh is not None and d1 is not None and d2 is not None:
+        logger.info("Using DIRECT vertex proximity labeling (more robust for corners)")
+        return label_boundary_vertices_direct(
+            tet_vertices, boundary_mask, part_mesh, hull_mesh, d1, d2,
+            inner_tolerance_fraction=inner_tolerance_fraction,
+            original_vertices=original_vertices
+        )
+    
+    # Fall back to face-based classification (legacy mode)
+    logger.info("Using face-based classification labeling (legacy mode)")
+    
     labels = np.zeros(len(tet_vertices), dtype=np.int8)
     
     # Get boundary vertex indices

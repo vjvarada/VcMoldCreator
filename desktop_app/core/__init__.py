@@ -51,6 +51,7 @@ from core.tetrahedral_mesh import (
     build_edge_to_index_map,
     build_tet_edge_indices,
     compute_cut_edge_flags,
+    label_boundary_vertices_direct,
     TetrahedralMeshResult,
     PYTETWILD_AVAILABLE,
 )

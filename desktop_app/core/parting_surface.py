@@ -486,7 +486,8 @@ def extract_parting_surface(
     tet_edge_indices: np.ndarray,
     use_original_vertices: bool = True,
     vertices_original: Optional[np.ndarray] = None,
-    boundary_labels: Optional[np.ndarray] = None
+    boundary_labels: Optional[np.ndarray] = None,
+    part_mesh: Optional[trimesh.Trimesh] = None
 ) -> PartingSurfaceResult:
     """
     Extract the parting surface mesh using Marching Tetrahedra.
@@ -516,6 +517,7 @@ def extract_parting_surface(
         use_original_vertices: If True, use vertices_original for surface construction
         vertices_original: (N, 3) original (non-inflated) vertex positions
         boundary_labels: (N,) vertex boundary labels: 0=interior, 1=H1, 2=H2, -1=part surface
+        part_mesh: Optional part mesh for projecting inner-inner edge midpoints onto the surface
     
     Returns:
         PartingSurfaceResult with the extracted surface mesh
@@ -565,6 +567,11 @@ def extract_parting_surface(
     n_part_boundary = 0   # Cut points placed on part surface M
     n_hull_boundary = 0   # Cut points placed on hull boundary ∂H
     n_midpoint = 0        # Cut points at edge midpoints (interior)
+    n_inner_inner_projected = 0  # Inner-inner edges projected to part mesh
+    
+    # Collect inner-inner edge midpoints for batch projection
+    inner_inner_indices = []  # Surface vertex indices that need projection
+    inner_inner_midpoints = []  # Their midpoint positions
     
     for i, e_idx in enumerate(cut_edge_indices):
         v0, v1 = edges[e_idx]
@@ -588,10 +595,14 @@ def extract_parting_surface(
                 vertex_boundary_type[i] = -1  # INNER boundary - re-project to part M
                 n_part_boundary += 1
             elif bl0 == -1 and bl1 == -1:
-                # BOTH on part surface → use midpoint but still mark as part boundary
-                surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
-                vertex_boundary_type[i] = -1  # INNER boundary - re-project to part M
+                # BOTH on part surface → midpoint will be projected to part mesh if available
+                midpoint = 0.5 * (verts[v0] + verts[v1])
+                surface_vertices[i] = midpoint
+                vertex_boundary_type[i] = -1  # INNER boundary - on part M
                 n_part_boundary += 1
+                # Mark for projection if part_mesh is available
+                inner_inner_indices.append(i)
+                inner_inner_midpoints.append(midpoint)
             # Check if either vertex is on hull boundary ∂H (boundary_label == 1 or 2)
             # If so, place cut point at that vertex to ensure surface is bounded by ∂H
             # Mark as OUTER boundary (type 1 or 2) for re-projection to hull during smoothing
@@ -628,6 +639,30 @@ def extract_parting_surface(
             surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
             vertex_boundary_type[i] = 0  # Interior - no boundary constraint
             n_midpoint += 1
+    
+    # Project inner-inner edge midpoints onto part mesh if available
+    # This ensures cut points for edges where BOTH vertices are on the part surface
+    # are placed exactly ON the part surface (not floating at the midpoint)
+    if part_mesh is not None and len(inner_inner_indices) > 0:
+        inner_inner_midpoints_arr = np.array(inner_inner_midpoints)
+        try:
+            # Find closest points on part mesh
+            closest_pts, distances, _ = part_mesh.nearest.on_surface(inner_inner_midpoints_arr)
+            
+            # Update surface vertices with projected positions
+            for idx, surf_idx in enumerate(inner_inner_indices):
+                surface_vertices[surf_idx] = closest_pts[idx]
+            
+            n_inner_inner_projected = len(inner_inner_indices)
+            avg_dist = np.mean(distances)
+            max_dist = np.max(distances)
+            logger.info(f"Projected {n_inner_inner_projected} inner-inner edge midpoints onto part mesh "
+                       f"(avg dist={avg_dist:.6f}, max dist={max_dist:.6f})")
+        except Exception as e:
+            logger.warning(f"Failed to project inner-inner midpoints to part mesh: {e}")
+            n_inner_inner_projected = 0
+    elif len(inner_inner_indices) > 0:
+        logger.info(f"Found {len(inner_inner_indices)} inner-inner edges but no part mesh for projection")
     
     logger.info(f"Cut point placement: {n_part_boundary} on part M (inner), "
                 f"{n_hull_boundary} on hull ∂H (outer), {n_midpoint} midpoints (interior)")
@@ -986,7 +1021,8 @@ def extract_parting_surface_from_tet_result(
     use_original_vertices: bool = True,
     prepare_data: bool = True,
     cut_type: str = 'both',
-    extend_to_primary: bool = True
+    extend_to_primary: bool = True,
+    part_mesh: Optional[trimesh.Trimesh] = None
 ) -> PartingSurfaceResult:
     """
     Convenience function to extract parting surface from a TetrahedralMeshResult.
@@ -998,6 +1034,7 @@ def extract_parting_surface_from_tet_result(
         cut_type: Which cut edges to use: 'primary', 'secondary', or 'both'
         extend_to_primary: If True and cut_type='secondary', extend secondary surface
                           to connect with primary surface in shared tetrahedra
+        part_mesh: Optional part mesh for projecting inner-inner edge midpoints
     
     Returns:
         PartingSurfaceResult
@@ -1062,7 +1099,8 @@ def extract_parting_surface_from_tet_result(
         tet_edge_indices=tet_result.tet_edge_indices,
         use_original_vertices=use_original_vertices,
         vertices_original=tet_result.vertices_original,
-        boundary_labels=tet_result.boundary_labels  # Pass for boundary-aware cut point placement
+        boundary_labels=tet_result.boundary_labels,  # Pass for boundary-aware cut point placement
+        part_mesh=part_mesh  # Pass for projecting inner-inner edge midpoints
     )
 
 

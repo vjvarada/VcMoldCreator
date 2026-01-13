@@ -178,6 +178,11 @@ class MeshViewer(QWidget):
         self._triangle_debug_mesh_ref = None  # Reference to the mesh being debugged
         self._triangle_debug_boundary_type_ref = None  # Vertex boundary types for debug
         
+        # Primary cut edge debug mode for Dijkstra edges
+        self._primary_cut_edge_debug_mode = False
+        self._selected_primary_edge_actor = None  # Currently selected edge highlight
+        self._primary_cut_edges_data = None  # Store primary cut edge data for picking
+        
         self._setup_ui()
     
     def _setup_ui(self):
@@ -4646,3 +4651,320 @@ class MeshViewer(QWidget):
     def triangle_debug_mode(self) -> bool:
         """Check if triangle debug mode is enabled."""
         return self._triangle_debug_mode
+
+    # =========================================================================
+    # PRIMARY CUT EDGE DEBUG MODE - For analyzing why edges don't connect to membrane
+    # =========================================================================
+    
+    def set_primary_cut_edge_debug_mode(self, enabled: bool, tet_result=None, 
+                                         part_mesh: trimesh.Trimesh = None,
+                                         parting_surface_result=None):
+        """
+        Enable/disable primary cut edge debug mode.
+        
+        When enabled, clicking near a yellow primary cut edge will log detailed
+        information about why it may not be connecting to the parting surface membrane.
+        
+        Args:
+            enabled: Whether to enable debug mode
+            tet_result: TetrahedralMeshResult with primary_cut_edges, boundary_labels, etc.
+            part_mesh: Part mesh for distance calculations
+            parting_surface_result: PartingSurfaceResult for checking cut edge coverage
+        """
+        self._primary_cut_edge_debug_mode = enabled
+        
+        if enabled:
+            # Store references
+            if tet_result is not None:
+                self._tet_result_ref = tet_result
+            if part_mesh is not None:
+                self._part_mesh_ref = part_mesh
+            if parting_surface_result is not None:
+                self._parting_surface_result_ref = parting_surface_result
+            
+            # Build primary cut edges data for picking
+            if self._tet_result_ref is not None and hasattr(self._tet_result_ref, 'primary_cut_edges'):
+                self._primary_cut_edges_data = self._tet_result_ref.primary_cut_edges
+            
+            if self._primary_cut_edges_data is None or len(self._primary_cut_edges_data) == 0:
+                logger.warning("No primary cut edges available for debug mode")
+                self._primary_cut_edge_debug_mode = False
+                return
+            
+            # Enable point picking
+            self._enable_primary_edge_picking()
+            logger.info("🔍 Primary cut edge debug mode ENABLED - Click on yellow edges to analyze them")
+            print("\n" + "="*70)
+            print("🔍 PRIMARY CUT EDGE DEBUG MODE ENABLED")
+            print("="*70)
+            print("Click near any yellow primary cut edge to analyze why it may not")
+            print("be connecting to the parting surface membrane.")
+            print("="*70 + "\n")
+        else:
+            # Disable picking and clear visualization
+            self._disable_primary_edge_picking()
+            self._clear_selected_primary_edge()
+            logger.info("Primary cut edge debug mode DISABLED")
+    
+    def _enable_primary_edge_picking(self):
+        """Enable point picking for primary edge selection."""
+        try:
+            self.plotter.enable_point_picking(
+                callback=self._on_point_picked_for_primary_edge,
+                show_message=True,
+                color='cyan',
+                point_size=15,
+                show_point=True,
+                tolerance=0.025,
+                pickable_window=True,
+            )
+            logger.debug("Primary edge picking enabled (point-based)")
+            print("🎯 Click near a yellow edge to select it for analysis")
+        except Exception as e:
+            logger.error(f"Failed to enable primary edge picking: {e}")
+    
+    def _disable_primary_edge_picking(self):
+        """Disable edge picking."""
+        try:
+            self.plotter.disable_picking()
+            logger.debug("Primary edge picking disabled")
+        except Exception:
+            pass
+    
+    def _clear_selected_primary_edge(self):
+        """Clear the selected edge highlight."""
+        if self._selected_primary_edge_actor is not None:
+            try:
+                self.plotter.remove_actor(self._selected_primary_edge_actor)
+            except Exception:
+                pass
+            self._selected_primary_edge_actor = None
+    
+    def _on_point_picked_for_primary_edge(self, point):
+        """Handle point pick and find nearest primary cut edge."""
+        if point is None or self._tet_result_ref is None:
+            logger.debug("No point or no tet result reference")
+            return
+        
+        picked_point = np.array(point)
+        vertices = self._tet_result_ref.vertices
+        primary_cut_edges = self._primary_cut_edges_data
+        
+        if primary_cut_edges is None or len(primary_cut_edges) == 0:
+            logger.warning("No primary cut edges to analyze")
+            return
+        
+        # Find the nearest primary cut edge by midpoint distance
+        min_dist = float('inf')
+        nearest_edge_idx = -1
+        nearest_edge = None
+        
+        for i, (v0, v1) in enumerate(primary_cut_edges):
+            midpoint = (vertices[v0] + vertices[v1]) / 2
+            dist = np.linalg.norm(midpoint - picked_point)
+            if dist < min_dist:
+                min_dist = dist
+                nearest_edge_idx = i
+                nearest_edge = (v0, v1)
+        
+        if nearest_edge is None or min_dist > 5.0:  # Max distance threshold
+            logger.debug(f"No edge close enough to picked point (min_dist={min_dist:.4f})")
+            return
+        
+        logger.debug(f"Picked point {picked_point}, nearest edge {nearest_edge} at distance {min_dist:.4f}")
+        
+        # Analyze the edge
+        self._analyze_primary_cut_edge(nearest_edge_idx, nearest_edge)
+    
+    def _analyze_primary_cut_edge(self, edge_idx: int, edge: tuple):
+        """Analyze and display detailed info about a primary cut edge."""
+        v0_idx, v1_idx = edge
+        tet_result = self._tet_result_ref
+        vertices = tet_result.vertices
+        
+        v0 = vertices[v0_idx]
+        v1 = vertices[v1_idx]
+        midpoint = (v0 + v1) / 2
+        edge_length = np.linalg.norm(v1 - v0)
+        
+        # Highlight the selected edge
+        self._highlight_selected_primary_edge(v0, v1)
+        
+        # Get boundary labels
+        boundary_labels = tet_result.boundary_labels if hasattr(tet_result, 'boundary_labels') else None
+        bl0 = boundary_labels[v0_idx] if boundary_labels is not None else None
+        bl1 = boundary_labels[v1_idx] if boundary_labels is not None else None
+        
+        # Get escape labels from seed data
+        escape_labels = {}
+        if hasattr(tet_result, 'seed_vertex_indices') and hasattr(tet_result, 'seed_escape_labels'):
+            for i, vi in enumerate(tet_result.seed_vertex_indices):
+                escape_labels[vi] = tet_result.seed_escape_labels[i]
+        
+        el0 = escape_labels.get(v0_idx, None)
+        el1 = escape_labels.get(v1_idx, None)
+        
+        # Check if edge is in cut_edge_flags
+        in_cut_flags = False
+        if hasattr(tet_result, 'cut_edge_flags') and tet_result.cut_edge_flags is not None:
+            from core.tetrahedral_mesh import build_edge_to_index_map
+            edge_to_index = build_edge_to_index_map(tet_result.edges)
+            edge_key = (min(v0_idx, v1_idx), max(v0_idx, v1_idx))
+            if edge_key in edge_to_index:
+                edge_global_idx = edge_to_index[edge_key]
+                in_cut_flags = bool(tet_result.cut_edge_flags[edge_global_idx])
+        
+        # Check if parting surface has a vertex on this edge
+        parting_surface_covers_edge = False
+        ps_vertex_idx = None
+        if self._parting_surface_result_ref is not None:
+            ps_result = self._parting_surface_result_ref
+            if hasattr(ps_result, 'vertex_to_edge') and ps_result.vertex_to_edge is not None:
+                # vertex_to_edge maps parting surface vertex index to global edge index
+                # We need to check if any PS vertex came from this edge
+                from core.tetrahedral_mesh import build_edge_to_index_map
+                if hasattr(tet_result, 'edges'):
+                    edge_to_index = build_edge_to_index_map(tet_result.edges)
+                    edge_key = (min(v0_idx, v1_idx), max(v0_idx, v1_idx))
+                    if edge_key in edge_to_index:
+                        target_edge_idx = edge_to_index[edge_key]
+                        for ps_vi, edge_idx in enumerate(ps_result.vertex_to_edge):
+                            if edge_idx == target_edge_idx:
+                                parting_surface_covers_edge = True
+                                ps_vertex_idx = ps_vi
+                                break
+        
+        # Distance to part mesh
+        dist_v0 = dist_v1 = dist_mid = None
+        if self._part_mesh_ref is not None:
+            try:
+                pts = np.array([v0, v1, midpoint])
+                _, distances, _ = trimesh.proximity.closest_point(self._part_mesh_ref, pts)
+                dist_v0, dist_v1, dist_mid = distances[0], distances[1], distances[2]
+            except Exception:
+                pass
+        
+        # Use original vertices if available for comparison
+        original_dist_v0 = original_dist_v1 = None
+        if hasattr(tet_result, 'vertices_original') and tet_result.vertices_original is not None:
+            try:
+                orig_v0 = tet_result.vertices_original[v0_idx]
+                orig_v1 = tet_result.vertices_original[v1_idx]
+                pts = np.array([orig_v0, orig_v1])
+                _, distances, _ = trimesh.proximity.closest_point(self._part_mesh_ref, pts)
+                original_dist_v0, original_dist_v1 = distances[0], distances[1]
+            except Exception:
+                pass
+        
+        # Print detailed debug info
+        print("\n" + "="*70)
+        print("🔗 PRIMARY CUT EDGE DEBUG ANALYSIS")
+        print("="*70)
+        print(f"Edge Index: {edge_idx}")
+        print(f"Vertex Indices: [{v0_idx}, {v1_idx}]")
+        
+        print(f"\n📍 VERTEX POSITIONS:")
+        print(f"   V0 [{v0_idx}]: [{v0[0]:.6f}, {v0[1]:.6f}, {v0[2]:.6f}]")
+        print(f"   V1 [{v1_idx}]: [{v1[0]:.6f}, {v1[1]:.6f}, {v1[2]:.6f}]")
+        print(f"   Midpoint: [{midpoint[0]:.6f}, {midpoint[1]:.6f}, {midpoint[2]:.6f}]")
+        print(f"   Edge Length: {edge_length:.6f}")
+        
+        print(f"\n🏷️ BOUNDARY LABELS (from label_boundary_vertices_direct):")
+        bl_names = {-1: "INNER (part M)", 0: "INTERIOR/unlabeled", 1: "OUTER (H1)", 2: "OUTER (H2)"}
+        print(f"   V0 [{v0_idx}]: {bl_names.get(bl0, f'UNKNOWN ({bl0})')}")
+        print(f"   V1 [{v1_idx}]: {bl_names.get(bl1, f'UNKNOWN ({bl1})')}")
+        
+        print(f"\n🚶 ESCAPE LABELS (from Dijkstra walk):")
+        el_names = {0: "UNREACHABLE", 1: "→H1", 2: "→H2", None: "NOT INTERIOR (boundary vertex)"}
+        print(f"   V0 [{v0_idx}]: {el_names.get(el0, f'UNKNOWN ({el0})')}")
+        print(f"   V1 [{v1_idx}]: {el_names.get(el1, f'UNKNOWN ({el1})')}")
+        
+        print(f"\n📏 DISTANCE TO PART MESH:")
+        if dist_v0 is not None:
+            print(f"   V0 (current): {dist_v0:.6f}")
+            print(f"   V1 (current): {dist_v1:.6f}")
+            print(f"   Midpoint: {dist_mid:.6f}")
+            if original_dist_v0 is not None:
+                print(f"   V0 (original): {original_dist_v0:.6f}")
+                print(f"   V1 (original): {original_dist_v1:.6f}")
+        else:
+            print("   (No part mesh available)")
+        
+        print(f"\n✂️ CUT EDGE STATUS:")
+        print(f"   In cut_edge_flags array: {'YES' if in_cut_flags else 'NO'}")
+        print(f"   Parting surface covers this edge: {'YES' if parting_surface_covers_edge else 'NO'}")
+        if ps_vertex_idx is not None:
+            print(f"   Parting surface vertex index: {ps_vertex_idx}")
+        
+        # Analyze potential issues
+        print(f"\n🔎 POTENTIAL ISSUES:")
+        issues_found = False
+        
+        # Issue 1: Edge not in cut flags but is in primary_cut_edges
+        if not in_cut_flags:
+            print(f"   ❌ Edge is a PRIMARY CUT but NOT in cut_edge_flags - won't generate surface triangle!")
+            issues_found = True
+        
+        # Issue 2: Both vertices have boundary label 0 (unlabeled)
+        if bl0 == 0 and bl1 == 0:
+            print(f"   ⚠️ Both vertices have boundary_label=0 (unlabeled) - may need label propagation")
+            issues_found = True
+        
+        # Issue 3: One vertex is inner boundary (-1) but not propagated
+        if bl0 == -1 or bl1 == -1:
+            if bl0 == -1 and bl1 not in (1, 2):
+                print(f"   ⚠️ V0 is inner boundary (part) but V1 label is {bl1} - not a clear H1/H2 cut")
+                issues_found = True
+            if bl1 == -1 and bl0 not in (1, 2):
+                print(f"   ⚠️ V1 is inner boundary (part) but V0 label is {bl0} - not a clear H1/H2 cut")
+                issues_found = True
+        
+        # Issue 4: Parting surface doesn't cover edge
+        if not parting_surface_covers_edge:
+            print(f"   ❌ Parting surface has NO vertex on this edge - GAP in membrane!")
+            issues_found = True
+        
+        # Issue 5: Escape labels don't match expected H1 vs H2
+        if el0 is not None and el1 is not None:
+            if not ((el0 == 1 and el1 == 2) or (el0 == 2 and el1 == 1)):
+                print(f"   ⚠️ Escape labels don't show H1↔H2 transition: {el0} vs {el1}")
+                issues_found = True
+        
+        if not issues_found:
+            print(f"   ✅ No obvious issues detected - edge should connect to membrane")
+        
+        print("="*70 + "\n")
+        
+        logger.info(f"Edge {edge_idx} analyzed: v=[{v0_idx},{v1_idx}], bl=[{bl0},{bl1}], in_flags={in_cut_flags}, covered={parting_surface_covers_edge}")
+    
+    def _highlight_selected_primary_edge(self, v0: np.ndarray, v1: np.ndarray):
+        """Highlight the selected primary cut edge."""
+        # Clear previous selection
+        self._clear_selected_primary_edge()
+        
+        try:
+            # Create a thick line for the edge
+            line = pv.Line(v0, v1)
+            
+            self._selected_primary_edge_actor = self.plotter.add_mesh(
+                line,
+                color='cyan',
+                line_width=10,
+                render_lines_as_tubes=True,
+            )
+            
+            # Add spheres at vertices for visibility
+            sphere0 = pv.Sphere(radius=0.3, center=v0)
+            sphere1 = pv.Sphere(radius=0.3, center=v1)
+            self.plotter.add_mesh(sphere0, color='red', opacity=0.9)
+            self.plotter.add_mesh(sphere1, color='blue', opacity=0.9)
+            
+            self.plotter.update()
+            
+        except Exception as e:
+            logger.error(f"Error highlighting edge: {e}")
+    
+    @property
+    def primary_cut_edge_debug_mode(self) -> bool:
+        """Check if primary cut edge debug mode is enabled."""
+        return self._primary_cut_edge_debug_mode

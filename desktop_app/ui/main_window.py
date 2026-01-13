@@ -85,8 +85,8 @@ STEPS = [
     {'id': Step.MOLD_HALVES, 'icon': '🎨', 'title': 'Mold Halves', 'description': 'Classify tetrahedral boundary into H₁ and H₂ mold halves'},
     {'id': Step.EDGE_WEIGHTS, 'icon': '⚖️', 'title': 'Edge Weights', 'description': 'Compute edge weights based on distance to part surface'},
     {'id': Step.DIJKSTRA, 'icon': '🛤️', 'title': 'Dijkstra Walk', 'description': 'Find shortest paths from part surface to mold halves'},
-    {'id': Step.SECONDARY_CUTS, 'icon': '✂️', 'title': 'Secondary Cuts', 'description': 'Detect secondary cutting edges where membrane intersects part'},
     {'id': Step.PARTING_SURFACE, 'icon': '🔲', 'title': 'Primary Surface', 'description': 'Generate, repair and smooth the primary parting surface'},
+    {'id': Step.SECONDARY_CUTS, 'icon': '✂️', 'title': 'Secondary Cuts', 'description': 'Detect secondary cutting edges where membrane intersects part'},
     {'id': Step.SECONDARY_SURFACE, 'icon': '🔴', 'title': 'Secondary Surface', 'description': 'Generate, propagate and smooth secondary parting surfaces'},
     {'id': Step.POURING, 'icon': '🧪', 'title': 'Pouring Directions', 'description': 'Optimize silicone/resin pouring directions for each mold half'},
 ]
@@ -1200,8 +1200,11 @@ class TetrahedralizeWorker(QThread):
                 if self.part_mesh is not None:
                     self.progress.emit("Filtering tetrahedra inside part mesh...")
                     from core.tetrahedral_mesh import filter_tetrahedra_outside_part
+                    # Use vertex_majority method to correctly handle tets straddling the boundary
+                    # This prevents spurious faces from appearing in the inner boundary mesh
                     tet_vertices, tetrahedra = filter_tetrahedra_outside_part(
-                        tet_vertices, tetrahedra, self.part_mesh
+                        tet_vertices, tetrahedra, self.part_mesh,
+                        classification_method='vertex_majority'
                     )
                     
                     if len(tetrahedra) == 0:
@@ -1418,9 +1421,11 @@ class EdgeWeightsWorker(QThread):
             # Emit classification for visualization
             self.boundary_classified.emit(tet_boundary_classification)
             
-            # Step 4: Label boundary vertices from the tetrahedral boundary mesh classification
-            # Use the INFLATED boundary mesh for vertex labeling (same face indices as original)
-            self.progress.emit("Labeling boundary vertices...")
+            # Step 4: Label boundary vertices using DIRECT vertex proximity (more robust)
+            # This directly checks each vertex's distance to the part mesh surface
+            # IMPORTANT: Uses ORIGINAL (non-inflated) vertices for inner boundary detection
+            # because inflation moves vertices away from the part surface
+            self.progress.emit("Labeling boundary vertices (direct proximity)...")
             
             inflated_boundary_mesh = result.boundary_mesh
             
@@ -1431,12 +1436,21 @@ class EdgeWeightsWorker(QThread):
                 boundary_mask = identify_boundary_vertices(result.vertices, inflated_boundary_mesh)
                 result.boundary_vertices = boundary_mask
             
+            # Use direct vertex labeling for more robust corner handling
+            # CRITICAL: Pass original_vertices for accurate inner boundary detection
+            # inner_tolerance_fraction=0.05 means 5% of mesh size for inner boundary detection
             result.boundary_labels = label_boundary_from_classification(
-                result.vertices,
+                result.vertices,  # Current (inflated) vertices for H1/H2 classification
                 boundary_mask,
-                inflated_boundary_mesh,  # Use the inflated boundary mesh (same face indices)
-                tet_boundary_classification,  # Classification done on original boundary mesh
-                self.hull_mesh  # Not used, kept for compatibility
+                inflated_boundary_mesh,  # Use the inflated boundary mesh
+                tet_boundary_classification,  # Classification (for legacy fallback)
+                hull_mesh=self.hull_mesh,  # For H1/H2 classification
+                part_mesh=self.part_mesh,  # For inner boundary detection
+                d1=d1,  # Parting direction
+                d2=d2,  # Parting direction
+                use_direct_vertex_labeling=True,  # Use direct method (more robust)
+                inner_tolerance_fraction=0.05,  # 5% of mesh size
+                original_vertices=result.vertices_original  # ORIGINAL vertices for inner boundary
             )
             
             n_h1 = np.sum(result.boundary_labels == 1)
@@ -1553,6 +1567,7 @@ class DijkstraWorker(QThread):
         1. Interior vertex → H1 adjacent to Interior vertex → H2
         2. H1 boundary vertex adjacent to Interior vertex → H2  
         3. H2 boundary vertex adjacent to Interior vertex → H1
+        4. Inner boundary vertex (part surface) adjacent to opposite-side vertex
         
         The parting surface passes through the midpoints of these cut edges,
         ensuring it flows from the hull boundary (∂H) to the part surface (M).
@@ -1589,11 +1604,69 @@ class DijkstraWorker(QThread):
             if escape_label in (1, 2):
                 vertex_labels[vert_idx] = escape_label
         
+        # IMPORTANT: Inner boundary vertices (boundary_labels == -1) need labels too!
+        # They're on the part surface M, and should be labeled H1 or H2 based on 
+        # which side of the parting line they're on.
+        # Propagate labels from neighboring classified vertices.
+        if boundary_labels is not None:
+            inner_boundary_mask = boundary_labels == -1
+            inner_boundary_indices = np.where(inner_boundary_mask)[0]
+            
+            if len(inner_boundary_indices) > 0:
+                # Build adjacency for quick neighbor lookup
+                from collections import defaultdict
+                adjacency = defaultdict(set)
+                for v0, v1 in edges:
+                    adjacency[v0].add(v1)
+                    adjacency[v1].add(v0)
+                
+                # Propagate labels to inner boundary vertices from their neighbors
+                # Use multiple passes to handle chains of inner boundary vertices
+                n_propagated = 0
+                for _pass in range(3):  # Up to 3 passes for propagation
+                    changed = False
+                    for v_idx in inner_boundary_indices:
+                        if vertex_labels[v_idx] != -1:
+                            continue  # Already classified
+                        
+                        # Look at neighbors and count H1 vs H2
+                        h1_count = 0
+                        h2_count = 0
+                        for neighbor in adjacency[v_idx]:
+                            nl = vertex_labels[neighbor]
+                            if nl == 1:
+                                h1_count += 1
+                            elif nl == 2:
+                                h2_count += 1
+                        
+                        # Assign based on majority of classified neighbors
+                        if h1_count > h2_count:
+                            vertex_labels[v_idx] = 1
+                            n_propagated += 1
+                            changed = True
+                        elif h2_count > h1_count:
+                            vertex_labels[v_idx] = 2
+                            n_propagated += 1
+                            changed = True
+                        # If tied or no classified neighbors, leave unclassified
+                    
+                    if not changed:
+                        break
+                
+                if n_propagated > 0:
+                    logger.info(f"Propagated H1/H2 labels to {n_propagated} inner boundary vertices")
+                
+                # Count remaining unclassified inner boundary vertices
+                n_unclassified = np.sum(vertex_labels[inner_boundary_indices] == -1)
+                if n_unclassified > 0:
+                    logger.warning(f"{n_unclassified} inner boundary vertices remain unclassified")
+        
         # Find edges where one endpoint is on H1 side and other is on H2 side
         # This includes:
         # - Interior → H1 adjacent to Interior → H2 (original)
         # - H1 boundary adjacent to Interior → H2 (NEW: reaches hull)
         # - H2 boundary adjacent to Interior → H1 (NEW: reaches hull)
+        # - Inner boundary (now classified) adjacent to opposite side
         primary_cuts = []
         for v0, v1 in edges:
             l0 = vertex_labels[v0]
@@ -1812,7 +1885,8 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                 use_original_vertices=True,
                 prepare_data=False,
                 cut_type='primary',
-                extend_to_primary=False
+                extend_to_primary=False,
+                part_mesh=self.part_mesh  # Pass for projecting inner-inner edge midpoints
             )
             
             result.extraction_time_ms = (time.time() - extraction_start) * 1000
@@ -2082,7 +2156,8 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
                 use_original_vertices=True,
                 prepare_data=False,
                 cut_type='secondary',
-                extend_to_primary=True  # Include connections to primary
+                extend_to_primary=True,  # Include connections to primary
+                part_mesh=self.part_mesh  # Pass for projecting inner-inner edge midpoints
             )
             
             result.extraction_time_ms = (time.time() - extraction_start) * 1000
@@ -2401,7 +2476,8 @@ class PartingSurfaceWorker(QThread):
                 use_original_vertices=self.use_original_vertices,
                 prepare_data=False,  # Already prepared above
                 cut_type=self.cut_type,
-                extend_to_primary=self.extend_to_primary
+                extend_to_primary=self.extend_to_primary,
+                part_mesh=self.part_mesh  # Pass for projecting inner-inner edge midpoints
             )
             
             # Step 3: Clean surface (merge vertices, remove degenerates)
@@ -3340,6 +3416,9 @@ class DisplayOptionsPanel(QFrame):
     # Triangle debug signal
     triangle_debug_mode_changed = pyqtSignal(bool)  # Toggle triangle debug mode for membrane analysis
     
+    # Primary cut edge debug signal
+    primary_cut_edge_debug_mode_changed = pyqtSignal(bool)  # Toggle primary cut edge debug mode
+    
     # Must match MeshViewer.BACKGROUND_COLOR for rounded corners to blend
     VIEWER_BG = "#1a1a1a"  # Matches React frontend BACKGROUND_COLOR
     
@@ -3505,6 +3584,14 @@ class DisplayOptionsPanel(QFrame):
         self.show_dijkstra_h1h2_cb.hide()
         layout.addWidget(self.show_dijkstra_h1h2_cb)
         
+        # Primary cut edge debug mode checkbox
+        self.primary_cut_edge_debug_cb = QCheckBox('🔍 Debug Primary Cut Edges')
+        self.primary_cut_edge_debug_cb.setChecked(False)
+        self.primary_cut_edge_debug_cb.setToolTip('Click on yellow primary cut edges to analyze why they may not connect to membrane')
+        self.primary_cut_edge_debug_cb.stateChanged.connect(lambda s: self.primary_cut_edge_debug_mode_changed.emit(s == Qt.CheckState.Checked.value))
+        self.primary_cut_edge_debug_cb.hide()
+        layout.addWidget(self.primary_cut_edge_debug_cb)
+        
         # Separator for Secondary cuts options
         self.secondary_cuts_separator = QFrame()
         self.secondary_cuts_separator.setFixedHeight(1)
@@ -3634,11 +3721,14 @@ class DisplayOptionsPanel(QFrame):
             self.show_dijkstra_result_cb.setChecked(True)  # Reset to showing result
             self.show_dijkstra_h1h2_cb.show()
             self.show_dijkstra_h1h2_cb.setChecked(True)  # Reset to showing H1/H2 edges
+            self.primary_cut_edge_debug_cb.show()  # Show debug option
+            self.primary_cut_edge_debug_cb.setChecked(False)  # Reset to disabled
         else:
             self.dijkstra_separator.hide()
             self.dijkstra_label.hide()
             self.show_dijkstra_result_cb.hide()
             self.show_dijkstra_h1h2_cb.hide()
+            self.primary_cut_edge_debug_cb.hide()
         self.adjustSize()
     
     def show_secondary_cuts_option(self, show: bool = True):
@@ -4082,8 +4172,31 @@ class MainWindow(QMainWindow):
         self.display_options.triangle_debug_mode_changed.connect(
             self._on_triangle_debug_mode_changed
         )
+        self.display_options.primary_cut_edge_debug_mode_changed.connect(
+            self._on_primary_cut_edge_debug_mode_changed
+        )
         
         return wrapper
+    
+    def _on_primary_cut_edge_debug_mode_changed(self, enabled: bool):
+        """Handle primary cut edge debug mode toggle."""
+        # Get the tet result with primary cut edges
+        tet_result = self._tet_result
+        part_mesh = self._current_mesh
+        parting_surface_result = self._parting_surface_result
+        
+        # Enable/disable primary cut edge debug mode in the mesh viewer
+        self.mesh_viewer.set_primary_cut_edge_debug_mode(
+            enabled=enabled,
+            tet_result=tet_result,
+            part_mesh=part_mesh,
+            parting_surface_result=parting_surface_result
+        )
+        
+        if enabled:
+            logger.info("🔍 Primary cut edge debug mode enabled - click on yellow edges to analyze them")
+        else:
+            logger.info("Primary cut edge debug mode disabled")
     
     def _on_triangle_debug_mode_changed(self, enabled: bool):
         """Handle triangle debug mode toggle."""
@@ -6922,9 +7035,9 @@ class MainWindow(QMainWindow):
         # Update step status
         self.step_buttons[Step.DIJKSTRA].set_status('completed')
         
-        # Unlock secondary cuts step
-        if Step.SECONDARY_CUTS in self.step_buttons:
-            self.step_buttons[Step.SECONDARY_CUTS].set_status('ready')
+        # Unlock parting surface step (it depends on primary_cut_edges from Dijkstra)
+        if Step.PARTING_SURFACE in self.step_buttons:
+            self.step_buttons[Step.PARTING_SURFACE].set_status('ready')
         
         n_h1 = np.sum(result.seed_escape_labels == 1)
         n_h2 = np.sum(result.seed_escape_labels == 2)
@@ -7570,9 +7683,9 @@ class MainWindow(QMainWindow):
         # Update step status
         self.step_buttons[Step.SECONDARY_CUTS].set_status('completed')
         
-        # Unlock parting surface step
-        if Step.PARTING_SURFACE in self.step_buttons:
-            self.step_buttons[Step.PARTING_SURFACE].set_status('ready')
+        # Unlock secondary surface step
+        if Step.SECONDARY_SURFACE in self.step_buttons:
+            self.step_buttons[Step.SECONDARY_SURFACE].set_status('ready')
         
         n_secondary = len(result.secondary_cut_edges) if result.secondary_cut_edges else 0
         logger.info(f"Secondary cuts complete: {n_secondary} secondary cutting edges found")
@@ -7607,10 +7720,10 @@ class MainWindow(QMainWindow):
     
     def _setup_parting_surface_step(self):
         """Setup the parting surface step UI."""
-        # Check prerequisites
-        if self._tet_result is None or self._tet_result.secondary_cut_edges is None:
-            no_secondary_label = QLabel("⚠️ Please run Secondary Cuts first.")
-            no_secondary_label.setStyleSheet(f"""
+        # Check prerequisites - needs primary_cut_edges from Dijkstra step
+        if self._tet_result is None or self._tet_result.primary_cut_edges is None:
+            no_dijkstra_label = QLabel("⚠️ Please run Dijkstra Walk first.")
+            no_dijkstra_label.setStyleSheet(f"""
                 color: {Colors.WARNING};
                 font-size: 13px;
                 padding: 12px;
@@ -7618,8 +7731,8 @@ class MainWindow(QMainWindow):
                 border: 1px solid {Colors.WARNING};
                 border-radius: 6px;
             """)
-            no_secondary_label.setWordWrap(True)
-            self.context_layout.addWidget(no_secondary_label)
+            no_dijkstra_label.setWordWrap(True)
+            self.context_layout.addWidget(no_dijkstra_label)
             return
         
         # Description section
@@ -7880,11 +7993,11 @@ class MainWindow(QMainWindow):
         # Visualize the parting surface
         self._visualize_parting_surface(result)
         
-        # Mark step complete and unlock secondary surface step
+        # Mark step complete and unlock secondary cuts step
         if Step.PARTING_SURFACE in self.step_buttons:
             self.step_buttons[Step.PARTING_SURFACE].set_status('completed')
-        if Step.SECONDARY_SURFACE in self.step_buttons:
-            self.step_buttons[Step.SECONDARY_SURFACE].set_status('available')
+        if Step.SECONDARY_CUTS in self.step_buttons:
+            self.step_buttons[Step.SECONDARY_CUTS].set_status('ready')
     
     def _on_parting_surface_error(self, error_msg: str):
         """Handle parting surface generation error."""

@@ -1075,13 +1075,18 @@ def classify_mold_halves_fast(
 def identify_outer_boundary_by_distance(
     boundary_mesh: trimesh.Trimesh,
     part_mesh: trimesh.Trimesh,
-    tolerance_fraction: float = 0.02
+    tolerance_fraction: float = 0.03,
+    corner_tolerance_multiplier: float = 2.0
 ) -> Tuple[Set[int], Set[int]]:
     """
     Fast outer boundary detection using vertex distance to part mesh SURFACE.
     
     A face is "inner" (from part surface) if ALL its vertices are within 
     tolerance of the part mesh surface. Otherwise it's "outer" (from hull surface).
+    
+    For vertices at sharp corners (high curvature), a larger tolerance is used
+    because the tetrahedral mesh may deviate more from the original surface
+    at corners.
     
     Uses trimesh's nearest.on_surface() for accurate surface distance computation,
     which is more reliable than vertex-to-vertex KD-tree distance when the
@@ -1090,7 +1095,8 @@ def identify_outer_boundary_by_distance(
     Args:
         boundary_mesh: The boundary mesh to classify
         part_mesh: The original part mesh
-        tolerance_fraction: Fraction of mesh size for tolerance (default 2%)
+        tolerance_fraction: Fraction of mesh size for base tolerance (default 3%)
+        corner_tolerance_multiplier: Multiplier for tolerance at high-curvature areas (default 2.0)
     
     Returns:
         Tuple of (outer_triangles, inner_triangles) sets
@@ -1101,20 +1107,40 @@ def identify_outer_boundary_by_distance(
     # Compute tolerance based on mesh size
     bounds = boundary_mesh.bounds
     mesh_size = np.linalg.norm(bounds[1] - bounds[0])
-    tolerance = mesh_size * tolerance_fraction
+    base_tolerance = mesh_size * tolerance_fraction
     
     # Query distances from boundary vertices to part mesh SURFACE
     # This is more accurate than vertex-to-vertex KD-tree distance
-    boundary_verts = boundary_mesh.vertices
-    _, distances, _ = part_mesh.nearest.on_surface(boundary_verts)
+    boundary_verts = np.asarray(boundary_mesh.vertices)
+    closest_points, distances, triangle_ids = part_mesh.nearest.on_surface(boundary_verts)
     
-    # Mark vertices as "near part surface" if within tolerance
-    near_part = distances < tolerance  # (n_verts,)
+    # Compute adaptive tolerance based on local curvature
+    # At corners (high curvature), we need larger tolerance because:
+    # 1. Tetrahedral mesh may deviate more from original surface
+    # 2. Sharp corners may have vertices slightly off-surface
+    
+    # Estimate vertex "sharpness" using angle between vertex normal and face normal
+    # at the closest point on the part mesh
+    vertex_normals = boundary_mesh.vertex_normals  # (n_verts, 3)
+    part_face_normals = part_mesh.face_normals[triangle_ids]  # (n_verts, 3)
+    
+    # Compute dot product between vertex normal and closest face normal
+    # Values close to 1 = smooth area, values close to 0 = sharp corner
+    normal_alignment = np.abs(np.sum(vertex_normals * part_face_normals, axis=1))  # (n_verts,)
+    
+    # Adaptive tolerance: base_tolerance for smooth areas, up to base_tolerance * multiplier for corners
+    # sharpness factor: 1.0 for aligned normals, up to corner_tolerance_multiplier for perpendicular
+    sharpness_factor = 1.0 + (corner_tolerance_multiplier - 1.0) * (1.0 - normal_alignment)
+    adaptive_tolerance = base_tolerance * sharpness_factor  # (n_verts,)
+    
+    # Mark vertices as "near part surface" if within their adaptive tolerance
+    near_part = distances < adaptive_tolerance  # (n_verts,)
     
     # Log distance statistics for debugging
     logger.debug(f"Distance to part surface: min={distances.min():.4f}, max={distances.max():.4f}, "
-                f"tolerance={tolerance:.4f}")
-    logger.debug(f"Vertices near part: {np.sum(near_part)} / {len(boundary_verts)}")
+                f"base_tolerance={base_tolerance:.4f}, corner_tolerance={base_tolerance * corner_tolerance_multiplier:.4f}")
+    logger.debug(f"Vertices near part: {np.sum(near_part)} / {len(boundary_verts)} "
+                f"(with adaptive tolerance, avg factor={sharpness_factor.mean():.2f})")
     
     # A face is inner if ALL its vertices are near part surface
     faces = boundary_mesh.faces  # (n_faces, 3)
