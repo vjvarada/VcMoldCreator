@@ -180,11 +180,15 @@ class MeshViewer(QWidget):
         
         # Feature debug visualization (sharp edges/corners)
         self._feature_debug_sharp_edges_actor = None  # Lines showing sharp edges on target mesh
-        self._feature_debug_corners_actor = None  # Spheres at corner vertices
-        self._feature_debug_sharp_edge_verts_actor = None  # Spheres at sharp edge vertices
+        self._feature_debug_corners_actor = None  # Spheres at convex corner vertices (red)
+        self._feature_debug_concave_corners_actor = None  # Spheres at concave corner vertices (purple)
+        self._feature_debug_sharp_edge_verts_actor = None  # Spheres at convex sharp edge vertices (cyan)
+        self._feature_debug_concave_edge_verts_actor = None  # Spheres at concave sharp edge vertices (orange)
         self._feature_debug_membrane_smooth_actor = None  # Membrane boundary verts -> smooth (green)
-        self._feature_debug_membrane_edge_actor = None  # Membrane boundary verts -> sharp edge (blue)
-        self._feature_debug_membrane_corner_actor = None  # Membrane boundary verts -> corner (red)
+        self._feature_debug_membrane_edge_actor = None  # Membrane boundary verts -> convex sharp edge (cyan)
+        self._feature_debug_membrane_corner_actor = None  # Membrane boundary verts -> convex corner (red)
+        self._feature_debug_membrane_concave_edge_actor = None  # Membrane boundary verts -> concave edge (orange)
+        self._feature_debug_membrane_concave_corner_actor = None  # Membrane boundary verts -> concave corner (magenta, FIXED)
         self._feature_debug_visible = True
         
         self._setup_ui()
@@ -1884,48 +1888,90 @@ class MeshViewer(QWidget):
                 )
                 logger.info(f"Added {n_edges} sharp edge lines")
         
-        # === 2. Draw corner vertices (red spheres) using glyphs ===
+        # === 2. Draw corner vertices using glyphs ===
+        # Feature types: 2 = convex corner, 4 = concave corner
         if debug_data.target_feature_types is not None and debug_data.target_mesh_vertices is not None:
-            corner_mask = debug_data.target_feature_types == 2
-            corner_positions = debug_data.target_mesh_vertices[corner_mask]
+            # Convex corners (red) - can be smoothed
+            convex_corner_mask = debug_data.target_feature_types == 2
+            convex_corner_positions = debug_data.target_mesh_vertices[convex_corner_mask]
             
-            if len(corner_positions) > 0:
-                # Use glyph for efficient sphere rendering
-                corner_cloud = pv.PolyData(corner_positions)
-                corner_glyphs = corner_cloud.glyph(
+            if len(convex_corner_positions) > 0:
+                convex_cloud = pv.PolyData(convex_corner_positions)
+                convex_glyphs = convex_cloud.glyph(
                     geom=pv.Sphere(radius=sphere_radius * 1.5),
                     scale=False,
                     orient=False
                 )
                 
                 self._feature_debug_corners_actor = self.plotter.add_mesh(
-                    corner_glyphs,
+                    convex_glyphs,
                     color='red',
                     opacity=1.0,
                 )
-                logger.info(f"Added {len(corner_positions)} corner spheres (red)")
-        
-        # === 3. Draw sharp edge vertices (cyan spheres) using glyphs ===
-        if debug_data.target_feature_types is not None and debug_data.target_mesh_vertices is not None:
-            edge_mask = debug_data.target_feature_types == 1
-            edge_positions = debug_data.target_mesh_vertices[edge_mask]
+                logger.info(f"Added {len(convex_corner_positions)} CONVEX corner spheres (red)")
             
-            if len(edge_positions) > 0:
-                edge_cloud = pv.PolyData(edge_positions)
-                edge_glyphs = edge_cloud.glyph(
+            # Concave corners (purple) - kept fixed during smoothing
+            concave_corner_mask = debug_data.target_feature_types == 4
+            concave_corner_positions = debug_data.target_mesh_vertices[concave_corner_mask]
+            
+            if len(concave_corner_positions) > 0:
+                concave_cloud = pv.PolyData(concave_corner_positions)
+                concave_glyphs = concave_cloud.glyph(
+                    geom=pv.Sphere(radius=sphere_radius * 1.8),
+                    scale=False,
+                    orient=False
+                )
+                
+                self._feature_debug_concave_corners_actor = self.plotter.add_mesh(
+                    concave_glyphs,
+                    color='purple',
+                    opacity=1.0,
+                )
+                logger.info(f"Added {len(concave_corner_positions)} CONCAVE corner spheres (purple)")
+        
+        # === 3. Draw sharp edge vertices using glyphs ===
+        # Feature types: 1 = convex sharp edge, 3 = concave sharp edge
+        if debug_data.target_feature_types is not None and debug_data.target_mesh_vertices is not None:
+            # Convex sharp edges (cyan)
+            convex_edge_mask = debug_data.target_feature_types == 1
+            convex_edge_positions = debug_data.target_mesh_vertices[convex_edge_mask]
+            
+            if len(convex_edge_positions) > 0:
+                convex_edge_cloud = pv.PolyData(convex_edge_positions)
+                convex_edge_glyphs = convex_edge_cloud.glyph(
                     geom=pv.Sphere(radius=sphere_radius),
                     scale=False,
                     orient=False
                 )
                 
                 self._feature_debug_sharp_edge_verts_actor = self.plotter.add_mesh(
-                    edge_glyphs,
+                    convex_edge_glyphs,
                     color='cyan',
                     opacity=0.8,
                 )
-                logger.info(f"Added {len(edge_positions)} sharp edge vertex spheres (cyan)")
+                logger.info(f"Added {len(convex_edge_positions)} CONVEX sharp edge spheres (cyan)")
+            
+            # Concave sharp edges (orange)
+            concave_edge_mask = debug_data.target_feature_types == 3
+            concave_edge_positions = debug_data.target_mesh_vertices[concave_edge_mask]
+            
+            if len(concave_edge_positions) > 0:
+                concave_edge_cloud = pv.PolyData(concave_edge_positions)
+                concave_edge_glyphs = concave_edge_cloud.glyph(
+                    geom=pv.Sphere(radius=sphere_radius),
+                    scale=False,
+                    orient=False
+                )
+                
+                self._feature_debug_concave_edge_verts_actor = self.plotter.add_mesh(
+                    concave_edge_glyphs,
+                    color='orange',
+                    opacity=0.8,
+                )
+                logger.info(f"Added {len(concave_edge_positions)} CONCAVE sharp edge spheres (orange)")
         
         # === 4. Draw membrane boundary vertices by projection type (using glyphs) ===
+        # Feature types: 0=smooth, 1=sharp_convex, 2=corner_convex, 3=sharp_concave, 4=corner_concave
         if debug_data.membrane_boundary_positions is not None and debug_data.membrane_boundary_projected_types is not None:
             positions = debug_data.membrane_boundary_positions
             types = debug_data.membrane_boundary_projected_types
@@ -1950,10 +1996,10 @@ class MeshViewer(QWidget):
                 )
                 logger.info(f"Added {np.sum(smooth_mask)} membrane smooth spheres (green)")
             
-            # Sharp edge (blue) - edge projection
-            edge_mask = types == 1
-            if np.sum(edge_mask) > 0:
-                edge_positions = positions[edge_mask]
+            # Sharp edge convex (cyan) - edge projection, can be smoothed
+            convex_edge_mask = types == 1
+            if np.sum(convex_edge_mask) > 0:
+                edge_positions = positions[convex_edge_mask]
                 edge_cloud = pv.PolyData(edge_positions)
                 edge_glyphs = edge_cloud.glyph(
                     geom=pv.Sphere(radius=membrane_radius),
@@ -1963,15 +2009,15 @@ class MeshViewer(QWidget):
                 
                 self._feature_debug_membrane_edge_actor = self.plotter.add_mesh(
                     edge_glyphs,
-                    color='blue',
+                    color='cyan',
                     opacity=0.9,
                 )
-                logger.info(f"Added {np.sum(edge_mask)} membrane edge spheres (blue)")
+                logger.info(f"Added {np.sum(convex_edge_mask)} membrane CONVEX edge spheres (cyan)")
             
-            # Corner (magenta) - fixed (no projection)
-            corner_mask = types == 2
-            if np.sum(corner_mask) > 0:
-                corner_positions = positions[corner_mask]
+            # Corner convex (red) - can be smoothed
+            convex_corner_mask = types == 2
+            if np.sum(convex_corner_mask) > 0:
+                corner_positions = positions[convex_corner_mask]
                 corner_cloud = pv.PolyData(corner_positions)
                 corner_glyphs = corner_cloud.glyph(
                     geom=pv.Sphere(radius=membrane_radius * 1.3),
@@ -1981,10 +2027,46 @@ class MeshViewer(QWidget):
                 
                 self._feature_debug_membrane_corner_actor = self.plotter.add_mesh(
                     corner_glyphs,
-                    color='magenta',
+                    color='red',
                     opacity=0.9,
                 )
-                logger.info(f"Added {np.sum(corner_mask)} membrane corner spheres (magenta)")
+                logger.info(f"Added {np.sum(convex_corner_mask)} membrane CONVEX corner spheres (red)")
+            
+            # Sharp edge concave (orange) - edge projection
+            concave_edge_mask = types == 3
+            if np.sum(concave_edge_mask) > 0:
+                edge_positions = positions[concave_edge_mask]
+                edge_cloud = pv.PolyData(edge_positions)
+                edge_glyphs = edge_cloud.glyph(
+                    geom=pv.Sphere(radius=membrane_radius),
+                    scale=False,
+                    orient=False
+                )
+                
+                self._feature_debug_membrane_concave_edge_actor = self.plotter.add_mesh(
+                    edge_glyphs,
+                    color='orange',
+                    opacity=0.9,
+                )
+                logger.info(f"Added {np.sum(concave_edge_mask)} membrane CONCAVE edge spheres (orange)")
+            
+            # Corner concave (magenta) - FIXED, no smoothing allowed
+            concave_corner_mask = types == 4
+            if np.sum(concave_corner_mask) > 0:
+                corner_positions = positions[concave_corner_mask]
+                corner_cloud = pv.PolyData(corner_positions)
+                corner_glyphs = corner_cloud.glyph(
+                    geom=pv.Sphere(radius=membrane_radius * 1.5),
+                    scale=False,
+                    orient=False
+                )
+                
+                self._feature_debug_membrane_concave_corner_actor = self.plotter.add_mesh(
+                    corner_glyphs,
+                    color='magenta',
+                    opacity=1.0,
+                )
+                logger.info(f"Added {np.sum(concave_corner_mask)} membrane CONCAVE corner spheres (magenta) - FIXED")
         
         self._feature_debug_visible = True
         self.plotter.update()
@@ -1997,10 +2079,14 @@ class MeshViewer(QWidget):
         actors = [
             self._feature_debug_sharp_edges_actor,
             self._feature_debug_corners_actor,
+            self._feature_debug_concave_corners_actor,
             self._feature_debug_sharp_edge_verts_actor,
+            self._feature_debug_concave_edge_verts_actor,
             self._feature_debug_membrane_smooth_actor,
             self._feature_debug_membrane_edge_actor,
             self._feature_debug_membrane_corner_actor,
+            self._feature_debug_membrane_concave_edge_actor,
+            self._feature_debug_membrane_concave_corner_actor,
         ]
         
         for actor in actors:
@@ -2012,10 +2098,14 @@ class MeshViewer(QWidget):
         
         self._feature_debug_sharp_edges_actor = None
         self._feature_debug_corners_actor = None
+        self._feature_debug_concave_corners_actor = None
         self._feature_debug_sharp_edge_verts_actor = None
+        self._feature_debug_concave_edge_verts_actor = None
         self._feature_debug_membrane_smooth_actor = None
         self._feature_debug_membrane_edge_actor = None
         self._feature_debug_membrane_corner_actor = None
+        self._feature_debug_membrane_concave_edge_actor = None
+        self._feature_debug_membrane_concave_corner_actor = None
         
         self.plotter.update()
     
