@@ -98,6 +98,9 @@ class SmoothingResult:
     
     # Timing
     total_time_ms: float = 0.0
+    
+    # Restored corner vertices (concave corners snapped back after smoothing)
+    restored_corner_positions: Optional[np.ndarray] = None  # (K, 3) positions of restored vertices
 
 
 @dataclass
@@ -113,38 +116,49 @@ class FeatureDebugVisualization:
     membrane_boundary_positions: Optional[np.ndarray] = None  # (M, 3) boundary vertex positions
     membrane_boundary_projected_types: Optional[np.ndarray] = None  # (M,) feature type each projects to
     membrane_boundary_nearest_target: Optional[np.ndarray] = None  # (M,) nearest target vertex index
+    
+    # Restored corner vertices (concave corners snapped back after smoothing)
+    restored_corner_positions: Optional[np.ndarray] = None  # (K, 3) positions of restored vertices (blue spheres)
 
 
 def get_feature_debug_visualization(
     target_mesh: trimesh.Trimesh,
     membrane_mesh: trimesh.Trimesh,
     membrane_boundary_indices: np.ndarray = None,
-    angle_threshold: float = SHARP_EDGE_ANGLE_THRESHOLD
+    angle_threshold: float = SHARP_EDGE_ANGLE_THRESHOLD,
+    restored_corner_positions: np.ndarray = None
 ) -> FeatureDebugVisualization:
     """
     Generate debug visualization data for feature classification.
     
-    This function returns data needed to visualize:
+    This function uses the SAME detection logic as the actual smoothing process:
+    - Directly analyzes membrane-part connections at each boundary vertex
+    - Classifies based on whether closest point is at a concave edge/vertex
+    - NOT based on nearest target mesh vertex (old approach)
+    
+    This displays:
     1. Which vertices on the target mesh are classified as sharp edges vs corners
-    2. Which membrane boundary vertices will be projected to these features
+    2. Which membrane boundary vertices connect to concave features (using direct analysis)
+    3. Restored corner vertices (concave corners snapped back after smoothing)
     
     Args:
-        target_mesh: The target mesh (part or hull) to classify features on
+        target_mesh: The target mesh (part) to classify features on
         membrane_mesh: The membrane mesh being smoothed
         membrane_boundary_indices: Indices of membrane boundary vertices (computed if not provided)
         angle_threshold: Dihedral angle threshold for sharp edge detection
+        restored_corner_positions: Optional array of restored corner vertex positions (from smoothing)
         
     Returns:
         FeatureDebugVisualization with all data needed for visualization
     """
-    from scipy.spatial import cKDTree
+    from trimesh.proximity import ProximityQuery
     
     debug = FeatureDebugVisualization()
     
     if target_mesh is None or len(target_mesh.faces) == 0:
         return debug
     
-    # Classify target mesh vertices
+    # Classify target mesh vertices (for visualization of target mesh features)
     feature_types, sharp_edge_info = classify_mesh_vertex_features(
         target_mesh, angle_threshold
     )
@@ -152,8 +166,7 @@ def get_feature_debug_visualization(
     debug.target_mesh_vertices = target_mesh.vertices.copy()
     debug.target_feature_types = feature_types
     
-    # Extract sharp edges from the target mesh
-    sharp_edges = []
+    # === Build adjacency structures for direct connection analysis ===
     edge_to_faces = {}
     for fi, face in enumerate(target_mesh.faces):
         for i in range(3):
@@ -163,6 +176,13 @@ def get_feature_debug_visualization(
                 edge_to_faces[edge] = []
             edge_to_faces[edge].append(fi)
     
+    vertex_to_faces = {v: [] for v in range(len(target_mesh.vertices))}
+    for fi, face in enumerate(target_mesh.faces):
+        for v in face:
+            vertex_to_faces[v].append(fi)
+    
+    # Extract sharp edges from the target mesh (for visualization)
+    sharp_edges = []
     for edge, face_indices in edge_to_faces.items():
         if len(face_indices) != 2:
             # Boundary edge - treat as sharp
@@ -198,25 +218,173 @@ def get_feature_debug_visualization(
         membrane_boundary_indices = np.array(list(boundary_verts), dtype=np.int64)
         logger.info(f"Feature debug: Computed {len(membrane_boundary_indices)} membrane boundary vertices")
     
-    # Map membrane boundary vertices to target mesh features
+    # === Classify membrane boundary vertices using DIRECT CONNECTION ANALYSIS ===
+    # This matches the actual detection logic in identify_concave_membrane_vertices_at_part_boundary
     if membrane_mesh is not None and membrane_boundary_indices is not None and len(membrane_boundary_indices) > 0:
-        target_kdtree = cKDTree(target_mesh.vertices)
         
+        def is_edge_concave(v0: int, v1: int) -> bool:
+            """Check if the edge (v0, v1) is concave on the target mesh."""
+            edge = (min(v0, v1), max(v0, v1))
+            face_indices = edge_to_faces.get(edge, [])
+            
+            if len(face_indices) != 2:
+                return False  # Boundary edge - not concave
+            
+            n0 = target_mesh.face_normals[face_indices[0]]
+            n1 = target_mesh.face_normals[face_indices[1]]
+            
+            dot = np.clip(np.dot(n0, n1), -1.0, 1.0)
+            angle_deg = np.degrees(np.arccos(dot))
+            
+            if angle_deg <= angle_threshold:
+                return False  # Not sharp
+            
+            # Determine concavity: check if faces fold inward
+            face0 = target_mesh.faces[face_indices[0]]
+            face1 = target_mesh.faces[face_indices[1]]
+            opposite_v1 = [v for v in face1 if v != v0 and v != v1][0]
+            
+            p_opposite1 = target_mesh.vertices[opposite_v1]
+            p_edge0 = target_mesh.vertices[v0]
+            
+            vec_to_opp1 = p_opposite1 - p_edge0
+            side = np.dot(vec_to_opp1, n0)
+            
+            return side > 0  # side > 0 means faces fold INWARD = CONCAVE
+        
+        def is_edge_convex_sharp(v0: int, v1: int) -> bool:
+            """Check if the edge (v0, v1) is convex sharp on the target mesh."""
+            edge = (min(v0, v1), max(v0, v1))
+            face_indices = edge_to_faces.get(edge, [])
+            
+            if len(face_indices) != 2:
+                return True  # Boundary edge - treat as convex sharp
+            
+            n0 = target_mesh.face_normals[face_indices[0]]
+            n1 = target_mesh.face_normals[face_indices[1]]
+            
+            dot = np.clip(np.dot(n0, n1), -1.0, 1.0)
+            angle_deg = np.degrees(np.arccos(dot))
+            
+            if angle_deg <= angle_threshold:
+                return False  # Not sharp
+            
+            # If sharp but not concave, it's convex
+            return not is_edge_concave(v0, v1)
+        
+        def get_vertex_feature_type_at_connection(vi: int) -> int:
+            """Get the feature type when closest to a target vertex."""
+            face_indices = vertex_to_faces.get(vi, [])
+            if len(face_indices) < 2:
+                return 0  # Smooth
+            
+            # Get all edges incident to this vertex
+            incident_edges = set()
+            for fi in face_indices:
+                face = target_mesh.faces[fi]
+                for i in range(3):
+                    if face[i] == vi or face[(i+1) % 3] == vi:
+                        v0, v1 = face[i], face[(i+1) % 3]
+                        incident_edges.add((min(v0, v1), max(v0, v1)))
+            
+            # Check for concave edges first (higher priority)
+            has_concave = False
+            has_convex_sharp = False
+            for edge in incident_edges:
+                if is_edge_concave(edge[0], edge[1]):
+                    has_concave = True
+                    break
+                if is_edge_convex_sharp(edge[0], edge[1]):
+                    has_convex_sharp = True
+            
+            if has_concave:
+                # Multiple concave edges = corner, single = edge
+                concave_count = sum(1 for e in incident_edges if is_edge_concave(e[0], e[1]))
+                return 4 if concave_count >= 2 else 3  # 4=concave_corner, 3=concave_edge
+            elif has_convex_sharp:
+                convex_count = sum(1 for e in incident_edges if is_edge_convex_sharp(e[0], e[1]))
+                return 2 if convex_count >= 2 else 1  # 2=convex_corner, 1=convex_edge
+            
+            return 0  # Smooth
+        
+        # Use ProximityQuery to find closest points (same as actual detection)
+        target_prox = ProximityQuery(target_mesh)
         boundary_positions = membrane_mesh.vertices[membrane_boundary_indices]
-        _, nearest_target_indices = target_kdtree.query(boundary_positions)
+        closest_pts, distances, triangle_ids = target_prox.on_surface(boundary_positions)
         
-        # Get feature type for each membrane boundary vertex based on nearest target
-        projected_types = feature_types[nearest_target_indices]
+        # Compute mesh scale for tolerance
+        bounds = target_mesh.bounds
+        mesh_scale = np.max(bounds[1] - bounds[0])
+        tolerance = mesh_scale * 0.005  # 0.5% of mesh size
+        
+        # Classify each membrane boundary vertex using direct connection analysis
+        projected_types = np.zeros(len(membrane_boundary_indices), dtype=np.int32)
+        nearest_target_indices = np.zeros(len(membrane_boundary_indices), dtype=np.int64)
+        
+        for i, (closest_pt, tri_id) in enumerate(zip(closest_pts, triangle_ids)):
+            if tri_id < 0 or tri_id >= len(target_mesh.faces):
+                continue
+            
+            face = target_mesh.faces[tri_id]
+            face_verts = target_mesh.vertices[face]
+            
+            # Find distance from closest_pt to each face vertex
+            vert_distances = np.linalg.norm(face_verts - closest_pt, axis=1)
+            min_vert_dist = np.min(vert_distances)
+            min_vert_idx = np.argmin(vert_distances)
+            
+            # Check if closest to a vertex
+            if min_vert_dist < tolerance:
+                part_vertex_idx = face[min_vert_idx]
+                nearest_target_indices[i] = part_vertex_idx
+                projected_types[i] = get_vertex_feature_type_at_connection(part_vertex_idx)
+                continue
+            
+            # Check if closest to an edge
+            found_edge = False
+            for edge_idx in range(3):
+                ev0, ev1 = face[edge_idx], face[(edge_idx + 1) % 3]
+                p0, p1 = target_mesh.vertices[ev0], target_mesh.vertices[ev1]
+                
+                edge_vec = p1 - p0
+                edge_len = np.linalg.norm(edge_vec)
+                if edge_len < 1e-10:
+                    continue
+                edge_dir = edge_vec / edge_len
+                
+                t = np.dot(closest_pt - p0, edge_dir)
+                t = np.clip(t, 0, edge_len)
+                proj_pt = p0 + t * edge_dir
+                edge_dist = np.linalg.norm(closest_pt - proj_pt)
+                
+                if edge_dist < tolerance:
+                    nearest_target_indices[i] = ev0  # Arbitrary choice for visualization
+                    if is_edge_concave(ev0, ev1):
+                        projected_types[i] = 3  # concave_edge
+                    elif is_edge_convex_sharp(ev0, ev1):
+                        projected_types[i] = 1  # convex_edge
+                    found_edge = True
+                    break
+            
+            if not found_edge:
+                # Closest to face interior - smooth
+                nearest_target_indices[i] = face[0]
+                projected_types[i] = 0
         
         debug.membrane_boundary_positions = boundary_positions.copy()
         debug.membrane_boundary_projected_types = projected_types
         debug.membrane_boundary_nearest_target = nearest_target_indices
         
         logger.info(
-            f"Feature debug: {np.sum(projected_types == 0)} smooth, "
-            f"{np.sum(projected_types == 1)} sharp edge, "
-            f"{np.sum(projected_types == 2)} corner membrane boundary vertices"
+            f"Feature debug (direct analysis): {np.sum(projected_types == 0)} smooth, "
+            f"{np.sum(projected_types == 1)} convex edge, {np.sum(projected_types == 2)} convex corner, "
+            f"{np.sum(projected_types == 3)} concave edge, {np.sum(projected_types == 4)} concave corner"
         )
+    
+    # Add restored corner positions if provided
+    if restored_corner_positions is not None and len(restored_corner_positions) > 0:
+        debug.restored_corner_positions = restored_corner_positions
+        logger.info(f"Feature debug: {len(restored_corner_positions)} restored corner vertices (blue spheres)")
     
     return debug
 
@@ -446,10 +614,19 @@ def classify_mesh_vertex_features(
     angle_threshold: float = SHARP_EDGE_ANGLE_THRESHOLD
 ) -> Tuple[np.ndarray, dict]:
     """
-    Classify mesh vertices to identify concave corners that must be kept fixed.
+    Classify mesh vertices into feature types for visualization and smoothing.
     
     Per paper Section 4.4: "corners should be kept fixed" during smoothing.
-    We only detect CONCAVE corners - all other vertices are smoothed normally.
+    Only concave corners (type 4) need to be kept fixed during smoothing.
+    
+    Convex vs Concave terminology (from the MOLD's perspective):
+    - CONVEX edge/corner on part = part sticks OUT = forms a pocket in the mold
+      These are the "sharp outer edges" of the original object.
+    - CONCAVE edge/corner on part = part goes IN = forms a protrusion in the mold
+      These are the "inner crevices" of the original object.
+    
+    For MOLD EXTRACTION, concave features on the PART are problematic because
+    they create CONVEX protrusions in the mold that lock in place.
     
     Args:
         mesh: Input trimesh
@@ -458,13 +635,16 @@ def classify_mesh_vertex_features(
     Returns:
         Tuple of:
         - vertex_feature_type: Array with values:
-            0 = smooth (all vertices except concave corners)
-            1 = concave corner (must be kept fixed)
-        - sharp_edge_info: Empty dict (unused in simplified version)
+            0 = smooth (no sharp edges)
+            1 = convex sharp edge (on 1-2 sharp edges, all convex)
+            2 = convex corner (on 3+ sharp edges, all convex)
+            3 = concave sharp edge (on 1-2 sharp edges, at least one concave)
+            4 = concave corner (on 3+ sharp edges, at least one concave) - FIXED during smoothing
+        - sharp_edge_info: Dict containing edge classification data
     """
     n_verts = len(mesh.vertices)
     vertex_feature_type = np.zeros(n_verts, dtype=np.int8)
-    sharp_edge_info = {}  # Unused in simplified version
+    sharp_edge_info = {'sharp_edges': [], 'edge_is_concave': {}}
     
     if mesh is None or len(mesh.faces) == 0:
         return vertex_feature_type, sharp_edge_info
@@ -490,7 +670,7 @@ def classify_mesh_vertex_features(
             edge_is_concave[edge] = False
             continue
         
-        # Get face normals and centroids
+        # Get face normals
         n0 = mesh.face_normals[face_indices[0]]
         n1 = mesh.face_normals[face_indices[1]]
         
@@ -502,8 +682,8 @@ def classify_mesh_vertex_features(
             sharp_edges.add(edge)
             
             # Determine concavity using signed dihedral angle
-            # The standard method: check if the opposite vertex of one face 
-            # is "above" or "below" the plane of the other face
+            # Check if the opposite vertex of one face is "above" or "below" 
+            # the plane of the other face
             v0, v1 = edge
             
             # Get the vertices in each face that are NOT on the shared edge
@@ -513,27 +693,29 @@ def classify_mesh_vertex_features(
             opposite_v1 = [v for v in face1 if v != v0 and v != v1][0]
             
             # Get the positions
-            p_opposite0 = mesh.vertices[opposite_v0]
             p_opposite1 = mesh.vertices[opposite_v1]
             p_edge0 = mesh.vertices[v0]
             
-            # Check: is the opposite vertex of face1 "above" or "below" 
-            # the plane of face0?
-            # If it's on the SAME side as n0 points, the edge is CONVEX
-            # If it's on the OPPOSITE side, the edge is CONCAVE
+            # Check: is the opposite vertex of face1 "above" or "below" face0's plane?
             vec_to_opp1 = p_opposite1 - p_edge0
             side = np.dot(vec_to_opp1, n0)
             
-            # For CONVEX edge: opposite vertex of face1 is BELOW face0's plane
-            #   (on opposite side from where n0 points) → side < 0
-            # For CONCAVE edge: opposite vertex of face1 is ABOVE face0's plane
-            #   (on same side as where n0 points) → side > 0
+            # CORRECTED LOGIC:
+            # If opposite vertex of face1 is on the SAME side as n0 points (side > 0),
+            # the faces fold INWARD creating a valley/groove = CONCAVE on part
+            # If opposite vertex is on the OPPOSITE side (side < 0),
+            # the faces fold OUTWARD creating a ridge = CONVEX on part
             is_concave = side > 0
             edge_is_concave[edge] = is_concave
+    
+    # Store in sharp_edge_info for debugging
+    sharp_edge_info['sharp_edges'] = list(sharp_edges)
+    sharp_edge_info['edge_is_concave'] = edge_is_concave
     
     # Count sharp edges meeting at each vertex and track concavity
     vertex_sharp_edge_count = np.zeros(n_verts, dtype=np.int32)
     vertex_concave_edge_count = np.zeros(n_verts, dtype=np.int32)
+    vertex_convex_edge_count = np.zeros(n_verts, dtype=np.int32)
     
     for edge in sharp_edges:
         v0, v1 = edge
@@ -543,21 +725,40 @@ def classify_mesh_vertex_features(
         if edge_is_concave.get(edge, False):
             vertex_concave_edge_count[v0] += 1
             vertex_concave_edge_count[v1] += 1
+        else:
+            vertex_convex_edge_count[v0] += 1
+            vertex_convex_edge_count[v1] += 1
     
-    # Classify vertices: 0 = smooth, 1 = concave corner (must be kept fixed)
-    # Per paper: only corners need to be kept fixed, and only concave ones cause drift issues
+    # Classify vertices using 5-type scheme:
+    # 0 = smooth, 1 = convex_edge, 2 = convex_corner, 3 = concave_edge, 4 = concave_corner
     for vi in range(n_verts):
         sharp_count = vertex_sharp_edge_count[vi]
         concave_count = vertex_concave_edge_count[vi]
+        convex_count = vertex_convex_edge_count[vi]
         
-        # Only mark as corner (type 1) if it's a CONCAVE corner
-        if sharp_count >= CORNER_SHARP_EDGE_COUNT and concave_count > 0:
-            vertex_feature_type[vi] = 1  # concave corner - keep fixed
-        # All other vertices remain 0 (smooth - normal smoothing + reprojection)
+        if sharp_count == 0:
+            vertex_feature_type[vi] = 0  # smooth
+        elif sharp_count >= CORNER_SHARP_EDGE_COUNT:
+            # Corner (3+ sharp edges)
+            if concave_count > 0:
+                vertex_feature_type[vi] = 4  # concave corner - FIXED during smoothing
+            else:
+                vertex_feature_type[vi] = 2  # convex corner
+        else:
+            # Edge vertex (1-2 sharp edges)
+            if concave_count > 0:
+                vertex_feature_type[vi] = 3  # concave edge
+            else:
+                vertex_feature_type[vi] = 1  # convex edge
     
     n_smooth = np.sum(vertex_feature_type == 0)
-    n_concave_corners = np.sum(vertex_feature_type == 1)
-    logger.debug(f"Feature classification: {n_smooth} smooth, {n_concave_corners} concave corners (fixed)")
+    n_convex_edge = np.sum(vertex_feature_type == 1)
+    n_convex_corner = np.sum(vertex_feature_type == 2)
+    n_concave_edge = np.sum(vertex_feature_type == 3)
+    n_concave_corner = np.sum(vertex_feature_type == 4)
+    logger.debug(f"Feature classification: {n_smooth} smooth, "
+                 f"{n_convex_edge} convex edge, {n_convex_corner} convex corner, "
+                 f"{n_concave_edge} concave edge, {n_concave_corner} concave corner (fixed)")
     
     return vertex_feature_type, sharp_edge_info
 
@@ -571,21 +772,24 @@ def reproject_with_feature_awareness(
     search_radius: Optional[float] = None
 ) -> np.ndarray:
     """
-    Re-project boundary vertices to target mesh, excluding concave corners.
+    Re-project boundary vertices to target mesh.
     
-    Per paper Section 4.4: "corners should be kept fixed" during smoothing.
-    This simplified version only identifies concave corners to exclude from reprojection.
-    All other vertices use standard nearest-point projection.
+    All vertices are now reprojected using standard nearest-point projection.
+    Concave corners are handled separately - they are smoothed normally during
+    iterations, then restored to original positions after smoothing completes.
     
-    Feature type codes:
+    Feature type codes (from classify_mesh_vertex_features):
         0 = smooth (normal reprojection)
-        1 = concave corner (skip reprojection - keep fixed)
+        1 = convex sharp edge (normal reprojection)
+        2 = convex corner (normal reprojection)
+        3 = concave sharp edge (normal reprojection)
+        4 = concave corner (normal reprojection - restored after smoothing)
     
     Args:
         vertices: (N, 3) all mesh vertices (membrane mesh)
         boundary_indices: Indices of boundary vertices to reproject (membrane mesh indices)
         target_mesh: The target mesh to project onto (part/hull mesh)
-        feature_types: Per-vertex feature type for TARGET MESH
+        feature_types: Per-vertex feature type for TARGET MESH (unused, kept for API)
         sharp_edge_info: Unused (kept for API compatibility)
         search_radius: Optional max search distance (auto-computed if None)
     
@@ -593,7 +797,6 @@ def reproject_with_feature_awareness(
         Updated vertices array (modified in place and returned)
     """
     from trimesh.proximity import ProximityQuery
-    from scipy.spatial import cKDTree
     
     if target_mesh is None or len(target_mesh.faces) == 0:
         return vertices
@@ -608,58 +811,14 @@ def reproject_with_feature_awareness(
         mesh_scale = np.linalg.norm(target_mesh.bounds[1] - target_mesh.bounds[0])
         search_radius = mesh_scale * 0.1  # 10% of mesh size
     
-    # Build KD-tree for target mesh vertices to find nearest target vertex for each membrane vertex
-    target_kdtree = cKDTree(target_mesh.vertices)
+    # === All vertices: standard nearest-point projection with bounded search ===
+    boundary_indices_arr = np.array(boundary_indices, dtype=np.int64)
+    boundary_positions = vertices[boundary_indices_arr]
+    closest_pts, distances, _ = proximity.on_surface(boundary_positions)
     
-    # For each membrane boundary vertex, find its nearest target mesh vertex
-    # to determine which feature type applies
-    boundary_positions = vertices[boundary_indices]
-    _, nearest_target_indices = target_kdtree.query(boundary_positions)
-    
-    # Build a KD-tree of ONLY CONCAVE corner vertices for radius-based corner detection
-    # Only concave corners (type 1) need to be kept fixed
-    concave_corner_mask = (feature_types == 1)
-    concave_corner_indices = np.where(concave_corner_mask)[0]
-    corner_detection_radius = search_radius * 0.3  # Use 30% of search radius for corner detection
-    
-    concave_corner_kdtree = None
-    if len(concave_corner_indices) > 0:
-        corner_positions = target_mesh.vertices[concave_corner_indices]
-        concave_corner_kdtree = cKDTree(corner_positions)
-    
-    # Separate membrane vertices: smooth (normal reprojection) vs concave corners (skip)
-    smooth_indices = []
-    concave_corner_indices_membrane = []
-    
-    for i, vi in enumerate(boundary_indices):
-        pos = boundary_positions[i]
-        
-        # Check if this vertex is within radius of ANY CONCAVE corner
-        if concave_corner_kdtree is not None:
-            corner_dist, _ = concave_corner_kdtree.query(pos)
-            if corner_dist < corner_detection_radius:
-                concave_corner_indices_membrane.append(vi)
-                continue
-        
-        # Not near a concave corner - use normal reprojection
-        smooth_indices.append(vi)
-    
-    # === Smooth vertices: standard nearest-point projection with bounded search ===
-    if len(smooth_indices) > 0:
-        smooth_indices_arr = np.array(smooth_indices, dtype=np.int64)
-        smooth_positions = vertices[smooth_indices_arr]
-        closest_pts, distances, _ = proximity.on_surface(smooth_positions)
-        
-        # Only apply projection if within search radius
-        within_radius = distances < search_radius
-        vertices[smooth_indices_arr[within_radius]] = closest_pts[within_radius]
-    
-    # === Concave corner vertices: keep fixed (no projection) ===
-    # These vertices are not modified at all during reprojection
-    # This prevents them from drifting across concave features
-    n_concave_corner = len(concave_corner_indices_membrane)
-    if n_concave_corner > 0:
-        logger.debug(f"Keeping {n_concave_corner} concave corner vertices fixed (no reprojection)")
+    # Only apply projection if within search radius
+    within_radius = distances < search_radius
+    vertices[boundary_indices_arr[within_radius]] = closest_pts[within_radius]
     
     return vertices
 
@@ -1076,7 +1235,8 @@ def smooth_membrane_with_boundary_reprojection(
     damping_factor: float = 0.5,
     excluded_vertices: Optional[np.ndarray] = None,
     use_fast_smoothing: bool = True,
-    vertex_boundary_type: Optional[np.ndarray] = None
+    vertex_boundary_type: Optional[np.ndarray] = None,
+    feature_aware_smoothing: bool = True
 ) -> SmoothingResult:
     """
     Smooth the membrane surface following the algorithm from Section 4.4 of the paper.
@@ -1111,6 +1271,8 @@ def smooth_membrane_with_boundary_reprojection(
                               0 = interior (no boundary constraint)
                               1/2 = on hull boundary ∂H (OUTER boundary, re-project to hull)
                              If None, falls back to distance-based classification
+        feature_aware_smoothing: If True (default), detect concave corners and keep them fixed.
+                                If False, smooth all vertices normally without feature detection.
     
     Returns:
         SmoothingResult with smoothed mesh and statistics
@@ -1451,10 +1613,13 @@ def smooth_membrane_with_boundary_reprojection(
     logger.info(f"Batched re-projection: {len(part_boundary_indices)} part, "
                f"{len(hull_boundary_indices)} hull, {len(primary_boundary_indices)} primary")
     
-    # === Feature detection for target meshes (for feature-aware reprojection) ===
-    # This handles sharp concave edges where standard nearest-point projection can
-    # jump to the wrong side of the feature. We detect sharp edges/corners on each
-    # target mesh and use edge-based projection for sharp features.
+    # === Feature detection is now done inline for part boundary only ===
+    # The new approach analyzes membrane-part connections directly rather than
+    # pre-classifying all vertices on target meshes.
+    # Hull and primary boundaries are smoothed normally without feature detection.
+    
+    # These variables are kept for backward compatibility with visualization
+    # but are no longer used for corner detection during smoothing
     part_feature_types = None
     part_sharp_edge_info = None
     hull_feature_types = None
@@ -1462,104 +1627,219 @@ def smooth_membrane_with_boundary_reprojection(
     primary_feature_types = None
     primary_sharp_edge_info = None
     
-    if part_mesh is not None and len(part_mesh.faces) > 0:
-        part_feature_types, part_sharp_edge_info = classify_mesh_vertex_features(part_mesh)
-        n_concave_corners = np.sum(part_feature_types == 1)
-        if n_concave_corners > 0:
-            logger.info(f"Part mesh: {n_concave_corners} concave corners (will be kept fixed)")
-    
-    if hull_mesh is not None and len(hull_mesh.faces) > 0:
-        hull_feature_types, hull_sharp_edge_info = classify_mesh_vertex_features(hull_mesh)
-        n_concave_corners = np.sum(hull_feature_types == 1)
-        if n_concave_corners > 0:
-            logger.info(f"Hull mesh: {n_concave_corners} concave corners (will be kept fixed)")
-    
-    if primary_mesh is not None and len(primary_mesh.faces) > 0:
-        primary_feature_types, primary_sharp_edge_info = classify_mesh_vertex_features(primary_mesh)
-        n_concave_corners = np.sum(primary_feature_types == 1)
-        if n_concave_corners > 0:
-            logger.info(f"Primary mesh: {n_concave_corners} concave corners (will be kept fixed)")
-    
     # Compute bounded search radius for reprojection
     search_radius = mesh_scale * MAX_REPROJECT_DISTANCE_FRACTION
     
     # === Pre-compute corner vertices that should be kept fixed ===
     # Per paper Section 4.4: corners should be "kept fixed" during smoothing
-    # We identify membrane boundary vertices that correspond to corners on the target mesh
-    # and exclude them from BOTH boundary smoothing AND interior smoothing
+    # 
+    # NEW APPROACH: Instead of finding concave corners on the part mesh first and then
+    # searching for nearby membrane vertices, we:
+    # 1. Find all membrane boundary vertices classified as 'part' (on part inner boundary)
+    # 2. For each, find the closest point on the part mesh (vertex, edge, or face)
+    # 3. If it's at a vertex or edge, analyze the adjacent faces for concavity
+    # 4. If concave, mark for restoration after smoothing
+    #
+    # IMPORTANT: This classification is ONLY for part boundary vertices.
+    # Hull boundary vertices are smoothed normally without feature detection.
     corner_vertex_set = set()
     
-    # Tolerance for corner detection - if a membrane vertex is within this distance
-    # of ANY corner vertex on the target mesh, treat it as a corner vertex
-    # This handles cases where the membrane boundary is slightly offset from the exact corner
-    corner_detection_radius = mesh_scale * 0.03  # 3% of mesh size
-    
-    def identify_corner_membrane_vertices(membrane_indices, target_mesh, feature_types):
-        """Find membrane boundary vertices near target mesh CONCAVE corners.
-        
-        Uses a radius-based search to find membrane vertices that are near any CONCAVE
-        corner on the target mesh. Only concave corners need to be fixed during smoothing.
-        
-        Feature type 1 = concave corner (must be kept fixed)
-        Feature type 0 = smooth (normal smoothing + reprojection)
+    def identify_concave_membrane_vertices_at_part_boundary(
+        membrane_indices: np.ndarray,
+        membrane_positions: np.ndarray,
+        part_mesh: trimesh.Trimesh,
+        angle_threshold: float = SHARP_EDGE_ANGLE_THRESHOLD
+    ) -> set:
         """
-        if len(membrane_indices) == 0 or target_mesh is None or feature_types is None:
+        Find membrane boundary vertices that connect to concave regions of the part mesh.
+        
+        For each membrane vertex on the part boundary:
+        1. Find closest point on part mesh (could be on vertex, edge, or face)
+        2. If closest to a vertex: check if that vertex is at a concave corner/edge
+        3. If closest to an edge: check if that edge is concave
+        4. If closest to face interior: not a sharp feature, skip
+        
+        Args:
+            membrane_indices: Indices of membrane boundary vertices classified as 'part'
+            membrane_positions: Positions of all membrane vertices
+            part_mesh: The part mesh
+            angle_threshold: Dihedral angle threshold for sharp edges
+            
+        Returns:
+            Set of membrane vertex indices that should be restored after smoothing
+        """
+        if len(membrane_indices) == 0 or part_mesh is None or len(part_mesh.faces) == 0:
             return set()
         
-        from scipy.spatial import cKDTree
+        from trimesh.proximity import ProximityQuery
         
-        # Find only CONCAVE corner vertices on the target mesh (feature_type == 1)
-        concave_corner_mask = (feature_types == 1)
-        corner_indices = np.where(concave_corner_mask)[0]
+        concave_verts = set()
         
-        if len(corner_indices) == 0:
-            return set()
+        # Build edge -> faces adjacency for part mesh
+        edge_to_faces = {}
+        for fi, face in enumerate(part_mesh.faces):
+            for i in range(3):
+                v0, v1 = face[i], face[(i+1) % 3]
+                edge = (min(v0, v1), max(v0, v1))
+                if edge not in edge_to_faces:
+                    edge_to_faces[edge] = []
+                edge_to_faces[edge].append(fi)
         
-        # Build KD-tree of only the concave corner positions
-        corner_positions = target_mesh.vertices[corner_indices]
-        corner_kdtree = cKDTree(corner_positions)
+        # Build vertex -> faces adjacency for part mesh
+        vertex_to_faces = {v: [] for v in range(len(part_mesh.vertices))}
+        for fi, face in enumerate(part_mesh.faces):
+            for v in face:
+                vertex_to_faces[v].append(fi)
         
-        corner_verts = set()
-        membrane_positions = vertices[membrane_indices]
+        # Pre-compute which edges are concave
+        def is_edge_concave(v0: int, v1: int) -> bool:
+            """Check if the edge (v0, v1) is concave on the part mesh."""
+            edge = (min(v0, v1), max(v0, v1))
+            face_indices = edge_to_faces.get(edge, [])
+            
+            if len(face_indices) != 2:
+                # Boundary edge - not concave (no folding)
+                return False
+            
+            # Get face normals
+            n0 = part_mesh.face_normals[face_indices[0]]
+            n1 = part_mesh.face_normals[face_indices[1]]
+            
+            # Compute dihedral angle
+            dot = np.clip(np.dot(n0, n1), -1.0, 1.0)
+            angle_deg = np.degrees(np.arccos(dot))
+            
+            if angle_deg <= angle_threshold:
+                # Not a sharp edge
+                return False
+            
+            # Determine concavity: check if faces fold inward
+            face0 = part_mesh.faces[face_indices[0]]
+            face1 = part_mesh.faces[face_indices[1]]
+            opposite_v1 = [v for v in face1 if v != v0 and v != v1][0]
+            
+            p_opposite1 = part_mesh.vertices[opposite_v1]
+            p_edge0 = part_mesh.vertices[v0]
+            
+            vec_to_opp1 = p_opposite1 - p_edge0
+            side = np.dot(vec_to_opp1, n0)
+            
+            # side > 0 means faces fold INWARD = CONCAVE
+            return side > 0
         
-        # For each membrane vertex, check if ANY concave corner is within the detection radius
-        distances, _ = corner_kdtree.query(membrane_positions)
+        def is_vertex_at_concave_feature(vi: int) -> bool:
+            """Check if vertex vi is at a concave edge or corner on the part mesh."""
+            face_indices = vertex_to_faces.get(vi, [])
+            if len(face_indices) < 2:
+                return False
+            
+            # Get all edges incident to this vertex
+            incident_edges = set()
+            for fi in face_indices:
+                face = part_mesh.faces[fi]
+                for i in range(3):
+                    if face[i] == vi or face[(i+1) % 3] == vi:
+                        v0, v1 = face[i], face[(i+1) % 3]
+                        incident_edges.add((min(v0, v1), max(v0, v1)))
+            
+            # Check if ANY incident edge is concave
+            for edge in incident_edges:
+                if is_edge_concave(edge[0], edge[1]):
+                    return True
+            
+            return False
+        
+        # Get closest points on part mesh for all membrane vertices
+        part_prox = ProximityQuery(part_mesh)
+        query_positions = membrane_positions[membrane_indices]
+        closest_pts, distances, triangle_ids = part_prox.on_surface(query_positions)
+        
+        # Tolerance for being "at" a vertex or edge vs. on face interior
+        # Use a small fraction of mesh scale
+        tolerance = mesh_scale * 0.005  # 0.5% of mesh size
         
         for i, vi in enumerate(membrane_indices):
-            if distances[i] < corner_detection_radius:
-                corner_verts.add(vi)
+            closest_pt = closest_pts[i]
+            tri_id = triangle_ids[i]
+            
+            if tri_id < 0 or tri_id >= len(part_mesh.faces):
+                continue
+            
+            face = part_mesh.faces[tri_id]
+            face_verts = part_mesh.vertices[face]
+            
+            # Compute barycentric-like distances to determine if closest to vertex, edge, or face
+            # Find distance from closest_pt to each face vertex
+            vert_distances = np.linalg.norm(face_verts - closest_pt, axis=1)
+            min_vert_dist = np.min(vert_distances)
+            min_vert_idx = np.argmin(vert_distances)
+            
+            # Check if closest to a vertex
+            if min_vert_dist < tolerance:
+                # Closest to a vertex - check if vertex is at concave feature
+                part_vertex_idx = face[min_vert_idx]
+                if is_vertex_at_concave_feature(part_vertex_idx):
+                    concave_verts.add(vi)
+                continue
+            
+            # Check if closest to an edge (distance to nearest edge < tolerance)
+            # Test each of the 3 edges of the triangle
+            for edge_idx in range(3):
+                ev0, ev1 = face[edge_idx], face[(edge_idx + 1) % 3]
+                p0, p1 = part_mesh.vertices[ev0], part_mesh.vertices[ev1]
+                
+                # Distance from closest_pt to line segment (p0, p1)
+                edge_vec = p1 - p0
+                edge_len = np.linalg.norm(edge_vec)
+                if edge_len < 1e-10:
+                    continue
+                edge_dir = edge_vec / edge_len
+                
+                # Project closest_pt onto the edge line
+                t = np.dot(closest_pt - p0, edge_dir)
+                t = np.clip(t, 0, edge_len)
+                proj_pt = p0 + t * edge_dir
+                edge_dist = np.linalg.norm(closest_pt - proj_pt)
+                
+                if edge_dist < tolerance:
+                    # Closest to this edge - check if edge is concave
+                    if is_edge_concave(ev0, ev1):
+                        concave_verts.add(vi)
+                    break
+            
+            # If closest to face interior (not vertex or edge), it's not a sharp feature
+            # No action needed
         
-        return corner_verts
+        return concave_verts
     
-    # Find corners for each target mesh
-    if part_feature_types is not None and len(part_boundary_indices) > 0:
-        part_corners = identify_corner_membrane_vertices(
-            part_boundary_indices, part_mesh, part_feature_types
+    # Only apply feature detection to part boundary, NOT hull boundary
+    if feature_aware_smoothing and part_mesh is not None and len(part_boundary_indices) > 0:
+        part_concave_verts = identify_concave_membrane_vertices_at_part_boundary(
+            membrane_indices=part_boundary_indices,
+            membrane_positions=vertices,
+            part_mesh=part_mesh,
+            angle_threshold=SHARP_EDGE_ANGLE_THRESHOLD
         )
-        corner_vertex_set.update(part_corners)
-        if part_corners:
-            logger.info(f"Found {len(part_corners)} membrane vertices at part concave corners (kept fixed)")
+        corner_vertex_set.update(part_concave_verts)
+        if part_concave_verts:
+            logger.info(f"Found {len(part_concave_verts)} membrane vertices at part concave features (will restore after smoothing)")
+    elif not feature_aware_smoothing:
+        logger.info("Feature-aware smoothing disabled - all part boundary vertices smoothed normally")
     
-    if hull_feature_types is not None and len(hull_boundary_indices) > 0:
-        hull_corners = identify_corner_membrane_vertices(
-            hull_boundary_indices, hull_mesh, hull_feature_types
-        )
-        corner_vertex_set.update(hull_corners)
-        if hull_corners:
-            logger.info(f"Found {len(hull_corners)} membrane vertices at hull concave corners (kept fixed)")
+    # NOTE: Hull boundary vertices are smoothed normally - no concave feature detection
+    # This is because the hull is the external boundary and doesn't need special handling
     
-    if primary_feature_types is not None and len(primary_boundary_indices) > 0:
-        primary_corners = identify_corner_membrane_vertices(
-            primary_boundary_indices, primary_mesh, primary_feature_types
-        )
-        corner_vertex_set.update(primary_corners)
-        if primary_corners:
-            logger.info(f"Found {len(primary_corners)} membrane vertices at primary concave corners (kept fixed)")
+    # Store original positions of concave corner vertices BEFORE smoothing
+    # These will be restored after smoothing completes
+    corner_original_positions = {}
+    for vi in corner_vertex_set:
+        corner_original_positions[vi] = vertices[vi].copy()
     
-    # Add corner vertices to excluded set (they won't be smoothed at all)
-    excluded_set.update(corner_vertex_set)
     if corner_vertex_set:
-        logger.info(f"Total {len(corner_vertex_set)} CONCAVE corner vertices excluded from smoothing")
+        logger.info(f"Total {len(corner_vertex_set)} part concave vertices - will smooth then restore positions")
+    
+    # NOTE: We no longer add corner vertices to excluded_set
+    # They will be smoothed normally, then snapped back to original positions after
     
     # Alternating smoothing iterations per paper Section 4.4:
     # "The smoothing is performed by alternating two main steps:
@@ -1674,6 +1954,16 @@ def smooth_membrane_with_boundary_reprojection(
         
         if (iteration + 1) % 2 == 0:
             logger.debug(f"Smoothing iteration {iteration + 1}/{iterations} complete")
+    
+    # === Post-smoothing: Restore concave corner vertices to original positions ===
+    # These were smoothed normally, but now snap back to preserve sharp concave corners
+    if corner_original_positions:
+        for vi, original_pos in corner_original_positions.items():
+            vertices[vi] = original_pos
+        logger.info(f"Restored {len(corner_original_positions)} concave corner vertices to original positions")
+        
+        # Store the restored positions for visualization (blue spheres)
+        result.restored_corner_positions = np.array(list(corner_original_positions.values()))
     
     # Create smoothed mesh
     smoothed_mesh = trimesh.Trimesh(vertices=vertices, faces=faces)

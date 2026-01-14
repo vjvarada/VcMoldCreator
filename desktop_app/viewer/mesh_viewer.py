@@ -189,6 +189,7 @@ class MeshViewer(QWidget):
         self._feature_debug_membrane_corner_actor = None  # Membrane boundary verts -> convex corner (red)
         self._feature_debug_membrane_concave_edge_actor = None  # Membrane boundary verts -> concave edge (orange)
         self._feature_debug_membrane_concave_corner_actor = None  # Membrane boundary verts -> concave corner (magenta, FIXED)
+        self._feature_debug_restored_corners_actor = None  # Restored corner vertices after smoothing (blue)
         self._feature_debug_visible = True
         
         self._setup_ui()
@@ -2068,6 +2069,26 @@ class MeshViewer(QWidget):
                 )
                 logger.info(f"Added {np.sum(concave_corner_mask)} membrane CONCAVE corner spheres (magenta) - FIXED")
         
+        # === 4. Draw restored corner vertices (blue spheres) ===
+        # These are concave corner vertices that were snapped back to original positions after smoothing
+        if debug_data.restored_corner_positions is not None and len(debug_data.restored_corner_positions) > 0:
+            restored_positions = debug_data.restored_corner_positions
+            restored_cloud = pv.PolyData(restored_positions)
+            # Use slightly larger spheres so they're visible over magenta
+            restored_radius = membrane_radius * 1.8 if 'membrane_radius' in dir() else sphere_radius * 1.2
+            restored_glyphs = restored_cloud.glyph(
+                geom=pv.Sphere(radius=restored_radius),
+                scale=False,
+                orient=False
+            )
+            
+            self._feature_debug_restored_corners_actor = self.plotter.add_mesh(
+                restored_glyphs,
+                color='blue',
+                opacity=1.0,
+            )
+            logger.info(f"Added {len(restored_positions)} restored corner spheres (blue)")
+        
         self._feature_debug_visible = True
         self.plotter.update()
     
@@ -2087,6 +2108,7 @@ class MeshViewer(QWidget):
             self._feature_debug_membrane_corner_actor,
             self._feature_debug_membrane_concave_edge_actor,
             self._feature_debug_membrane_concave_corner_actor,
+            self._feature_debug_restored_corners_actor,
         ]
         
         for actor in actors:
@@ -2106,6 +2128,7 @@ class MeshViewer(QWidget):
         self._feature_debug_membrane_corner_actor = None
         self._feature_debug_membrane_concave_edge_actor = None
         self._feature_debug_membrane_concave_corner_actor = None
+        self._feature_debug_restored_corners_actor = None
         
         self.plotter.update()
     
@@ -2133,6 +2156,139 @@ class MeshViewer(QWidget):
                     pass
         
         self.plotter.update()
+    
+    def set_feature_sharp_edges_visible(self, visible: bool):
+        """Toggle visibility of sharp edges (yellow lines)."""
+        if not PYVISTA_AVAILABLE:
+            return
+        if self._feature_debug_sharp_edges_actor is not None:
+            try:
+                self._feature_debug_sharp_edges_actor.SetVisibility(visible)
+                self.plotter.update()
+            except Exception:
+                pass
+    
+    def set_feature_convex_corners_visible(self, visible: bool):
+        """Toggle visibility of convex corners (red spheres)."""
+        if not PYVISTA_AVAILABLE:
+            return
+        if self._feature_debug_corners_actor is not None:
+            try:
+                self._feature_debug_corners_actor.SetVisibility(visible)
+                self.plotter.update()
+            except Exception:
+                pass
+    
+    def set_feature_concave_corners_visible(self, visible: bool):
+        """Toggle visibility of concave corners (purple spheres)."""
+        if not PYVISTA_AVAILABLE:
+            return
+        if self._feature_debug_concave_corners_actor is not None:
+            try:
+                self._feature_debug_concave_corners_actor.SetVisibility(visible)
+                self.plotter.update()
+            except Exception:
+                pass
+    
+    def set_feature_convex_edge_verts_visible(self, visible: bool):
+        """Toggle visibility of convex sharp edge vertices (cyan spheres)."""
+        if not PYVISTA_AVAILABLE:
+            return
+        # This includes both target mesh convex edge verts and membrane convex edge verts
+        actors = [
+            self._feature_debug_sharp_edge_verts_actor,
+            self._feature_debug_membrane_edge_actor,
+        ]
+        for actor in actors:
+            if actor is not None:
+                try:
+                    actor.SetVisibility(visible)
+                except Exception:
+                    pass
+        self.plotter.update()
+    
+    def set_feature_concave_edge_verts_visible(self, visible: bool):
+        """Toggle visibility of concave sharp edge vertices (orange spheres)."""
+        if not PYVISTA_AVAILABLE:
+            return
+        # This includes both target mesh concave edge verts and membrane concave edge verts
+        actors = [
+            self._feature_debug_concave_edge_verts_actor,
+            self._feature_debug_membrane_concave_edge_actor,
+        ]
+        for actor in actors:
+            if actor is not None:
+                try:
+                    actor.SetVisibility(visible)
+                except Exception:
+                    pass
+        self.plotter.update()
+    
+    def set_feature_membrane_smooth_visible(self, visible: bool):
+        """Toggle visibility of membrane smooth vertices (lime spheres)."""
+        if not PYVISTA_AVAILABLE:
+            return
+        if self._feature_debug_membrane_smooth_actor is not None:
+            try:
+                self._feature_debug_membrane_smooth_actor.SetVisibility(visible)
+                self.plotter.update()
+            except Exception:
+                pass
+    
+    def set_feature_membrane_convex_edge_visible(self, visible: bool):
+        """Toggle visibility of membrane convex edge vertices (cyan spheres)."""
+        if not PYVISTA_AVAILABLE:
+            return
+        if self._feature_debug_membrane_edge_actor is not None:
+            try:
+                self._feature_debug_membrane_edge_actor.SetVisibility(visible)
+                self.plotter.update()
+            except Exception:
+                pass
+    
+    def set_feature_membrane_convex_corner_visible(self, visible: bool):
+        """Toggle visibility of membrane convex corner vertices (red spheres)."""
+        if not PYVISTA_AVAILABLE:
+            return
+        if self._feature_debug_membrane_corner_actor is not None:
+            try:
+                self._feature_debug_membrane_corner_actor.SetVisibility(visible)
+                self.plotter.update()
+            except Exception:
+                pass
+    
+    def set_feature_membrane_concave_edge_visible(self, visible: bool):
+        """Toggle visibility of membrane concave edge vertices (orange spheres)."""
+        if not PYVISTA_AVAILABLE:
+            return
+        if self._feature_debug_membrane_concave_edge_actor is not None:
+            try:
+                self._feature_debug_membrane_concave_edge_actor.SetVisibility(visible)
+                self.plotter.update()
+            except Exception:
+                pass
+    
+    def set_feature_membrane_concave_corner_visible(self, visible: bool):
+        """Toggle visibility of membrane concave corner vertices (magenta spheres - FIXED)."""
+        if not PYVISTA_AVAILABLE:
+            return
+        if self._feature_debug_membrane_concave_corner_actor is not None:
+            try:
+                self._feature_debug_membrane_concave_corner_actor.SetVisibility(visible)
+                self.plotter.update()
+            except Exception:
+                pass
+    
+    def set_feature_restored_corners_visible(self, visible: bool):
+        """Toggle visibility of restored corner vertices (blue spheres)."""
+        if not PYVISTA_AVAILABLE:
+            return
+        if self._feature_debug_restored_corners_actor is not None:
+            try:
+                self._feature_debug_restored_corners_actor.SetVisibility(visible)
+                self.plotter.update()
+            except Exception:
+                pass
 
     def apply_visibility_paint(
         self,

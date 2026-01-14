@@ -1692,6 +1692,9 @@ class ComprehensiveSurfaceResult:
     smooth_iterations: int = 0
     damping_factor: float = 0.5
     
+    # Restored corner vertices (concave corners snapped back after smoothing)
+    restored_corner_positions: Optional[np.ndarray] = None
+    
     # Extension faces (yellow for debugging)
     fill_face_indices: Optional[np.ndarray] = None
     
@@ -1725,7 +1728,7 @@ class ComprehensivePrimarySurfaceWorker(QThread):
     
     def __init__(self, tet_result, part_mesh=None, hull_mesh=None,
                  smooth_iterations: int = 5, damping_factor: float = 0.5,
-                 use_tet_boundaries: bool = True):
+                 use_tet_boundaries: bool = True, feature_aware_smoothing: bool = True):
         """
         Initialize primary surface worker.
         
@@ -1738,6 +1741,8 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             use_tet_boundaries: If True (default), use tetrahedral boundary surfaces
                                for re-projection instead of original input meshes.
                                This ensures exact alignment with the membrane.
+            feature_aware_smoothing: If True (default), detect and preserve concave corners.
+                                    If False, smooth all vertices normally without feature detection.
         """
         super().__init__()
         self.tet_result = tet_result
@@ -1746,6 +1751,7 @@ class ComprehensivePrimarySurfaceWorker(QThread):
         self.smooth_iterations = smooth_iterations
         self.damping_factor = damping_factor
         self.use_tet_boundaries = use_tet_boundaries
+        self.feature_aware_smoothing = feature_aware_smoothing
     
     def run(self):
         try:
@@ -1945,12 +1951,17 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                     iterations=self.smooth_iterations,
                     damping_factor=self.damping_factor,
                     excluded_vertices=None,
-                    vertex_boundary_type=current_boundary_type
+                    vertex_boundary_type=current_boundary_type,
+                    feature_aware_smoothing=self.feature_aware_smoothing
                 )
                 
                 result.smoothing_time_ms = (time.time() - smoothing_start) * 1000
                 result.boundary_vertices = smoothing_result.boundary_vertices
                 result.interior_vertices = smoothing_result.interior_vertices
+                
+                # Copy restored corner positions for visualization
+                if hasattr(smoothing_result, 'restored_corner_positions'):
+                    result.restored_corner_positions = smoothing_result.restored_corner_positions
                 
                 if smoothing_result.mesh is not None:
                     current_mesh = smoothing_result.mesh
@@ -2047,7 +2058,8 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
     
     def __init__(self, tet_result, primary_mesh=None, part_mesh=None, hull_mesh=None,
                  min_island_triangles: int = 3, max_propagation_distance: float = 10.0,
-                 smooth_iterations: int = 5, damping_factor: float = 0.5):
+                 smooth_iterations: int = 5, damping_factor: float = 0.5,
+                 feature_aware_smoothing: bool = True):
         """
         Initialize comprehensive secondary surface worker.
         
@@ -2060,6 +2072,7 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
             max_propagation_distance: Maximum distance to propagate boundaries
             smooth_iterations: Number of smoothing iterations
             damping_factor: Smoothing damping factor
+            feature_aware_smoothing: If True, detect and preserve concave corners
         """
         super().__init__()
         self.tet_result = tet_result
@@ -2070,6 +2083,7 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
         self.max_propagation_distance = max_propagation_distance
         self.smooth_iterations = smooth_iterations
         self.damping_factor = damping_factor
+        self.feature_aware_smoothing = feature_aware_smoothing
     
     def run(self):
         try:
@@ -2263,7 +2277,8 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
                     primary_mesh=self.primary_mesh,  # Re-project to primary surface too
                     iterations=self.smooth_iterations,
                     damping_factor=self.damping_factor,
-                    excluded_vertices=excluded_vertices  # Don't smooth gap-fill vertices
+                    excluded_vertices=excluded_vertices,  # Don't smooth gap-fill vertices
+                    feature_aware_smoothing=self.feature_aware_smoothing
                 )
                 
                 result.smoothing_time_ms = (time.time() - smoothing_start) * 1000
@@ -2538,7 +2553,7 @@ class MembraneSmoothingWorker(QThread):
     error = pyqtSignal(str)
     
     def __init__(self, membrane_mesh, part_mesh=None, hull_mesh=None, primary_mesh=None,
-                 iterations: int = 5, damping_factor: float = 0.5):
+                 iterations: int = 5, damping_factor: float = 0.5, feature_aware_smoothing: bool = True):
         """
         Initialize membrane smoothing worker.
         
@@ -2549,6 +2564,7 @@ class MembraneSmoothingWorker(QThread):
             primary_mesh: The primary parting surface for secondary smoothing (re-projection)
             iterations: Number of alternating smooth/re-project iterations
             damping_factor: Smoothing damping factor (0.5 recommended)
+            feature_aware_smoothing: If True, detect and preserve concave corners
         """
         super().__init__()
         self.membrane_mesh = membrane_mesh
@@ -2557,6 +2573,7 @@ class MembraneSmoothingWorker(QThread):
         self.primary_mesh = primary_mesh
         self.iterations = iterations
         self.damping_factor = damping_factor
+        self.feature_aware_smoothing = feature_aware_smoothing
     
     def run(self):
         try:
@@ -2573,7 +2590,8 @@ class MembraneSmoothingWorker(QThread):
                 hull_mesh=self.hull_mesh,
                 primary_mesh=self.primary_mesh,
                 iterations=self.iterations,
-                damping_factor=self.damping_factor
+                damping_factor=self.damping_factor,
+                feature_aware_smoothing=self.feature_aware_smoothing
             )
             
             elapsed = (time.time() - start_time) * 1000
@@ -3373,6 +3391,22 @@ class DisplayOptionsPanel(QFrame):
     # Feature classification debug signal
     show_feature_debug_changed = pyqtSignal(bool)  # Toggle sharp edge/corner visualization
     
+    # Individual feature type visibility signals
+    # Target mesh features:
+    show_feature_sharp_edges_changed = pyqtSignal(bool)  # Yellow lines - sharp edges on target
+    show_feature_convex_corners_changed = pyqtSignal(bool)  # Red spheres - target convex corners
+    show_feature_concave_corners_changed = pyqtSignal(bool)  # Purple spheres - target concave corners
+    show_feature_convex_edge_verts_changed = pyqtSignal(bool)  # Cyan spheres - target convex edge verts
+    show_feature_concave_edge_verts_changed = pyqtSignal(bool)  # Orange spheres - target concave edge verts
+    # Membrane boundary features:
+    show_feature_membrane_smooth_changed = pyqtSignal(bool)  # Lime spheres - membrane smooth
+    show_feature_membrane_convex_edge_changed = pyqtSignal(bool)  # Cyan spheres - membrane convex edge
+    show_feature_membrane_convex_corner_changed = pyqtSignal(bool)  # Red spheres - membrane convex corner
+    show_feature_membrane_concave_edge_changed = pyqtSignal(bool)  # Orange spheres - membrane concave edge
+    show_feature_membrane_concave_corner_changed = pyqtSignal(bool)  # Magenta spheres - membrane concave corners (FIXED)
+    # Restored corners (after smoothing):
+    show_feature_restored_corners_changed = pyqtSignal(bool)  # Blue spheres - restored corner positions
+    
     # Must match MeshViewer.BACKGROUND_COLOR for rounded corners to blend
     VIEWER_BG = "#1a1a1a"  # Matches React frontend BACKGROUND_COLOR
     
@@ -3606,6 +3640,120 @@ class DisplayOptionsPanel(QFrame):
         self.show_feature_debug_cb.hide()
         layout.addWidget(self.show_feature_debug_cb)
         
+        # Individual feature type checkboxes (shown when feature debug is enabled)
+        self.feature_type_checkboxes_container = QWidget()
+        feature_type_layout = QVBoxLayout(self.feature_type_checkboxes_container)
+        feature_type_layout.setContentsMargins(12, 0, 0, 0)  # Indent sub-options
+        feature_type_layout.setSpacing(2)
+        
+        # === TARGET MESH FEATURES (on part/hull) ===
+        target_label = QLabel("─ Target Mesh ─")
+        target_label.setStyleSheet("font-size: 9px; color: #888; font-weight: bold;")
+        feature_type_layout.addWidget(target_label)
+        
+        # Sharp edges (yellow lines)
+        self.show_sharp_edges_cb = QCheckBox('Sharp Edges (Yellow)')
+        self.show_sharp_edges_cb.setChecked(True)
+        self.show_sharp_edges_cb.setStyleSheet("font-size: 10px;")
+        self.show_sharp_edges_cb.stateChanged.connect(
+            lambda s: self.show_feature_sharp_edges_changed.emit(s == Qt.CheckState.Checked.value))
+        feature_type_layout.addWidget(self.show_sharp_edges_cb)
+        
+        # Convex corners (red spheres)
+        self.show_convex_corners_cb = QCheckBox('Convex Corners (Red)')
+        self.show_convex_corners_cb.setChecked(True)
+        self.show_convex_corners_cb.setStyleSheet("font-size: 10px;")
+        self.show_convex_corners_cb.stateChanged.connect(
+            lambda s: self.show_feature_convex_corners_changed.emit(s == Qt.CheckState.Checked.value))
+        feature_type_layout.addWidget(self.show_convex_corners_cb)
+        
+        # Concave corners (purple spheres) - kept fixed
+        self.show_concave_corners_cb = QCheckBox('Concave Corners (Purple)')
+        self.show_concave_corners_cb.setChecked(True)
+        self.show_concave_corners_cb.setStyleSheet("font-size: 10px;")
+        self.show_concave_corners_cb.stateChanged.connect(
+            lambda s: self.show_feature_concave_corners_changed.emit(s == Qt.CheckState.Checked.value))
+        feature_type_layout.addWidget(self.show_concave_corners_cb)
+        
+        # Convex sharp edge verts (cyan spheres)
+        self.show_convex_edge_verts_cb = QCheckBox('Convex Edge Verts (Cyan)')
+        self.show_convex_edge_verts_cb.setChecked(True)
+        self.show_convex_edge_verts_cb.setStyleSheet("font-size: 10px;")
+        self.show_convex_edge_verts_cb.stateChanged.connect(
+            lambda s: self.show_feature_convex_edge_verts_changed.emit(s == Qt.CheckState.Checked.value))
+        feature_type_layout.addWidget(self.show_convex_edge_verts_cb)
+        
+        # Concave sharp edge verts (orange spheres)
+        self.show_concave_edge_verts_cb = QCheckBox('Concave Edge Verts (Orange)')
+        self.show_concave_edge_verts_cb.setChecked(True)
+        self.show_concave_edge_verts_cb.setStyleSheet("font-size: 10px;")
+        self.show_concave_edge_verts_cb.stateChanged.connect(
+            lambda s: self.show_feature_concave_edge_verts_changed.emit(s == Qt.CheckState.Checked.value))
+        feature_type_layout.addWidget(self.show_concave_edge_verts_cb)
+        
+        # === MEMBRANE BOUNDARY FEATURES (on membrane edge) ===
+        membrane_label = QLabel("─ Membrane Boundary ─")
+        membrane_label.setStyleSheet("font-size: 9px; color: #888; font-weight: bold;")
+        feature_type_layout.addWidget(membrane_label)
+        
+        # Membrane smooth (lime spheres)
+        self.show_membrane_smooth_cb = QCheckBox('Smooth (Lime)')
+        self.show_membrane_smooth_cb.setChecked(True)
+        self.show_membrane_smooth_cb.setStyleSheet("font-size: 10px;")
+        self.show_membrane_smooth_cb.stateChanged.connect(
+            lambda s: self.show_feature_membrane_smooth_changed.emit(s == Qt.CheckState.Checked.value))
+        feature_type_layout.addWidget(self.show_membrane_smooth_cb)
+        
+        # Membrane convex edge (cyan spheres)
+        self.show_membrane_convex_edge_cb = QCheckBox('Convex Edge (Cyan)')
+        self.show_membrane_convex_edge_cb.setChecked(True)
+        self.show_membrane_convex_edge_cb.setStyleSheet("font-size: 10px;")
+        self.show_membrane_convex_edge_cb.stateChanged.connect(
+            lambda s: self.show_feature_membrane_convex_edge_changed.emit(s == Qt.CheckState.Checked.value))
+        feature_type_layout.addWidget(self.show_membrane_convex_edge_cb)
+        
+        # Membrane convex corner (red spheres)
+        self.show_membrane_convex_corner_cb = QCheckBox('Convex Corner (Red)')
+        self.show_membrane_convex_corner_cb.setChecked(True)
+        self.show_membrane_convex_corner_cb.setStyleSheet("font-size: 10px;")
+        self.show_membrane_convex_corner_cb.stateChanged.connect(
+            lambda s: self.show_feature_membrane_convex_corner_changed.emit(s == Qt.CheckState.Checked.value))
+        feature_type_layout.addWidget(self.show_membrane_convex_corner_cb)
+        
+        # Membrane concave edge (orange spheres)
+        self.show_membrane_concave_edge_cb = QCheckBox('Concave Edge (Orange)')
+        self.show_membrane_concave_edge_cb.setChecked(True)
+        self.show_membrane_concave_edge_cb.setStyleSheet("font-size: 10px;")
+        self.show_membrane_concave_edge_cb.stateChanged.connect(
+            lambda s: self.show_feature_membrane_concave_edge_changed.emit(s == Qt.CheckState.Checked.value))
+        feature_type_layout.addWidget(self.show_membrane_concave_edge_cb)
+        
+        # Membrane concave corners (magenta spheres) - FIXED during smoothing
+        self.show_membrane_concave_corner_cb = QCheckBox('Concave Corner FIXED (Magenta)')
+        self.show_membrane_concave_corner_cb.setChecked(True)
+        self.show_membrane_concave_corner_cb.setStyleSheet("font-size: 10px;")
+        self.show_membrane_concave_corner_cb.setToolTip("Concave corner vertices - kept FIXED during smoothing")
+        self.show_membrane_concave_corner_cb.stateChanged.connect(
+            lambda s: self.show_feature_membrane_concave_corner_changed.emit(s == Qt.CheckState.Checked.value))
+        feature_type_layout.addWidget(self.show_membrane_concave_corner_cb)
+        
+        # Restored corners label
+        restored_label = QLabel("Restored Corners:")
+        restored_label.setStyleSheet("font-size: 10px; font-weight: bold; margin-top: 5px;")
+        feature_type_layout.addWidget(restored_label)
+        
+        # Restored corner positions (blue spheres) - snapped back after smoothing
+        self.show_restored_corners_cb = QCheckBox('Restored Positions (Blue)')
+        self.show_restored_corners_cb.setChecked(True)
+        self.show_restored_corners_cb.setStyleSheet("font-size: 10px;")
+        self.show_restored_corners_cb.setToolTip("Vertices restored to original positions after smoothing")
+        self.show_restored_corners_cb.stateChanged.connect(
+            lambda s: self.show_feature_restored_corners_changed.emit(s == Qt.CheckState.Checked.value))
+        feature_type_layout.addWidget(self.show_restored_corners_cb)
+        
+        self.feature_type_checkboxes_container.hide()
+        layout.addWidget(self.feature_type_checkboxes_container)
+        
         # Store reference to feature debug data (set externally)
         self._feature_debug_data = None
         self._mesh_viewer = None
@@ -3720,6 +3868,7 @@ class DisplayOptionsPanel(QFrame):
             self.triangle_debug_cb.setChecked(False)  # Reset when hiding
             self.show_feature_debug_cb.hide()
             self.show_feature_debug_cb.setChecked(False)  # Reset when hiding
+            self.feature_type_checkboxes_container.hide()  # Also hide individual checkboxes
         
         if show_primary:
             self.show_primary_parting_surface_cb.show()
@@ -3739,6 +3888,28 @@ class DisplayOptionsPanel(QFrame):
         """Handle feature debug checkbox state change."""
         show = state == Qt.CheckState.Checked.value
         self.show_feature_debug_changed.emit(show)
+        
+        # Show/hide individual feature type checkboxes
+        if show:
+            self.feature_type_checkboxes_container.show()
+            # Reset all checkboxes to checked when showing
+            # Target mesh features:
+            self.show_sharp_edges_cb.setChecked(True)
+            self.show_convex_corners_cb.setChecked(True)
+            self.show_concave_corners_cb.setChecked(True)
+            self.show_convex_edge_verts_cb.setChecked(True)
+            self.show_concave_edge_verts_cb.setChecked(True)
+            # Membrane boundary features:
+            self.show_membrane_smooth_cb.setChecked(True)
+            self.show_membrane_convex_edge_cb.setChecked(True)
+            self.show_membrane_convex_corner_cb.setChecked(True)
+            self.show_membrane_concave_edge_cb.setChecked(True)
+            self.show_membrane_concave_corner_cb.setChecked(True)
+            # Restored corners:
+            self.show_restored_corners_cb.setChecked(True)
+        else:
+            self.feature_type_checkboxes_container.hide()
+        self.adjustSize()
     
     def set_feature_debug_context(self, mesh_viewer, feature_debug_data):
         """Set the context for feature debug visualization."""
@@ -4158,6 +4329,41 @@ class MainWindow(QMainWindow):
             self._on_feature_debug_changed
         )
         
+        # Individual feature type visibility signals
+        self.display_options.show_feature_sharp_edges_changed.connect(
+            lambda show: self.mesh_viewer.set_feature_sharp_edges_visible(show)
+        )
+        self.display_options.show_feature_convex_corners_changed.connect(
+            lambda show: self.mesh_viewer.set_feature_convex_corners_visible(show)
+        )
+        self.display_options.show_feature_concave_corners_changed.connect(
+            lambda show: self.mesh_viewer.set_feature_concave_corners_visible(show)
+        )
+        self.display_options.show_feature_convex_edge_verts_changed.connect(
+            lambda show: self.mesh_viewer.set_feature_convex_edge_verts_visible(show)
+        )
+        self.display_options.show_feature_concave_edge_verts_changed.connect(
+            lambda show: self.mesh_viewer.set_feature_concave_edge_verts_visible(show)
+        )
+        self.display_options.show_feature_membrane_smooth_changed.connect(
+            lambda show: self.mesh_viewer.set_feature_membrane_smooth_visible(show)
+        )
+        self.display_options.show_feature_membrane_convex_edge_changed.connect(
+            lambda show: self.mesh_viewer.set_feature_membrane_convex_edge_visible(show)
+        )
+        self.display_options.show_feature_membrane_convex_corner_changed.connect(
+            lambda show: self.mesh_viewer.set_feature_membrane_convex_corner_visible(show)
+        )
+        self.display_options.show_feature_membrane_concave_edge_changed.connect(
+            lambda show: self.mesh_viewer.set_feature_membrane_concave_edge_visible(show)
+        )
+        self.display_options.show_feature_membrane_concave_corner_changed.connect(
+            lambda show: self.mesh_viewer.set_feature_membrane_concave_corner_visible(show)
+        )
+        self.display_options.show_feature_restored_corners_changed.connect(
+            lambda show: self.mesh_viewer.set_feature_restored_corners_visible(show)
+        )
+        
         return wrapper
     
     def _on_triangle_debug_mode_changed(self, enabled: bool):
@@ -4204,10 +4410,22 @@ class MainWindow(QMainWindow):
             try:
                 from core.surface_propagation import get_feature_debug_visualization
                 
+                # Use smoothed membrane mesh if available, otherwise use un-smoothed
+                # This ensures we visualize the actual boundary vertices that were processed
+                membrane_mesh = None
+                restored_corner_positions = None
+                
+                if self._primary_smoothing_result is not None and self._primary_smoothing_result.mesh is not None:
+                    membrane_mesh = self._primary_smoothing_result.mesh
+                    restored_corner_positions = getattr(self._primary_smoothing_result, 'restored_corner_positions', None)
+                else:
+                    membrane_mesh = self._parting_surface_result.mesh
+                
                 # Get debug visualization data
                 debug_data = get_feature_debug_visualization(
                     target_mesh=self._current_mesh,
-                    membrane_mesh=self._parting_surface_result.mesh
+                    membrane_mesh=membrane_mesh,
+                    restored_corner_positions=restored_corner_positions
                 )
                 
                 if debug_data is not None:
@@ -7852,6 +8070,33 @@ class MainWindow(QMainWindow):
         self.primary_smooth_damping_spin.setToolTip("Damping factor (λ) - higher = more smoothing per iteration")
         smooth_layout.addRow("Damping (λ):", self.primary_smooth_damping_spin)
         
+        # Feature-aware smoothing checkbox
+        self.primary_feature_aware_cb = QCheckBox("Feature-Aware Smoothing")
+        self.primary_feature_aware_cb.setChecked(True)  # Default: enabled
+        self.primary_feature_aware_cb.setToolTip(
+            "If enabled, concave corners are detected and kept fixed during smoothing.\n"
+            "If disabled, all vertices are smoothened normally without feature detection."
+        )
+        self.primary_feature_aware_cb.setStyleSheet(f"""
+            QCheckBox {{
+                color: {Colors.DARK};
+                font-size: 12px;
+                padding: 4px 0;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+                border-radius: 3px;
+                border: 1px solid {Colors.GRAY};
+                background-color: {Colors.WHITE};
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: #9966ff;
+                border: 1px solid #7744dd;
+            }}
+        """)
+        smooth_layout.addRow("", self.primary_feature_aware_cb)
+        
         self.context_layout.addWidget(smooth_group)
         
         # Compute button
@@ -7942,6 +8187,9 @@ class MainWindow(QMainWindow):
         damping_factor = getattr(self, 'primary_smooth_damping_spin', None)
         damping_factor = damping_factor.value() if damping_factor else 0.5
         
+        feature_aware = getattr(self, 'primary_feature_aware_cb', None)
+        feature_aware = feature_aware.isChecked() if feature_aware else True
+        
         # Show progress
         self.parting_surface_btn.setEnabled(False)
         self.parting_surface_progress.show()
@@ -7958,7 +8206,8 @@ class MainWindow(QMainWindow):
             part_mesh=self._current_mesh,
             hull_mesh=hull_mesh,
             smooth_iterations=smooth_iterations,
-            damping_factor=damping_factor
+            damping_factor=damping_factor,
+            feature_aware_smoothing=feature_aware
         )
         self._parting_surface_worker.progress.connect(self._on_parting_surface_progress)
         self._parting_surface_worker.complete.connect(self._on_parting_surface_complete)
@@ -8312,6 +8561,33 @@ class MainWindow(QMainWindow):
         self.secondary_smooth_damping_spin.setToolTip("Damping factor (λ) - higher = more smoothing per iteration")
         params_layout.addRow("Damping (λ):", self.secondary_smooth_damping_spin)
         
+        # Feature-aware smoothing checkbox
+        self.secondary_feature_aware_cb = QCheckBox("Feature-Aware Smoothing")
+        self.secondary_feature_aware_cb.setChecked(True)  # Default: enabled
+        self.secondary_feature_aware_cb.setToolTip(
+            "If enabled, concave corners are detected and kept fixed during smoothing.\n"
+            "If disabled, all vertices are smoothened normally without feature detection."
+        )
+        self.secondary_feature_aware_cb.setStyleSheet(f"""
+            QCheckBox {{
+                color: {Colors.DARK};
+                font-size: 12px;
+                padding: 4px 0;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+                border-radius: 3px;
+                border: 1px solid {Colors.GRAY};
+                background-color: {Colors.WHITE};
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: #9966ff;
+                border: 1px solid #7744dd;
+            }}
+        """)
+        params_layout.addRow("", self.secondary_feature_aware_cb)
+        
         self.context_layout.addWidget(params_group)
         
         # Run button
@@ -8384,6 +8660,8 @@ class MainWindow(QMainWindow):
         max_dist = self.secondary_max_dist_spin.value()
         smooth_iterations = self.secondary_smooth_iterations_spin.value()
         damping_factor = self.secondary_smooth_damping_spin.value()
+        feature_aware = getattr(self, 'secondary_feature_aware_cb', None)
+        feature_aware = feature_aware.isChecked() if feature_aware else True
         
         # Get target surfaces
         primary_mesh = None
@@ -8411,7 +8689,8 @@ class MainWindow(QMainWindow):
             min_island_triangles=min_island,
             max_propagation_distance=max_dist,
             smooth_iterations=smooth_iterations,
-            damping_factor=damping_factor
+            damping_factor=damping_factor,
+            feature_aware_smoothing=feature_aware
         )
         self._secondary_surface_worker.progress.connect(self._on_secondary_surface_progress)
         self._secondary_surface_worker.complete.connect(self._on_secondary_surface_complete)
