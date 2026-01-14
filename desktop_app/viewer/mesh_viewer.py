@@ -2702,19 +2702,21 @@ class MeshViewer(QWidget):
         
         # Build edges ONLY from outer hull faces (H1, H2, boundary zone)
         # This excludes edges from the inner boundary (part surface)
-        outer_edge_set = set()
-        for face_idx, face in enumerate(boundary_faces):
-            # Only include edges from outer hull faces
-            if face_idx not in outer_hull_faces:
-                continue
-            
-            v0, v1, v2 = face
-            outer_edge_set.add((min(v0, v1), max(v0, v1)))
-            outer_edge_set.add((min(v1, v2), max(v1, v2)))
-            outer_edge_set.add((min(v2, v0), max(v2, v0)))
-        
-        boundary_edges = np.array(list(outer_edge_set)) if outer_edge_set else np.empty((0, 2), dtype=np.int64)
-        n_boundary_edges = len(boundary_edges)
+        # VECTORIZED for performance - process all outer faces at once
+        outer_face_indices = np.array(list(outer_hull_faces), dtype=np.int64)
+        if len(outer_face_indices) > 0:
+            outer_faces = boundary_faces[outer_face_indices]  # (n_outer, 3)
+            # Extract all 3 edges from each face
+            edge01 = np.sort(outer_faces[:, [0, 1]], axis=1)
+            edge12 = np.sort(outer_faces[:, [1, 2]], axis=1)
+            edge20 = np.sort(outer_faces[:, [2, 0]], axis=1)
+            all_edges = np.vstack([edge01, edge12, edge20])  # (3*n_outer, 2)
+            # Remove duplicates using numpy unique
+            boundary_edges = np.unique(all_edges, axis=0)
+            n_boundary_edges = len(boundary_edges)
+        else:
+            boundary_edges = np.empty((0, 2), dtype=np.int64)
+            n_boundary_edges = 0
         
         logger.info(f"Outer hull edges: {n_boundary_edges}")
         
@@ -2722,25 +2724,31 @@ class MeshViewer(QWidget):
         # STEP 2b: Assign colors to outer hull boundary edges only
         # =====================================================================
         
-        # Assign edge colors based on endpoint labels
-        edge_colors = np.zeros((n_boundary_edges, 3), dtype=np.uint8)
-        for i, (v0, v1) in enumerate(boundary_edges):
-            l0, l1 = boundary_vertex_labels[v0], boundary_vertex_labels[v1]
+        # Assign edge colors based on endpoint labels - VECTORIZED
+        edge_colors = np.full((n_boundary_edges, 3), 158, dtype=np.uint8)  # Default gray
+        
+        if n_boundary_edges > 0:
+            # Get labels for both endpoints
+            l0 = boundary_vertex_labels[boundary_edges[:, 0]]
+            l1 = boundary_vertex_labels[boundary_edges[:, 1]]
             
-            if l0 == 1 and l1 == 1:
-                edge_colors[i] = [76, 175, 80]  # Green for H1
-            elif l0 == 2 and l1 == 2:
-                edge_colors[i] = [255, 152, 0]  # Orange for H2
-            elif l0 == 3 and l1 == 3:
-                edge_colors[i] = [158, 158, 158]  # Gray for boundary zone
-            elif l0 in [1, 2] and l1 in [1, 2]:
-                edge_colors[i] = [158, 158, 158]  # Gray for H1-H2 interface
-            elif l0 == 1 or l1 == 1:
-                edge_colors[i] = [76, 175, 80]  # Green
-            elif l0 == 2 or l1 == 2:
-                edge_colors[i] = [255, 152, 0]  # Orange
-            else:
-                edge_colors[i] = [158, 158, 158]  # Gray for unclassified
+            # Both H1 -> Green
+            both_h1 = (l0 == 1) & (l1 == 1)
+            edge_colors[both_h1] = [76, 175, 80]
+            
+            # Both H2 -> Orange
+            both_h2 = (l0 == 2) & (l1 == 2)
+            edge_colors[both_h2] = [255, 152, 0]
+            
+            # At least one H1 (but not both H2) -> Green
+            has_h1 = ((l0 == 1) | (l1 == 1)) & ~both_h2
+            edge_colors[has_h1] = [76, 175, 80]
+            
+            # At least one H2 (but not both H1) -> Orange
+            has_h2 = ((l0 == 2) | (l1 == 2)) & ~both_h1 & ~has_h1
+            edge_colors[has_h2] = [255, 152, 0]
+            
+            # Rest stay gray (boundary zone, unclassified, etc.)
         
         n_h1_verts = np.sum(boundary_vertex_labels == 1)
         n_h2_verts = np.sum(boundary_vertex_labels == 2)
@@ -2783,16 +2791,16 @@ class MeshViewer(QWidget):
         # =====================================================================
         
         if n_inner_faces > 0:
-            # Build edges from inner boundary faces (similar to outer boundary)
-            inner_edge_set = set()
-            for face_idx in inner_set:
-                face = boundary_faces[face_idx]
-                v0, v1, v2 = face
-                inner_edge_set.add((min(v0, v1), max(v0, v1)))
-                inner_edge_set.add((min(v1, v2), max(v1, v2)))
-                inner_edge_set.add((min(v2, v0), max(v2, v0)))
-            
-            inner_edges = np.array(list(inner_edge_set)) if inner_edge_set else np.empty((0, 2), dtype=np.int64)
+            # Build edges from inner boundary faces - VECTORIZED
+            inner_face_indices = np.array(list(inner_set), dtype=np.int64)
+            inner_faces = boundary_faces[inner_face_indices]  # (n_inner, 3)
+            # Extract all 3 edges from each face
+            edge01 = np.sort(inner_faces[:, [0, 1]], axis=1)
+            edge12 = np.sort(inner_faces[:, [1, 2]], axis=1)
+            edge20 = np.sort(inner_faces[:, [2, 0]], axis=1)
+            all_inner_edges = np.vstack([edge01, edge12, edge20])
+            # Remove duplicates
+            inner_edges = np.unique(all_inner_edges, axis=0)
             n_inner_edges = len(inner_edges)
             
             if n_inner_edges > 0:

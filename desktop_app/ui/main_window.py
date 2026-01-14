@@ -1370,9 +1370,13 @@ class EdgeWeightsWorker(QThread):
                 d2 = np.array([0.0, 0.0, -1.0])
                 logger.warning("Using default parting directions (Z-axis)")
             
-            # Classify the ORIGINAL boundary mesh using proximity method
+            # Classify the ORIGINAL boundary mesh
             # Triangle indices stay the same after inflation, so this classification
             # can be applied to the inflated mesh
+            # 
+            # Auto-selects the fastest path:
+            # - If hull << boundary mesh: classify small hull first, then map to boundary (FASTEST)
+            # - Otherwise: use distance-based outer boundary detection (FAST)
             original_boundary_mesh = result.boundary_mesh
             tet_boundary_classification = classify_mold_halves(
                 original_boundary_mesh,  # The ORIGINAL tetrahedral boundary mesh
@@ -1380,7 +1384,8 @@ class EdgeWeightsWorker(QThread):
                 d1, d2,
                 boundary_zone_threshold=0.15,
                 part_mesh=self.part_mesh,
-                use_proximity_method=True  # Important: use proximity for tet boundary mesh
+                use_proximity_method=False,  # Let it auto-select fast path
+                use_fast_method=True  # Use fast region-growing classification
             )
             
             classify_time = (time.time() - start_time) * 1000 - r_time
