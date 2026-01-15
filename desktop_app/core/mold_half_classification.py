@@ -1078,14 +1078,14 @@ def identify_outer_boundary_by_distance(
     tolerance_fraction: float = 0.02
 ) -> Tuple[Set[int], Set[int]]:
     """
-    Fast outer boundary detection using vertex distance to part mesh SURFACE.
+    Fast outer boundary detection using vertex distance to part mesh.
     
     A face is "inner" (from part surface) if ALL its vertices are within 
     tolerance of the part mesh surface. Otherwise it's "outer" (from hull surface).
     
-    Uses trimesh's nearest.on_surface() for accurate surface distance computation,
-    which is more reliable than vertex-to-vertex KD-tree distance when the
-    tetrahedral boundary mesh has finer resolution than the part mesh.
+    Uses KDTree for fast vertex-to-vertex distance computation.
+    For most cases, this is accurate enough since boundary mesh vertices that
+    are on the part surface will be very close to part mesh vertices.
     
     Args:
         boundary_mesh: The boundary mesh to classify
@@ -1096,6 +1096,8 @@ def identify_outer_boundary_by_distance(
         Tuple of (outer_triangles, inner_triangles) sets
     """
     import time
+    from scipy.spatial import cKDTree
+    
     start = time.time()
     
     # Compute tolerance based on mesh size
@@ -1103,17 +1105,21 @@ def identify_outer_boundary_by_distance(
     mesh_size = np.linalg.norm(bounds[1] - bounds[0])
     tolerance = mesh_size * tolerance_fraction
     
-    # Query distances from boundary vertices to part mesh SURFACE
-    # This is more accurate than vertex-to-vertex KD-tree distance
+    # Build KDTree on part mesh vertices (fast O(n log n))
     boundary_verts = boundary_mesh.vertices
-    _, distances, _ = part_mesh.nearest.on_surface(boundary_verts)
+    part_verts = part_mesh.vertices
+    
+    kdtree_start = time.time()
+    part_tree = cKDTree(part_verts)
+    distances, _ = part_tree.query(boundary_verts, k=1)
+    kdtree_time = (time.time() - kdtree_start) * 1000
     
     # Mark vertices as "near part surface" if within tolerance
     near_part = distances < tolerance  # (n_verts,)
     
     # Log distance statistics for debugging
-    logger.debug(f"Distance to part surface: min={distances.min():.4f}, max={distances.max():.4f}, "
-                f"tolerance={tolerance:.4f}")
+    logger.debug(f"Distance to part (KDTree): min={distances.min():.4f}, max={distances.max():.4f}, "
+                f"tolerance={tolerance:.4f}, query_time={kdtree_time:.0f}ms")
     logger.debug(f"Vertices near part: {np.sum(near_part)} / {len(boundary_verts)}")
     
     # A face is inner if ALL its vertices are near part surface
@@ -1125,7 +1131,7 @@ def identify_outer_boundary_by_distance(
     outer_triangles = set(np.where(~all_near_part)[0])
     
     elapsed = (time.time() - start) * 1000
-    logger.debug(f"Surface distance-based outer detection: {len(outer_triangles)} outer, "
+    logger.debug(f"KDTree-based outer detection: {len(outer_triangles)} outer, "
                 f"{len(inner_triangles)} inner in {elapsed:.0f}ms")
     
     return outer_triangles, inner_triangles
@@ -1158,12 +1164,20 @@ def identify_outer_boundary_from_tet_labels(
     Returns:
         Tuple of (outer_triangles, inner_triangles) sets
     """
+    import time
+    start = time.time()
+    
     from scipy.spatial import cKDTree
     
     # Map boundary mesh vertices to tet mesh vertices
     boundary_verts = np.asarray(boundary_mesh.vertices)
+    n_boundary_verts = len(boundary_verts)
+    n_tet_verts = len(tet_vertices)
+    
+    kdtree_start = time.time()
     tet_tree = cKDTree(tet_vertices)
     _, boundary_to_tet = tet_tree.query(boundary_verts, k=1)
+    kdtree_time = (time.time() - kdtree_start) * 1000
     
     # Get labels for boundary mesh vertices
     vertex_labels = boundary_labels[boundary_to_tet]  # (n_boundary_verts,)
@@ -1179,7 +1193,9 @@ def identify_outer_boundary_from_tet_labels(
     inner_triangles = set(np.where(all_inner)[0])
     outer_triangles = set(np.where(~all_inner)[0])
     
-    logger.debug(f"From tet labels: {len(outer_triangles)} outer, {len(inner_triangles)} inner triangles")
+    elapsed = (time.time() - start) * 1000
+    logger.debug(f"From tet labels: {len(outer_triangles)} outer, {len(inner_triangles)} inner "
+                f"({n_boundary_verts} boundary verts → {n_tet_verts} tet verts, KDTree: {kdtree_time:.0f}ms, total: {elapsed:.0f}ms)")
     
     return outer_triangles, inner_triangles
 
@@ -1861,6 +1877,13 @@ def classify_mold_halves(
     d2 = d2 / np.linalg.norm(d2)
     
     n_triangles = len(cavity_mesh.faces)
+    n_hull_faces = len(hull_mesh.faces)
+    
+    # Log available acceleration options
+    logger.info(f"Mold half classification: {n_triangles} boundary faces, {n_hull_faces} hull faces")
+    logger.debug(f"Acceleration: CUDA={CUDA_AVAILABLE}, C++={CPP_FAST_AVAILABLE}, "
+                f"tet_labels={'yes' if tet_boundary_labels is not None else 'no'}, "
+                f"part_mesh={'yes' if part_mesh is not None else 'no'}")
     
     # Compute boundary zone hops from threshold
     # Scale: 0% = 0 hops, 15% = 3 hops, 30% = 8 hops
@@ -1888,11 +1911,15 @@ def classify_mold_halves(
     
     # =========================================================================
     # FAST PATH: Hull-based classification (classify small hull, map to boundary)
-    # This is much faster for tet boundary meshes where hull << boundary mesh
+    # This is much faster than the Python fallback because:
+    # 1. Hull classification uses fast region-growing O(hull_faces)
+    # 2. Outer detection uses trimesh's optimized on_surface() 
+    # 3. Mapping uses KDTree O(boundary_faces * log(hull_faces))
+    # Always prefer this path when part_mesh is available.
     # =========================================================================
-    if part_mesh is not None and len(hull_mesh.faces) < len(cavity_mesh.faces) / 5:
-        # Hull is much smaller than boundary mesh - use hull-based approach
-        logger.debug(f"Using hull-based classification (hull={len(hull_mesh.faces)}, boundary={n_triangles})")
+    if part_mesh is not None:
+        # Use fast hull-based approach - always faster than Python fallback
+        logger.info(f"Using fast hull-based classification (hull={len(hull_mesh.faces)}, boundary={n_triangles})")
         return classify_mold_halves_via_hull(
             cavity_mesh, hull_mesh, part_mesh,
             d1, d2, boundary_zone_threshold
@@ -1900,7 +1927,13 @@ def classify_mold_halves(
     
     # =========================================================================
     # FALLBACK: Python pipeline (for when tet labels not available)
+    # WARNING: This path is slow for large meshes (>50k faces)
+    # Consider using the hull-based path by providing part_mesh
     # =========================================================================
+    logger.warning(f"Using slow Python fallback for {n_triangles} faces. "
+                  f"Consider providing part_mesh for fast hull-based classification.")
+    
+    step_start = time.time()
     
     # Step 1: Identify outer boundary triangles
     if tet_vertices is not None and tet_boundary_labels is not None:
@@ -1908,7 +1941,7 @@ def classify_mold_halves(
         outer_triangles, inner_boundary_triangles = identify_outer_boundary_from_tet_labels(
             cavity_mesh, tet_vertices, tet_boundary_labels
         )
-        logger.debug(f"Using tet labels: {len(outer_triangles)} outer, {len(inner_boundary_triangles)} inner")
+        logger.info(f"Step 1 (tet labels): {len(outer_triangles)} outer, {len(inner_boundary_triangles)} inner in {(time.time()-step_start)*1000:.0f}ms")
     elif part_mesh is not None:
         # FAST: Use distance-based detection (O(n) with KD-tree)
         outer_triangles, inner_boundary_triangles = identify_outer_boundary_by_distance(
@@ -1936,7 +1969,9 @@ def classify_mold_halves(
         effective_outer_triangles = set(range(n_triangles))
     
     # Step 2: Build triangle adjacency on the FULL cavity mesh
+    step_start = time.time()
     adjacency = build_triangle_adjacency(cavity_mesh)
+    logger.info(f"Step 2 (adjacency): built in {(time.time()-step_start)*1000:.0f}ms")
     
     # Early exit if no outer triangles
     if len(effective_outer_triangles) == 0:
@@ -1952,6 +1987,8 @@ def classify_mold_halves(
         )
     
     # Step 3: Classify using chosen method
+    # Step 3: Classify using chosen method
+    step_start = time.time()
     if use_fast_method:
         # Fast O(n) greedy region-growing (per research paper)
         # Uses GPU when available for large meshes
@@ -1960,16 +1997,23 @@ def classify_mold_halves(
         # Original morphological smoothing approach (requires triangle info)
         triangles_info = extract_triangle_info(cavity_mesh)
         side = classify_and_smooth(triangles_info, adjacency, effective_outer_triangles, d1, d2)
+    logger.info(f"Step 3 (classification): completed in {(time.time()-step_start)*1000:.0f}ms")
     
-    # Step 5: Compute boundary zone parameters
-    # Pre-compute neighbors filtered to outer triangles
+    # Step 4: Compute boundary zone parameters
+    step_start = time.time()
+    # Pre-compute neighbors filtered to outer triangles - VECTORIZED
+    # Convert outer triangles to array for fast lookup
+    outer_array = np.array(list(effective_outer_triangles), dtype=np.int64)
+    outer_set = effective_outer_triangles  # Keep set for O(1) membership test
+    
+    # Build neighbors using vectorized numpy operations where possible
     neighbors: Dict[int, List[int]] = {}
-    for i in effective_outer_triangles:
-        neighbors[i] = [n for n in adjacency.get(i, []) if n in effective_outer_triangles]
+    for i in outer_array:
+        neighbors[i] = [n for n in adjacency.get(i, []) if n in outer_set]
     
     # Find interface triangles (where H₁ meets H₂)
     interface_triangles: Set[int] = set()
-    for tri_idx in effective_outer_triangles:
+    for tri_idx in outer_array:
         my_side = side.get(tri_idx)
         if my_side is None:
             continue
@@ -1980,9 +2024,9 @@ def classify_mold_halves(
                 interface_triangles.add(tri_idx)
                 break
     
-    logger.debug(f"Interface triangles (H₁/H₂ border): {len(interface_triangles)}")
+    logger.info(f"Step 4 (interface): {len(interface_triangles)} triangles in {(time.time()-step_start)*1000:.0f}ms")
     
-    # Step 6: Expand boundary zone using BFS from interface triangles
+    # Step 5: Expand boundary zone using BFS from interface triangles
     # Scale: 0% = 0 hops, 15% = 3 hops, 30% = 8 hops
     boundary_zone_hops = round(boundary_zone_threshold * boundary_zone_threshold * 180)
     logger.debug(f"Boundary zone threshold: {boundary_zone_threshold*100:.0f}% → {boundary_zone_hops} hops")
@@ -1993,6 +2037,8 @@ def classify_mold_halves(
     # Initialize distances for interface triangles
     for tri_idx in interface_triangles:
         distance[tri_idx] = 0
+    # Step 5: Expand boundary zone using BFS from interface triangles
+    step_start = time.time()
     
     # BFS to expand boundary zone
     queue = list(interface_triangles)
@@ -2012,7 +2058,10 @@ def classify_mold_halves(
                 boundary_zone_triangles.add(neighbor_idx)
                 queue.append(neighbor_idx)
     
-    logger.debug(f"Boundary zone triangles: {len(boundary_zone_triangles)}")
+    logger.info(f"Step 5 (BFS): {len(boundary_zone_triangles)} boundary zone in {(time.time()-step_start)*1000:.0f}ms")
+    
+    # Step 6: Build result sets
+    step_start = time.time()
     
     # Remove boundary zone triangles from H₁ and H₂ sets
     h1_triangles: Set[int] = set()
@@ -2030,6 +2079,8 @@ def classify_mold_halves(
     # Second pass: remove boundary zone triangles from side map
     for tri_idx in boundary_zone_triangles:
         side.pop(tri_idx, None)
+    
+    logger.info(f"Step 6 (result sets): built in {(time.time()-step_start)*1000:.0f}ms")
     
     elapsed = time.time() - start_time
     

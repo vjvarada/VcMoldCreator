@@ -2693,8 +2693,8 @@ class MeshViewer(QWidget):
         tet_edges: np.ndarray,
         boundary_mesh: 'trimesh.Trimesh',
         classification_result,
-        part_mesh: 'trimesh.Trimesh',
-        seed_distance_threshold: float = None
+        part_mesh: 'trimesh.Trimesh' = None,
+        seed_distance_threshold: float = None  # Deprecated, kept for API compatibility
     ):
         """
         Apply mold half classification to the OUTER HULL boundary of the tetrahedral mesh.
@@ -2712,19 +2712,21 @@ class MeshViewer(QWidget):
         part of the mold half classification.
         
         Args:
-            tet_vertices: Full tetrahedral mesh vertices (N x 3)
-            tet_edges: Tetrahedral mesh edges (E x 2)
+            tet_vertices: Full tetrahedral mesh vertices (N x 3) - not used, kept for API compatibility
+            tet_edges: Tetrahedral mesh edges (E x 2) - not used, kept for API compatibility
             boundary_mesh: The tetrahedral boundary mesh
             classification_result: MoldHalfClassificationResult
-            part_mesh: Original part mesh (for identifying seed vertices)
-            seed_distance_threshold: Distance threshold for seed vertices (auto if None)
+            part_mesh: Not used, kept for API compatibility
+            seed_distance_threshold: Not used, kept for API compatibility
         """
         if not PYVISTA_AVAILABLE:
             return
         
         import pyvista as pv
+        import time
+        start_time = time.time()
         
-        logger.info("Applying tet mesh classification with seed vertices")
+        logger.info("Applying tet mesh classification")
         
         # Remove existing mold halves actors
         if self._mold_halves_actor is not None:
@@ -2761,30 +2763,12 @@ class MeshViewer(QWidget):
         # (don't remove it - user can toggle it back on via display options)
         self.set_tetrahedral_mesh_visible(False)
         
-        # =====================================================================
-        # STEP 1: Identify seed vertices (tetrahedral vertices close to part)
-        # =====================================================================
-        
-        # Compute distance from all tetrahedral vertices to part surface
-        _, tet_to_part_distances, _ = part_mesh.nearest.on_surface(tet_vertices)
-        
-        # Auto-compute threshold if not provided
-        if seed_distance_threshold is None:
-            # Use a small fraction of the mesh size
-            bounds = part_mesh.bounds
-            mesh_size = np.linalg.norm(bounds[1] - bounds[0])
-            seed_distance_threshold = mesh_size * 0.02  # 2% of mesh size
-        
-        # Find seed vertices (those very close to part surface)
-        seed_mask = tet_to_part_distances < seed_distance_threshold
-        n_seeds = np.sum(seed_mask)
-        seed_indices = np.where(seed_mask)[0]
-        
-        logger.info(f"Found {n_seeds} seed vertices (distance < {seed_distance_threshold:.4f})")
-        logger.info(f"  Distance to part: min={tet_to_part_distances.min():.4f}, max={tet_to_part_distances.max():.4f}")
+        # NOTE: Seed vertex identification (vertices close to part) has been removed
+        # from visualization step as it was expensive and not used for display.
+        # Seed identification is done during Dijkstra computation instead.
         
         # =====================================================================
-        # STEP 2: Classify OUTER hull boundary for H1/H2/boundary visualization
+        # STEP 1: Classify OUTER hull boundary for H1/H2/boundary visualization
         # Only include faces that are on the outer hull (H1, H2, or boundary zone)
         # Exclude inner boundary faces (part surface)
         # =====================================================================
@@ -2818,43 +2802,74 @@ class MeshViewer(QWidget):
         logger.info(f"Outer hull faces: {n_outer_faces}, Inner boundary faces: {n_inner_faces}")
         
         # Assign vertex labels based on adjacent OUTER triangles only
+        # VECTORIZED for performance
         vertex_h1_count = np.zeros(n_boundary_verts, dtype=np.int32)
         vertex_h2_count = np.zeros(n_boundary_verts, dtype=np.int32)
         vertex_boundary_count = np.zeros(n_boundary_verts, dtype=np.int32)
         
-        for face_idx, face in enumerate(boundary_faces):
-            # Skip inner boundary faces (part surface)
-            if face_idx in inner_set:
-                continue
-            
-            v0, v1, v2 = face
-            if face_idx in h1_set:
-                vertex_h1_count[v0] += 1
-                vertex_h1_count[v1] += 1
-                vertex_h1_count[v2] += 1
-            elif face_idx in h2_set:
-                vertex_h2_count[v0] += 1
-                vertex_h2_count[v1] += 1
-                vertex_h2_count[v2] += 1
-            elif face_idx in boundary_set:
-                vertex_boundary_count[v0] += 1
-                vertex_boundary_count[v1] += 1
-                vertex_boundary_count[v2] += 1
+        # Create face label array (vectorized lookup)
+        n_faces = len(boundary_faces)
+        face_labels = np.zeros(n_faces, dtype=np.int8)  # 0=inner/unknown, 1=H1, 2=H2, 3=boundary
         
-        # Assign boundary vertex labels
+        # Convert sets to arrays for vectorized assignment
+        if len(h1_set) > 0:
+            h1_indices = np.array(list(h1_set), dtype=np.int64)
+            h1_indices = h1_indices[h1_indices < n_faces]  # Bounds check
+            face_labels[h1_indices] = 1
+        if len(h2_set) > 0:
+            h2_indices = np.array(list(h2_set), dtype=np.int64)
+            h2_indices = h2_indices[h2_indices < n_faces]
+            face_labels[h2_indices] = 2
+        if len(boundary_set) > 0:
+            boundary_indices = np.array(list(boundary_set), dtype=np.int64)
+            boundary_indices = boundary_indices[boundary_indices < n_faces]
+            face_labels[boundary_indices] = 3
+        
+        # Vectorized vertex counting using np.add.at
+        # H1 faces
+        h1_mask = face_labels == 1
+        h1_faces = boundary_faces[h1_mask]
+        if len(h1_faces) > 0:
+            np.add.at(vertex_h1_count, h1_faces[:, 0], 1)
+            np.add.at(vertex_h1_count, h1_faces[:, 1], 1)
+            np.add.at(vertex_h1_count, h1_faces[:, 2], 1)
+        
+        # H2 faces
+        h2_mask = face_labels == 2
+        h2_faces = boundary_faces[h2_mask]
+        if len(h2_faces) > 0:
+            np.add.at(vertex_h2_count, h2_faces[:, 0], 1)
+            np.add.at(vertex_h2_count, h2_faces[:, 1], 1)
+            np.add.at(vertex_h2_count, h2_faces[:, 2], 1)
+        
+        # Boundary zone faces
+        bz_mask = face_labels == 3
+        bz_faces = boundary_faces[bz_mask]
+        if len(bz_faces) > 0:
+            np.add.at(vertex_boundary_count, bz_faces[:, 0], 1)
+            np.add.at(vertex_boundary_count, bz_faces[:, 1], 1)
+            np.add.at(vertex_boundary_count, bz_faces[:, 2], 1)
+        
+        # Assign boundary vertex labels - VECTORIZED
         boundary_vertex_labels = np.zeros(n_boundary_verts, dtype=np.int8)
-        for i in range(n_boundary_verts):
-            if vertex_h1_count[i] > vertex_h2_count[i] and vertex_h1_count[i] > vertex_boundary_count[i]:
-                boundary_vertex_labels[i] = 1  # H1
-            elif vertex_h2_count[i] > vertex_h1_count[i] and vertex_h2_count[i] > vertex_boundary_count[i]:
-                boundary_vertex_labels[i] = 2  # H2
-            elif vertex_boundary_count[i] > 0:
-                boundary_vertex_labels[i] = 3  # Boundary zone
-            elif vertex_h1_count[i] > 0:
-                boundary_vertex_labels[i] = 1
-            elif vertex_h2_count[i] > 0:
-                boundary_vertex_labels[i] = 2
-            # Vertices with no outer hull face adjacency stay at 0 (inner/unclassified)
+        
+        # H1 wins: h1 > h2 AND h1 > boundary
+        h1_wins = (vertex_h1_count > vertex_h2_count) & (vertex_h1_count > vertex_boundary_count)
+        boundary_vertex_labels[h1_wins] = 1
+        
+        # H2 wins: h2 > h1 AND h2 > boundary (and not already H1)
+        h2_wins = (vertex_h2_count > vertex_h1_count) & (vertex_h2_count > vertex_boundary_count) & ~h1_wins
+        boundary_vertex_labels[h2_wins] = 2
+        
+        # Boundary zone: boundary > 0 (and not H1 or H2)
+        bz_wins = (vertex_boundary_count > 0) & ~h1_wins & ~h2_wins
+        boundary_vertex_labels[bz_wins] = 3
+        
+        # Fallback: any H1 count -> H1, any H2 count -> H2
+        h1_fallback = (vertex_h1_count > 0) & (boundary_vertex_labels == 0)
+        boundary_vertex_labels[h1_fallback] = 1
+        h2_fallback = (vertex_h2_count > 0) & (boundary_vertex_labels == 0)
+        boundary_vertex_labels[h2_fallback] = 2
         
         # Build edges ONLY from outer hull faces (H1, H2, boundary zone)
         # This excludes edges from the inner boundary (part surface)
@@ -2987,7 +3002,8 @@ class MeshViewer(QWidget):
             logger.info("No inner boundary faces to display")
         
         self.plotter.update()
-        logger.info(f"Applied tet classification: {n_boundary_edges} outer hull edges, {n_inner_faces} inner boundary faces")
+        elapsed = (time.time() - start_time) * 1000
+        logger.info(f"Applied tet classification in {elapsed:.0f}ms: {n_boundary_edges} outer hull edges, {n_inner_faces} inner boundary faces")
     
     def show_part_surface_reference(self, part_mesh: 'trimesh.Trimesh'):
         """

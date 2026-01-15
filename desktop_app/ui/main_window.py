@@ -1559,8 +1559,9 @@ class DijkstraWorker(QThread):
         2. H1 boundary vertex adjacent to Interior vertex → H2  
         3. H2 boundary vertex adjacent to Interior vertex → H1
         
-        The parting surface passes through the midpoints of these cut edges,
-        ensuring it flows from the hull boundary (∂H) to the part surface (M).
+        CRITICAL: All vertices must be assigned H1 or H2 labels for the marching
+        tetrahedra algorithm to work correctly. Unlabeled vertices cause invalid
+        configurations (1, 2, 5, 6 edge configs) that create holes and self-intersections.
         
         Args:
             edges: (E, 2) all tetrahedral mesh edges
@@ -1570,35 +1571,87 @@ class DijkstraWorker(QThread):
         Returns:
             List of (vi, vj) tuples for primary cut edges
         """
-        # Build vertex -> effective label mapping
-        # This combines boundary labels (for H1/H2 boundary vertices) with escape labels
         n_verts = np.max(edges) + 1 if len(edges) > 0 else 0
-        
-        # Start with boundary labels: 0=interior, 1=H1, 2=H2, -1=inner boundary (part)
         boundary_labels = self.tet_result.boundary_labels
         
-        # Initialize: -1 means "not classified" (neither H1 nor H2)
-        # 1 = H1 side, 2 = H2 side
-        vertex_labels = np.full(n_verts, -1, dtype=np.int8)
+        # Initialize: 0 means "not yet classified"
+        # Final labels will be: 1 = H1 side, 2 = H2 side
+        vertex_labels = np.zeros(n_verts, dtype=np.int8)
         
-        # First, assign H1/H2 boundary vertices their boundary labels
+        # Step 1: Assign H1/H2 boundary vertices their boundary labels
         if boundary_labels is not None:
             h1_mask = boundary_labels == 1
             h2_mask = boundary_labels == 2
-            vertex_labels[h1_mask] = 1  # H1 boundary vertices
-            vertex_labels[h2_mask] = 2  # H2 boundary vertices
+            vertex_labels[h1_mask] = 1
+            vertex_labels[h2_mask] = 2
         
-        # Then, assign interior vertices their escape labels
+        # Step 2: Assign interior vertices their escape labels (1=H1, 2=H2)
         for i, vert_idx in enumerate(interior_vertex_indices):
             escape_label = interior_escape_labels[i]
             if escape_label in (1, 2):
                 vertex_labels[vert_idx] = escape_label
         
-        # Find edges where one endpoint is on H1 side and other is on H2 side
-        # This includes:
-        # - Interior → H1 adjacent to Interior → H2 (original)
-        # - H1 boundary adjacent to Interior → H2 (NEW: reaches hull)
-        # - H2 boundary adjacent to Interior → H1 (NEW: reaches hull)
+        # Step 3: CRITICAL - Propagate labels to any remaining unlabeled vertices
+        # This ensures every vertex has a valid H1 or H2 label, preventing invalid
+        # marching tetrahedra configurations (1, 2, 5, 6 edge configs).
+        # Use iterative nearest-neighbor propagation through the edge graph.
+        unlabeled_count = np.sum(vertex_labels == 0)
+        if unlabeled_count > 0:
+            logger.info(f"Propagating labels to {unlabeled_count} unlabeled vertices...")
+            
+            # Build adjacency list for propagation
+            adjacency = {i: [] for i in range(n_verts)}
+            for v0, v1 in edges:
+                adjacency[v0].append(v1)
+                adjacency[v1].append(v0)
+            
+            # Iterative propagation: assign unlabeled vertices the label of their
+            # nearest labeled neighbor. Repeat until all vertices are labeled.
+            max_iterations = 100
+            for iteration in range(max_iterations):
+                newly_labeled = 0
+                unlabeled_indices = np.where(vertex_labels == 0)[0]
+                
+                if len(unlabeled_indices) == 0:
+                    break
+                
+                for vi in unlabeled_indices:
+                    # Check neighbors for labels
+                    h1_neighbors = 0
+                    h2_neighbors = 0
+                    for neighbor in adjacency[vi]:
+                        if vertex_labels[neighbor] == 1:
+                            h1_neighbors += 1
+                        elif vertex_labels[neighbor] == 2:
+                            h2_neighbors += 1
+                    
+                    # Assign label based on majority of labeled neighbors
+                    if h1_neighbors > 0 or h2_neighbors > 0:
+                        if h1_neighbors >= h2_neighbors:
+                            vertex_labels[vi] = 1
+                        else:
+                            vertex_labels[vi] = 2
+                        newly_labeled += 1
+                
+                if newly_labeled == 0:
+                    # No progress - remaining vertices are isolated
+                    break
+            
+            final_unlabeled = np.sum(vertex_labels == 0)
+            if final_unlabeled > 0:
+                # Fallback: assign remaining unlabeled vertices to H1 (arbitrary but consistent)
+                logger.warning(f"{final_unlabeled} vertices remain unlabeled after propagation, assigning to H1")
+                vertex_labels[vertex_labels == 0] = 1
+            else:
+                logger.info(f"Label propagation complete in {iteration + 1} iterations")
+        
+        # Store the complete vertex labels for use in marching tetrahedra
+        self.tet_result.vertex_mold_labels = vertex_labels
+        n_h1_total = np.sum(vertex_labels == 1)
+        n_h2_total = np.sum(vertex_labels == 2)
+        logger.info(f"Stored vertex_mold_labels: {len(vertex_labels)} vertices, {n_h1_total} H1, {n_h2_total} H2")
+        
+        # Step 4: Find edges where one endpoint is H1 and other is H2
         primary_cuts = []
         for v0, v1 in edges:
             l0 = vertex_labels[v0]
@@ -1608,7 +1661,7 @@ class DijkstraWorker(QThread):
             if (l0 == 1 and l1 == 2) or (l0 == 2 and l1 == 1):
                 primary_cuts.append((int(v0), int(v1)))
         
-        logger.info(f"Found {len(primary_cuts)} primary cut edges (including hull boundary edges)")
+        logger.info(f"Found {len(primary_cuts)} primary cut edges (all vertices labeled)")
         return primary_cuts
 
 
@@ -1943,6 +1996,15 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                 
                 smoothing_start = time.time()
                 
+                # Debug: verify vertex count matches boundary type array
+                n_mesh_verts = len(current_mesh.vertices)
+                n_boundary_type = len(current_boundary_type) if current_boundary_type is not None else 0
+                if n_mesh_verts != n_boundary_type:
+                    logger.warning(f"VERTEX COUNT MISMATCH: mesh has {n_mesh_verts} vertices, "
+                                  f"boundary_type has {n_boundary_type} entries")
+                else:
+                    logger.debug(f"Vertex counts match: {n_mesh_verts} vertices")
+                
                 smoothing_result = smooth_membrane_with_boundary_reprojection(
                     current_mesh,
                     part_mesh=part_mesh_for_reprojection,
@@ -1971,7 +2033,52 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                     self.progress.emit("Smoothing returned no mesh - using unsmoothed")
             
             # =====================================================================
-            # STEP 5: Fix normals for consistent orientation
+            # STEP 5: Fill floating edge gaps (edges that drifted during smoothing)
+            # After smoothing, boundary vertices are re-projected to the part surface,
+            # but edges connecting them may "float" away. Detect and fill these gaps.
+            # =====================================================================
+            if self.smooth_iterations > 0 and part_mesh_for_reprojection is not None:
+                from core.parting_surface import (
+                    detect_floating_boundary_edges,
+                    fill_floating_edge_gaps
+                )
+                self.progress.emit("Detecting and filling floating edge gaps...")
+                
+                # Record face count before fill (to track which faces are fill triangles)
+                faces_before_fill = len(current_mesh.faces)
+                
+                fill_result = fill_floating_edge_gaps(
+                    membrane_mesh=current_mesh,
+                    part_mesh=part_mesh_for_reprojection,
+                    vertex_boundary_type=current_boundary_type
+                )
+                
+                if fill_result.floating_edges_found > 0:
+                    self.progress.emit(f"Filled {fill_result.floating_edges_found} floating edges, "
+                                     f"added {fill_result.fill_triangles_added} triangles")
+                    if fill_result.mesh is not None:
+                        current_mesh = fill_result.mesh
+                        
+                        # Record fill face indices for yellow visualization
+                        result.fill_face_indices = np.arange(
+                            faces_before_fill,
+                            faces_before_fill + fill_result.fill_triangles_added
+                        )
+                        
+                        # Update boundary type array with new vertices (type -1 = on part)
+                        if current_boundary_type is not None and fill_result.new_vertices_added > 0:
+                            new_boundary_type = np.zeros(
+                                len(current_boundary_type) + fill_result.new_vertices_added,
+                                dtype=np.int32
+                            )
+                            new_boundary_type[:len(current_boundary_type)] = current_boundary_type
+                            new_boundary_type[len(current_boundary_type):] = -1  # On part surface
+                            current_boundary_type = new_boundary_type
+                else:
+                    self.progress.emit("No floating edges detected")
+            
+            # =====================================================================
+            # STEP 6: Fix normals for consistent orientation
             # =====================================================================
             self.progress.emit("Fixing surface normals...")
             current_mesh.fix_normals()
@@ -2286,14 +2393,32 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
                 result.interior_vertices = smoothing_result.interior_vertices
                 
                 if smoothing_result.mesh is not None:
-                    result.mesh = smoothing_result.mesh
-                    result.num_vertices = len(smoothing_result.mesh.vertices)
-                    result.num_faces = len(smoothing_result.mesh.faces)
+                    current_mesh = smoothing_result.mesh
                 else:
                     # Smoothing failed, use current mesh (may include gap-fill)
-                    result.mesh = current_mesh
-                    result.num_vertices = len(current_mesh.vertices)
-                    result.num_faces = len(current_mesh.faces)
+                    pass  # current_mesh unchanged
+                
+                # === Fill floating edge gaps after smoothing ===
+                from core.parting_surface import fill_floating_edge_gaps
+                
+                self.progress.emit("Detecting and filling floating edge gaps...")
+                fill_result = fill_floating_edge_gaps(
+                    membrane_mesh=current_mesh,
+                    part_mesh=self.part_mesh,
+                    vertex_boundary_type=None  # Use distance-based detection
+                )
+                
+                if fill_result.floating_edges_found > 0:
+                    self.progress.emit(f"Filled {fill_result.floating_edges_found} floating edges, "
+                                     f"added {fill_result.fill_triangles_added} triangles")
+                    if fill_result.mesh is not None:
+                        current_mesh = fill_result.mesh
+                else:
+                    self.progress.emit("No floating edges detected")
+                
+                result.mesh = current_mesh
+                result.num_vertices = len(current_mesh.vertices)
+                result.num_faces = len(current_mesh.faces)
             else:
                 # No smoothing requested, use current mesh (may include gap-fill)
                 result.mesh = current_mesh
@@ -2422,7 +2547,8 @@ class PartingSurfaceWorker(QThread):
                 extract_parting_surface_from_tet_result,
                 smooth_parting_surface,
                 repair_parting_surface,
-                repair_parting_surface_with_part
+                repair_parting_surface_with_part,
+                fill_floating_edge_gaps_parting_surface
             )
             from core.tetrahedral_mesh import prepare_parting_surface_data
             import time
@@ -2461,6 +2587,11 @@ class PartingSurfaceWorker(QThread):
             if self.smooth_iterations > 0 and result.mesh is not None:
                 self.progress.emit(f"Smoothing surface ({self.smooth_iterations} iterations)...")
                 result = smooth_parting_surface(result, iterations=self.smooth_iterations)
+            
+            # Step 5: Fill floating edge gaps (edges that drifted from part during smoothing)
+            if self.smooth_iterations > 0 and result.mesh is not None and self.part_mesh is not None:
+                self.progress.emit("Filling floating edge gaps...")
+                result = fill_floating_edge_gaps_parting_surface(result, self.part_mesh)
             
             elapsed = (time.time() - start_time) * 1000
             
@@ -2593,6 +2724,26 @@ class MembraneSmoothingWorker(QThread):
                 damping_factor=self.damping_factor,
                 feature_aware_smoothing=self.feature_aware_smoothing
             )
+            
+            # Fill floating edge gaps after smoothing
+            if result.mesh is not None and self.part_mesh is not None:
+                from core.parting_surface import fill_floating_edge_gaps
+                
+                self.progress.emit("Detecting and filling floating edge gaps...")
+                fill_result = fill_floating_edge_gaps(
+                    membrane_mesh=result.mesh,
+                    part_mesh=self.part_mesh,
+                    vertex_boundary_type=None  # Use distance-based detection
+                )
+                
+                if fill_result.floating_edges_found > 0:
+                    self.progress.emit(f"Filled {fill_result.floating_edges_found} floating edges, "
+                                     f"added {fill_result.fill_triangles_added} triangles")
+                    if fill_result.mesh is not None:
+                        result.mesh = fill_result.mesh
+                        result.final_vertices = len(fill_result.mesh.vertices)
+                else:
+                    self.progress.emit("No floating edges detected")
             
             elapsed = (time.time() - start_time) * 1000
             
@@ -5528,16 +5679,23 @@ class MainWindow(QMainWindow):
                     data[key] = value.copy()
                 elif isinstance(value, (int, float, str, bool, type(None), list, tuple)):
                     data[key] = value
+                elif isinstance(value, set):
+                    # Convert sets to lists for serialization
+                    data[key] = list(value)
                 elif isinstance(value, dict):
                     # Try to serialize dict items
+                    # Convert keys to strings if they're integers (JSON requires string keys)
                     data[key] = {}
                     for k, v in value.items():
+                        str_key = str(k) if isinstance(k, int) else k
                         if isinstance(v, np.ndarray):
-                            data[key][k] = v.copy()
+                            data[key][str_key] = v.copy()
                         elif isinstance(v, (int, float, str, bool, type(None), list, tuple)):
-                            data[key][k] = v
+                            data[key][str_key] = v
+                        elif isinstance(v, set):
+                            data[key][str_key] = list(v)
                         else:
-                            data[key][k] = str(v)  # Fallback
+                            data[key][str_key] = str(v)  # Fallback
                 else:
                     # Skip non-serializable objects
                     pass
@@ -5606,11 +5764,18 @@ class MainWindow(QMainWindow):
                 return None
             
             # Process data - convert mesh dicts back to trimesh objects
+            # Also restore sets and integer-keyed dicts
             processed_data = {}
             for key, value in data.items():
                 if isinstance(value, dict) and 'vertices' in value and 'faces' in value:
                     # This is a mesh
                     processed_data[key] = dict_to_mesh(value)
+                elif isinstance(value, list) and key in ('h1_triangles', 'h2_triangles', 'boundary_zone_triangles', 'inner_boundary_triangles'):
+                    # These are sets that were serialized as lists
+                    processed_data[key] = set(value)
+                elif isinstance(value, dict) and key == 'side_map':
+                    # side_map has integer keys that were converted to strings
+                    processed_data[key] = {int(k): v for k, v in value.items()}
                 else:
                     processed_data[key] = value
             
@@ -5710,7 +5875,7 @@ class MainWindow(QMainWindow):
                 
                 # Restore mold halves visualization if we have both tet_result and mold_halves_result
                 # This must happen AFTER tet_result is restored since it needs tet data
-                if self._mold_halves_result is not None and hasattr(self._mold_halves_result, 'classification') and self._mold_halves_result.classification is not None:
+                if self._mold_halves_result is not None and hasattr(self._mold_halves_result, 'h1_triangles') and self._mold_halves_result.h1_triangles is not None:
                     boundary_mesh = self._tet_result.boundary_mesh if hasattr(self._tet_result, 'boundary_mesh') else None
                     self.mesh_viewer.apply_tet_mesh_classification(
                         tet_vertices=self._tet_result.vertices,

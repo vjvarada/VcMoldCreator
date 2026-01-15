@@ -499,6 +499,11 @@ MIN_PROJECTION_DISTANCE_FRACTION = 0.1
 PROJECTION_OFFSET_FRACTION = 0.3
 DISTANCE_THRESHOLD_EDGE_MULTIPLIER = 3.0
 
+# Floating edge detection (post-smoothing hole filling)
+FLOATING_EDGE_DISTANCE_MULTIPLIER = 2.0  # Edge floats if midpoint > edge_length * this
+FLOATING_EDGE_MIN_DISTANCE = 0.1         # Minimum absolute distance (mm)
+FLOATING_EDGE_MAX_SAMPLES = 5            # Sample points along edge
+
 # Small feature removal
 DEFAULT_MIN_LOOP_PERIMETER = 4.0  # mm
 TUBULAR_ASPECT_RATIO_THRESHOLD = 6.0
@@ -561,7 +566,49 @@ BOUNDARY_EXCLUSION_THRESHOLD = 0.15  # 15% of bbox diagonal
 - `remove_small_boundary_loops()` for internal holes
 - `close_parting_surface_gaps()` with vertex_boundary_type support
 
-#### Phase 6: Pipeline Integration ✅
+#### Phase 6: Floating Edge Detection and Filling ✅
+After smoothing, boundary VERTICES are re-projected to the part surface, but the EDGES 
+connecting them may "float" away from the part. This creates gaps between the membrane 
+boundary and the actual part surface.
+
+**Functions (in parting_surface.py):**
+- `detect_floating_boundary_edges()` - Detect edges where both vertices are on part but edge floats
+- `fill_floating_edge_gaps()` - Fill gaps using triangle fan approach
+- `fill_floating_edge_gaps_ribbon()` - Fill gaps using ribbon/quad strip approach (higher quality)
+
+**Algorithm:**
+```python
+# For each boundary edge (v0, v1) where both vertices have boundary_type == -1 (part):
+# 1. Sample N points along the edge
+# 2. Measure distance from each sample point to part surface
+# 3. If max_distance > threshold, edge is "floating"
+# 4. Create fill triangles connecting edge to projected polyline on part
+
+# Detection threshold:
+threshold = max(edge_length * FLOATING_EDGE_DISTANCE_MULTIPLIER, FLOATING_EDGE_MIN_DISTANCE)
+```
+
+**Usage (after smoothing):**
+```python
+from parting_surface import fill_floating_edge_gaps_ribbon
+
+# Detect and fill floating edges
+fill_result = fill_floating_edge_gaps_ribbon(
+    smoothed_mesh,
+    part_mesh,
+    vertex_boundary_type=boundary_type_array,
+    distance_multiplier=2.0,
+    min_distance=0.1
+)
+
+# Result contains:
+# - fill_result.mesh: Patched mesh with fill triangles
+# - fill_result.floating_edges_found: Number of floating edges detected
+# - fill_result.fill_triangles_added: Number of triangles added
+# - fill_result.part_constrained_vertices: New vertices that should stay on part
+```
+
+#### Phase 7: Pipeline Integration ✅
 - `ComprehensivePrimarySurfaceWorker` with 9-step pipeline
 
 ---

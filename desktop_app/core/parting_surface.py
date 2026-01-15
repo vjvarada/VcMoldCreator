@@ -4,11 +4,19 @@ Parting Surface Extraction using Marching Tetrahedra
 This module extracts a continuous parting surface mesh from a tetrahedral mesh
 where certain edges have been marked as "cut" (either primary or secondary cuts).
 
-Algorithm: Marching Tetrahedra (paper-based vertex classification)
+Algorithm: Marching Tetrahedra for Binary Labeling (H1 vs H2)
 - Each tetrahedron has 6 edges
-- Cut edges are derived from vertex labels (H1 vs H2)
-- Only 3-edge and 4-edge configurations generate triangles
-- 5-edge and 6-edge configs are skipped to avoid self-intersections
+- Cut edges connect vertices with different labels (H1 vs H2)
+- In a proper binary system, only 3-edge and 4-edge configurations are valid
+- All vertices must be labeled H1 or H2 before extraction (see label propagation)
+
+Valid configurations in binary (2-class) system:
+- 0-edge: All vertices same label → no surface (trivial)
+- 3-edge: One vertex isolated (3+1 split) → single triangle
+- 4-edge: Two vertices vs two vertices (2+2 split) → quad (2 triangles)
+
+Invalid configurations (indicate labeling issues):
+- 1, 2, 5, 6-edge configs should NOT occur if all vertices are properly labeled
 
 Edge numbering within a tetrahedron (vertices 0,1,2,3):
     Edge 0: (0,1)
@@ -57,6 +65,17 @@ MIN_TUBULAR_VERTICES = 6  # Minimum vertices in loop to consider tubular
 PRIMARY_MIN_ISLAND_TRIANGLES = 10  # Minimum triangles to keep an island (primary surface)
 PRIMARY_MIN_ISLAND_AREA_FRACTION = 0.01  # Islands with area < 1% of total are removed
 
+# Floating edge detection and filling thresholds
+# After smoothing, boundary vertices are re-projected to the part surface, but
+# edges connecting them may "float" away from the part. We detect these floating
+# edges and create fill triangles to close the gaps.
+#
+# An edge is "floating" if its MIDPOINT is not on the part surface.
+# This is mathematically optimal because the midpoint of a chord is where
+# maximum deviation from a curve occurs.
+FLOATING_EDGE_TOLERANCE_FRACTION = 0.05  # Edge is floating if midpoint is > 5% of edge length from part
+FLOATING_EDGE_MIN_TOLERANCE = 0.01       # Minimum tolerance in mm (for very short edges)
+
 
 # =============================================================================
 # MARCHING TETRAHEDRA LOOKUP TABLES
@@ -72,36 +91,19 @@ TET_EDGES = [
     (2, 3),  # Edge 5
 ]
 
-# Face definitions: face index -> (vertex_a, vertex_b, vertex_c)
-# Each face is opposite to a vertex (face i is opposite to vertex i)
-TET_FACES = [
-    (1, 2, 3),  # Face 0: opposite to v0, edges: 3(v1-v2), 4(v1-v3), 5(v2-v3)
-    (0, 2, 3),  # Face 1: opposite to v1, edges: 1(v0-v2), 2(v0-v3), 5(v2-v3)
-    (0, 1, 3),  # Face 2: opposite to v2, edges: 0(v0-v1), 2(v0-v3), 4(v1-v3)
-    (0, 1, 2),  # Face 3: opposite to v3, edges: 0(v0-v1), 1(v0-v2), 3(v1-v2)
-]
-
-# Map from face index to the 3 edge indices that form that face
-TET_FACE_EDGES = [
-    (3, 4, 5),  # Face 0 (v1,v2,v3): edges 3, 4, 5
-    (1, 2, 5),  # Face 1 (v0,v2,v3): edges 1, 2, 5
-    (0, 2, 4),  # Face 2 (v0,v1,v3): edges 0, 2, 4
-    (0, 1, 3),  # Face 3 (v0,v1,v2): edges 0, 1, 3
-]
-
 
 def _build_marching_tet_table() -> Dict[int, List[Tuple]]:
     """
-    Build the marching tetrahedra lookup table.
+    Build the marching tetrahedra lookup table for BINARY (2-class) labeling.
     
-    Per Nielson & Franke 1997 "Computing the Separating Surface for Segmented Data",
-    we implement ALL 5 cases for complete surface extraction:
+    In a proper binary system where every vertex is labeled H1 or H2:
+    - 0-edge config: All 4 vertices same label → no surface
+    - 3-edge config: 1 vertex isolated (3+1 split) → single triangle
+    - 4-edge config: 2 vs 2 vertices (2+2 split) → quad (2 triangles)
     
-    Case 0: All same label (0 edges cut) → No surface
-    Case 1: 3+1 (3 edges cut) → 1 triangle using mid-edge points
-    Case 2: 2+2 (4 edges cut) → 2 triangles (quad) using mid-edge points
-    Case 3: 2+1+1 (5 edges cut) → 5 triangles using mid-edge + face vertex
-    Case 4: 1+1+1+1 (6 edges cut) → 12 triangles using mid-edge + face + inner vertices
+    5-edge and 6-edge configs should NOT occur in a binary system (they require
+    3+ classes). If they do occur, it indicates a labeling bug upstream.
+    We handle them as warnings but still attempt reasonable triangulation.
     
     Edge numbering:
         Edge 0: (v0, v1)    Edge 3: (v1, v2)
@@ -110,9 +112,7 @@ def _build_marching_tet_table() -> Dict[int, List[Tuple]]:
     
     Returns:
         Dictionary mapping 6-bit config -> list of triangle specs
-        - For 0-4 edge configs: [(e0, e1, e2), ...] using edge indices
-        - For 5-edge configs: special marker 'FACE_VERTEX' 
-        - For 6-edge config: special marker 'INNER_VERTEX'
+        Each triangle is (edge0, edge1, edge2) using local edge indices
     """
     table = {}
     
@@ -121,30 +121,28 @@ def _build_marching_tet_table() -> Dict[int, List[Tuple]]:
         table[i] = []
     
     # ===========================================================================
-    # 3-EDGE CONFIGS (Case 1): Single triangle (vertex isolated from others)
-    # In a 2-label system, only 4 configs are geometrically valid:
-    # Each isolates exactly one vertex from the other three.
+    # 3-EDGE CONFIGS: Single triangle (one vertex isolated from the other three)
+    # These are the ONLY valid 3-edge configs in a binary system.
     # ===========================================================================
-    # Vertex 0 isolated: edges 0,1,2 cut (all edges from v0)
-    # Config 7 = 000111 (edges 0,1,2)
+    # Vertex 0 isolated (label differs from v1,v2,v3): edges 0,1,2 cut
+    # Config 7 = 000111 (binary)
     table[7] = [(0, 1, 2)]
     
-    # Vertex 1 isolated: edges 0,3,4 cut (all edges from v1)
-    # Config 25 = 011001 (edges 0,3,4)
+    # Vertex 1 isolated: edges 0,3,4 cut
+    # Config 25 = 011001
     table[25] = [(0, 3, 4)]
     
-    # Vertex 2 isolated: edges 1,3,5 cut (all edges from v2)
-    # Config 42 = 101010 (edges 1,3,5)
+    # Vertex 2 isolated: edges 1,3,5 cut
+    # Config 42 = 101010
     table[42] = [(1, 3, 5)]
     
-    # Vertex 3 isolated: edges 2,4,5 cut (all edges from v3)
-    # Config 52 = 110100 (edges 2,4,5)
+    # Vertex 3 isolated: edges 2,4,5 cut
+    # Config 52 = 110100
     table[52] = [(2, 4, 5)]
     
     # ===========================================================================
-    # 4-EDGE CONFIGS (Case 2): Quadrilateral surface (2 triangles)
-    # In a 2-label system, only 3 configs are geometrically valid:
-    # Each separates 2 vertices from the other 2 (opposite edges uncut).
+    # 4-EDGE CONFIGS: Quadrilateral surface (two triangles)
+    # Two vertices on one side, two on the other.
     # ===========================================================================
     # Split {v0,v1} vs {v2,v3}: edges 1,2,3,4 cut (edges 0,5 uncut)
     # Config 30 = 011110
@@ -159,32 +157,20 @@ def _build_marching_tet_table() -> Dict[int, List[Tuple]]:
     table[51] = [(0, 4, 5), (0, 5, 1)]
     
     # ===========================================================================
-    # 5-EDGE CONFIGS (Case 3): Per Nielson & Franke 1997
-    # When 5 edges are cut, 2 vertices share the same label and 2 others differ.
-    # This requires a FACE VERTEX at the centroid of 3 mid-edge points.
-    # All 6 such configs are valid (one for each edge that could be uncut).
+    # INVALID CONFIGS (should not occur in binary system)
+    # These indicate a labeling bug. We mark them for warning but don't generate
+    # triangles since doing so incorrectly causes self-intersections.
     # ===========================================================================
-    # Config 62 = 111110 (edge 0 not cut) → v0, v1 same label
-    # Config 61 = 111101 (edge 1 not cut) → v0, v2 same label
-    # Config 59 = 111011 (edge 2 not cut) → v0, v3 same label
-    # Config 55 = 110111 (edge 3 not cut) → v1, v2 same label
-    # Config 47 = 101111 (edge 4 not cut) → v1, v3 same label
-    # Config 31 = 011111 (edge 5 not cut) → v2, v3 same label
+    # 5-edge configs (would require 3 classes)
+    table[62] = 'SKIP'  # Edge 0 not cut - invalid in binary
+    table[61] = 'SKIP'  # Edge 1 not cut
+    table[59] = 'SKIP'  # Edge 2 not cut
+    table[55] = 'SKIP'  # Edge 3 not cut
+    table[47] = 'SKIP'  # Edge 4 not cut
+    table[31] = 'SKIP'  # Edge 5 not cut
     
-    table[62] = 'FACE_VERTEX'  # Edge 0 not cut
-    table[61] = 'FACE_VERTEX'  # Edge 1 not cut
-    table[59] = 'FACE_VERTEX'  # Edge 2 not cut
-    table[55] = 'FACE_VERTEX'  # Edge 3 not cut
-    table[47] = 'FACE_VERTEX'  # Edge 4 not cut
-    table[31] = 'FACE_VERTEX'  # Edge 5 not cut
-    
-    # ===========================================================================
-    # 6-EDGE CONFIG (Case 4): Per Nielson & Franke 1997
-    # When all 6 edges are cut, all 4 vertices have different labels
-    # This requires 4 FACE VERTICES + 1 INNER VERTEX (mid-tetrahedron)
-    # Generates 12 triangles (3 per face)
-    # ===========================================================================
-    table[63] = 'INNER_VERTEX'
+    # 6-edge config (would require 4 classes)
+    table[63] = 'SKIP'  # All edges cut - invalid in binary
     
     return table
 
@@ -192,173 +178,6 @@ def _build_marching_tet_table() -> Dict[int, List[Tuple]]:
 # Pre-build the lookup table
 MARCHING_TET_TABLE = _build_marching_tet_table()
 
-
-def _get_5_edge_triangles(config: int, edge_to_vertex: Dict[int, int], 
-                          face_vertex_idx: int) -> List[List[int]]:
-    """
-    Generate triangles for 5-edge configuration using face vertex.
-    
-    Per Nielson & Franke 1997 Case 3: When 5 edges are cut, two vertices share
-    the same label (connected by the uncut edge). The separating surface requires
-    a face vertex at the centroid of 3 mid-edge points on a face where all 3
-    edges are cut.
-    
-    In a 5-edge config, there are exactly 2 faces with all 3 edges cut (the faces
-    opposite to the two same-label vertices). We use the first such face.
-    
-    This generates EXACTLY 5 triangles total:
-    - 3 triangles forming a fan from face_vertex to consecutive mid-edge pairs on the target face
-    - 2 triangles connecting each remaining mid-edge point to face_vertex and its 
-      adjacent mid-edge points on the target face
-    
-    Args:
-        config: The 6-bit configuration (one of 62, 61, 59, 55, 47, 31)
-        edge_to_vertex: Map from local edge index to surface vertex index
-        face_vertex_idx: Index of the face vertex in surface vertices
-    
-    Returns:
-        List of triangles (each as [v0, v1, v2] surface vertex indices)
-    """
-    # Find which edge is NOT cut (connects the two same-label vertices)
-    uncut_edge = None
-    for e in range(6):
-        if not (config & (1 << e)):
-            uncut_edge = e
-            break
-    
-    if uncut_edge is None:
-        logger.warning(f"5-edge config {config}: could not find uncut edge")
-        return []
-    
-    # Get the two vertices connected by the uncut edge (same-label vertices)
-    same_label_verts = set(TET_EDGES[uncut_edge])
-    
-    # Find a face where ALL 3 edges are cut (this face is opposite to one same-label vertex)
-    # In 5-edge config, there are exactly 2 such faces
-    target_face = None
-    for face_idx, face_edges in enumerate(TET_FACE_EDGES):
-        if all(e in edge_to_vertex for e in face_edges):
-            target_face = face_idx
-            break
-    
-    if target_face is None:
-        logger.warning(f"5-edge config {config}: could not find face with 3 cut edges")
-        return []
-    
-    triangles = []
-    face_edges = TET_FACE_EDGES[target_face]
-    
-    # Create 3 triangles: fan from face_vertex to consecutive mid-edge pairs on target face
-    # Use consistent winding: mid_edge_i -> mid_edge_(i+1) -> face_vertex
-    for i in range(3):
-        e1 = face_edges[i]
-        e2 = face_edges[(i + 1) % 3]
-        triangles.append([edge_to_vertex[e1], edge_to_vertex[e2], face_vertex_idx])
-    
-    # Find the 2 remaining cut edges (not on target face and not the uncut edge)
-    remaining_cut_edges = [e for e in range(6) 
-                          if e != uncut_edge and e not in face_edges and e in edge_to_vertex]
-    
-    if len(remaining_cut_edges) != 2:
-        logger.warning(f"5-edge config {config}: expected 2 remaining edges, got {len(remaining_cut_edges)}")
-        # Still try to create triangles with what we have
-    
-    # Create triangles connecting remaining edges to the face vertex
-    # Each remaining edge should connect to TWO face edges (forms a quad with face vertex)
-    # We need to find the correct face edge that shares a vertex with the remaining edge
-    for re in remaining_cut_edges:
-        re_verts = set(TET_EDGES[re])
-        
-        # Find ALL face edges that share a vertex with this remaining edge
-        # (there should be exactly 2, forming a quad that we triangulate)
-        connected_face_edges = []
-        for fe in face_edges:
-            fe_verts = set(TET_EDGES[fe])
-            if re_verts & fe_verts:  # Shared vertex
-                connected_face_edges.append(fe)
-        
-        if len(connected_face_edges) >= 1:
-            # Create triangle: remaining_edge -> first_connected_face_edge -> face_vertex
-            # Use the first connected face edge to form a triangle
-            fe = connected_face_edges[0]
-            triangles.append([edge_to_vertex[re], edge_to_vertex[fe], face_vertex_idx])
-        else:
-            logger.warning(f"5-edge config {config}: remaining edge {re} has no connected face edges")
-    
-    # Validate we generated exactly 5 triangles
-    if len(triangles) != 5:
-        logger.warning(f"5-edge config {config}: generated {len(triangles)} triangles, expected 5")
-    
-    return triangles
-
-
-def _get_6_edge_triangles(edge_to_vertex: Dict[int, int],
-                          face_vertex_indices: List[int],
-                          inner_vertex_idx: int) -> List[List[int]]:
-    """
-    Generate triangles for 6-edge configuration using face and inner vertices.
-    
-    Per Nielson & Franke 1997 Case 4: All 6 edges are cut, meaning all 4 vertices
-    have different labels. The separating surface requires:
-    - 4 face vertices (one per tetrahedron face, at centroid of 3 mid-edge points)
-    - 1 inner vertex (at centroid of 4 face vertices = mid-tetrahedron)
-    
-    This generates EXACTLY 12 triangles (3 per face):
-    - For each face, create 3 triangles in a fan from inner_vertex through face_vertex
-      to consecutive mid-edge points
-    
-    Triangle winding is consistent: inner_vertex -> face_vertex -> mid_edge
-    This ensures normals point consistently outward when viewed from the inner vertex.
-    
-    Args:
-        edge_to_vertex: Map from local edge index to surface vertex index
-        face_vertex_indices: List of 4 face vertex indices (one per face, in order)
-        inner_vertex_idx: Index of the inner (mid-tetrahedron) vertex
-    
-    Returns:
-        List of triangles (each as [v0, v1, v2] surface vertex indices)
-    """
-    if len(face_vertex_indices) != 4:
-        logger.warning(f"6-edge config: expected 4 face vertices, got {len(face_vertex_indices)}")
-        return []
-    
-    triangles = []
-    missing_edges = 0
-    
-    # For each of the 4 faces, create 3 triangles in a consistent fan pattern
-    # The fan goes: inner_vertex -> face_vertex -> mid_edge_i -> (back to inner_vertex)
-    # This creates a consistent winding order across all faces
-    for face_idx, face_edges in enumerate(TET_FACE_EDGES):
-        face_v = face_vertex_indices[face_idx]
-        
-        # Get all mid-edge vertices for this face
-        face_mid_edges = []
-        for e in face_edges:
-            if e in edge_to_vertex:
-                face_mid_edges.append(edge_to_vertex[e])
-            else:
-                missing_edges += 1
-        
-        if len(face_mid_edges) < 3:
-            logger.warning(f"6-edge config face {face_idx}: only {len(face_mid_edges)} mid-edge vertices, expected 3")
-            continue
-        
-        # Create 3 triangles for this face with consistent winding
-        # Fan from inner vertex through face vertex to each mid-edge
-        for i in range(3):
-            me_curr = face_mid_edges[i]
-            me_next = face_mid_edges[(i + 1) % 3]
-            # Triangle: face_vertex -> mid_edge_curr -> mid_edge_next
-            # Then: inner_vertex -> face_vertex -> mid_edge for each
-            # Consistent winding: inner -> face -> mid_edge
-            triangles.append([inner_vertex_idx, face_v, me_curr])
-    
-    # Validate we generated exactly 12 triangles
-    if len(triangles) != 12:
-        logger.warning(f"6-edge config: generated {len(triangles)} triangles, expected 12 "
-                      f"(missing {missing_edges} edge vertices)")
-    
-    return triangles
 
 
 # =============================================================================
@@ -408,7 +227,8 @@ def extract_parting_surface(
     tet_edge_indices: np.ndarray,
     use_original_vertices: bool = True,
     vertices_original: Optional[np.ndarray] = None,
-    boundary_labels: Optional[np.ndarray] = None
+    boundary_labels: Optional[np.ndarray] = None,
+    vertex_mold_labels: Optional[np.ndarray] = None
 ) -> PartingSurfaceResult:
     """
     Extract the parting surface mesh using Marching Tetrahedra.
@@ -456,6 +276,22 @@ def extract_parting_surface(
         verts = vertices
         logger.info("Using current (possibly inflated) vertices for parting surface")
     
+    # CRITICAL FIX: If vertex_mold_labels is provided, recompute cut edges directly
+    # from the labels. This ensures cut edges are CONSISTENT with the binary labeling.
+    # The pre-computed cut_edge_flags may include secondary cuts that create invalid configs.
+    if vertex_mold_labels is not None:
+        logger.info("Recomputing cut edges from vertex_mold_labels for consistency...")
+        n_edges = len(edges)
+        cut_edge_flags = np.zeros(n_edges, dtype=np.int8)
+        for e_idx in range(n_edges):
+            v0, v1 = edges[e_idx]
+            l0 = vertex_mold_labels[v0]
+            l1 = vertex_mold_labels[v1]
+            # Edge is cut if labels differ (1 vs 2)
+            if l0 != l1 and l0 in (1, 2) and l1 in (1, 2):
+                cut_edge_flags[e_idx] = 1
+        logger.info(f"Computed {np.sum(cut_edge_flags)} cut edges from vertex labels")
+    
     # Count cut edges
     n_cut = np.sum(cut_edge_flags)
     logger.info(f"Extracting parting surface from {len(tetrahedra)} tets, {n_cut} cut edges")
@@ -492,53 +328,43 @@ def extract_parting_surface(
         v0, v1 = edges[e_idx]
         
         # Determine cut point placement based on boundary labels
+        # boundary_labels: -1 = on part surface M, 0 = interior, 1 = on H1 hull, 2 = on H2 hull
         if boundary_labels is not None:
             bl0 = boundary_labels[v0]
             bl1 = boundary_labels[v1]
             
+            # Priority order for cut point placement:
+            # 1. Part surface M (boundary_label == -1) - INNER boundary
+            # 2. Hull surface ∂H (boundary_label == 1 or 2) - OUTER boundary
+            # 3. Interior (both == 0) - midpoint
+            
             # Check if either vertex is on part surface M (boundary_label == -1)
-            # If so, place cut point at that vertex to ensure surface is bounded by M
-            # Mark as INNER boundary (type -1) for re-projection to part during smoothing
-            if bl0 == -1 and bl1 != -1:
-                # v0 is on part surface, v1 is not → place at v0
-                surface_vertices[i] = verts[v0]
-                vertex_boundary_type[i] = -1  # INNER boundary - re-project to part M
-                n_part_boundary += 1
-            elif bl1 == -1 and bl0 != -1:
-                # v1 is on part surface, v0 is not → place at v1
-                surface_vertices[i] = verts[v1]
-                vertex_boundary_type[i] = -1  # INNER boundary - re-project to part M
-                n_part_boundary += 1
-            elif bl0 == -1 and bl1 == -1:
-                # BOTH on part surface → use midpoint but still mark as part boundary
-                surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
+            if bl0 == -1 or bl1 == -1:
+                if bl0 == -1 and bl1 == -1:
+                    # BOTH on part surface → use midpoint
+                    surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
+                elif bl0 == -1:
+                    # Only v0 on part surface → place at v0
+                    surface_vertices[i] = verts[v0]
+                else:
+                    # Only v1 on part surface → place at v1
+                    surface_vertices[i] = verts[v1]
                 vertex_boundary_type[i] = -1  # INNER boundary - re-project to part M
                 n_part_boundary += 1
             # Check if either vertex is on hull boundary ∂H (boundary_label == 1 or 2)
-            # If so, place cut point at that vertex to ensure surface is bounded by ∂H
-            # Mark as OUTER boundary (type 1 or 2) for re-projection to hull during smoothing
-            elif bl0 in (1, 2) and bl1 == 0:
-                # v0 is on hull boundary, v1 is interior → place at v0
-                surface_vertices[i] = verts[v0]
-                vertex_boundary_type[i] = bl0  # OUTER boundary - re-project to hull ∂H
-                n_hull_boundary += 1
-            elif bl1 in (1, 2) and bl0 == 0:
-                # v1 is on hull boundary, v0 is interior → place at v1
-                surface_vertices[i] = verts[v1]
-                vertex_boundary_type[i] = bl1  # OUTER boundary - re-project to hull ∂H
-                n_hull_boundary += 1
-            elif bl0 in (1, 2) and bl1 in (1, 2):
-                # BOTH on hull boundary → use midpoint but still mark as hull boundary
-                surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
-                vertex_boundary_type[i] = bl0  # OUTER boundary - re-project to hull ∂H
-                n_hull_boundary += 1
-            elif (bl0 in (1, 2) and bl1 == -1) or (bl1 in (1, 2) and bl0 == -1):
-                # One on hull, one on part - this is a seam edge
-                # Place at midpoint, but should still connect to BOTH boundaries
-                # For re-projection, prefer hull since outer boundary projection is critical
-                surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
-                # Mark as hull boundary since we want outer edges to project to hull
-                vertex_boundary_type[i] = bl0 if bl0 in (1, 2) else bl1  # OUTER boundary
+            elif bl0 in (1, 2) or bl1 in (1, 2):
+                if bl0 in (1, 2) and bl1 in (1, 2):
+                    # BOTH on hull boundary → use midpoint (this is an edge ON the hull)
+                    surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
+                    vertex_boundary_type[i] = bl0  # Use first label
+                elif bl0 in (1, 2):
+                    # Only v0 on hull → place at v0
+                    surface_vertices[i] = verts[v0]
+                    vertex_boundary_type[i] = bl0
+                else:
+                    # Only v1 on hull → place at v1
+                    surface_vertices[i] = verts[v1]
+                    vertex_boundary_type[i] = bl1
                 n_hull_boundary += 1
             else:
                 # Both interior (bl0 == 0 and bl1 == 0) → use midpoint
@@ -554,31 +380,53 @@ def extract_parting_surface(
     logger.info(f"Cut point placement: {n_part_boundary} on part M (inner), "
                 f"{n_hull_boundary} on hull ∂H (outer), {n_midpoint} midpoints (interior)")
     
-    # Step 2: Process each tetrahedron
+    # Step 2: Process each tetrahedron using marching tetrahedra
+    # 
+    # CRITICAL FIX: If vertex_mold_labels is provided, compute cut edges directly
+    # from the labels. This GUARANTEES valid configurations (0, 3, or 4 edges only).
+    # The pre-computed cut_edge_flags may include edges from other sources that
+    # create invalid 5/6-edge configs.
     triangles = []
     tets_contributing = 0
     
     # Track configuration statistics for debugging
     config_counts = {}
+    n_skipped_configs = 0  # Count of invalid 5/6-edge configs (indicates labeling issues)
+    n_label_derived = 0    # Count of configs derived from vertex labels
+    n_flag_derived = 0     # Count of configs derived from cut_edge_flags
     
-    # Track dynamically created vertices (face vertices, inner vertices)
-    # These are appended to surface_vertices and tracked in extended arrays
-    dynamic_vertices = []  # List of (position, boundary_type, edge_index=-1)
-    
-    # Counters for special configs
-    n_5edge_configs = 0
-    n_6edge_configs = 0
+    # Local edge definitions: (v0_local, v1_local) for each of 6 edges
+    LOCAL_TET_EDGES = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
     
     for t in range(len(tetrahedra)):
-        # Get the 6 global edge indices for this tet
-        tet_edges = tet_edge_indices[t]  # Shape (6,)
+        tet_verts = tetrahedra[t]  # Shape (4,) - the 4 vertex indices
+        tet_edges = tet_edge_indices[t]  # Shape (6,) - the 6 global edge indices
         
-        # Build 6-bit configuration: bit i = 1 if edge i is cut
-        config = 0
-        for local_e in range(6):
-            global_e = tet_edges[local_e]
-            if cut_edge_flags[global_e]:
-                config |= (1 << local_e)
+        # Determine configuration: prefer using vertex_mold_labels if available
+        # This guarantees valid binary configurations (0, 3, or 4 edges only)
+        if vertex_mold_labels is not None:
+            # Compute cut edges directly from vertex labels
+            # An edge is cut if its endpoints have different labels (1 vs 2)
+            config = 0
+            for local_e in range(6):
+                v0_local, v1_local = LOCAL_TET_EDGES[local_e]
+                v0_global = tet_verts[v0_local]
+                v1_global = tet_verts[v1_local]
+                label0 = vertex_mold_labels[v0_global]
+                label1 = vertex_mold_labels[v1_global]
+                
+                # Edge is cut if labels differ (1 vs 2)
+                if label0 != label1 and label0 in (1, 2) and label1 in (1, 2):
+                    config |= (1 << local_e)
+            n_label_derived += 1
+        else:
+            # Fallback: use pre-computed cut_edge_flags
+            config = 0
+            for local_e in range(6):
+                global_e = tet_edges[local_e]
+                if cut_edge_flags[global_e]:
+                    config |= (1 << local_e)
+            n_flag_derived += 1
         
         # Track config counts
         config_counts[config] = config_counts.get(config, 0) + 1
@@ -593,93 +441,21 @@ def extract_parting_surface(
             if global_e in edge_to_surface_vertex:
                 local_edge_to_vertex[local_e] = edge_to_surface_vertex[global_e]
         
-        if table_entry == 'FACE_VERTEX':
+        if table_entry == 'SKIP':
             # =================================================================
-            # 5-EDGE CONFIGURATION (Case 3 per Nielson & Franke 1997)
-            # Requires a face vertex at centroid of 3 mid-edge points
+            # INVALID CONFIGURATION (5 or 6 edges cut)
+            # This should not occur in a proper binary labeling system.
+            # It indicates that some vertices are unlabeled or have inconsistent labels.
+            # Skip to avoid generating broken geometry.
             # =================================================================
-            n_5edge_configs += 1
-            tets_contributing += 1
-            
-            # Find a face where ALL 3 edges are cut
-            # In 5-edge config, there are exactly 2 such faces
-            target_face = None
-            for face_idx, face_edges in enumerate(TET_FACE_EDGES):
-                if all(fe in local_edge_to_vertex for fe in face_edges):
-                    target_face = face_idx
-                    break
-            
-            if target_face is None:
-                logger.warning(f"Tet {t}: 5-edge config {config} but no face with 3 cut edges")
-                continue
-            
-            # Get the 3 cut edges on the target face
-            face_edges = TET_FACE_EDGES[target_face]
-            
-            # Compute face vertex position: centroid of 3 mid-edge points
-            # Per Nielson & Franke: m_ijk = (m_ij + m_ik + m_jk) / 3
-            mid_edge_positions = []
-            for fe in face_edges:
-                sv_idx = local_edge_to_vertex[fe]
-                mid_edge_positions.append(surface_vertices[sv_idx])
-            
-            face_vertex_pos = np.mean(mid_edge_positions, axis=0)
-            
-            # Add face vertex to dynamic vertices
-            face_vertex_idx = len(surface_vertices) + len(dynamic_vertices)
-            dynamic_vertices.append((face_vertex_pos, 0, -1))  # boundary_type=0 (interior)
-            
-            # Generate triangles using the helper function
-            tris = _get_5_edge_triangles(config, local_edge_to_vertex, face_vertex_idx)
-            triangles.extend(tris)
-            
-        elif table_entry == 'INNER_VERTEX':
-            # =================================================================
-            # 6-EDGE CONFIGURATION (Case 4 per Nielson & Franke 1997)
-            # Requires 4 face vertices + 1 inner vertex (mid-tetrahedron)
-            # =================================================================
-            n_6edge_configs += 1
-            tets_contributing += 1
-            
-            # Compute 4 face vertices (one per face)
-            face_vertex_indices = []
-            face_vertex_positions = []
-            
-            for face_idx, face_edges in enumerate(TET_FACE_EDGES):
-                # Face vertex = centroid of 3 mid-edge points on this face
-                mid_edge_positions = []
-                for fe in face_edges:
-                    if fe in local_edge_to_vertex:
-                        sv_idx = local_edge_to_vertex[fe]
-                        mid_edge_positions.append(surface_vertices[sv_idx])
-                
-                if len(mid_edge_positions) < 3:
-                    continue
-                
-                face_v_pos = np.mean(mid_edge_positions, axis=0)
-                face_vertex_positions.append(face_v_pos)
-                
-                face_v_idx = len(surface_vertices) + len(dynamic_vertices)
-                dynamic_vertices.append((face_v_pos, 0, -1))  # boundary_type=0 (interior)
-                face_vertex_indices.append(face_v_idx)
-            
-            if len(face_vertex_indices) < 4:
-                continue
-            
-            # Compute inner vertex: centroid of 4 face vertices
-            # Per Nielson & Franke: m_t = (m_ijk + m_jkl + m_ikl + m_ijl) / 4
-            inner_vertex_pos = np.mean(face_vertex_positions, axis=0)
-            inner_vertex_idx = len(surface_vertices) + len(dynamic_vertices)
-            dynamic_vertices.append((inner_vertex_pos, 0, -1))  # boundary_type=0 (interior)
-            
-            # Generate triangles using the helper function
-            tris = _get_6_edge_triangles(local_edge_to_vertex, face_vertex_indices, inner_vertex_idx)
-            triangles.extend(tris)
+            n_skipped_configs += 1
+            continue
             
         elif table_entry:
             # =================================================================
-            # STANDARD CONFIGURATIONS (Cases 1 & 2: 3 or 4 edges cut)
-            # Simple triangles using only mid-edge vertices
+            # VALID CONFIGURATIONS (3 or 4 edges cut)
+            # Generate triangles using mid-edge vertices
+            # Orient triangles so normal points from H1 towards H2
             # =================================================================
             tets_contributing += 1
             
@@ -698,25 +474,39 @@ def extract_parting_surface(
                         break
                 
                 if valid and len(tri_verts) == 3:
+                    # Orient triangle so normal points from H1 towards H2
+                    # We use the centroid of H2 vertices in this tet to determine orientation
+                    if vertex_mold_labels is not None:
+                        # Get positions of the 3 cut points
+                        p0 = surface_vertices[tri_verts[0]]
+                        p1 = surface_vertices[tri_verts[1]]
+                        p2 = surface_vertices[tri_verts[2]]
+                        
+                        # Compute triangle centroid and normal
+                        tri_center = (p0 + p1 + p2) / 3.0
+                        edge1 = p1 - p0
+                        edge2 = p2 - p0
+                        normal = np.cross(edge1, edge2)
+                        
+                        # Find the H2 centroid in this tet (vertices with label 2)
+                        h2_positions = []
+                        for v_local in range(4):
+                            v_global = tet_verts[v_local]
+                            if vertex_mold_labels[v_global] == 2:
+                                h2_positions.append(verts[v_global])
+                        
+                        if len(h2_positions) > 0:
+                            h2_centroid = np.mean(h2_positions, axis=0)
+                            # Vector from triangle center towards H2
+                            to_h2 = h2_centroid - tri_center
+                            
+                            # If normal points away from H2, flip the triangle
+                            if np.dot(normal, to_h2) < 0:
+                                tri_verts = [tri_verts[0], tri_verts[2], tri_verts[1]]  # Flip winding
+                    
                     triangles.append(tri_verts)
     
-    # Append dynamic vertices to surface_vertices array
-    if dynamic_vertices:
-        dynamic_positions = np.array([dv[0] for dv in dynamic_vertices], dtype=np.float64)
-        surface_vertices = np.vstack([surface_vertices, dynamic_positions])
-        
-        # Extend boundary type array
-        dynamic_boundary_types = np.array([dv[1] for dv in dynamic_vertices], dtype=np.int8)
-        vertex_boundary_type = np.concatenate([vertex_boundary_type, dynamic_boundary_types])
-        
-        # Extend edge mapping array (-1 for dynamic vertices not on edges)
-        dynamic_edge_indices = np.full(len(dynamic_vertices), -1, dtype=np.int64)
-        cut_edge_indices = np.concatenate([cut_edge_indices, dynamic_edge_indices])
-        
-        logger.info(f"Added {len(dynamic_vertices)} dynamic vertices "
-                    f"({n_5edge_configs} 5-edge configs, {n_6edge_configs} 6-edge configs)")
-    
-    # Store extended arrays in result
+    # Store arrays in result
     result.vertex_to_edge = cut_edge_indices.copy()
     result.vertex_boundary_type = vertex_boundary_type.copy()
     
@@ -741,26 +531,28 @@ def extract_parting_surface(
         logger.warning(f"Removed {len(invalid_triangles)} invalid triangles, {len(triangles)} remain")
     
     # Log configuration statistics
-    logger.info(f"Configuration statistics ({len(config_counts)} unique configs):")
-    high_config_tets = 0  # Count tets with 5+ edges cut
+    config_source = "vertex_mold_labels" if n_label_derived > 0 else "cut_edge_flags"
+    logger.info(f"Configuration statistics ({len(config_counts)} unique configs, source: {config_source}):")
+    invalid_config_tets = 0  # Count tets with invalid configs (1, 2, 5, 6 edges)
     for config in sorted(config_counts.keys()):
         n_edges = bin(config).count('1')
         table_entry = MARCHING_TET_TABLE.get(config, [])
-        if table_entry == 'FACE_VERTEX':
-            status = "→ 5-edge (face vertex)"
-        elif table_entry == 'INNER_VERTEX':
-            status = "→ 6-edge (inner vertex)"
+        if table_entry == 'SKIP':
+            status = "-> SKIPPED (invalid in binary system)"
+            invalid_config_tets += config_counts[config]
         elif table_entry:
-            status = "→ triangles"
+            status = "-> triangles"
         else:
-            status = "→ EMPTY (no triangles)"
+            status = "-> EMPTY (no triangles)"
+            if n_edges in (1, 2):
+                invalid_config_tets += config_counts[config]
         if config_counts[config] > 10:  # Only log significant configs
             logger.info(f"  Config {config:2d} ({config:06b}, {n_edges} edges): {config_counts[config]:5d} tets {status}")
-        if n_edges >= 5:
-            high_config_tets += config_counts[config]
     
-    if high_config_tets > 0:
-        logger.info(f"  {high_config_tets} tets with 5+ edges cut - now handled with face/inner vertices")
+    if n_skipped_configs > 0:
+        logger.warning(f"  {n_skipped_configs} tets had 5/6-edge configs (SKIPPED) - indicates labeling issues upstream")
+    if invalid_config_tets > 0:
+        logger.warning(f"  {invalid_config_tets} total tets with invalid/empty configs (1, 2, 5, or 6 edges)")
     
     result.num_tets_contributing = tets_contributing
     
@@ -787,6 +579,21 @@ def extract_parting_surface(
     result.faces = faces
     result.num_vertices = len(surface_vertices)
     result.num_faces = len(faces)
+    
+    # Check for non-manifold edges (edges shared by more than 2 triangles)
+    edge_face_count = {}
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            edge_face_count[edge_key] = edge_face_count.get(edge_key, 0) + 1
+    
+    non_manifold_edges = [(e, c) for e, c in edge_face_count.items() if c > 2]
+    if non_manifold_edges:
+        logger.warning(f"Found {len(non_manifold_edges)} non-manifold edges (shared by >2 triangles)")
+        # Log a few examples
+        for edge, count in non_manifold_edges[:5]:
+            logger.debug(f"  Edge {edge}: shared by {count} triangles")
     
     # Create trimesh
     try:
@@ -844,6 +651,7 @@ def _repair_local_normal_consistency(mesh: trimesh.Trimesh, max_iterations: int 
     n_faces = len(faces)
     
     total_flipped = 0
+    prev_inconsistent = n_faces  # Initialize for oscillation detection
     
     for iteration in range(max_iterations):
         # Compute current face normals
@@ -891,6 +699,13 @@ def _repair_local_normal_consistency(mesh: trimesh.Trimesh, max_iterations: int 
         if len(inconsistent) == 0:
             break
         
+        # Check for oscillation: if we're not making progress, stop
+        # This prevents infinite loops in regions with conflicting orientations
+        if iteration > 0 and len(inconsistent) > 0.95 * prev_inconsistent:
+            logger.debug(f"Normal consistency stopping early - oscillation detected ({len(inconsistent)} vs {prev_inconsistent})")
+            break
+        prev_inconsistent = len(inconsistent)
+        
         # Flip inconsistent triangles
         for fi in inconsistent:
             # Flip winding: swap vertices 1 and 2
@@ -926,6 +741,16 @@ def extract_parting_surface_from_tet_result(
     """
     # Import here to avoid circular imports
     from . import tetrahedral_mesh as tm
+    
+    # Debug: Check vertex_mold_labels status
+    if tet_result.vertex_mold_labels is not None:
+        n_labels = len(tet_result.vertex_mold_labels)
+        n_h1 = np.sum(tet_result.vertex_mold_labels == 1)
+        n_h2 = np.sum(tet_result.vertex_mold_labels == 2)
+        n_unlabeled = np.sum(tet_result.vertex_mold_labels == 0)
+        logger.info(f"vertex_mold_labels available: {n_labels} total, {n_h1} H1, {n_h2} H2, {n_unlabeled} unlabeled")
+    else:
+        logger.warning("vertex_mold_labels is None - will use cut_edge_flags (may have inconsistencies)")
     
     # Prepare data structures if not already done
     if prepare_data and tet_result.tet_edge_indices is None:
@@ -984,7 +809,8 @@ def extract_parting_surface_from_tet_result(
         tet_edge_indices=tet_result.tet_edge_indices,
         use_original_vertices=use_original_vertices,
         vertices_original=tet_result.vertices_original,
-        boundary_labels=tet_result.boundary_labels  # Pass for boundary-aware cut point placement
+        boundary_labels=tet_result.boundary_labels,  # Pass for boundary-aware cut point placement
+        vertex_mold_labels=tet_result.vertex_mold_labels  # Pass for direct label-based config computation
     )
 
 
@@ -1042,11 +868,12 @@ def smooth_parting_surface(
         
         vertices = new_vertices
     
-    # Create result
+    # Create result - IMPORTANT: preserve vertex_boundary_type for floating edge detection!
     result = PartingSurfaceResult(
         vertices=vertices,
         faces=surface.faces,
         vertex_to_edge=surface.vertex_to_edge,
+        vertex_boundary_type=surface.vertex_boundary_type,  # Preserve boundary type!
         num_vertices=surface.num_vertices,
         num_faces=surface.num_faces,
         num_tets_processed=surface.num_tets_processed,
@@ -1179,7 +1006,8 @@ def repair_parting_surface(
         if np.sum(~valid_faces) > 0:
             mesh = trimesh.Trimesh(
                 vertices=mesh.vertices,
-                faces=mesh.faces[valid_faces]
+                faces=mesh.faces[valid_faces],
+                process=False  # Don't auto-process - we handle vertex removal in Step 4
             )
             # Boundary type stays the same - only faces changed
         
@@ -1194,7 +1022,8 @@ def repair_parting_surface(
                 logger.info(f"Removing {small_removed} very small triangles (< {min_area_threshold:.6f} area)")
                 mesh = trimesh.Trimesh(
                     vertices=mesh.vertices,
-                    faces=mesh.faces[valid_area_mask]
+                    faces=mesh.faces[valid_area_mask],
+                    process=False  # Don't auto-process - we handle vertex removal in Step 4
                 )
         
         # Step 4: Remove unreferenced vertices (and update boundary type)
@@ -1208,7 +1037,7 @@ def repair_parting_surface(
                 new_vertices = mesh.vertices[referenced]
                 new_faces = old_to_new[mesh.faces]
                 
-                mesh = trimesh.Trimesh(vertices=new_vertices, faces=new_faces)
+                mesh = trimesh.Trimesh(vertices=new_vertices, faces=new_faces, process=False)
                 
                 # Update boundary type to match new vertex indices
                 if has_boundary_type and current_boundary_type is not None:
@@ -1553,6 +1382,598 @@ def close_parting_surface_gaps(
                 f"{len(result.fill_boundary_vertices)} fill-boundary (inner rim), "
                 f"{len(result.inner_rim_edges)} inner rim edges "
                 f"in {result.processing_time_ms:.1f}ms")
+    
+    return result
+
+
+# =============================================================================
+# FLOATING EDGE DETECTION AND HOLE FILLING
+# =============================================================================
+
+@dataclass
+class FloatingEdgeInfo:
+    """Information about a detected floating boundary edge."""
+    edge: Tuple[int, int]            # (v0, v1) vertex indices
+    v0_pos: np.ndarray               # Position of v0
+    v1_pos: np.ndarray               # Position of v1
+    edge_length: float               # Length of the edge
+    midpoint: np.ndarray             # Midpoint of the edge
+    midpoint_distance: float         # Distance from midpoint to part surface
+    projected_midpoint: np.ndarray   # Midpoint projected onto part surface
+    is_floating: bool                # Whether edge is considered floating
+    face_index: int = -1             # Index of the triangle containing this edge
+    face_normal: np.ndarray = None   # Normal of the containing triangle
+    face_centroid: np.ndarray = None # Centroid of the containing triangle
+
+
+@dataclass
+class FloatingEdgeFillingResult:
+    """Result of floating edge detection and hole filling."""
+    mesh: Optional[trimesh.Trimesh] = None
+    vertices: Optional[np.ndarray] = None
+    faces: Optional[np.ndarray] = None
+    
+    # Statistics
+    boundary_edges_checked: int = 0
+    floating_edges_found: int = 0
+    fill_triangles_added: int = 0
+    new_vertices_added: int = 0
+    
+    # Indices of new vertices that should be constrained to part surface
+    part_constrained_vertices: Optional[np.ndarray] = None
+    
+    # Details of each floating edge
+    floating_edges_info: List[FloatingEdgeInfo] = None
+    
+    processing_time_ms: float = 0.0
+
+
+def detect_floating_boundary_edges(
+    membrane_mesh: trimesh.Trimesh,
+    part_mesh: trimesh.Trimesh,
+    vertex_boundary_type: Optional[np.ndarray] = None,
+    tolerance_fraction: float = FLOATING_EDGE_TOLERANCE_FRACTION,
+    min_tolerance: float = FLOATING_EDGE_MIN_TOLERANCE
+) -> List[FloatingEdgeInfo]:
+    """
+    Detect boundary edges that are "floating" away from the part surface.
+    
+    Uses a MIDPOINT-BASED approach: For each boundary edge on the part boundary,
+    check if the edge's midpoint is on the part surface. The midpoint is the
+    mathematically optimal point to check because for a chord between two points
+    on a curve, the midpoint is where maximum deviation from the curve occurs.
+    
+    An edge is considered "floating" if:
+    1. Both vertices are on the part boundary (vertex_boundary_type == -1)
+    2. The edge MIDPOINT is NOT on the part surface (distance > tolerance)
+    
+    Args:
+        membrane_mesh: The smoothed membrane mesh
+        part_mesh: The part mesh to measure distance against
+        vertex_boundary_type: Array tracking boundary type (-1=part, 0=interior, 1/2=hull)
+        tolerance_fraction: Fraction of edge length to use as tolerance (default 5%)
+        min_tolerance: Minimum absolute tolerance in mm (default 0.01mm)
+    
+    Returns:
+        List of FloatingEdgeInfo for each detected floating edge
+    """
+    if membrane_mesh is None or part_mesh is None:
+        logger.warning("Missing membrane or part mesh for floating edge detection")
+        return []
+    
+    vertices = np.array(membrane_mesh.vertices, dtype=np.float64)
+    faces = np.array(membrane_mesh.faces, dtype=np.int64)
+    n_verts = len(vertices)
+    
+    # Find boundary edges (edges that appear in only one face)
+    # Also track which face each boundary edge belongs to
+    edge_to_faces = {}
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            if edge_key not in edge_to_faces:
+                edge_to_faces[edge_key] = []
+            edge_to_faces[edge_key].append(fi)
+    
+    # Boundary edges have exactly one adjacent face
+    boundary_edges_with_face = [
+        ((v0, v1), flist[0]) 
+        for (v0, v1), flist in edge_to_faces.items() 
+        if len(flist) == 1
+    ]
+    
+    if len(boundary_edges_with_face) == 0:
+        logger.info("No boundary edges found on membrane")
+        return []
+    
+    logger.info(f"Found {len(boundary_edges_with_face)} boundary edges on membrane")
+    
+    # Pre-compute face normals and centroids
+    face_normals = membrane_mesh.face_normals
+    face_centroids = membrane_mesh.triangles_center
+    
+    # Check if we have boundary type information
+    has_boundary_type = (
+        vertex_boundary_type is not None and 
+        len(vertex_boundary_type) >= n_verts
+    )
+    
+    # If no boundary type info, use distance-based classification
+    # Project all boundary vertices to part and check distance
+    if not has_boundary_type:
+        logger.info("No vertex_boundary_type provided - using distance-based classification")
+        boundary_vert_set = set()
+        for (v0, v1), _ in boundary_edges_with_face:
+            boundary_vert_set.add(v0)
+            boundary_vert_set.add(v1)
+        boundary_vert_list = sorted(boundary_vert_set)
+        boundary_positions = vertices[boundary_vert_list]
+        
+        # Project to part surface
+        _, boundary_distances, _ = trimesh.proximity.closest_point(part_mesh, boundary_positions)
+        
+        # Build a map of which vertices are on the part boundary
+        # Consider "on part" if within 1% of mesh bbox diagonal
+        bbox_diag = np.linalg.norm(np.ptp(vertices, axis=0))
+        on_part_threshold = bbox_diag * 0.01  # 1% of bbox diagonal
+        
+        part_boundary_verts = set()
+        for i, vi in enumerate(boundary_vert_list):
+            if boundary_distances[i] < on_part_threshold:
+                part_boundary_verts.add(vi)
+        
+        logger.info(f"Distance-based: {len(part_boundary_verts)}/{len(boundary_vert_list)} boundary verts on part")
+    
+    # First, filter to only part-boundary edges and collect their midpoints
+    part_boundary_edges = []
+    midpoints = []
+    
+    # Debug: track why edges are skipped
+    skipped_not_part_boundary = 0
+    skipped_boundary_type_mismatch = 0
+    
+    for (v0, v1), face_idx in boundary_edges_with_face:
+        if has_boundary_type:
+            bt0 = vertex_boundary_type[v0] if v0 < len(vertex_boundary_type) else 0
+            bt1 = vertex_boundary_type[v1] if v1 < len(vertex_boundary_type) else 0
+            # Only check edges where BOTH vertices are on the part boundary (-1)
+            if bt0 != -1 or bt1 != -1:
+                # Debug: log specific vertices that are being skipped
+                if v0 in [550, 1201, 3150] or v1 in [550, 1201, 3150]:
+                    logger.debug(f"Skipping edge ({v0}, {v1}) in face {face_idx}: "
+                               f"bt0={bt0}, bt1={bt1} (need both -1)")
+                skipped_boundary_type_mismatch += 1
+                continue
+        else:
+            # Use distance-based classification
+            if v0 not in part_boundary_verts or v1 not in part_boundary_verts:
+                skipped_not_part_boundary += 1
+                continue
+        
+        p0 = vertices[v0]
+        p1 = vertices[v1]
+        midpoint = 0.5 * (p0 + p1)
+        part_boundary_edges.append((v0, v1, p0, p1, face_idx))
+        midpoints.append(midpoint)
+    
+    if len(part_boundary_edges) == 0:
+        logger.info(f"No part-boundary edges found (skipped: {skipped_boundary_type_mismatch} boundary type mismatch, "
+                   f"{skipped_not_part_boundary} not on part)")
+        return []
+    
+    logger.info(f"Checking {len(part_boundary_edges)} part-boundary edges (midpoint method) "
+               f"[skipped: {skipped_boundary_type_mismatch} boundary type, {skipped_not_part_boundary} distance]")
+    
+    # Batch query: project ALL midpoints to part surface at once (much faster!)
+    midpoints_array = np.array(midpoints, dtype=np.float64)
+    projected_midpoints, distances, _ = trimesh.proximity.closest_point(part_mesh, midpoints_array)
+    
+    # Classify each edge
+    floating_edges = []
+    
+    for i, (v0, v1, p0, p1, face_idx) in enumerate(part_boundary_edges):
+        edge_length = np.linalg.norm(p1 - p0)
+        
+        if edge_length < 1e-8:
+            continue
+        
+        midpoint = midpoints_array[i]
+        midpoint_dist = distances[i]
+        projected_mid = projected_midpoints[i]
+        
+        # Tolerance: 5% of edge length or minimum tolerance
+        tolerance = max(edge_length * tolerance_fraction, min_tolerance)
+        is_floating = midpoint_dist > tolerance
+        
+        info = FloatingEdgeInfo(
+            edge=(v0, v1),
+            v0_pos=p0.copy(),
+            v1_pos=p1.copy(),
+            edge_length=edge_length,
+            midpoint=midpoint.copy(),
+            midpoint_distance=midpoint_dist,
+            projected_midpoint=projected_mid.copy(),
+            is_floating=is_floating,
+            face_index=face_idx,
+            face_normal=face_normals[face_idx].copy() if face_idx < len(face_normals) else None,
+            face_centroid=face_centroids[face_idx].copy() if face_idx < len(face_centroids) else None
+        )
+        
+        if is_floating:
+            floating_edges.append(info)
+            logger.debug(f"FLOATING edge ({v0}, {v1}): length={edge_length:.4f}mm, "
+                        f"midpoint_dist={midpoint_dist:.4f}mm, tolerance={tolerance:.4f}mm")
+    
+    logger.info(f"Floating edge detection: {len(part_boundary_edges)} part-boundary edges checked, "
+                f"{len(floating_edges)} FLOATING (need fill)")
+    
+    if len(floating_edges) > 0:
+        max_gap = max(e.midpoint_distance for e in floating_edges)
+        avg_gap = np.mean([e.midpoint_distance for e in floating_edges])
+        logger.info(f"Floating edge gaps: max={max_gap:.4f}mm, avg={avg_gap:.4f}mm")
+    
+    return floating_edges
+
+
+def fill_floating_edge_gaps(
+    membrane_mesh: trimesh.Trimesh,
+    part_mesh: trimesh.Trimesh,
+    vertex_boundary_type: Optional[np.ndarray] = None,
+    floating_edges: Optional[List[FloatingEdgeInfo]] = None,
+    tolerance_fraction: float = FLOATING_EDGE_TOLERANCE_FRACTION,
+    min_tolerance: float = FLOATING_EDGE_MIN_TOLERANCE,
+    n_samples: int = 7
+) -> FloatingEdgeFillingResult:
+    """
+    Fill gaps created by floating boundary edges using in-plane raycasting.
+    
+    For each floating edge (v0, v1):
+    1. Get the triangle that contains this boundary edge
+    2. Sample N points along the edge
+    3. Compute projection direction: perpendicular to edge, in triangle plane,
+       pointing from edge midpoint toward triangle centroid
+    4. Raycast from each sample point toward part surface
+    5. Create triangles connecting edge points to their ray hit points
+    
+    This creates a "curtain" that follows the part surface's concave regions
+    properly (unlike closest-point projection which misses concavities).
+    
+    Args:
+        membrane_mesh: The smoothed membrane mesh with floating edges
+        part_mesh: The part mesh to connect to
+        vertex_boundary_type: Array tracking boundary type (-1=part, 0=interior, 1/2=hull)
+        floating_edges: Pre-detected floating edges (or None to detect)
+        tolerance_fraction: Fraction of edge length as tolerance
+        min_tolerance: Minimum absolute tolerance in mm
+        n_samples: Number of sample points along each floating edge (5-10)
+    
+    Returns:
+        FloatingEdgeFillingResult with the patched mesh
+    """
+    import time
+    start = time.time()
+    
+    result = FloatingEdgeFillingResult()
+    result.floating_edges_info = []
+    
+    if membrane_mesh is None or part_mesh is None:
+        logger.warning("Missing membrane or part mesh for floating edge filling")
+        return result
+    
+    # Detect floating edges if not provided
+    if floating_edges is None:
+        floating_edges = detect_floating_boundary_edges(
+            membrane_mesh, part_mesh, vertex_boundary_type,
+            tolerance_fraction, min_tolerance
+        )
+    
+    result.floating_edges_info = floating_edges
+    result.boundary_edges_checked = len(floating_edges)
+    result.floating_edges_found = len([e for e in floating_edges if e.is_floating])
+    
+    if result.floating_edges_found == 0:
+        logger.info("No floating edges found - no fill needed")
+        result.mesh = membrane_mesh
+        result.vertices = np.array(membrane_mesh.vertices)
+        result.faces = np.array(membrane_mesh.faces)
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    # Work with copies
+    vertices = list(membrane_mesh.vertices)
+    faces = list(membrane_mesh.faces)
+    n_orig_verts = len(vertices)
+    n_orig_faces = len(faces)
+    
+    new_vertex_indices = []  # Track which new vertices should be constrained to part
+    
+    # For each floating edge, create ribbon fill using raycast
+    edges_filled = 0
+    edges_skipped = 0
+    
+    for edge_info in floating_edges:
+        if not edge_info.is_floating:
+            continue
+        
+        # Need face info for raycast direction
+        if edge_info.face_normal is None or edge_info.face_centroid is None:
+            logger.debug(f"Skipping edge {edge_info.edge} - no face info")
+            edges_skipped += 1
+            continue
+        
+        v0, v1 = edge_info.edge
+        p0 = np.array(edge_info.v0_pos)
+        p1 = np.array(edge_info.v1_pos)
+        face_normal = np.array(edge_info.face_normal)
+        face_centroid = np.array(edge_info.face_centroid)
+        
+        # Compute edge direction and midpoint
+        edge_dir = p1 - p0
+        edge_len = np.linalg.norm(edge_dir)
+        if edge_len < 1e-8:
+            edges_skipped += 1
+            continue
+        edge_dir = edge_dir / edge_len
+        edge_midpoint = 0.5 * (p0 + p1)
+        
+        # Compute projection direction:
+        # 1. Perpendicular to edge, in the triangle plane
+        # 2. Pointing from edge midpoint toward face centroid
+        
+        # in_plane_perp = cross(face_normal, edge_dir) gives a vector perpendicular
+        # to the edge and lying in the triangle plane
+        in_plane_perp = np.cross(face_normal, edge_dir)
+        perp_len = np.linalg.norm(in_plane_perp)
+        if perp_len < 1e-8:
+            edges_skipped += 1
+            continue
+        in_plane_perp = in_plane_perp / perp_len
+        
+        # Check direction: should point from edge midpoint toward face centroid
+        to_centroid = face_centroid - edge_midpoint
+        if np.dot(in_plane_perp, to_centroid) < 0:
+            in_plane_perp = -in_plane_perp
+        
+        # Now in_plane_perp points from the edge INTO the triangle (toward interior)
+        # We want to raycast in the OPPOSITE direction (away from triangle, toward part)
+        ray_direction = -in_plane_perp
+        
+        # Sample points along the edge
+        t_values = np.linspace(0.0, 1.0, n_samples)
+        edge_points = np.array([p0 + t * (p1 - p0) for t in t_values])
+        
+        # === CHECK WHICH POINTS ARE ALREADY ON/INSIDE THE PART SURFACE ===
+        # Points already on the part don't need raycasting - use them directly
+        # Points inside the part should be skipped to avoid crossing triangles
+        
+        # First, find closest point on part surface for each sample
+        closest_pts, closest_dists, _ = trimesh.proximity.closest_point(part_mesh, edge_points)
+        
+        # Tolerance for "on surface" - use the same tolerance as floating edge detection
+        on_surface_tolerance = max(edge_len * tolerance_fraction, min_tolerance)
+        
+        # Classify each sample point
+        point_status = []  # 'floating', 'on_surface', 'inside'
+        for i in range(n_samples):
+            dist_to_part = closest_dists[i]
+            
+            if dist_to_part <= on_surface_tolerance:
+                # Point is on the part surface - use closest point directly
+                point_status.append('on_surface')
+            else:
+                # Check if point is INSIDE the part by seeing if ray hits immediately
+                # (hit distance very small means we're inside looking out)
+                # We'll handle this during raycasting
+                point_status.append('floating')
+        
+        # Raycast only from floating points
+        floating_indices = [i for i, status in enumerate(point_status) if status == 'floating']
+        
+        if len(floating_indices) > 0:
+            ray_origins = edge_points[floating_indices]
+            ray_directions = np.tile(ray_direction, (len(floating_indices), 1))
+            
+            # Find intersections with part mesh
+            try:
+                locations, index_ray, index_tri = part_mesh.ray.intersects_location(
+                    ray_origins=ray_origins,
+                    ray_directions=ray_directions,
+                    multiple_hits=False  # Only first hit
+                )
+            except Exception as e:
+                logger.debug(f"Ray intersection failed for edge {edge_info.edge}: {e}")
+                locations = np.array([])
+                index_ray = np.array([])
+        else:
+            locations = np.array([])
+            index_ray = np.array([])
+        
+        # Build mapping: which original sample index hit where
+        ray_hit_map = {}  # original_sample_index -> hit_location
+        for i, local_ray_idx in enumerate(index_ray):
+            original_idx = floating_indices[local_ray_idx]
+            hit_location = locations[i]
+            hit_distance = np.linalg.norm(hit_location - edge_points[original_idx])
+            
+            # Skip if hit is too close (point might be inside the part)
+            # A very short hit distance suggests we're inside looking out
+            if hit_distance < on_surface_tolerance:
+                point_status[original_idx] = 'inside'
+            else:
+                ray_hit_map[original_idx] = hit_location
+        
+        # Build vertex indices for the ribbon
+        # Edge side: endpoints use existing v0, v1; intermediate points are new
+        # Projected side: from ray hits OR closest points for on_surface
+        edge_vert_indices = []
+        proj_vert_indices = []
+        valid_samples = []  # Track which samples have both edge and projection
+        
+        for i in range(n_samples):
+            status = point_status[i]
+            
+            # Skip points that are inside the part
+            if status == 'inside':
+                continue
+            
+            # Edge vertex
+            if i == 0:
+                edge_idx = v0
+            elif i == n_samples - 1:
+                edge_idx = v1
+            else:
+                # Intermediate point on edge - add as new vertex
+                edge_idx = len(vertices)
+                vertices.append(edge_points[i].copy())
+            
+            # Projection vertex
+            if status == 'on_surface':
+                # Point is already on surface - use closest point
+                proj_idx = len(vertices)
+                vertices.append(closest_pts[i].copy())
+                new_vertex_indices.append(proj_idx)
+                
+                edge_vert_indices.append(edge_idx)
+                proj_vert_indices.append(proj_idx)
+                valid_samples.append(i)
+                
+            elif i in ray_hit_map:
+                # Ray hit the part surface
+                proj_idx = len(vertices)
+                vertices.append(ray_hit_map[i].copy())
+                new_vertex_indices.append(proj_idx)
+                
+                edge_vert_indices.append(edge_idx)
+                proj_vert_indices.append(proj_idx)
+                valid_samples.append(i)
+            else:
+                # Ray missed and point not on surface - skip
+                # Remove intermediate edge vertex if we added one
+                if i != 0 and i != n_samples - 1:
+                    vertices.pop()
+        
+        if len(valid_samples) < 2:
+            logger.debug(f"Not enough ray hits for edge {edge_info.edge} ({len(valid_samples)} hits)")
+            edges_skipped += 1
+            continue
+        
+        # Create triangles connecting edge to projection
+        # For consecutive valid samples, create quad (2 triangles)
+        for j in range(len(valid_samples) - 1):
+            e_curr = edge_vert_indices[j]
+            e_next = edge_vert_indices[j + 1]
+            p_curr = proj_vert_indices[j]
+            p_next = proj_vert_indices[j + 1]
+            
+            # Create 2 triangles forming a quad
+            # Winding should match the original face normal direction
+            # Triangle 1: e_curr -> p_curr -> p_next
+            faces.append([e_curr, p_curr, p_next])
+            # Triangle 2: e_curr -> p_next -> e_next
+            faces.append([e_curr, p_next, e_next])
+            result.fill_triangles_added += 2
+        
+        edges_filled += 1
+    
+    result.new_vertices_added = len(vertices) - n_orig_verts
+    result.part_constrained_vertices = np.array(new_vertex_indices, dtype=np.int64)
+    
+    # Create result mesh
+    try:
+        result.mesh = trimesh.Trimesh(
+            vertices=np.array(vertices),
+            faces=np.array(faces),
+            process=False
+        )
+        result.mesh.fix_normals()
+        result.vertices = np.array(result.mesh.vertices)
+        result.faces = np.array(result.mesh.faces)
+    except Exception as e:
+        logger.error(f"Failed to create filled mesh: {e}")
+        result.mesh = membrane_mesh
+        result.vertices = np.array(membrane_mesh.vertices)
+        result.faces = np.array(membrane_mesh.faces)
+    
+    result.processing_time_ms = (time.time() - start) * 1000
+    
+    logger.info(f"Floating edge fill: {edges_filled}/{result.floating_edges_found} edges filled "
+                f"({edges_skipped} skipped), {result.fill_triangles_added} triangles added, "
+                f"{result.new_vertices_added} new vertices in {result.processing_time_ms:.1f}ms")
+    
+    return result
+
+
+def fill_floating_edge_gaps_parting_surface(
+    surface: 'PartingSurfaceResult',
+    part_mesh: trimesh.Trimesh,
+    tolerance_fraction: float = FLOATING_EDGE_TOLERANCE_FRACTION,
+    min_tolerance: float = FLOATING_EDGE_MIN_TOLERANCE
+) -> 'PartingSurfaceResult':
+    """
+    Fill floating edge gaps in a PartingSurfaceResult.
+    
+    This is a wrapper around fill_floating_edge_gaps that integrates with
+    the PartingSurfaceResult data structure used in the pipeline.
+    
+    Should be called AFTER smoothing, as smoothing can cause boundary edges
+    to "float" away from the part surface.
+    
+    Args:
+        surface: The parting surface result (after smoothing)
+        part_mesh: The part mesh to connect to
+        tolerance_fraction: Fraction of edge length as tolerance (default 5%)
+        min_tolerance: Minimum absolute tolerance in mm
+    
+    Returns:
+        Updated PartingSurfaceResult with floating edges filled
+    """
+    if surface.mesh is None or part_mesh is None:
+        logger.warning("Missing surface or part mesh for floating edge filling")
+        return surface
+    
+    # Call the core filling function
+    fill_result = fill_floating_edge_gaps(
+        membrane_mesh=surface.mesh,
+        part_mesh=part_mesh,
+        vertex_boundary_type=surface.vertex_boundary_type,
+        tolerance_fraction=tolerance_fraction,
+        min_tolerance=min_tolerance
+    )
+    
+    if fill_result.mesh is None or fill_result.floating_edges_found == 0:
+        # No changes made
+        return surface
+    
+    # Update the vertex_boundary_type array to include new vertices
+    # New vertices from fill are constrained to part surface (-1)
+    n_orig_verts = len(surface.vertices) if surface.vertices is not None else 0
+    n_new_verts = fill_result.new_vertices_added
+    
+    if surface.vertex_boundary_type is not None and n_new_verts > 0:
+        new_boundary_type = np.zeros(n_orig_verts + n_new_verts, dtype=np.int32)
+        new_boundary_type[:n_orig_verts] = surface.vertex_boundary_type
+        # New vertices are on part surface (type -1)
+        new_boundary_type[n_orig_verts:] = -1
+    else:
+        new_boundary_type = surface.vertex_boundary_type
+    
+    # Create updated result
+    result = PartingSurfaceResult(
+        mesh=fill_result.mesh,
+        vertices=fill_result.vertices,
+        faces=fill_result.faces,
+        vertex_to_edge=surface.vertex_to_edge,  # Original mapping still valid
+        vertex_boundary_type=new_boundary_type,
+        num_vertices=len(fill_result.vertices),
+        num_faces=len(fill_result.faces),
+        num_tets_processed=surface.num_tets_processed,
+        num_tets_contributing=surface.num_tets_contributing,
+        extraction_time_ms=surface.extraction_time_ms + fill_result.processing_time_ms
+    )
+    
+    logger.info(f"Floating edge gaps filled: {fill_result.floating_edges_found} edges, "
+                f"{fill_result.fill_triangles_added} triangles added")
     
     return result
 

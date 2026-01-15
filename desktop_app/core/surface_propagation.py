@@ -1362,6 +1362,12 @@ def smooth_membrane_with_boundary_reprojection(
         len(vertex_boundary_type) == n_verts
     )
     
+    # Debug: log what we received
+    if vertex_boundary_type is not None:
+        logger.debug(f"vertex_boundary_type: {len(vertex_boundary_type)} entries, n_verts={n_verts}, match={len(vertex_boundary_type) == n_verts}")
+    else:
+        logger.debug(f"vertex_boundary_type: None, n_verts={n_verts}")
+    
     if use_boundary_type_classification:
         # === CLASSIFICATION FROM EXTRACTION ===
         # Use the vertex_boundary_type from extraction (per paper Section 4.4)
@@ -1877,6 +1883,14 @@ def smooth_membrane_with_boundary_reprojection(
             
             vertices = new_vertices
         
+        # === Step 1b: Restore concave corner vertices after boundary smoothing ===
+        # This ensures concave corners stay pinned during each iteration,
+        # not just at the very end. This prevents smoothing from gradually
+        # pulling them away from their correct positions.
+        if corner_original_positions:
+            for vi, original_pos in corner_original_positions.items():
+                vertices[vi] = original_pos
+        
         # === Step 2: Re-project boundary vertices onto target surfaces ===
         # Per paper: "After this smooth step, we re-project those vertices onto the 
         # original surface of M or the external boundary ∂H"
@@ -1955,8 +1969,10 @@ def smooth_membrane_with_boundary_reprojection(
         if (iteration + 1) % 2 == 0:
             logger.debug(f"Smoothing iteration {iteration + 1}/{iterations} complete")
     
-    # === Post-smoothing: Restore concave corner vertices to original positions ===
-    # These were smoothed normally, but now snap back to preserve sharp concave corners
+    # === Final restoration (for consistency after last interior smoothing) ===
+    # Since interior smoothing can affect boundary vertices through neighbor averaging,
+    # we do one final restoration to ensure concave corners are exactly at original positions.
+    # Also store positions for visualization (blue spheres).
     if corner_original_positions:
         for vi, original_pos in corner_original_positions.items():
             vertices[vi] = original_pos

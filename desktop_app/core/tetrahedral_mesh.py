@@ -141,6 +141,11 @@ class TetrahedralMeshResult:
     # seed_escape_paths[i] = [start_v, v1, v2, ..., dest_v] path from interior vertex to boundary
     seed_escape_paths: Optional[List[List[int]]] = None
     
+    # Full vertex mold labels (N,) - final H1(1) or H2(2) classification for ALL vertices
+    # After Dijkstra + propagation, every vertex should have label 1 or 2
+    # Used by marching tetrahedra for parting surface extraction
+    vertex_mold_labels: Optional[np.ndarray] = None
+    
     # Primary cutting edges - edges where one vertex escapes to H1 and the other to H2
     # These are the edges the parting surface passes through (shown in yellow)
     # List of (vi, vj) tuples representing primary cut edges
@@ -1234,6 +1239,9 @@ def _compute_edge_boundary_labels_python(
     tet_result: 'TetrahedralMeshResult'
 ) -> np.ndarray:
     """Python fallback implementation of edge boundary label computation."""
+    import time
+    start_time = time.time()
+    
     edges = tet_result.edges
     n_edges = len(edges)
     
@@ -1256,7 +1264,7 @@ def _compute_edge_boundary_labels_python(
     
     # Build set of edges that are ON THE BOUNDARY MESH SURFACE
     # These are edges of boundary triangles, not just edges between boundary vertices
-    boundary_faces = np.asarray(boundary_mesh.faces)
+    boundary_faces = np.asarray(boundary_mesh.faces, dtype=np.int64)
     
     # First, we need to map boundary mesh vertex indices to tet mesh vertex indices
     # The boundary mesh may have different vertex indexing than the tet mesh
@@ -1266,33 +1274,53 @@ def _compute_edge_boundary_labels_python(
     # Build mapping from boundary mesh vertices to tet vertices
     # Use spatial matching since indices may not correspond directly
     from scipy.spatial import cKDTree
+    kdtree_start = time.time()
     tet_tree = cKDTree(tet_verts)
     _, boundary_to_tet_map = tet_tree.query(boundary_mesh_verts, k=1)
+    kdtree_time = (time.time() - kdtree_start) * 1000
     
-    # Build set of boundary surface edges (in tet vertex indices)
-    boundary_surface_edges = set()
-    for face in boundary_faces:
-        # Convert boundary mesh indices to tet indices
-        v0_tet = boundary_to_tet_map[face[0]]
-        v1_tet = boundary_to_tet_map[face[1]]
-        v2_tet = boundary_to_tet_map[face[2]]
-        
-        # Add edges (sorted to ensure consistent ordering)
-        boundary_surface_edges.add((min(v0_tet, v1_tet), max(v0_tet, v1_tet)))
-        boundary_surface_edges.add((min(v1_tet, v2_tet), max(v1_tet, v2_tet)))
-        boundary_surface_edges.add((min(v2_tet, v0_tet), max(v2_tet, v0_tet)))
+    # Vectorized extraction of boundary surface edges (in tet vertex indices)
+    # Convert all face vertex indices to tet vertex indices
+    tet_faces = boundary_to_tet_map[boundary_faces]  # (n_faces, 3)
     
-    logger.info(f"Found {len(boundary_surface_edges)} edges on boundary surface")
+    # Extract edges from faces (each face has 3 edges)
+    edge0_v0 = tet_faces[:, 0]
+    edge0_v1 = tet_faces[:, 1]
+    edge1_v0 = tet_faces[:, 1]
+    edge1_v1 = tet_faces[:, 2]
+    edge2_v0 = tet_faces[:, 2]
+    edge2_v1 = tet_faces[:, 0]
+    
+    # Stack all edges and sort each edge (min, max)
+    all_edges_v0 = np.concatenate([edge0_v0, edge1_v0, edge2_v0])
+    all_edges_v1 = np.concatenate([edge0_v1, edge1_v1, edge2_v1])
+    sorted_min = np.minimum(all_edges_v0, all_edges_v1)
+    sorted_max = np.maximum(all_edges_v0, all_edges_v1)
+    
+    # Create a unique key for each edge using Cantor pairing function
+    # For efficiency, use simpler hashing: v_min * max_vertex_id + v_max
+    max_v = max(tet_verts.shape[0], np.max(sorted_max) + 1)
+    boundary_edge_keys = sorted_min.astype(np.int64) * max_v + sorted_max.astype(np.int64)
+    boundary_edge_keys_set = set(boundary_edge_keys)
+    
+    logger.info(f"Found {len(boundary_edge_keys_set)} unique edges on boundary surface")
     
     # Get labels for both endpoints of each edge
     v0_labels = boundary_labels[edges[:, 0]]
     v1_labels = boundary_labels[edges[:, 1]]
     
-    # Check if each tet edge is on the boundary surface
-    on_boundary_surface = np.zeros(n_edges, dtype=bool)
-    for i, (v0, v1) in enumerate(edges):
-        edge_key = (min(v0, v1), max(v0, v1))
-        on_boundary_surface[i] = edge_key in boundary_surface_edges
+    # Vectorized check if each tet edge is on the boundary surface
+    edges_arr = np.asarray(edges, dtype=np.int64)
+    tet_edge_min = np.minimum(edges_arr[:, 0], edges_arr[:, 1])
+    tet_edge_max = np.maximum(edges_arr[:, 0], edges_arr[:, 1])
+    tet_edge_keys = tet_edge_min * max_v + tet_edge_max
+    
+    # Use numpy isin for vectorized set membership (can be slow for large sets)
+    # Instead, convert to sorted array and use searchsorted
+    boundary_keys_sorted = np.sort(np.array(list(boundary_edge_keys_set), dtype=np.int64))
+    insertion_idx = np.searchsorted(boundary_keys_sorted, tet_edge_keys)
+    insertion_idx = np.clip(insertion_idx, 0, len(boundary_keys_sorted) - 1)
+    on_boundary_surface = boundary_keys_sorted[insertion_idx] == tet_edge_keys
     
     # Edge label rules (only for edges that are ON THE BOUNDARY SURFACE):
     # - Both H1: edge is H1 (1)
@@ -1327,9 +1355,10 @@ def _compute_edge_boundary_labels_python(
     n_inner = np.sum(edge_labels == -1)
     n_mixed = np.sum(edge_labels == -2)
     
+    elapsed = (time.time() - start_time) * 1000
     logger.info(
-        f"Edge boundary labels: interior={n_interior}, H1={n_h1}, H2={n_h2}, "
-        f"inner={n_inner}, mixed={n_mixed}"
+        f"[Python] Edge boundary labels in {elapsed:.0f}ms (KDTree: {kdtree_time:.0f}ms): "
+        f"interior={n_interior}, H1={n_h1}, H2={n_h2}, inner={n_inner}, mixed={n_mixed}"
     )
     
     return edge_labels
@@ -1783,7 +1812,11 @@ def label_boundary_from_classification(
     Returns:
         (N,) int8 array: 0=interior/boundary zone, 1=H1 boundary, 2=H2 boundary, -1=inner boundary (part surface)
     """
-    labels = np.zeros(len(tet_vertices), dtype=np.int8)
+    import time
+    start_time = time.time()
+    
+    n_tet_verts = len(tet_vertices)
+    labels = np.zeros(n_tet_verts, dtype=np.int8)
     
     # Get boundary vertex indices
     boundary_indices = np.where(boundary_mask)[0]
@@ -1796,76 +1829,89 @@ def label_boundary_from_classification(
     h2_set = classification_result.h2_triangles
     inner_set = classification_result.inner_boundary_triangles
     
-    # Build vertex-to-face adjacency from the boundary mesh
-    # Each vertex gets labels from all faces it belongs to
-    vertex_h1_count = np.zeros(len(tet_vertices), dtype=np.int32)
-    vertex_h2_count = np.zeros(len(tet_vertices), dtype=np.int32)
-    vertex_inner_count = np.zeros(len(tet_vertices), dtype=np.int32)
-    
-    # The boundary mesh vertices are indexed from 0, but they correspond to 
-    # tetrahedral vertices. We need to map boundary mesh faces to tet vertices.
-    # boundary_mesh.faces contains indices into boundary_mesh.vertices
-    
     # Find the mapping from boundary mesh vertices to tet vertices
-    # boundary_mesh.vertices should be a subset of tet_vertices (boundary vertices)
     # Use KDTree for efficient lookup
     from scipy.spatial import cKDTree
     
+    kdtree_start = time.time()
     tet_tree = cKDTree(tet_vertices)
-    
-    # Find which tet vertex each boundary mesh vertex corresponds to
     boundary_to_tet = tet_tree.query(boundary_mesh.vertices, k=1)[1]
+    kdtree_time = (time.time() - kdtree_start) * 1000
     
-    # Now iterate over faces and accumulate labels for each vertex
-    for face_idx, face in enumerate(boundary_mesh.faces):
-        # Map face vertex indices to tet vertex indices
-        tet_v0 = boundary_to_tet[face[0]]
-        tet_v1 = boundary_to_tet[face[1]]
-        tet_v2 = boundary_to_tet[face[2]]
-        
-        if face_idx in h1_set:
-            vertex_h1_count[tet_v0] += 1
-            vertex_h1_count[tet_v1] += 1
-            vertex_h1_count[tet_v2] += 1
-        elif face_idx in h2_set:
-            vertex_h2_count[tet_v0] += 1
-            vertex_h2_count[tet_v1] += 1
-            vertex_h2_count[tet_v2] += 1
-        elif face_idx in inner_set:
-            vertex_inner_count[tet_v0] += 1
-            vertex_inner_count[tet_v1] += 1
-            vertex_inner_count[tet_v2] += 1
-        # Boundary zone faces contribute to no count (vertex stays 0)
+    # Get boundary mesh faces
+    boundary_faces = np.asarray(boundary_mesh.faces)
+    n_faces = len(boundary_faces)
     
-    # For each boundary vertex, assign label based on majority vote
-    # Strategy: Use majority voting across all face types
-    # Inner boundary vertices should ONLY be marked as seeds if they don't touch H1/H2
-    for vert_idx in boundary_indices:
-        h1_count = vertex_h1_count[vert_idx]
-        h2_count = vertex_h2_count[vert_idx]
-        inner_count = vertex_inner_count[vert_idx]
-        
-        total = h1_count + h2_count + inner_count
-        
-        if total == 0:
-            # No classified faces touch this vertex - stays 0 (boundary zone)
-            continue
-        
-        # Use majority voting
-        if h1_count >= h2_count and h1_count >= inner_count:
-            labels[vert_idx] = 1
-        elif h2_count >= h1_count and h2_count >= inner_count:
-            labels[vert_idx] = 2
-        else:
-            # Inner has majority - this is a seed vertex
-            labels[vert_idx] = -1
+    # Create face label array (vectorized)
+    face_labels = np.zeros(n_faces, dtype=np.int8)  # 0=boundary_zone, 1=H1, 2=H2, -1=inner
+    
+    # Convert sets to arrays for vectorized assignment
+    if len(h1_set) > 0:
+        h1_indices = np.array(list(h1_set), dtype=np.int64)
+        h1_indices = h1_indices[h1_indices < n_faces]  # Bounds check
+        face_labels[h1_indices] = 1
+    if len(h2_set) > 0:
+        h2_indices = np.array(list(h2_set), dtype=np.int64)
+        h2_indices = h2_indices[h2_indices < n_faces]
+        face_labels[h2_indices] = 2
+    if len(inner_set) > 0:
+        inner_indices = np.array(list(inner_set), dtype=np.int64)
+        inner_indices = inner_indices[inner_indices < n_faces]
+        face_labels[inner_indices] = -1
+    
+    # Map boundary mesh face vertex indices to tet vertex indices
+    tet_faces = boundary_to_tet[boundary_faces]  # (n_faces, 3) tet vertex indices
+    
+    # Initialize vertex counts
+    vertex_h1_count = np.zeros(n_tet_verts, dtype=np.int32)
+    vertex_h2_count = np.zeros(n_tet_verts, dtype=np.int32)
+    vertex_inner_count = np.zeros(n_tet_verts, dtype=np.int32)
+    
+    # Vectorized counting using np.add.at
+    h1_mask = face_labels == 1
+    h2_mask = face_labels == 2
+    inner_mask = face_labels == -1
+    
+    h1_faces = tet_faces[h1_mask]
+    if len(h1_faces) > 0:
+        np.add.at(vertex_h1_count, h1_faces[:, 0], 1)
+        np.add.at(vertex_h1_count, h1_faces[:, 1], 1)
+        np.add.at(vertex_h1_count, h1_faces[:, 2], 1)
+    
+    h2_faces = tet_faces[h2_mask]
+    if len(h2_faces) > 0:
+        np.add.at(vertex_h2_count, h2_faces[:, 0], 1)
+        np.add.at(vertex_h2_count, h2_faces[:, 1], 1)
+        np.add.at(vertex_h2_count, h2_faces[:, 2], 1)
+    
+    inner_faces = tet_faces[inner_mask]
+    if len(inner_faces) > 0:
+        np.add.at(vertex_inner_count, inner_faces[:, 0], 1)
+        np.add.at(vertex_inner_count, inner_faces[:, 1], 1)
+        np.add.at(vertex_inner_count, inner_faces[:, 2], 1)
+    
+    # Vectorized label assignment using majority voting
+    # H1 wins if h1 >= h2 AND h1 >= inner
+    h1_wins = (vertex_h1_count >= vertex_h2_count) & (vertex_h1_count >= vertex_inner_count) & (vertex_h1_count > 0)
+    labels[h1_wins] = 1
+    
+    # H2 wins if h2 > h1 AND h2 >= inner (strict > for h1 since h1 checked first)
+    h2_wins = (vertex_h2_count > vertex_h1_count) & (vertex_h2_count >= vertex_inner_count) & (vertex_h2_count > 0) & ~h1_wins
+    labels[h2_wins] = 2
+    
+    # Inner wins if inner > h1 AND inner > h2
+    inner_wins = (vertex_inner_count > vertex_h1_count) & (vertex_inner_count > vertex_h2_count) & ~h1_wins & ~h2_wins
+    labels[inner_wins] = -1
     
     # Log distribution
     n_h1 = np.sum(labels == 1)
     n_h2 = np.sum(labels == 2)
     n_inner = np.sum(labels == -1)
     n_unclassified = np.sum(labels == 0)
-    logger.info(f"label_boundary_from_classification: H1={n_h1}, H2={n_h2}, inner(seeds)={n_inner}, unclassified={n_unclassified}")
+    
+    elapsed = (time.time() - start_time) * 1000
+    logger.info(f"label_boundary_from_classification in {elapsed:.0f}ms (KDTree: {kdtree_time:.0f}ms): "
+               f"H1={n_h1}, H2={n_h2}, inner(seeds)={n_inner}, unclassified={n_unclassified}")
     
     return labels
 
