@@ -331,76 +331,62 @@ def extract_parting_surface(
     # Map from global edge index to surface vertex index
     edge_to_surface_vertex = {int(e): i for i, e in enumerate(cut_edge_indices)}
     
-    # Compute cut point positions with boundary-aware placement
+    # Compute cut point positions - ALWAYS at edge midpoint for proper geometry
+    # The boundary type is tracked separately for later re-projection, but we 
+    # never snap during initial surface extraction to avoid degenerate triangles.
     surface_vertices = np.zeros((len(cut_edge_indices), 3), dtype=np.float64)
     
     # Track boundary type for each vertex (per paper Section 4.4):
     # -1 = on part surface M (INNER boundary - re-project to part during smoothing)
-    #  0 = interior midpoint (no boundary constraint)
+    #  0 = interior (no boundary constraint)
     #  1 = on hull H1 boundary (OUTER boundary - re-project to hull)
     #  2 = on hull H2 boundary (OUTER boundary - re-project to hull)
+    # NOTE: This is for LATER re-projection, NOT for initial placement!
     vertex_boundary_type = np.zeros(len(cut_edge_indices), dtype=np.int8)
     
     # Track statistics for logging
-    n_part_boundary = 0   # Cut points placed on part surface M
-    n_hull_boundary = 0   # Cut points placed on hull boundary ∂H
-    n_midpoint = 0        # Cut points at edge midpoints (interior)
+    n_part_boundary = 0   # Cut points near part surface M (will re-project later)
+    n_hull_boundary = 0   # Cut points near hull boundary ∂H (will re-project later)
+    n_interior = 0        # Cut points in interior (no re-projection needed)
     
     for i, e_idx in enumerate(cut_edge_indices):
         v0, v1 = edges[e_idx]
         
-        # Determine cut point placement based on boundary labels
+        # ALWAYS place cut point at edge midpoint for proper geometry
+        # This prevents degenerate triangles when multiple cut points would
+        # otherwise snap to the same or nearby boundary vertices
+        surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
+        
+        # Determine boundary type for LATER re-projection (not for placement)
         # boundary_labels: -1 = on part surface M, 0 = interior, 1 = on H1 hull, 2 = on H2 hull
         if boundary_labels is not None:
             bl0 = boundary_labels[v0]
             bl1 = boundary_labels[v1]
             
-            # Priority order for cut point placement:
-            # 1. Part surface M (boundary_label == -1) - INNER boundary
-            # 2. Hull surface ∂H (boundary_label == 1 or 2) - OUTER boundary
-            # 3. Interior (both == 0) - midpoint
-            
-            # Check if either vertex is on part surface M (boundary_label == -1)
+            # Priority: Part surface M (-1) > Hull (1,2) > Interior (0)
+            # If either endpoint is on part surface, mark for re-projection to part M
             if bl0 == -1 or bl1 == -1:
-                if bl0 == -1 and bl1 == -1:
-                    # BOTH on part surface → use midpoint
-                    surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
-                elif bl0 == -1:
-                    # Only v0 on part surface → place at v0
-                    surface_vertices[i] = verts[v0]
-                else:
-                    # Only v1 on part surface → place at v1
-                    surface_vertices[i] = verts[v1]
-                vertex_boundary_type[i] = -1  # INNER boundary - re-project to part M
+                vertex_boundary_type[i] = -1  # Will re-project to part M later
                 n_part_boundary += 1
-            # Check if either vertex is on hull boundary ∂H (boundary_label == 1 or 2)
+            # Else if either endpoint is on hull boundary, mark for re-projection to hull
             elif bl0 in (1, 2) or bl1 in (1, 2):
-                if bl0 in (1, 2) and bl1 in (1, 2):
-                    # BOTH on hull boundary → use midpoint (this is an edge ON the hull)
-                    surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
-                    vertex_boundary_type[i] = bl0  # Use first label
-                elif bl0 in (1, 2):
-                    # Only v0 on hull → place at v0
-                    surface_vertices[i] = verts[v0]
+                # Use the non-zero hull label (prefer H1 if both are hull vertices)
+                if bl0 in (1, 2):
                     vertex_boundary_type[i] = bl0
                 else:
-                    # Only v1 on hull → place at v1
-                    surface_vertices[i] = verts[v1]
                     vertex_boundary_type[i] = bl1
                 n_hull_boundary += 1
             else:
-                # Both interior (bl0 == 0 and bl1 == 0) → use midpoint
-                surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
-                vertex_boundary_type[i] = 0  # Interior - no boundary constraint
-                n_midpoint += 1
+                # Both interior - no re-projection needed
+                vertex_boundary_type[i] = 0
+                n_interior += 1
         else:
-            # No boundary labels available → use midpoint (fallback)
-            surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
-            vertex_boundary_type[i] = 0  # Interior - no boundary constraint
-            n_midpoint += 1
+            # No boundary labels available
+            vertex_boundary_type[i] = 0
+            n_interior += 1
     
-    logger.info(f"Cut point placement: {n_part_boundary} on part M (inner), "
-                f"{n_hull_boundary} on hull ∂H (outer), {n_midpoint} midpoints (interior)")
+    logger.info(f"Cut point boundary types: {n_part_boundary} near part M, "
+                f"{n_hull_boundary} near hull ∂H, {n_interior} interior")
     
     # Step 2: Process each tetrahedron using marching tetrahedra
     # 
