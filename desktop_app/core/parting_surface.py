@@ -250,7 +250,8 @@ def extract_parting_surface(
     use_original_vertices: bool = True,
     vertices_original: Optional[np.ndarray] = None,
     boundary_labels: Optional[np.ndarray] = None,
-    vertex_mold_labels: Optional[np.ndarray] = None
+    vertex_mold_labels: Optional[np.ndarray] = None,
+    vertex_escape_distances: Optional[np.ndarray] = None
 ) -> PartingSurfaceResult:
     """
     Extract the parting surface mesh using Marching Tetrahedra.
@@ -271,6 +272,19 @@ def extract_parting_surface(
     
     This ensures the parting surface is "bounded by construction" by M and ∂H.
     
+    Cut Point Placement (per Nielson & Franke 1997):
+        If vertex_escape_distances is provided, we use WEIGHTED interpolation to place
+        cut points at the estimated location where the classification actually changes:
+        
+            t = d0 / (d0 + d1)
+            cut_point = (1-t) * v0 + t * v1
+        
+        where d0, d1 are the geodesic escape distances of the two vertices.
+        This places the cut point closer to the vertex with the shorter escape path,
+        which better approximates the true parting surface location.
+        
+        If vertex_escape_distances is None, we fall back to geometric midpoint (t=0.5).
+    
     Args:
         vertices: (N, 3) vertex positions (inflated mesh)
         tetrahedra: (M, 4) tetrahedron vertex indices
@@ -280,6 +294,9 @@ def extract_parting_surface(
         use_original_vertices: If True, use vertices_original for surface construction
         vertices_original: (N, 3) original (non-inflated) vertex positions
         boundary_labels: (N,) vertex boundary labels: 0=interior, 1=H1, 2=H2, -1=part surface
+        vertex_mold_labels: (N,) mold half labels: 1=H1, 2=H2 for all vertices
+        vertex_escape_distances: (N,) geodesic distance from each vertex to its escape boundary.
+            Used for weighted cut point placement per Nielson & Franke. If None, uses midpoint.
     
     Returns:
         PartingSurfaceResult with the extracted surface mesh
@@ -331,9 +348,11 @@ def extract_parting_surface(
     # Map from global edge index to surface vertex index
     edge_to_surface_vertex = {int(e): i for i, e in enumerate(cut_edge_indices)}
     
-    # Compute cut point positions - ALWAYS at edge midpoint for proper geometry
-    # The boundary type is tracked separately for later re-projection, but we 
-    # never snap during initial surface extraction to avoid degenerate triangles.
+    # Compute cut point positions using WEIGHTED interpolation if distances available
+    # Per Nielson & Franke 1997: "In some applications where there is additional 
+    # information on which to base any bias or adjustment... weights may be used"
+    # We use the geodesic escape distances to place cut points at the estimated
+    # location where the classification changes (d0 = d1 boundary).
     surface_vertices = np.zeros((len(cut_edge_indices), 3), dtype=np.float64)
     
     # Track boundary type for each vertex (per paper Section 4.4):
@@ -348,14 +367,45 @@ def extract_parting_surface(
     n_part_boundary = 0   # Cut points near part surface M (will re-project later)
     n_hull_boundary = 0   # Cut points near hull boundary ∂H (will re-project later)
     n_interior = 0        # Cut points in interior (no re-projection needed)
+    n_weighted = 0        # Cut points placed using weighted interpolation
+    n_midpoint = 0        # Cut points placed at midpoint (fallback)
+    
+    # Check if weighted placement is possible
+    use_weighted = (vertex_escape_distances is not None and 
+                    len(vertex_escape_distances) == len(vertices))
+    if use_weighted:
+        logger.info("Using WEIGHTED cut point placement (per Nielson & Franke 1997)")
+    else:
+        logger.info("Using MIDPOINT cut point placement (no escape distances available)")
     
     for i, e_idx in enumerate(cut_edge_indices):
         v0, v1 = edges[e_idx]
         
-        # ALWAYS place cut point at edge midpoint for proper geometry
-        # This prevents degenerate triangles when multiple cut points would
-        # otherwise snap to the same or nearby boundary vertices
-        surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
+        # Compute cut point position using weighted interpolation if available
+        # Per Nielson & Franke: t = d0 / (d0 + d1), cut_point = (1-t)*v0 + t*v1
+        # This places the cut point at the estimated classification boundary
+        if use_weighted:
+            d0 = vertex_escape_distances[v0]
+            d1 = vertex_escape_distances[v1]
+            
+            # Validate distances - both should be positive and finite
+            if d0 > 0 and d1 > 0 and np.isfinite(d0) and np.isfinite(d1):
+                # t = d0 / (d0 + d1) means cut point is closer to v0 when d0 is small
+                # (v0 has shorter escape path → is closer to its boundary)
+                t = d0 / (d0 + d1)
+                # Clamp t to [0.1, 0.9] to avoid placing cut points too close to vertices
+                # which could create degenerate triangles
+                t = np.clip(t, 0.1, 0.9)
+                surface_vertices[i] = (1.0 - t) * verts[v0] + t * verts[v1]
+                n_weighted += 1
+            else:
+                # Fallback to midpoint if distances are invalid
+                surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
+                n_midpoint += 1
+        else:
+            # No distance data - use geometric midpoint (default per Nielson)
+            surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
+            n_midpoint += 1
         
         # Determine boundary type for LATER re-projection (not for placement)
         # boundary_labels: -1 = on part surface M, 0 = interior, 1 = on H1 hull, 2 = on H2 hull
@@ -385,6 +435,7 @@ def extract_parting_surface(
             vertex_boundary_type[i] = 0
             n_interior += 1
     
+    logger.info(f"Cut point placement: {n_weighted} weighted, {n_midpoint} midpoint")
     logger.info(f"Cut point boundary types: {n_part_boundary} near part M, "
                 f"{n_hull_boundary} near hull ∂H, {n_interior} interior")
     
@@ -1062,6 +1113,30 @@ def extract_parting_surface_from_tet_result(
         cut_flags = tet_result.cut_edge_flags
         logger.info(f"Extracting combined (PRIMARY + SECONDARY) parting surface ({np.sum(cut_flags)} edges)")
     
+    # Build full vertex_escape_distances array from seed data if available
+    # seed_distances is indexed by interior vertex index, we need global vertex index
+    vertex_escape_distances = None
+    if (tet_result.seed_distances is not None and 
+        tet_result.seed_vertex_indices is not None and
+        len(tet_result.seed_distances) == len(tet_result.seed_vertex_indices)):
+        
+        n_vertices = len(tet_result.vertices)
+        vertex_escape_distances = np.full(n_vertices, np.inf, dtype=np.float64)
+        
+        # Map interior vertex distances to global array
+        for idx, v_global in enumerate(tet_result.seed_vertex_indices):
+            vertex_escape_distances[v_global] = tet_result.seed_distances[idx]
+        
+        # For boundary vertices (H1/H2), distance is 0 (they ARE on the boundary)
+        if tet_result.boundary_labels is not None:
+            boundary_mask = (tet_result.boundary_labels == 1) | (tet_result.boundary_labels == 2)
+            vertex_escape_distances[boundary_mask] = 0.0
+        
+        n_finite = np.sum(np.isfinite(vertex_escape_distances))
+        logger.info(f"Built vertex_escape_distances: {n_finite}/{n_vertices} vertices with valid distances")
+    else:
+        logger.info("No seed_distances available - will use midpoint cut point placement")
+    
     return extract_parting_surface(
         vertices=tet_result.vertices,
         tetrahedra=tet_result.tetrahedra,
@@ -1071,7 +1146,8 @@ def extract_parting_surface_from_tet_result(
         use_original_vertices=use_original_vertices,
         vertices_original=tet_result.vertices_original,
         boundary_labels=tet_result.boundary_labels,  # Pass for boundary-aware cut point placement
-        vertex_mold_labels=tet_result.vertex_mold_labels  # Pass for direct label-based config computation
+        vertex_mold_labels=tet_result.vertex_mold_labels,  # Pass for direct label-based config computation
+        vertex_escape_distances=vertex_escape_distances  # Pass for weighted cut point placement
     )
 
 
