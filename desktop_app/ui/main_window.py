@@ -1382,7 +1382,7 @@ class EdgeWeightsWorker(QThread):
                 original_boundary_mesh,  # The ORIGINAL tetrahedral boundary mesh
                 self.hull_mesh,
                 d1, d2,
-                boundary_zone_threshold=0.15,
+                boundary_zone_threshold=0.05,  # 5% of bbox diagonal for boundary zone
                 part_mesh=self.part_mesh,
                 use_proximity_method=False,  # Let it auto-select fast path
                 use_fast_method=True  # Use fast region-growing classification

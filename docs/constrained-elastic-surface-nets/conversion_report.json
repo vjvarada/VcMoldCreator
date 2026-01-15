@@ -1,0 +1,17 @@
+{
+  "source": "constrained-elastic-surface-nets.pdf",
+  "converted_at": "2026-01-15T23:16:50.475875",
+  "pages": 11,
+  "complexity": "moderate",
+  "backend": "mineru",
+  "mineru_backend": "pipeline",
+  "has_math": true,
+  "has_tables": false,
+  "has_images": true,
+  "output_folder": "output\\constrained-elastic-surface-nets",
+  "files": {
+    "markdown": "constrained-elastic-surface-nets.md",
+    "images": "images/",
+    "report": "conversion_report.json"
+  }
+}

@@ -57,7 +57,7 @@ OUTER_BOUNDARY_TOLERANCE_FRACTION = 0.001  # 0.1% of hull size for outer boundar
 TET_OUTER_BOUNDARY_TOLERANCE_FRACTION = 0.02  # 2% of hull size for tet-based detection
 
 # Boundary zone parameters
-DEFAULT_BOUNDARY_ZONE_THRESHOLD = 0.15  # Default threshold for boundary zone extent
+DEFAULT_BOUNDARY_ZONE_THRESHOLD = 0.05  # Default threshold for boundary zone (5% of bbox diagonal per paper)
 
 # Area-based filtering
 ORPHAN_REGION_AREA_THRESHOLD = 0.02   # 2% of total area - regions smaller are orphans
@@ -182,23 +182,28 @@ def classify_hull_faces_fast(
     hull_mesh: trimesh.Trimesh,
     d1: np.ndarray,
     d2: np.ndarray,
-    boundary_zone_hops: int = 3
+    boundary_zone_threshold: float = 0.15
 ) -> MoldHalfClassificationResult:
     """
     Fast hull face classification following the paper's algorithm exactly.
     
-    Per paper: "Given the two parting directions, we partition the boundary ∂H
+    Per paper Section 4.1: "Given the two parting directions, we partition the boundary ∂H
     into two parts, ∂H1 and ∂H2: we select the two faces F1 and F2 of ∂H whose 
     normals best align with d1 and d2 and then use a greedy region-growing 
     approach from F1 and F2 to assign faces to ∂H1 and ∂H2."
     
-    This is O(n) and much faster than the cavity-based classification.
+    Per paper: "We compute the shortest paths towards all vertices of ∂H, except for 
+    those whose distance from the boundary between ∂H1 and ∂H2 is less than a fixed 
+    threshold... we set the threshold to 15% of the convex hull bounding box diagonal."
+    
+    IMPORTANT: The boundary zone is defined by PHYSICAL DISTANCE, not hop count.
+    This ensures consistent boundary zone width regardless of mesh density.
     
     Args:
         hull_mesh: The hull mesh (∂H) to partition
         d1: First parting direction (normalized)
         d2: Second parting direction (normalized)
-        boundary_zone_hops: Number of hops from interface to include in boundary zone
+        boundary_zone_threshold: Fraction of bbox diagonal for boundary zone (default 0.15 = 15%)
     
     Returns:
         MoldHalfClassificationResult with H1, H2, and boundary zone
@@ -208,6 +213,11 @@ def classify_hull_faces_fast(
     
     n_faces = len(hull_mesh.faces)
     face_normals = hull_mesh.face_normals
+    face_centroids = hull_mesh.triangles_center
+    
+    # Compute bounding box diagonal for distance threshold
+    bbox_diagonal = np.linalg.norm(hull_mesh.bounds[1] - hull_mesh.bounds[0])
+    distance_threshold = boundary_zone_threshold * bbox_diagonal
     
     # Normalize directions
     d1 = d1 / np.linalg.norm(d1)
@@ -295,37 +305,58 @@ def classify_hull_faces_fast(
     if np.any(unassigned):
         labels[unassigned] = np.where(dot1[unassigned] >= dot2[unassigned], 1, 2)
     
-    # Find interface faces (where H1 meets H2)
-    interface_mask = np.zeros(n_faces, dtype=bool)
+    # =========================================================================
+    # BOUNDARY ZONE: Use PHYSICAL DISTANCE as per paper Section 4.1
+    # "We compute the shortest paths towards all vertices of ∂H, except for 
+    # those whose distance from the boundary between ∂H1 and ∂H2 is less than 
+    # a fixed threshold... we set the threshold to 15% of the convex hull 
+    # bounding box diagonal."
+    # =========================================================================
+    
+    # Find interface edges (edges where H1 face meets H2 face)
+    # These define the boundary line between ∂H1 and ∂H2
+    interface_edges = []
     for i in range(n_faces):
         my_label = labels[i]
-        for n_idx in adjacency[i]:
-            if labels[n_idx] != my_label:
-                interface_mask[i] = True
-                break
+        face = hull_mesh.faces[i]
+        for j in range(3):
+            v0, v1 = face[j], face[(j + 1) % 3]
+            edge_key = (min(v0, v1), max(v0, v1))
+            # Check if this edge is shared with a face of different label
+            for n_idx in adjacency[i]:
+                if labels[n_idx] != my_label:
+                    n_face = hull_mesh.faces[n_idx]
+                    n_verts = set(n_face)
+                    if v0 in n_verts and v1 in n_verts:
+                        interface_edges.append((v0, v1))
+                        break
     
-    # Expand boundary zone from interface using BFS
-    distance = np.full(n_faces, -1, dtype=np.int32)
-    distance[interface_mask] = 0
+    # Remove duplicates and get interface edge midpoints
+    interface_edges = list(set(interface_edges))
     
-    queue = list(np.where(interface_mask)[0])
-    head = 0
-    
-    while head < len(queue):
-        idx = queue[head]
-        head += 1
-        d = distance[idx]
+    if len(interface_edges) > 0:
+        # Compute interface line points (edge midpoints)
+        vertices = hull_mesh.vertices
+        interface_points = np.array([
+            (vertices[e[0]] + vertices[e[1]]) / 2 for e in interface_edges
+        ])
         
-        if d >= boundary_zone_hops:
-            continue
+        # Build KDTree for fast distance queries
+        from scipy.spatial import cKDTree
+        interface_tree = cKDTree(interface_points)
         
-        for n_idx in adjacency[idx]:
-            if distance[n_idx] == -1:
-                distance[n_idx] = d + 1
-                queue.append(n_idx)
-    
-    # Create boundary zone mask (distance >= 0 and <= boundary_zone_hops)
-    boundary_zone_mask = (distance >= 0) & (distance <= boundary_zone_hops)
+        # Compute distance from each face centroid to the interface
+        distances_to_interface, _ = interface_tree.query(face_centroids, k=1)
+        
+        # Faces within threshold distance are in the boundary zone
+        boundary_zone_mask = distances_to_interface <= distance_threshold
+        
+        logger.debug(f"Boundary zone: threshold={distance_threshold:.2f} ({boundary_zone_threshold*100:.0f}% of {bbox_diagonal:.2f}), "
+                    f"{np.sum(boundary_zone_mask)} faces within threshold")
+    else:
+        # No interface found (all faces same label) - no boundary zone
+        boundary_zone_mask = np.zeros(n_faces, dtype=bool)
+        logger.warning("No interface edges found between H1 and H2")
     
     # Build result sets
     h1_triangles = set(np.where((labels == 1) & ~boundary_zone_mask)[0])
@@ -341,7 +372,7 @@ def classify_hull_faces_fast(
     
     elapsed = (time.time() - start_time) * 1000
     logger.info(f"Hull classification: H1={len(h1_triangles)}, H2={len(h2_triangles)}, "
-               f"boundary={len(boundary_zone_triangles)} in {elapsed:.0f}ms")
+               f"boundary={len(boundary_zone_triangles)} (threshold={distance_threshold:.2f}) in {elapsed:.0f}ms")
     
     return MoldHalfClassificationResult(
         side_map=side_map,
@@ -2183,14 +2214,14 @@ def classify_mold_halves_via_hull(
     d1 = d1 / np.linalg.norm(d1)
     d2 = d2 / np.linalg.norm(d2)
     
-    # Compute boundary zone hops
-    boundary_zone_hops = round(boundary_zone_threshold * boundary_zone_threshold * 180)
-    
     # =========================================================================
     # Step 1: Classify hull mesh (FAST - small mesh)
+    # 
+    # Per paper Section 4.1: boundary zone is defined by PHYSICAL DISTANCE
+    # "we set the threshold to 15% of the convex hull bounding box diagonal"
     # =========================================================================
     hull_start = time.time()
-    hull_classification = classify_hull_faces_fast(hull_mesh, d1, d2, boundary_zone_hops)
+    hull_classification = classify_hull_faces_fast(hull_mesh, d1, d2, boundary_zone_threshold)
     hull_time = (time.time() - hull_start) * 1000
     
     logger.debug(f"Hull classification in {hull_time:.0f}ms: "

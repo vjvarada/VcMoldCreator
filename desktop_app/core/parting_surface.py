@@ -143,17 +143,39 @@ def _build_marching_tet_table() -> Dict[int, List[Tuple]]:
     # ===========================================================================
     # 4-EDGE CONFIGS: Quadrilateral surface (two triangles)
     # Two vertices on one side, two on the other.
+    # 
+    # CRITICAL: Diagonal choice must be CONSISTENT across adjacent tetrahedra.
+    # Per Nielson & Franke paper: "After this is done for each prism, it is seen 
+    # that the diagonal on the separating quadrilateral is arbitrary, and we 
+    # choose the m_jk to m_il segment."
+    #
+    # For each 4-edge config, we have a quad with 4 cut points. We need to
+    # triangulate consistently. We use the rule: connect cut points on edges
+    # that share the LOWEST-indexed vertex (v0).
+    #
+    # Quad vertex order (CCW when viewed from H2 side):
+    # For config 30: m1(v0-v2) → m3(v1-v2) → m4(v1-v3) → m2(v0-v3)
+    # Diagonal through m1-m4: triangles (1,3,4) and (1,4,2)
     # ===========================================================================
     # Split {v0,v1} vs {v2,v3}: edges 1,2,3,4 cut (edges 0,5 uncut)
+    # Cut points: m1(v0-v2), m2(v0-v3), m3(v1-v2), m4(v1-v3)
+    # Quad order: m1 → m3 → m4 → m2
     # Config 30 = 011110
+    # Diagonal m1-m4: triangles (m1,m3,m4) and (m1,m4,m2) = (1,3,4) and (1,4,2)
     table[30] = [(1, 3, 4), (1, 4, 2)]
     
     # Split {v0,v2} vs {v1,v3}: edges 0,2,3,5 cut (edges 1,4 uncut)
+    # Cut points: m0(v0-v1), m2(v0-v3), m3(v1-v2), m5(v2-v3)
+    # Quad order: m0 → m3 → m5 → m2
     # Config 45 = 101101
+    # Diagonal m0-m5: triangles (m0,m3,m5) and (m0,m5,m2) = (0,3,5) and (0,5,2)
     table[45] = [(0, 3, 5), (0, 5, 2)]
     
     # Split {v0,v3} vs {v1,v2}: edges 0,1,4,5 cut (edges 2,3 uncut)
+    # Cut points: m0(v0-v1), m1(v0-v2), m4(v1-v3), m5(v2-v3)
+    # Quad order: m0 → m4 → m5 → m1
     # Config 51 = 110011
+    # Diagonal m0-m5: triangles (m0,m4,m5) and (m0,m5,m1) = (0,4,5) and (0,5,1)
     table[51] = [(0, 4, 5), (0, 5, 1)]
     
     # ===========================================================================
@@ -506,9 +528,9 @@ def extract_parting_surface(
                     
                     triangles.append(tri_verts)
     
-    # Store arrays in result
+    # Store vertex_to_edge now (before any vertex merging which would invalidate it)
+    # The mapping will be invalidated by any vertex merge later
     result.vertex_to_edge = cut_edge_indices.copy()
-    result.vertex_boundary_type = vertex_boundary_type.copy()
     
     # === VALIDATION: Check that all triangle indices are within bounds ===
     n_total_vertices = len(surface_vertices)
@@ -568,6 +590,7 @@ def extract_parting_surface(
     valid_mask = (faces[:, 0] != faces[:, 1]) & \
                  (faces[:, 1] != faces[:, 2]) & \
                  (faces[:, 0] != faces[:, 2])
+    n_degenerate_idx = np.sum(~valid_mask)
     faces = faces[valid_mask]
     
     if len(faces) == 0:
@@ -575,25 +598,89 @@ def extract_parting_surface(
         result.extraction_time_ms = (time.time() - start) * 1000
         return result
     
+    # Step 3b: Merge nearly-coincident vertices (per Bloomenthal paper)
+    # "each pair of connected vertices whose distance is less than ε is replaced
+    # by the average of the two vertices"
+    # This helps eliminate thin/sliver triangles that cause visual artifacts.
+    merge_epsilon = 1e-8  # Tight threshold for near-coincident points
+    
+    # Build KD-tree to find close vertex pairs
+    from scipy.spatial import cKDTree
+    tree = cKDTree(surface_vertices)
+    pairs = tree.query_pairs(merge_epsilon)
+    
+    if pairs:
+        # Build vertex merge mapping
+        n_verts = len(surface_vertices)
+        vertex_map = np.arange(n_verts)
+        
+        # Union-find for merging
+        for i, j in pairs:
+            # Find roots
+            root_i = i
+            while vertex_map[root_i] != root_i:
+                root_i = vertex_map[root_i]
+            root_j = j
+            while vertex_map[root_j] != root_j:
+                root_j = vertex_map[root_j]
+            # Merge to lower index
+            if root_i != root_j:
+                vertex_map[max(root_i, root_j)] = min(root_i, root_j)
+        
+        # Flatten mapping
+        for i in range(n_verts):
+            root = i
+            while vertex_map[root] != root:
+                root = vertex_map[root]
+            vertex_map[i] = root
+        
+        # Count unique vertices
+        unique_roots = np.unique(vertex_map)
+        if len(unique_roots) < n_verts:
+            logger.debug(f"Merging {n_verts - len(unique_roots)} near-coincident vertices")
+            
+            # Remap vertices
+            old_to_new = np.full(n_verts, -1, dtype=np.int64)
+            old_to_new[unique_roots] = np.arange(len(unique_roots))
+            
+            new_surface_vertices = surface_vertices[unique_roots]
+            new_vertex_boundary_type = vertex_boundary_type[unique_roots]
+            
+            # Remap face indices through union-find then to new indices
+            new_faces = old_to_new[vertex_map[faces]]
+            
+            # Remove degenerate faces after merge
+            valid_after_merge = (new_faces[:, 0] != new_faces[:, 1]) & \
+                               (new_faces[:, 1] != new_faces[:, 2]) & \
+                               (new_faces[:, 0] != new_faces[:, 2])
+            n_degenerate_merge = np.sum(~valid_after_merge)
+            new_faces = new_faces[valid_after_merge]
+            
+            if n_degenerate_merge > 0:
+                logger.debug(f"Removed {n_degenerate_merge} triangles degenerate after vertex merge")
+            
+            surface_vertices = new_surface_vertices
+            vertex_boundary_type = new_vertex_boundary_type
+            faces = new_faces
+    
     result.vertices = surface_vertices
     result.faces = faces
+    result.vertex_boundary_type = vertex_boundary_type.copy()  # Store after any vertex merge
     result.num_vertices = len(surface_vertices)
     result.num_faces = len(faces)
     
-    # Check for non-manifold edges (edges shared by more than 2 triangles)
-    edge_face_count = {}
-    for fi, face in enumerate(faces):
-        for i in range(3):
-            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-            edge_key = (min(v0, v1), max(v0, v1))
-            edge_face_count[edge_key] = edge_face_count.get(edge_key, 0) + 1
+    # Check for and FIX non-manifold edges (edges shared by more than 2 triangles)
+    # Non-manifold edges cause self-intersections and prevent proper mesh operations
+    surface_vertices, faces, vertex_boundary_type = _fix_non_manifold_edges(
+        surface_vertices, faces, vertex_boundary_type
+    )
     
-    non_manifold_edges = [(e, c) for e, c in edge_face_count.items() if c > 2]
-    if non_manifold_edges:
-        logger.warning(f"Found {len(non_manifold_edges)} non-manifold edges (shared by >2 triangles)")
-        # Log a few examples
-        for edge, count in non_manifold_edges[:5]:
-            logger.debug(f"  Edge {edge}: shared by {count} triangles")
+    # Update result after non-manifold fix
+    result.vertices = surface_vertices
+    result.faces = faces
+    result.vertex_boundary_type = vertex_boundary_type.copy()
+    result.num_vertices = len(surface_vertices)
+    result.num_faces = len(faces)
     
     # Create trimesh
     try:
@@ -624,21 +711,129 @@ def extract_parting_surface(
     return result
 
 
-def _repair_local_normal_consistency(mesh: trimesh.Trimesh, max_iterations: int = 3) -> Tuple[trimesh.Trimesh, int]:
+def _fix_non_manifold_edges(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    vertex_boundary_type: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Repair locally inconsistent normals by flipping triangles that disagree with neighbors.
+    Fix non-manifold edges by removing duplicate triangles that share the same edge.
     
-    Unlike trimesh.fix_normals() which tries to make all triangles face the same global
-    direction, this function focuses on LOCAL consistency - ensuring each triangle's
-    normal aligns with its edge-adjacent neighbors.
+    Non-manifold edges occur when more than 2 triangles share the same edge.
+    This typically happens due to:
+    1. Duplicate triangles generated from adjacent tetrahedra
+    2. Vertex merging that incorrectly combines separate surface sheets
     
-    Self-folding regions occur when triangles "flip" relative to their neighbors,
-    creating regions where the surface folds back on itself. This function detects
-    such flipped triangles and corrects their winding.
+    The fix strategy:
+    1. Identify edges shared by more than 2 triangles
+    2. For each such edge, keep only the 2 triangles with most consistent normals
+    3. Remove the extra triangles
+    
+    This is simpler and more robust than vertex duplication because it removes
+    the erroneous geometry rather than trying to separate it.
+    
+    Args:
+        vertices: (N, 3) vertex positions
+        faces: (M, 3) face indices
+        vertex_boundary_type: (N,) boundary type for each vertex
+    
+    Returns:
+        Updated (vertices, faces, vertex_boundary_type) tuple
+    """
+    # Build edge-to-faces map
+    edge_to_faces = {}
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            if edge_key not in edge_to_faces:
+                edge_to_faces[edge_key] = []
+            edge_to_faces[edge_key].append(fi)
+    
+    # Find non-manifold edges
+    non_manifold_edges = {e: fs for e, fs in edge_to_faces.items() if len(fs) > 2}
+    
+    if not non_manifold_edges:
+        return vertices, faces, vertex_boundary_type
+    
+    logger.warning(f"Found {len(non_manifold_edges)} non-manifold edges - fixing...")
+    for edge, face_list in list(non_manifold_edges.items())[:5]:
+        logger.debug(f"  Edge {edge}: shared by {len(face_list)} triangles")
+    
+    # Compute face normals for comparison
+    v0 = vertices[faces[:, 0]]
+    v1 = vertices[faces[:, 1]]
+    v2 = vertices[faces[:, 2]]
+    face_normals = np.cross(v1 - v0, v2 - v0)
+    norms = np.linalg.norm(face_normals, axis=1, keepdims=True)
+    norms[norms < 1e-10] = 1.0  # Avoid division by zero
+    face_normals = face_normals / norms
+    
+    # For each non-manifold edge, keep only the 2 best triangles
+    # "Best" = the 2 triangles whose normals are most similar (likely from same surface sheet)
+    faces_to_remove = set()
+    
+    for edge, face_list in non_manifold_edges.items():
+        if len(face_list) <= 2:
+            continue
+        
+        # Find the pair of faces with most similar normals (same sheet)
+        # For a proper manifold edge, the 2 triangles should have similar normals
+        # (pointing roughly the same direction on the surface)
+        best_pair = None
+        best_similarity = -2.0
+        
+        for i in range(len(face_list)):
+            for j in range(i + 1, len(face_list)):
+                fi, fj = face_list[i], face_list[j]
+                similarity = np.dot(face_normals[fi], face_normals[fj])
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_pair = (fi, fj)
+        
+        # Mark all faces except the best pair for removal
+        for fi in face_list:
+            if fi not in best_pair:
+                faces_to_remove.add(fi)
+    
+    if faces_to_remove:
+        logger.info(f"Removing {len(faces_to_remove)} duplicate triangles from non-manifold edges")
+        
+        # Create mask for faces to keep
+        keep_mask = np.ones(len(faces), dtype=bool)
+        keep_mask[list(faces_to_remove)] = False
+        faces = faces[keep_mask]
+        
+        # Remove unreferenced vertices
+        referenced = np.unique(faces.ravel())
+        if len(referenced) < len(vertices):
+            old_to_new = np.full(len(vertices), -1, dtype=np.int64)
+            old_to_new[referenced] = np.arange(len(referenced))
+            
+            vertices = vertices[referenced]
+            vertex_boundary_type = vertex_boundary_type[referenced]
+            faces = old_to_new[faces]
+    
+    return vertices, faces, vertex_boundary_type
+
+
+def _repair_local_normal_consistency(mesh: trimesh.Trimesh, max_iterations: int = 5) -> Tuple[trimesh.Trimesh, int]:
+    """
+    Repair normal consistency using BFS propagation from a seed triangle.
+    
+    This is more robust than majority-voting because it ensures global consistency
+    by propagating orientation from a known-good starting point.
+    
+    The algorithm:
+    1. Build face adjacency graph (faces sharing edges)
+    2. For each connected component:
+       a. Pick a seed face (the one with most area, likely to be reliable)
+       b. BFS propagate orientation: if neighbor disagrees, flip it
+    3. After propagation, use majority-vote to fix any remaining edge cases
     
     Args:
         mesh: Input mesh with potentially inconsistent normals
-        max_iterations: Maximum repair iterations (propagates fixes)
+        max_iterations: Maximum iterations for final majority-vote cleanup
     
     Returns:
         Tuple of (repaired_mesh, num_triangles_flipped)
@@ -650,15 +845,110 @@ def _repair_local_normal_consistency(mesh: trimesh.Trimesh, max_iterations: int 
     faces = mesh.faces.copy()
     n_faces = len(faces)
     
-    total_flipped = 0
-    prev_inconsistent = n_faces  # Initialize for oscillation detection
+    # Build edge-to-faces adjacency
+    edge_to_faces = {}
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            if edge_key not in edge_to_faces:
+                edge_to_faces[edge_key] = []
+            edge_to_faces[edge_key].append(fi)
     
+    # Build face adjacency list
+    face_neighbors = [[] for _ in range(n_faces)]
+    for edge_key, face_list in edge_to_faces.items():
+        if len(face_list) == 2:
+            fi, fj = face_list
+            face_neighbors[fi].append(fj)
+            face_neighbors[fj].append(fi)
+    
+    # Track which faces have been visited and total flips
+    visited = np.zeros(n_faces, dtype=bool)
+    total_flipped = 0
+    
+    # Process each connected component
+    component_id = 0
+    for start_face in range(n_faces):
+        if visited[start_face]:
+            continue
+        
+        # Find all faces in this component using BFS
+        component_faces = []
+        queue = [start_face]
+        visited[start_face] = True
+        
+        while queue:
+            fi = queue.pop(0)
+            component_faces.append(fi)
+            for fj in face_neighbors[fi]:
+                if not visited[fj]:
+                    visited[fj] = True
+                    queue.append(fj)
+        
+        if len(component_faces) == 0:
+            continue
+        
+        component_id += 1
+        
+        # Choose seed as largest triangle in component (most reliable normal)
+        temp_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        component_areas = temp_mesh.area_faces[component_faces]
+        seed_idx = component_faces[np.argmax(component_areas)]
+        
+        # BFS propagate orientation from seed
+        propagation_visited = np.zeros(n_faces, dtype=bool)
+        propagation_queue = [seed_idx]
+        propagation_visited[seed_idx] = True
+        component_flipped = 0
+        
+        while propagation_queue:
+            fi = propagation_queue.pop(0)
+            face_i = faces[fi]
+            
+            # Compute normal for face i
+            p0 = vertices[face_i[0]]
+            p1 = vertices[face_i[1]]
+            p2 = vertices[face_i[2]]
+            normal_i = np.cross(p1 - p0, p2 - p0)
+            norm_len = np.linalg.norm(normal_i)
+            if norm_len > 1e-10:
+                normal_i = normal_i / norm_len
+            
+            for fj in face_neighbors[fi]:
+                if propagation_visited[fj]:
+                    continue
+                propagation_visited[fj] = True
+                propagation_queue.append(fj)
+                
+                # Compute normal for face j
+                face_j = faces[fj]
+                q0 = vertices[face_j[0]]
+                q1 = vertices[face_j[1]]
+                q2 = vertices[face_j[2]]
+                normal_j = np.cross(q1 - q0, q2 - q0)
+                norm_len = np.linalg.norm(normal_j)
+                if norm_len > 1e-10:
+                    normal_j = normal_j / norm_len
+                
+                # Check if normals disagree
+                if np.dot(normal_i, normal_j) < 0:
+                    # Flip face j
+                    faces[fj, 1], faces[fj, 2] = faces[fj, 2], faces[fj, 1]
+                    component_flipped += 1
+        
+        total_flipped += component_flipped
+        
+        if component_flipped > 0:
+            logger.debug(f"Component {component_id}: propagation flipped {component_flipped}/{len(component_faces)} triangles")
+    
+    # Final cleanup: majority vote for any remaining inconsistencies
+    # (can happen at T-junctions or non-manifold regions)
     for iteration in range(max_iterations):
-        # Compute current face normals
         temp_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
         face_normals = temp_mesh.face_normals
         
-        # Build edge-to-faces map
+        # Rebuild edge-to-faces for current faces
         edge_to_faces = {}
         for fi, face in enumerate(faces):
             for i in range(3):
@@ -668,11 +958,7 @@ def _repair_local_normal_consistency(mesh: trimesh.Trimesh, max_iterations: int 
                     edge_to_faces[edge_key] = []
                 edge_to_faces[edge_key].append(fi)
         
-        # Find triangles with inconsistent normals
-        # A triangle is inconsistent if its normal has negative dot product with
-        # majority of its edge-adjacent neighbors
         inconsistent = []
-        
         for fi in range(n_faces):
             face = faces[fi]
             neighbor_normals = []
@@ -687,32 +973,21 @@ def _repair_local_normal_consistency(mesh: trimesh.Trimesh, max_iterations: int 
             if len(neighbor_normals) == 0:
                 continue
             
-            # Check how many neighbors this triangle agrees with
             my_normal = face_normals[fi]
             n_agree = sum(1 for nn in neighbor_normals if np.dot(my_normal, nn) > 0)
             n_disagree = len(neighbor_normals) - n_agree
             
-            # If disagrees with majority of neighbors, mark for flipping
             if n_disagree > n_agree:
                 inconsistent.append(fi)
         
         if len(inconsistent) == 0:
             break
         
-        # Check for oscillation: if we're not making progress, stop
-        # This prevents infinite loops in regions with conflicting orientations
-        if iteration > 0 and len(inconsistent) > 0.95 * prev_inconsistent:
-            logger.debug(f"Normal consistency stopping early - oscillation detected ({len(inconsistent)} vs {prev_inconsistent})")
-            break
-        prev_inconsistent = len(inconsistent)
-        
-        # Flip inconsistent triangles
         for fi in inconsistent:
-            # Flip winding: swap vertices 1 and 2
             faces[fi, 1], faces[fi, 2] = faces[fi, 2], faces[fi, 1]
         
         total_flipped += len(inconsistent)
-        logger.debug(f"Normal consistency iteration {iteration + 1}: flipped {len(inconsistent)} triangles")
+        logger.debug(f"Normal consistency cleanup iteration {iteration + 1}: flipped {len(inconsistent)} triangles")
     
     result_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     return result_mesh, total_flipped
