@@ -1549,7 +1549,10 @@ class DijkstraWorker(QThread):
         self,
         edges: np.ndarray,
         interior_vertex_indices: np.ndarray,
-        interior_escape_labels: np.ndarray
+        interior_escape_labels: np.ndarray,
+        smooth_labels: bool = True,
+        smooth_iterations: int = 2,
+        smooth_threshold: float = 0.7
     ) -> List[Tuple[int, int]]:
         """
         Compute primary cut edges - edges where vertices on opposite sides of the membrane.
@@ -1563,10 +1566,17 @@ class DijkstraWorker(QThread):
         tetrahedra algorithm to work correctly. Unlabeled vertices cause invalid
         configurations (1, 2, 5, 6 edge configs) that create holes and self-intersections.
         
+        TUNNEL PREVENTION: Small isolated pockets of opposite labels create "tunnels"
+        in the membrane. We apply label smoothing to remove these by flipping vertices
+        whose label disagrees with a supermajority of their neighbors.
+        
         Args:
             edges: (E, 2) all tetrahedral mesh edges
             interior_vertex_indices: (I,) indices of interior vertices
             interior_escape_labels: (I,) escape labels (1=H1, 2=H2, 0=unreachable)
+            smooth_labels: If True, apply label smoothing to remove small isolated pockets
+            smooth_iterations: Number of smoothing iterations (each removes smaller pockets)
+            smooth_threshold: Fraction of neighbors that must agree to flip a label (0.5-0.9)
         
         Returns:
             List of (vi, vj) tuples for primary cut edges
@@ -1591,6 +1601,12 @@ class DijkstraWorker(QThread):
             if escape_label in (1, 2):
                 vertex_labels[vert_idx] = escape_label
         
+        # Build adjacency list (needed for propagation and smoothing)
+        adjacency = {i: [] for i in range(n_verts)}
+        for v0, v1 in edges:
+            adjacency[v0].append(v1)
+            adjacency[v1].append(v0)
+        
         # Step 3: CRITICAL - Propagate labels to any remaining unlabeled vertices
         # This ensures every vertex has a valid H1 or H2 label, preventing invalid
         # marching tetrahedra configurations (1, 2, 5, 6 edge configs).
@@ -1598,12 +1614,6 @@ class DijkstraWorker(QThread):
         unlabeled_count = np.sum(vertex_labels == 0)
         if unlabeled_count > 0:
             logger.info(f"Propagating labels to {unlabeled_count} unlabeled vertices...")
-            
-            # Build adjacency list for propagation
-            adjacency = {i: [] for i in range(n_verts)}
-            for v0, v1 in edges:
-                adjacency[v0].append(v1)
-                adjacency[v1].append(v0)
             
             # Iterative propagation: assign unlabeled vertices the label of their
             # nearest labeled neighbor. Repeat until all vertices are labeled.
@@ -1645,6 +1655,300 @@ class DijkstraWorker(QThread):
             else:
                 logger.info(f"Label propagation complete in {iteration + 1} iterations")
         
+        # Step 3.5: TUNNEL PREVENTION - Label smoothing to remove isolated pockets
+        # Small isolated regions of H1 surrounded by H2 (or vice versa) create tunnels.
+        # We apply iterative majority-vote smoothing: if a vertex's label differs from
+        # a supermajority of its neighbors, flip it to the majority label.
+        # 
+        # IMPORTANT: Only smooth INTERIOR vertices. Boundary vertices (on H1 or H2 hull)
+        # must keep their original labels to maintain proper surface boundaries.
+        if smooth_labels:
+            interior_set = set(interior_vertex_indices.tolist())
+            
+            for smooth_iter in range(smooth_iterations):
+                flipped_count = 0
+                new_labels = vertex_labels.copy()
+                
+                for vi in interior_set:
+                    current_label = vertex_labels[vi]
+                    if current_label not in (1, 2):
+                        continue
+                    
+                    neighbors = adjacency[vi]
+                    if len(neighbors) < 3:
+                        continue  # Not enough neighbors for reliable voting
+                    
+                    # Count neighbor labels
+                    h1_count = sum(1 for n in neighbors if vertex_labels[n] == 1)
+                    h2_count = sum(1 for n in neighbors if vertex_labels[n] == 2)
+                    total_labeled = h1_count + h2_count
+                    
+                    if total_labeled == 0:
+                        continue
+                    
+                    # Check if current label is in the minority (below threshold)
+                    if current_label == 1:
+                        my_fraction = h1_count / total_labeled
+                        opposite_label = 2
+                    else:
+                        my_fraction = h2_count / total_labeled
+                        opposite_label = 1
+                    
+                    # Flip if supermajority of neighbors have opposite label
+                    if my_fraction < (1.0 - smooth_threshold):
+                        new_labels[vi] = opposite_label
+                        flipped_count += 1
+                
+                vertex_labels = new_labels
+                
+                if flipped_count > 0:
+                    logger.info(f"Label smoothing iteration {smooth_iter + 1}: flipped {flipped_count} vertices")
+                else:
+                    logger.info(f"Label smoothing converged after {smooth_iter + 1} iterations")
+                    break
+            
+            # Step 3.6: CONNECTED COMPONENT FILTER - Remove small isolated regions
+            # After majority-vote smoothing, find connected components of same-labeled
+            # interior vertices and flip small components to the surrounding label.
+            # This catches "tunnel-forming" pockets that majority voting might miss.
+            min_component_size = max(10, len(interior_set) // 1000)  # At least 0.1% of interior
+            
+            for target_label in [1, 2]:
+                opposite_label = 2 if target_label == 1 else 1
+                
+                # Find all interior vertices with target_label
+                target_verts = set(vi for vi in interior_set if vertex_labels[vi] == target_label)
+                
+                if len(target_verts) == 0:
+                    continue
+                
+                # Find connected components using BFS
+                visited = set()
+                components = []
+                
+                for start_v in target_verts:
+                    if start_v in visited:
+                        continue
+                    
+                    # BFS to find connected component
+                    component = []
+                    queue = [start_v]
+                    visited.add(start_v)
+                    
+                    while queue:
+                        v = queue.pop(0)
+                        component.append(v)
+                        
+                        for neighbor in adjacency[v]:
+                            if neighbor in target_verts and neighbor not in visited:
+                                visited.add(neighbor)
+                                queue.append(neighbor)
+                    
+                    components.append(component)
+                
+                # Find and flip small components
+                small_component_verts = []
+                for comp in components:
+                    if len(comp) < min_component_size:
+                        small_component_verts.extend(comp)
+                
+                if len(small_component_verts) > 0:
+                    for vi in small_component_verts:
+                        vertex_labels[vi] = opposite_label
+                    logger.info(f"Flipped {len(small_component_verts)} vertices in {sum(1 for c in components if len(c) < min_component_size)} "
+                               f"small H{target_label} components (< {min_component_size} vertices)")
+            
+            # Log final label distribution
+            n_h1_after = np.sum(vertex_labels == 1)
+            n_h2_after = np.sum(vertex_labels == 2)
+            logger.info(f"After smoothing: {n_h1_after} H1, {n_h2_after} H2 vertices")
+        
+        # Create interior vertex set for later steps (needed regardless of smooth_labels)
+        interior_set_array = set(interior_vertex_indices.tolist())
+        
+        # Step 3.65: TETRAHEDRAL POCKET DETECTION AND ELIMINATION
+        # Tunnels form when isolated pockets of same-labeled tetrahedra are surrounded
+        # by cut tetrahedra. A "non-contributing" tet (all vertices same label) that's
+        # surrounded by "contributing" tets (mixed labels) creates a tunnel.
+        #
+        # Algorithm:
+        # 1. Classify each tet as "contributing" (has cut edge) or "non-contributing"
+        # 2. Build tet adjacency graph (tets sharing a face)
+        # 3. Find connected components of non-contributing tets
+        # 4. For small components completely surrounded by contributing tets, flip labels
+        tetrahedra = self.tet_result.tetrahedra
+        if tetrahedra is not None and len(tetrahedra) > 0:
+            logger.info("Detecting isolated tetrahedral pockets...")
+            
+            # Classify each tet based on current vertex labels
+            tet_labels = vertex_labels[tetrahedra]  # (T, 4) array of labels per tet vertex
+            
+            # A tet is "contributing" if it has mixed labels (will produce cut edges)
+            tet_has_h1 = np.any(tet_labels == 1, axis=1)
+            tet_has_h2 = np.any(tet_labels == 2, axis=1)
+            contributing_mask = tet_has_h1 & tet_has_h2
+            
+            # Non-contributing tets are potential pocket members
+            non_contributing_indices = np.where(~contributing_mask)[0]
+            n_contributing = np.sum(contributing_mask)
+            n_non_contributing = len(non_contributing_indices)
+            logger.info(f"Tetrahedra: {n_contributing} contributing (mixed), {n_non_contributing} non-contributing (same label)")
+            
+            if n_non_contributing > 0 and n_non_contributing < len(tetrahedra) * 0.5:
+                # Build tet-to-tet adjacency (tets sharing a face)
+                # A face is defined by 3 vertices - use frozenset for hashing
+                face_to_tets = {}
+                for ti, tet in enumerate(tetrahedra):
+                    # 4 faces per tet: (0,1,2), (0,1,3), (0,2,3), (1,2,3)
+                    for face_indices in [(0,1,2), (0,1,3), (0,2,3), (1,2,3)]:
+                        face = frozenset([tet[i] for i in face_indices])
+                        if face not in face_to_tets:
+                            face_to_tets[face] = []
+                        face_to_tets[face].append(ti)
+                
+                # Build adjacency list for tets
+                tet_adjacency = {ti: set() for ti in range(len(tetrahedra))}
+                for face, tet_list in face_to_tets.items():
+                    for i, ti in enumerate(tet_list):
+                        for tj in tet_list[i+1:]:
+                            tet_adjacency[ti].add(tj)
+                            tet_adjacency[tj].add(ti)
+                
+                # Find connected components of non-contributing tets
+                non_contributing_set = set(non_contributing_indices)
+                visited_tets = set()
+                tet_components = []
+                
+                for start_ti in non_contributing_indices:
+                    if start_ti in visited_tets:
+                        continue
+                    
+                    # BFS within non-contributing tets only
+                    component = []
+                    queue = [start_ti]
+                    visited_tets.add(start_ti)
+                    
+                    while queue:
+                        ti = queue.pop(0)
+                        component.append(ti)
+                        
+                        for neighbor_ti in tet_adjacency[ti]:
+                            if neighbor_ti in non_contributing_set and neighbor_ti not in visited_tets:
+                                visited_tets.add(neighbor_ti)
+                                queue.append(neighbor_ti)
+                    
+                    tet_components.append(component)
+                
+                logger.info(f"Found {len(tet_components)} non-contributing tet components")
+                
+                # Check each component: if it's small AND completely surrounded by contributing tets,
+                # it's a tunnel pocket - flip its vertices to eliminate the pocket
+                min_tet_component_size = max(5, len(tetrahedra) // 500)  # At least 0.2% of tets
+                pockets_eliminated = 0
+                verts_flipped_for_pockets = 0
+                
+                for comp in tet_components:
+                    if len(comp) >= min_tet_component_size:
+                        continue  # Not a small pocket
+                    
+                    # Check if this component is surrounded by contributing tets
+                    # (all adjacent tets that are not in the component should be contributing)
+                    comp_set = set(comp)
+                    surrounding_tets = set()
+                    for ti in comp:
+                        for neighbor_ti in tet_adjacency[ti]:
+                            if neighbor_ti not in comp_set:
+                                surrounding_tets.add(neighbor_ti)
+                    
+                    # If all surrounding tets are contributing, this is a tunnel pocket
+                    if len(surrounding_tets) > 0 and all(contributing_mask[ti] for ti in surrounding_tets):
+                        # Determine the dominant label in the pocket
+                        pocket_verts = set()
+                        for ti in comp:
+                            pocket_verts.update(tetrahedra[ti])
+                        
+                        # Only flip interior vertices in the pocket
+                        interior_pocket_verts = [v for v in pocket_verts if v in interior_set_array]
+                        
+                        if len(interior_pocket_verts) == 0:
+                            continue
+                        
+                        # Get current pocket label (should be uniform since non-contributing)
+                        pocket_label = vertex_labels[interior_pocket_verts[0]]
+                        opposite_label = 2 if pocket_label == 1 else 1
+                        
+                        # Flip to opposite label (matching surrounding contributing tets)
+                        for vi in interior_pocket_verts:
+                            if vertex_labels[vi] == pocket_label:
+                                vertex_labels[vi] = opposite_label
+                                verts_flipped_for_pockets += 1
+                        
+                        pockets_eliminated += 1
+                
+                if pockets_eliminated > 0:
+                    logger.info(f"Eliminated {pockets_eliminated} tunnel pockets by flipping {verts_flipped_for_pockets} vertices")
+
+        # Step 3.7: CUT EDGE LOOP DETECTION AND BREAKING (Tunnel Prevention)
+        # Tunnels form when there's a closed loop of cut edges. We detect vertices
+        # that have high "cut valence" (many incident cut edges) and flip their 
+        # labels to break the loops. A vertex with cut valence > 2 is suspicious
+        # because it means multiple surface sheets meet at that vertex.
+        #
+        # Algorithm:
+        # 1. Compute cut edges from current labels
+        # 2. For each vertex, count incident cut edges (cut valence)
+        # 3. Vertices with cut valence > threshold are "junction vertices"
+        # 4. Flip labels of junction vertices to match their local majority
+        #    (but considering only labeled neighbors, not cut edge structure)
+        max_cut_valence = 4  # Vertices with more than this many incident cut edges are suspect
+        
+        # Compute temporary cut edges based on current labels
+        temp_edge_labels_v0 = vertex_labels[edges[:, 0]]
+        temp_edge_labels_v1 = vertex_labels[edges[:, 1]]
+        temp_cut_mask = ((temp_edge_labels_v0 == 1) & (temp_edge_labels_v1 == 2)) | \
+                        ((temp_edge_labels_v0 == 2) & (temp_edge_labels_v1 == 1))
+        temp_cut_edges = edges[temp_cut_mask]
+        
+        # Compute cut valence for each vertex
+        cut_valence = np.zeros(n_verts, dtype=np.int32)
+        for v0, v1 in temp_cut_edges:
+            cut_valence[v0] += 1
+            cut_valence[v1] += 1
+        
+        # Find high-valence vertices (potential tunnel junctions)
+        high_valence_verts = np.where(cut_valence > max_cut_valence)[0]
+        
+        # Only process interior high-valence vertices
+        high_valence_interior = [v for v in high_valence_verts if v in interior_set_array]
+        
+        if len(high_valence_interior) > 0:
+            logger.info(f"Found {len(high_valence_interior)} interior vertices with cut valence > {max_cut_valence}")
+            
+            # For each high-valence vertex, flip to local majority label
+            # This breaks loops by reducing the cut edge count
+            flipped_for_loop_breaking = 0
+            for vi in high_valence_interior:
+                current_label = vertex_labels[vi]
+                neighbors = adjacency[vi]
+                
+                # Count neighbor labels (weighted by whether they're also high-valence)
+                h1_count = sum(1 for n in neighbors if vertex_labels[n] == 1)
+                h2_count = sum(1 for n in neighbors if vertex_labels[n] == 2)
+                
+                if h1_count + h2_count == 0:
+                    continue
+                
+                # Determine majority
+                if h1_count > h2_count and current_label != 1:
+                    vertex_labels[vi] = 1
+                    flipped_for_loop_breaking += 1
+                elif h2_count > h1_count and current_label != 2:
+                    vertex_labels[vi] = 2
+                    flipped_for_loop_breaking += 1
+            
+            if flipped_for_loop_breaking > 0:
+                logger.info(f"Flipped {flipped_for_loop_breaking} high-valence vertices to break potential tunnel loops")
+        
         # Store the complete vertex labels for use in marching tetrahedra
         self.tet_result.vertex_mold_labels = vertex_labels
         n_h1_total = np.sum(vertex_labels == 1)
@@ -1652,16 +1956,20 @@ class DijkstraWorker(QThread):
         logger.info(f"Stored vertex_mold_labels: {len(vertex_labels)} vertices, {n_h1_total} H1, {n_h2_total} H2")
         
         # Step 4: Find edges where one endpoint is H1 and other is H2
-        primary_cuts = []
-        for v0, v1 in edges:
-            l0 = vertex_labels[v0]
-            l1 = vertex_labels[v1]
-            
-            # Primary cut: one is on H1 side (1), other is on H2 side (2)
-            if (l0 == 1 and l1 == 2) or (l0 == 2 and l1 == 1):
-                primary_cuts.append((int(v0), int(v1)))
+        # OPTIMIZED: Use vectorized numpy operations instead of Python loop
+        edge_labels_v0 = vertex_labels[edges[:, 0]]
+        edge_labels_v1 = vertex_labels[edges[:, 1]]
         
-        logger.info(f"Found {len(primary_cuts)} primary cut edges (all vertices labeled)")
+        # Primary cut: one is on H1 side (1), other is on H2 side (2)
+        # This is equivalent to: (l0==1 && l1==2) || (l0==2 && l1==1)
+        # Which can be expressed as: labels are different AND both are in {1, 2}
+        cut_mask = ((edge_labels_v0 == 1) & (edge_labels_v1 == 2)) | \
+                   ((edge_labels_v0 == 2) & (edge_labels_v1 == 1))
+        
+        cut_edge_indices = np.where(cut_mask)[0]
+        primary_cuts = [(int(edges[i, 0]), int(edges[i, 1])) for i in cut_edge_indices]
+        
+        logger.info(f"Found {len(primary_cuts)} primary cut edges (vectorized, all vertices labeled)")
         return primary_cuts
 
 

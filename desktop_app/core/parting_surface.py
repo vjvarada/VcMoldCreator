@@ -251,7 +251,8 @@ def extract_parting_surface(
     vertices_original: Optional[np.ndarray] = None,
     boundary_labels: Optional[np.ndarray] = None,
     vertex_mold_labels: Optional[np.ndarray] = None,
-    vertex_escape_distances: Optional[np.ndarray] = None
+    vertex_escape_distances: Optional[np.ndarray] = None,
+    use_label_derived_cuts: bool = True
 ) -> PartingSurfaceResult:
     """
     Extract the parting surface mesh using Marching Tetrahedra.
@@ -315,11 +316,15 @@ def extract_parting_surface(
         verts = vertices
         logger.info("Using current (possibly inflated) vertices for parting surface")
     
-    # CRITICAL FIX: If vertex_mold_labels is provided, recompute cut edges directly
-    # from the labels. This ensures cut edges are CONSISTENT with the binary labeling.
-    # The pre-computed cut_edge_flags may include secondary cuts that create invalid configs.
-    if vertex_mold_labels is not None:
-        logger.info("Recomputing cut edges from vertex_mold_labels for consistency...")
+    # CRITICAL FIX: For PRIMARY surfaces, if vertex_mold_labels is provided, 
+    # recompute cut edges directly from the labels. This ensures cut edges are 
+    # CONSISTENT with the binary labeling.
+    # 
+    # For SECONDARY surfaces, we MUST use the pre-computed cut_edge_flags directly
+    # because secondary cuts connect vertices with the SAME mold label (both H1 or
+    # both H2) - deriving cuts from labels would produce zero edges!
+    if vertex_mold_labels is not None and use_label_derived_cuts:
+        logger.info("Recomputing cut edges from vertex_mold_labels for PRIMARY surface consistency...")
         n_edges = len(edges)
         cut_edge_flags = np.zeros(n_edges, dtype=np.int8)
         for e_idx in range(n_edges):
@@ -330,6 +335,8 @@ def extract_parting_surface(
             if l0 != l1 and l0 in (1, 2) and l1 in (1, 2):
                 cut_edge_flags[e_idx] = 1
         logger.info(f"Computed {np.sum(cut_edge_flags)} cut edges from vertex labels")
+    elif not use_label_derived_cuts:
+        logger.info("Using pre-computed cut_edge_flags (SECONDARY surface mode)")
     
     # Count cut edges
     n_cut = np.sum(cut_edge_flags)
@@ -441,10 +448,11 @@ def extract_parting_surface(
     
     # Step 2: Process each tetrahedron using marching tetrahedra
     # 
-    # CRITICAL FIX: If vertex_mold_labels is provided, compute cut edges directly
-    # from the labels. This GUARANTEES valid configurations (0, 3, or 4 edges only).
-    # The pre-computed cut_edge_flags may include edges from other sources that
-    # create invalid 5/6-edge configs.
+    # For PRIMARY surfaces (use_label_derived_cuts=True): compute cut edges directly
+    # from vertex_mold_labels. This GUARANTEES valid configurations (0, 3, or 4 edges only).
+    # 
+    # For SECONDARY surfaces (use_label_derived_cuts=False): use the pre-computed 
+    # cut_edge_flags directly because secondary cuts connect same-label vertices.
     triangles = []
     tets_contributing = 0
     
@@ -461,10 +469,10 @@ def extract_parting_surface(
         tet_verts = tetrahedra[t]  # Shape (4,) - the 4 vertex indices
         tet_edges = tet_edge_indices[t]  # Shape (6,) - the 6 global edge indices
         
-        # Determine configuration: prefer using vertex_mold_labels if available
-        # This guarantees valid binary configurations (0, 3, or 4 edges only)
-        if vertex_mold_labels is not None:
-            # Compute cut edges directly from vertex labels
+        # Determine configuration: use vertex_mold_labels for PRIMARY surfaces,
+        # use cut_edge_flags directly for SECONDARY surfaces
+        if vertex_mold_labels is not None and use_label_derived_cuts:
+            # PRIMARY: Compute cut edges directly from vertex labels
             # An edge is cut if its endpoints have different labels (1 vs 2)
             config = 0
             for local_e in range(6):
@@ -479,7 +487,7 @@ def extract_parting_surface(
                     config |= (1 << local_e)
             n_label_derived += 1
         else:
-            # Fallback: use pre-computed cut_edge_flags
+            # SECONDARY (or fallback): use pre-computed cut_edge_flags
             config = 0
             for local_e in range(6):
                 global_e = tet_edges[local_e]
@@ -533,10 +541,12 @@ def extract_parting_surface(
                         break
                 
                 if valid and len(tri_verts) == 3:
-                    # Orient triangle so normal points from H1 towards H2
-                    # We use the centroid of H2 vertices in this tet to determine orientation
-                    if vertex_mold_labels is not None:
-                        # Get positions of the 3 cut points
+                    # Orient triangle normals consistently
+                    # For PRIMARY surfaces: normal points from H1 towards H2
+                    # For SECONDARY surfaces: normal points towards the "secondary side"
+                    #   (we use escape distances as a proxy for "side")
+                    if vertex_mold_labels is not None and use_label_derived_cuts:
+                        # PRIMARY: Get positions of the 3 cut points
                         p0 = surface_vertices[tri_verts[0]]
                         p1 = surface_vertices[tri_verts[1]]
                         p2 = surface_vertices[tri_verts[2]]
@@ -562,6 +572,36 @@ def extract_parting_surface(
                             # If normal points away from H2, flip the triangle
                             if np.dot(normal, to_h2) < 0:
                                 tri_verts = [tri_verts[0], tri_verts[2], tri_verts[1]]  # Flip winding
+                    else:
+                        # SECONDARY: Orient based on escape distances if available
+                        # The side with LONGER escape distance should be the "outside"
+                        # (secondary cuts occur where paths diverge around the part M)
+                        if vertex_escape_distances is not None:
+                            p0 = surface_vertices[tri_verts[0]]
+                            p1 = surface_vertices[tri_verts[1]]
+                            p2 = surface_vertices[tri_verts[2]]
+                            
+                            tri_center = (p0 + p1 + p2) / 3.0
+                            edge1 = p1 - p0
+                            edge2 = p2 - p0
+                            normal = np.cross(edge1, edge2)
+                            
+                            # For secondary cuts, find the tet vertex with LONGEST escape distance
+                            # and orient AWAY from it (it's on the "far side" of the cut)
+                            max_dist = -np.inf
+                            max_dist_pos = None
+                            for v_local in range(4):
+                                v_global = tet_verts[v_local]
+                                d = vertex_escape_distances[v_global]
+                                if np.isfinite(d) and d > max_dist:
+                                    max_dist = d
+                                    max_dist_pos = verts[v_global]
+                            
+                            if max_dist_pos is not None:
+                                to_far = max_dist_pos - tri_center
+                                # Normal should point AWAY from the far vertex
+                                if np.dot(normal, to_far) > 0:
+                                    tri_verts = [tri_verts[0], tri_verts[2], tri_verts[1]]  # Flip winding
                     
                     triangles.append(tri_verts)
     
@@ -1137,6 +1177,11 @@ def extract_parting_surface_from_tet_result(
     else:
         logger.info("No seed_distances available - will use midpoint cut point placement")
     
+    # CRITICAL: For secondary surfaces, do NOT derive cuts from vertex_mold_labels
+    # because secondary cuts connect vertices with the SAME label (both H1 or both H2).
+    # Primary surfaces need label-derived cuts for consistency.
+    use_label_derived_cuts = (cut_type == 'primary')
+    
     return extract_parting_surface(
         vertices=tet_result.vertices,
         tetrahedra=tet_result.tetrahedra,
@@ -1147,7 +1192,8 @@ def extract_parting_surface_from_tet_result(
         vertices_original=tet_result.vertices_original,
         boundary_labels=tet_result.boundary_labels,  # Pass for boundary-aware cut point placement
         vertex_mold_labels=tet_result.vertex_mold_labels,  # Pass for direct label-based config computation
-        vertex_escape_distances=vertex_escape_distances  # Pass for weighted cut point placement
+        vertex_escape_distances=vertex_escape_distances,  # Pass for weighted cut point placement
+        use_label_derived_cuts=use_label_derived_cuts  # Only True for primary surface
     )
 
 
