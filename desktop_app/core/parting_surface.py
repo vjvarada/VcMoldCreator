@@ -102,7 +102,8 @@ def _build_marching_tet_table() -> Dict[int, List[Tuple]]:
     - 4-edge config: 2 vs 2 vertices (2+2 split) → quad (2 triangles)
     
     5-edge and 6-edge configs should NOT occur in a binary system (they require
-    3+ classes). These are handled by _build_multiclass_marching_tet_table().
+    3+ classes). If they do occur, it indicates a labeling bug upstream.
+    We handle them as warnings but still attempt reasonable triangulation.
     
     Edge numbering:
         Edge 0: (v0, v1)    Edge 3: (v1, v2)
@@ -179,212 +180,25 @@ def _build_marching_tet_table() -> Dict[int, List[Tuple]]:
     
     # ===========================================================================
     # INVALID CONFIGS (should not occur in binary system)
-    # These indicate a labeling bug. We mark them for fallback to multiclass.
+    # These indicate a labeling bug. We mark them for warning but don't generate
+    # triangles since doing so incorrectly causes self-intersections.
     # ===========================================================================
-    # 5-edge configs (would require 3 classes) - use 'MULTICLASS' marker
-    table[62] = 'MULTICLASS'  # Edge 0 not cut (v0-v1 same class)
-    table[61] = 'MULTICLASS'  # Edge 1 not cut (v0-v2 same class)
-    table[59] = 'MULTICLASS'  # Edge 2 not cut (v0-v3 same class)
-    table[55] = 'MULTICLASS'  # Edge 3 not cut (v1-v2 same class)
-    table[47] = 'MULTICLASS'  # Edge 4 not cut (v1-v3 same class)
-    table[31] = 'MULTICLASS'  # Edge 5 not cut (v2-v3 same class)
+    # 5-edge configs (would require 3 classes)
+    table[62] = 'SKIP'  # Edge 0 not cut - invalid in binary
+    table[61] = 'SKIP'  # Edge 1 not cut
+    table[59] = 'SKIP'  # Edge 2 not cut
+    table[55] = 'SKIP'  # Edge 3 not cut
+    table[47] = 'SKIP'  # Edge 4 not cut
+    table[31] = 'SKIP'  # Edge 5 not cut
     
-    # 6-edge config (would require 4 classes) - use 'MULTICLASS' marker
-    table[63] = 'MULTICLASS'  # All edges cut - 4 different classes
+    # 6-edge config (would require 4 classes)
+    table[63] = 'SKIP'  # All edges cut - invalid in binary
     
     return table
 
 
-def _build_multiclass_marching_tet_table() -> Dict[int, any]:
-    """
-    Build the multi-class (3+ classes) marching tetrahedra lookup table.
-    
-    Per Nielson & Franke 1997 "Computing the Separating Surface for Segmented Data":
-    - Case (3): 2+1+1 split - two vertices of one class, two others each of different classes
-                Uses mid-edge points AND TWO mid-face points (for the faces sharing the uncut edge)
-    - Case (4): 1+1+1+1 split - each vertex is a different class
-                Uses mid-edge points, 4 mid-face points AND a mid-tetrahedron point (m_t)
-    
-    Vertex naming: i, j, k, l correspond to local vertices 0, 1, 2, 3
-    Edge naming: m_ij = midpoint of edge (i,j)  
-    Face naming: m_ijk = centroid of face (i,j,k)
-    Tet center: m_t = centroid of tetrahedron
-    
-    For Case 3, we identify which two vertices share a class by finding the uncut edge.
-    The two faces sharing that edge need mid-face points.
-    
-    For Case 4, we create 12 triangles connecting to the mid-tetrahedron point.
-    
-    Face definitions (face i is opposite to vertex i):
-        Face 0: (1,2,3) - opposite v0 - edges 3,4,5
-        Face 1: (0,2,3) - opposite v1 - edges 1,2,5
-        Face 2: (0,1,3) - opposite v2 - edges 0,2,4
-        Face 3: (0,1,2) - opposite v3 - edges 0,1,3
-    
-    Returns:
-        Dictionary mapping 6-bit config -> triangle specs with special vertex markers
-    """
-    table = {}
-    
-    # Edge-to-faces mapping: which 2 faces contain each edge
-    EDGE_TO_FACES = {
-        0: [2, 3],  # Edge (0,1) in faces 2 (0,1,3) and 3 (0,1,2)
-        1: [1, 3],  # Edge (0,2) in faces 1 (0,2,3) and 3 (0,1,2)
-        2: [1, 2],  # Edge (0,3) in faces 1 (0,2,3) and 2 (0,1,3)
-        3: [0, 3],  # Edge (1,2) in faces 0 (1,2,3) and 3 (0,1,2)
-        4: [0, 2],  # Edge (1,3) in faces 0 (1,2,3) and 2 (0,1,3)
-        5: [0, 1],  # Edge (2,3) in faces 0 (1,2,3) and 1 (0,2,3)
-    }
-    
-    # ===========================================================================
-    # CASE 3: 5-edge configs (2+1+1 split)
-    # Two vertices share a class (connected by the uncut edge), other two each
-    # have different classes.
-    # 
-    # Per Nielson-Franke: Generates 5 triangles using mid-edge points AND
-    # mid-face points for the TWO faces that share the uncut edge.
-    #
-    # Let i,j be the two vertices sharing a class (uncut edge), k,l the others.
-    # The two faces containing edge (i,j) are the ones that need mid-face points.
-    # ===========================================================================
-    
-    # Config 62 = 111110 (edge 0 not cut: v0-v1 same class)
-    # Faces sharing edge 0: face 2 (0,1,3) and face 3 (0,1,2)
-    # Cut edges: 1,2,3,4,5 (all except 0)
-    table[62] = {
-        'type': 'case3',
-        'uncut_edge': 0,
-        'midface_indices': [2, 3],  # Faces sharing the uncut edge need mid-face points
-        # 5 triangles connecting the separating surface patches
-        # Using edges 1(0-2), 2(0-3), 3(1-2), 4(1-3), 5(2-3)
-        'triangles': [
-            (5, 'mf2', 'mf3'),   # m_23 to mid-faces
-            (3, 1, 'mf3'),       # m_12, m_02, mf_012
-            (1, 'mf3', 'mf2'),   # m_02 to both mid-faces
-            (4, 2, 'mf2'),       # m_13, m_03, mf_013
-            (2, 'mf2', 'mf3'),   # m_03 to both mid-faces
-        ]
-    }
-    
-    # Config 61 = 111101 (edge 1 not cut: v0-v2 same class)
-    # Faces sharing edge 1: face 1 (0,2,3) and face 3 (0,1,2)
-    # Cut edges: 0,2,3,4,5
-    table[61] = {
-        'type': 'case3',
-        'uncut_edge': 1,
-        'midface_indices': [1, 3],
-        'triangles': [
-            (4, 'mf1', 'mf3'),
-            (0, 3, 'mf3'),
-            (3, 'mf3', 'mf1'),
-            (5, 2, 'mf1'),
-            (2, 'mf1', 'mf3'),
-        ]
-    }
-    
-    # Config 59 = 111011 (edge 2 not cut: v0-v3 same class)
-    # Faces sharing edge 2: face 1 (0,2,3) and face 2 (0,1,3)
-    # Cut edges: 0,1,3,4,5
-    table[59] = {
-        'type': 'case3',
-        'uncut_edge': 2,
-        'midface_indices': [1, 2],
-        'triangles': [
-            (3, 'mf1', 'mf2'),
-            (0, 4, 'mf2'),
-            (4, 'mf2', 'mf1'),
-            (5, 1, 'mf1'),
-            (1, 'mf1', 'mf2'),
-        ]
-    }
-    
-    # Config 55 = 110111 (edge 3 not cut: v1-v2 same class)
-    # Faces sharing edge 3: face 0 (1,2,3) and face 3 (0,1,2)
-    # Cut edges: 0,1,2,4,5
-    table[55] = {
-        'type': 'case3',
-        'uncut_edge': 3,
-        'midface_indices': [0, 3],
-        'triangles': [
-            (2, 'mf0', 'mf3'),
-            (0, 1, 'mf3'),
-            (1, 'mf3', 'mf0'),
-            (5, 4, 'mf0'),
-            (4, 'mf0', 'mf3'),
-        ]
-    }
-    
-    # Config 47 = 101111 (edge 4 not cut: v1-v3 same class)
-    # Faces sharing edge 4: face 0 (1,2,3) and face 2 (0,1,3)
-    # Cut edges: 0,1,2,3,5
-    table[47] = {
-        'type': 'case3',
-        'uncut_edge': 4,
-        'midface_indices': [0, 2],
-        'triangles': [
-            (1, 'mf0', 'mf2'),
-            (0, 2, 'mf2'),
-            (2, 'mf2', 'mf0'),
-            (5, 3, 'mf0'),
-            (3, 'mf0', 'mf2'),
-        ]
-    }
-    
-    # Config 31 = 011111 (edge 5 not cut: v2-v3 same class)
-    # Faces sharing edge 5: face 0 (1,2,3) and face 1 (0,2,3)
-    # Cut edges: 0,1,2,3,4
-    table[31] = {
-        'type': 'case3',
-        'uncut_edge': 5,
-        'midface_indices': [0, 1],
-        'triangles': [
-            (0, 'mf0', 'mf1'),
-            (1, 3, 'mf1'),
-            (3, 'mf1', 'mf0'),
-            (4, 2, 'mf0'),
-            (2, 'mf0', 'mf1'),
-        ]
-    }
-    
-    # ===========================================================================
-    # CASE 4: 6-edge config (1+1+1+1 split)
-    # Each vertex is a different class - all 6 edges are cut.
-    # Generates 12 triangles with all 4 mid-face points AND mid-tetrahedron point.
-    #
-    # Per Nielson-Franke paper:
-    # "Triangles: m_ij, m_ijk, m_t; m_ij, m_ijl, m_t; ..." (12 total)
-    # Each edge connects to its two adjacent mid-faces through m_t.
-    # ===========================================================================
-    
-    # Config 63 = 111111 (all edges cut: 4 different classes)
-    table[63] = {
-        'type': 'case4',
-        # All 4 mid-face points AND mid-tetrahedron point needed
-        'midface_indices': [0, 1, 2, 3],
-        # 12 triangles: each edge connects to its two adjacent mid-faces through m_t
-        # Edge e is contained in faces EDGE_TO_FACES[e]
-        'triangles': [
-            # Edge 0 (v0-v1): in faces 2 and 3
-            (0, 'mf3', 'mt'), (0, 'mt', 'mf2'),
-            # Edge 1 (v0-v2): in faces 1 and 3
-            (1, 'mf3', 'mt'), (1, 'mt', 'mf1'),
-            # Edge 2 (v0-v3): in faces 1 and 2
-            (2, 'mf2', 'mt'), (2, 'mt', 'mf1'),
-            # Edge 3 (v1-v2): in faces 0 and 3
-            (3, 'mf3', 'mt'), (3, 'mt', 'mf0'),
-            # Edge 4 (v1-v3): in faces 0 and 2
-            (4, 'mf2', 'mt'), (4, 'mt', 'mf0'),
-            # Edge 5 (v2-v3): in faces 0 and 1
-            (5, 'mf1', 'mt'), (5, 'mt', 'mf0'),
-        ]
-    }
-    
-    return table
-
-
-# Pre-build the lookup tables
+# Pre-build the lookup table
 MARCHING_TET_TABLE = _build_marching_tet_table()
-MULTICLASS_TET_TABLE = _build_multiclass_marching_tet_table()
 
 
 
@@ -436,7 +250,6 @@ def extract_parting_surface(
     use_original_vertices: bool = True,
     vertices_original: Optional[np.ndarray] = None,
     boundary_labels: Optional[np.ndarray] = None,
-    boundary_vertices: Optional[np.ndarray] = None,  # Boolean mask of tet surface vertices
     vertex_mold_labels: Optional[np.ndarray] = None,
     vertex_escape_distances: Optional[np.ndarray] = None,
     use_label_derived_cuts: bool = True
@@ -602,22 +415,17 @@ def extract_parting_surface(
             n_midpoint += 1
         
         # Determine boundary type for LATER re-projection (not for placement)
-        # boundary_labels: -1 = on part surface M, 0 = interior/boundary_zone, 1 = on H1 hull, 2 = on H2 hull
-        # boundary_vertices: boolean mask indicating if tet vertex is on boundary surface
+        # boundary_labels: -1 = on part surface M, 0 = interior, 1 = on H1 hull, 2 = on H2 hull
         if boundary_labels is not None:
             bl0 = boundary_labels[v0]
             bl1 = boundary_labels[v1]
             
-            # Check if vertices are on the boundary surface (even if label=0)
-            on_boundary_v0 = boundary_vertices[v0] if boundary_vertices is not None else False
-            on_boundary_v1 = boundary_vertices[v1] if boundary_vertices is not None else False
-            
-            # Priority: Part surface M (-1) > Hull (1,2) > Boundary zone (0 with on_boundary) > Interior
+            # Priority: Part surface M (-1) > Hull (1,2) > Interior (0)
             # If either endpoint is on part surface, mark for re-projection to part M
             if bl0 == -1 or bl1 == -1:
                 vertex_boundary_type[i] = -1  # Will re-project to part M later
                 n_part_boundary += 1
-            # Else if either endpoint is on hull boundary (H1/H2), mark for re-projection to hull
+            # Else if either endpoint is on hull boundary, mark for re-projection to hull
             elif bl0 in (1, 2) or bl1 in (1, 2):
                 # Use the non-zero hull label (prefer H1 if both are hull vertices)
                 if bl0 in (1, 2):
@@ -625,14 +433,8 @@ def extract_parting_surface(
                 else:
                     vertex_boundary_type[i] = bl1
                 n_hull_boundary += 1
-            # Else if BOTH endpoints are on boundary surface with label 0 (boundary zone)
-            # they are on the hull surface but in the grey zone between H1/H2
-            # Mark as hull type 1 for re-projection
-            elif on_boundary_v0 and on_boundary_v1 and bl0 == 0 and bl1 == 0:
-                vertex_boundary_type[i] = 1  # Will re-project to hull (boundary zone)
-                n_hull_boundary += 1
             else:
-                # At least one endpoint is truly interior - no re-projection needed
+                # Both interior - no re-projection needed
                 vertex_boundary_type[i] = 0
                 n_interior += 1
         else:
@@ -642,7 +444,7 @@ def extract_parting_surface(
     
     logger.info(f"Cut point placement: {n_weighted} weighted, {n_midpoint} midpoint")
     logger.info(f"Cut point boundary types: {n_part_boundary} near part M, "
-                f"{n_hull_boundary} near hull ∂H (including boundary zone), {n_interior} interior")
+                f"{n_hull_boundary} near hull ∂H, {n_interior} interior")
     
     # Step 2: Process each tetrahedron using marching tetrahedra
     # 
@@ -708,114 +510,13 @@ def extract_parting_surface(
         
         if table_entry == 'SKIP':
             # =================================================================
-            # INVALID CONFIGURATION (5 or 6 edges cut) - DEPRECATED
-            # This should no longer occur as we now use 'MULTICLASS' marker.
+            # INVALID CONFIGURATION (5 or 6 edges cut)
+            # This should not occur in a proper binary labeling system.
+            # It indicates that some vertices are unlabeled or have inconsistent labels.
+            # Skip to avoid generating broken geometry.
             # =================================================================
             n_skipped_configs += 1
             continue
-        
-        elif table_entry == 'MULTICLASS':
-            # =================================================================
-            # MULTI-CLASS CONFIGURATION (5 or 6 edges cut)
-            # Per Nielson-Franke 1997: Use mid-face and mid-tetrahedron points
-            # to properly triangulate surfaces separating 3+ classes.
-            # This commonly occurs for SECONDARY surfaces where primary and
-            # secondary cuts meet in the same tetrahedron.
-            # =================================================================
-            multiclass_entry = MULTICLASS_TET_TABLE.get(config)
-            if multiclass_entry is None:
-                n_skipped_configs += 1
-                continue
-            
-            tets_contributing += 1
-            
-            # Compute mid-face points for this tetrahedron
-            # Per Nielson-Franke eq (1): m_ijk = (m_ij + m_ik + m_jk) / 3
-            # where m_ij are mid-edge points
-            # Face definitions: face[i] is opposite vertex i
-            FACE_EDGES = {
-                0: [3, 4, 5],  # Face (1,2,3): edges (1-2), (1-3), (2-3)
-                1: [1, 2, 5],  # Face (0,2,3): edges (0-2), (0-3), (2-3)
-                2: [0, 2, 4],  # Face (0,1,3): edges (0-1), (0-3), (1-3)
-                3: [0, 1, 3],  # Face (0,1,2): edges (0-1), (0-2), (1-2)
-            }
-            
-            # Compute mid-face point positions
-            midface_positions = {}
-            midface_vertex_indices = {}  # Maps 'mf0'-'mf3' to surface vertex index
-            
-            for face_idx, face_edge_list in FACE_EDGES.items():
-                # Get mid-edge positions for this face
-                face_midedge_positions = []
-                for local_e in face_edge_list:
-                    global_e = int(tet_edges[local_e])
-                    if global_e in edge_to_surface_vertex:
-                        sv_idx = edge_to_surface_vertex[global_e]
-                        face_midedge_positions.append(surface_vertices[sv_idx])
-                
-                if len(face_midedge_positions) == 3:
-                    # All 3 edges of this face are cut - compute mid-face point
-                    midface_pos = np.mean(face_midedge_positions, axis=0)
-                    midface_key = f'mf{face_idx}'
-                    midface_positions[midface_key] = midface_pos
-                    # Allocate new surface vertex for this mid-face point
-                    new_sv_idx = len(surface_vertices)
-                    surface_vertices = np.vstack([surface_vertices, midface_pos.reshape(1, 3)])
-                    # Mid-face points are interior (no boundary re-projection)
-                    vertex_boundary_type = np.append(vertex_boundary_type, 0)
-                    midface_vertex_indices[midface_key] = new_sv_idx
-            
-            # Compute mid-tetrahedron point if needed (Case 4: all 6 edges cut)
-            midtet_vertex_idx = None
-            if multiclass_entry.get('type') == 'case4':
-                # Per Nielson-Franke eq (1): m_t = (m_ijk + m_jkl + m_ikl + m_ijl) / 4
-                # Using all 4 mid-face points
-                midface_positions_list = [midface_positions.get(f'mf{i}') for i in range(4)]
-                valid_midfaces = [p for p in midface_positions_list if p is not None]
-                if len(valid_midfaces) == 4:
-                    midtet_pos = np.mean(valid_midfaces, axis=0)
-                    midtet_vertex_idx = len(surface_vertices)
-                    surface_vertices = np.vstack([surface_vertices, midtet_pos.reshape(1, 3)])
-                    vertex_boundary_type = np.append(vertex_boundary_type, 0)  # Interior
-            
-            # Generate triangles using the multiclass table
-            for tri_spec in multiclass_entry.get('triangles', []):
-                tri_verts = []
-                valid = True
-                
-                for vertex_ref in tri_spec:
-                    if isinstance(vertex_ref, int):
-                        # Regular mid-edge vertex (0-5)
-                        global_e = int(tet_edges[vertex_ref])
-                        if global_e in edge_to_surface_vertex:
-                            tri_verts.append(edge_to_surface_vertex[global_e])
-                        else:
-                            valid = False
-                            break
-                    elif isinstance(vertex_ref, str):
-                        if vertex_ref.startswith('mf'):
-                            # Mid-face vertex
-                            if vertex_ref in midface_vertex_indices:
-                                tri_verts.append(midface_vertex_indices[vertex_ref])
-                            else:
-                                valid = False
-                                break
-                        elif vertex_ref == 'mt':
-                            # Mid-tetrahedron vertex
-                            if midtet_vertex_idx is not None:
-                                tri_verts.append(midtet_vertex_idx)
-                            else:
-                                valid = False
-                                break
-                        else:
-                            valid = False
-                            break
-                    else:
-                        valid = False
-                        break
-                
-                if valid and len(tri_verts) == 3:
-                    triangles.append(tri_verts)
             
         elif table_entry:
             # =================================================================
@@ -931,19 +632,15 @@ def extract_parting_surface(
     # Log configuration statistics
     config_source = "vertex_mold_labels" if n_label_derived > 0 else "cut_edge_flags"
     logger.info(f"Configuration statistics ({len(config_counts)} unique configs, source: {config_source}):")
-    invalid_config_tets = 0  # Count tets with truly invalid configs (1, 2 edges)
-    multiclass_tets = 0  # Count tets processed with multiclass algorithm
+    invalid_config_tets = 0  # Count tets with invalid configs (1, 2, 5, 6 edges)
     for config in sorted(config_counts.keys()):
         n_edges = bin(config).count('1')
         table_entry = MARCHING_TET_TABLE.get(config, [])
         if table_entry == 'SKIP':
-            status = "-> SKIPPED (deprecated)"
+            status = "-> SKIPPED (invalid in binary system)"
             invalid_config_tets += config_counts[config]
-        elif table_entry == 'MULTICLASS':
-            status = "-> MULTICLASS (Nielson-Franke Case 3/4)"
-            multiclass_tets += config_counts[config]
         elif table_entry:
-            status = "-> triangles (binary)"
+            status = "-> triangles"
         else:
             status = "-> EMPTY (no triangles)"
             if n_edges in (1, 2):
@@ -951,12 +648,10 @@ def extract_parting_surface(
         if config_counts[config] > 10:  # Only log significant configs
             logger.info(f"  Config {config:2d} ({config:06b}, {n_edges} edges): {config_counts[config]:5d} tets {status}")
     
-    if multiclass_tets > 0:
-        logger.info(f"  {multiclass_tets} tets processed with multi-class algorithm (5/6 edges)")
     if n_skipped_configs > 0:
-        logger.warning(f"  {n_skipped_configs} tets had invalid configs (SKIPPED)")
+        logger.warning(f"  {n_skipped_configs} tets had 5/6-edge configs (SKIPPED) - indicates labeling issues upstream")
     if invalid_config_tets > 0:
-        logger.warning(f"  {invalid_config_tets} total tets with invalid/empty configs (1 or 2 edges)")
+        logger.warning(f"  {invalid_config_tets} total tets with invalid/empty configs (1, 2, 5, or 6 edges)")
     
     result.num_tets_contributing = tets_contributing
     
@@ -1496,7 +1191,6 @@ def extract_parting_surface_from_tet_result(
         use_original_vertices=use_original_vertices,
         vertices_original=tet_result.vertices_original,
         boundary_labels=tet_result.boundary_labels,  # Pass for boundary-aware cut point placement
-        boundary_vertices=tet_result.boundary_vertices,  # Pass for boundary zone detection
         vertex_mold_labels=tet_result.vertex_mold_labels,  # Pass for direct label-based config computation
         vertex_escape_distances=vertex_escape_distances,  # Pass for weighted cut point placement
         use_label_derived_cuts=use_label_derived_cuts  # Only True for primary surface

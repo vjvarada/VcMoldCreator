@@ -1401,27 +1401,20 @@ def smooth_membrane_with_boundary_reprojection(
         for vi in boundary_verts:
             bt = vertex_boundary_type[vi]
             if bt == -1:
-                # INNER boundary - cut point on edge touching part surface M
-                # Must re-project to part M during smoothing
+                # INNER boundary - originally on part surface M
                 boundary_surface[vi] = 'part'
             elif bt in (1, 2):
-                # OUTER boundary - cut point on edge touching hull boundary ∂H (H1 or H2)
-                # Must re-project to hull ∂H during smoothing
+                # OUTER boundary - originally on hull boundary ∂H (H1 or H2)
                 boundary_surface[vi] = 'hull'
             elif bt == 0:
-                # Type 0 = cut point on edge where BOTH endpoints were interior/boundary zone
-                # This means the cut point is NOT on any boundary surface
-                # 
-                # However, if this vertex is on the MEMBRANE BOUNDARY (not membrane interior),
-                # we need to determine what to do with it. There are two cases:
-                # 
-                # Case A: It's a TRUE interior vertex that ended up on membrane boundary due to
-                #         the triangulation - could happen at mesh edges/corners
-                # Case B: It's at the hull boundary zone (label 0 vertices on hull surface)
-                # 
-                # For now, mark as 'patch' so the fallback logic can determine using distance
-                # or neighbor propagation
-                boundary_surface[vi] = 'patch'
+                # Type 0 = either:
+                # 1. Interior midpoint of an edge where both tet verts were interior/boundary zone
+                # 2. Boundary zone vertex on hull (grey zone between H1 and H2)
+                #
+                # Since this vertex is on the MEMBRANE BOUNDARY (not interior), it should
+                # be re-projected to the hull. The boundary zone is ON the hull surface,
+                # not inside the volume. Mark as hull for re-projection.
+                boundary_surface[vi] = 'hull'
             else:
                 # Unexpected value - use fallback
                 boundary_surface[vi] = 'patch'
