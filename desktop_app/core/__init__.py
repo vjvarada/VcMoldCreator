@@ -67,15 +67,6 @@ from core.parting_surface import (
     MARCHING_TET_TABLE,
     TET_EDGES,
 )
-from core.label_cleanup import (
-    cleanup_vertex_labels,
-    cleanup_secondary_edges,
-    LabelCleanupResult,
-    SecondaryEdgeCleanupResult,
-)
-from core.surface_propagation import (
-    _safe_on_surface,  # Safe wrapper for trimesh proximity queries
-)
 
 __all__ = [
     'STLLoader',
@@ -140,11 +131,4 @@ __all__ = [
     'GapClosingResult',
     'MARCHING_TET_TABLE',
     'TET_EDGES',
-    # Label cleanup (tunnel prevention)
-    'cleanup_vertex_labels',
-    'cleanup_secondary_edges',
-    'LabelCleanupResult',
-    'SecondaryEdgeCleanupResult',
-    # Utilities
-    '_safe_on_surface',
 ]

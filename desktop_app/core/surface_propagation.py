@@ -12,37 +12,12 @@ reach target surfaces.
 """
 
 import logging
-import warnings
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Set
 import numpy as np
 import trimesh
 
 logger = logging.getLogger(__name__)
-
-
-def _safe_on_surface(proximity_query, points):
-    """
-    Safely call ProximityQuery.on_surface() with warning suppression.
-    
-    Trimesh's on_surface() can emit divide-by-zero and invalid value warnings
-    when dealing with degenerate triangles or edge cases (e.g., points exactly
-    on triangle edges). These are benign - trimesh handles them internally and
-    returns valid results or NaN which we can check for.
-    
-    Args:
-        proximity_query: A trimesh.proximity.ProximityQuery object
-        points: Points to query (N, 3) array
-        
-    Returns:
-        Same as ProximityQuery.on_surface(): (closest_points, distances, triangle_ids)
-    """
-    with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', category=RuntimeWarning, 
-                               message='divide by zero encountered')
-        warnings.filterwarnings('ignore', category=RuntimeWarning,
-                               message='invalid value encountered')
-        return proximity_query.on_surface(points)
 
 
 # =============================================================================
@@ -335,7 +310,7 @@ def get_feature_debug_visualization(
         # Use ProximityQuery to find closest points (same as actual detection)
         target_prox = ProximityQuery(target_mesh)
         boundary_positions = membrane_mesh.vertices[membrane_boundary_indices]
-        closest_pts, distances, triangle_ids = _safe_on_surface(target_prox, boundary_positions)
+        closest_pts, distances, triangle_ids = target_prox.on_surface(boundary_positions)
         
         # Compute mesh scale for tolerance
         bounds = target_mesh.bounds
@@ -535,7 +510,7 @@ def remove_on_surface_triangles(
     part_proximity = ProximityQuery(part_mesh)
     
     # Check distances for all vertices first
-    _, vertex_distances, _ = _safe_on_surface(part_proximity, vertices)
+    _, vertex_distances, _ = part_proximity.on_surface(vertices)
     
     # For each face, check if all 3 vertices AND centroid are on the part mesh
     faces_to_keep = []
@@ -553,7 +528,7 @@ def remove_on_surface_triangles(
         if all_vertices_on_surface:
             # Also check centroid
             centroid = (vertices[v0] + vertices[v1] + vertices[v2]) / 3.0
-            _, centroid_dist, _ = _safe_on_surface(part_proximity, centroid.reshape(1, 3))
+            _, centroid_dist, _ = part_proximity.on_surface(centroid.reshape(1, 3))
             
             if centroid_dist[0] < tolerance:
                 # This triangle is entirely on the part mesh - remove it
@@ -839,7 +814,7 @@ def reproject_with_feature_awareness(
     # === All vertices: standard nearest-point projection with bounded search ===
     boundary_indices_arr = np.array(boundary_indices, dtype=np.int64)
     boundary_positions = vertices[boundary_indices_arr]
-    closest_pts, distances, _ = _safe_on_surface(proximity, boundary_positions)
+    closest_pts, distances, _ = proximity.on_surface(boundary_positions)
     
     # Only apply projection if within search radius
     within_radius = distances < search_radius
@@ -1052,7 +1027,7 @@ def propagate_to_target_surfaces(
             
             # Check primary surface
             if primary_proximity is not None:
-                closest_pts, dists, _ = _safe_on_surface(primary_proximity, [pos])
+                closest_pts, dists, _ = primary_proximity.on_surface([pos])
                 if dists[0] < target_distances[i]:
                     target_distances[i] = dists[0]
                     target_positions[i] = closest_pts[0]
@@ -1061,7 +1036,7 @@ def propagate_to_target_surfaces(
             
             # Check part surface (take closer one)
             if part_proximity is not None:
-                closest_pts, dists, _ = _safe_on_surface(part_proximity, [pos])
+                closest_pts, dists, _ = part_proximity.on_surface([pos])
                 if dists[0] < target_distances[i]:
                     target_distances[i] = dists[0]
                     target_positions[i] = closest_pts[0]
@@ -1486,13 +1461,13 @@ def smooth_membrane_with_boundary_reprojection(
                 # Build proximity queries
                 if part_mesh is not None and len(part_mesh.faces) > 0:
                     part_prox = ProximityQuery(part_mesh)
-                    _, dist_to_part, _ = _safe_on_surface(part_prox, patch_positions)
+                    _, dist_to_part, _ = part_prox.on_surface(patch_positions)
                 else:
                     dist_to_part = np.full(len(remaining_patches), np.inf)
                 
                 if hull_mesh is not None and len(hull_mesh.faces) > 0:
                     hull_prox = ProximityQuery(hull_mesh)
-                    _, dist_to_hull, _ = _safe_on_surface(hull_prox, patch_positions)
+                    _, dist_to_hull, _ = hull_prox.on_surface(patch_positions)
                 else:
                     dist_to_hull = np.full(len(remaining_patches), np.inf)
                 
@@ -1536,13 +1511,13 @@ def smooth_membrane_with_boundary_reprojection(
         dist_to_primary = np.full(n_boundary, np.inf)
         
         if part_proximity is not None:
-            _, dist_to_part, _ = _safe_on_surface(part_proximity, boundary_positions)
+            _, dist_to_part, _ = part_proximity.on_surface(boundary_positions)
         
         if hull_proximity is not None:
-            _, dist_to_hull, _ = _safe_on_surface(hull_proximity, boundary_positions)
+            _, dist_to_hull, _ = hull_proximity.on_surface(boundary_positions)
         
         if primary_proximity is not None:
-            _, dist_to_primary, _ = _safe_on_surface(primary_proximity, boundary_positions)
+            _, dist_to_primary, _ = primary_proximity.on_surface(boundary_positions)
         
         # Classify each boundary vertex based on distances
         for i, vi in enumerate(boundary_verts):
@@ -1783,7 +1758,7 @@ def smooth_membrane_with_boundary_reprojection(
         # Get closest points on part mesh for all membrane vertices
         part_prox = ProximityQuery(part_mesh)
         query_positions = membrane_positions[membrane_indices]
-        closest_pts, distances, triangle_ids = _safe_on_surface(part_prox, query_positions)
+        closest_pts, distances, triangle_ids = part_prox.on_surface(query_positions)
         
         # Tolerance for being "at" a vertex or edge vs. on face interior
         # Use a small fraction of mesh scale
@@ -1938,7 +1913,7 @@ def smooth_membrane_with_boundary_reprojection(
             elif part_proximity is not None:
                 # Fallback to standard reprojection
                 part_positions = vertices[part_boundary_indices]
-                closest_pts, _, _ = _safe_on_surface(part_proximity, part_positions)
+                closest_pts, _, _ = part_proximity.on_surface(part_positions)
                 vertices[part_boundary_indices] = closest_pts
         
         # Re-project to hull mesh ∂H (excluding concave corners)
@@ -1956,7 +1931,7 @@ def smooth_membrane_with_boundary_reprojection(
             elif hull_proximity is not None:
                 # Fallback to standard reprojection
                 hull_positions = vertices[hull_boundary_indices]
-                closest_pts, _, _ = _safe_on_surface(hull_proximity, hull_positions)
+                closest_pts, _, _ = hull_proximity.on_surface(hull_positions)
                 vertices[hull_boundary_indices] = closest_pts
         
         # Re-project to primary mesh (for secondary surfaces, excluding concave corners)
@@ -1974,7 +1949,7 @@ def smooth_membrane_with_boundary_reprojection(
             elif primary_proximity is not None:
                 # Fallback to standard reprojection
                 primary_positions = vertices[primary_boundary_indices]
-                closest_pts, _, _ = _safe_on_surface(primary_proximity, primary_positions)
+                closest_pts, _, _ = primary_proximity.on_surface(primary_positions)
                 vertices[primary_boundary_indices] = closest_pts
         
         # === Step 3: Smooth interior vertices (boundary vertices now fixed) ===
