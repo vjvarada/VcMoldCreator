@@ -3288,6 +3288,11 @@ def _find_secondary_cuts_collision_based(
     manager.add_object("seed_surface", seed_mesh)
     logger.info(f"  Built seed surface mesh: {len(seed_verts)} verts, {len(seed_faces)} faces")
     
+    # Compute average edge length for penetration depth threshold
+    # This scales the threshold appropriately for different mesh sizes
+    avg_edge_length = seed_mesh.edges_unique_length.mean() if len(seed_mesh.edges_unique) > 0 else 1.0
+    logger.info(f"  Average seed mesh edge length: {avg_edge_length:.4f}")
+    
     secondary_cuts = []
     
     # Progress tracking
@@ -3300,7 +3305,7 @@ def _find_secondary_cuts_collision_based(
         membrane_triangles = _build_membrane_triangles(
             path_i, path_j, boundary_path, vertices, boundary_verts,
             min_thickness=min_membrane_thickness,
-            skip_first_n=1  # Skip triangles at the part surface
+            skip_first_n=2  # Skip first 2 triangle pairs (near part surface)
         )
         
         if len(membrane_triangles) == 0:
@@ -3323,15 +3328,25 @@ def _find_secondary_cuts_collision_based(
             process=False
         )
         
-        # Check collision with seed surface - this is O(log n) due to BVH
-        is_collision = manager.in_collision_single(membrane_mesh)
+        # Check collision with seed surface, requesting contact data for depth filtering
+        # This filters out grazing contacts in concave regions
+        is_collision, _, contacts = manager.in_collision_single(
+            membrane_mesh, return_names=True, return_data=True
+        )
         
-        if is_collision:
-            # Additional check: verify this isn't just touching at the start
-            # by checking if there's intersection beyond the first membrane triangle
-            # For now, we accept all collisions - the membrane thickness check
-            # should filter out degenerate cases
-            secondary_cuts.append((vi, vj))
+        if is_collision and contacts:
+            # Filter by penetration depth - grazing contacts have very small depth
+            # Use min_penetration_depth as threshold (scaled by average edge length)
+            min_penetration_depth = avg_edge_length * 0.05  # 5% of avg edge length
+            
+            significant_collision = False
+            for contact in contacts:
+                if contact.depth > min_penetration_depth:
+                    significant_collision = True
+                    break
+            
+            if significant_collision:
+                secondary_cuts.append((vi, vj))
         
         # Progress logging
         if membrane_idx > 0 and membrane_idx % progress_interval == 0:
