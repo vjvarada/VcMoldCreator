@@ -72,7 +72,8 @@ class Step(Enum):
     EDGE_WEIGHTS = 'edge-weights'
     DIJKSTRA = 'dijkstra'              # Dijkstra walk to find parting surface
     SECONDARY_CUTS = 'secondary-cuts'  # Secondary cutting edges detection
-    PARTING_SURFACE = 'parting-surface'  # Primary parting surface: generation + repair + smoothing
+    PARTING_SURFACE = 'parting-surface'  # Primary parting surface: generation + repair (extraction only)
+    PARTING_SURFACE_SMOOTH = 'parting-surface-smooth'  # Primary surface smoothing with boundary re-projection
     SECONDARY_SURFACE = 'secondary-surface'  # Secondary surface: generation + propagation + smoothing
     POURING = 'pouring'                # Pouring direction optimization (final step)
 
@@ -85,7 +86,8 @@ STEPS = [
     {'id': Step.MOLD_HALVES, 'icon': '🎨', 'title': 'Mold Halves', 'description': 'Classify tetrahedral boundary into H₁ and H₂ mold halves'},
     {'id': Step.EDGE_WEIGHTS, 'icon': '⚖️', 'title': 'Edge Weights', 'description': 'Compute edge weights based on distance to part surface'},
     {'id': Step.DIJKSTRA, 'icon': '🛤️', 'title': 'Dijkstra Walk', 'description': 'Find shortest paths from part surface to mold halves'},
-    {'id': Step.PARTING_SURFACE, 'icon': '🔲', 'title': 'Primary Surface', 'description': 'Generate, repair and smooth the primary parting surface'},
+    {'id': Step.PARTING_SURFACE, 'icon': '🔲', 'title': 'Primary Surface', 'description': 'Extract primary parting surface using Marching Tetrahedra'},
+    {'id': Step.PARTING_SURFACE_SMOOTH, 'icon': '✨', 'title': 'Smooth Surface', 'description': 'Smooth primary surface with boundary re-projection to part/hull'},
     {'id': Step.SECONDARY_CUTS, 'icon': '✂️', 'title': 'Secondary Cuts', 'description': 'Detect secondary cutting edges where membrane intersects part'},
     {'id': Step.SECONDARY_SURFACE, 'icon': '🔴', 'title': 'Secondary Surface', 'description': 'Generate, propagate and smooth secondary parting surfaces'},
     {'id': Step.POURING, 'icon': '🧪', 'title': 'Pouring Directions', 'description': 'Optimize silicone/resin pouring directions for each mold half'},
@@ -2064,6 +2066,442 @@ class ComprehensiveSurfaceResult:
     repair_time_ms: float = 0.0
     smoothing_time_ms: float = 0.0
     total_time_ms: float = 0.0
+
+
+@dataclass
+class PrimarySurfaceExtractionResult:
+    """
+    Result of primary surface extraction (Marching Tetrahedra + cleaning).
+    
+    Per paper Section 4.3:
+    - Membrane meshing: Marching tetrahedra extracts surface at cut edge midpoints
+    - Surface is "bounded by construction" by M and ∂H
+    """
+    # Extracted mesh
+    mesh: Optional[trimesh.Trimesh] = None
+    num_vertices: int = 0
+    num_faces: int = 0
+    num_tets_contributing: int = 0
+    num_tets_processed: int = 0
+    
+    # Boundary type tracking for smoothing step
+    # -1 = on part mesh M, 0 = interior, 1/2 = on hull ∂H
+    vertex_boundary_type: Optional[np.ndarray] = None
+    
+    # Mapping from surface vertex index to tet mesh edge index (for debugging)
+    vertex_to_edge: Optional[np.ndarray] = None
+    
+    # Timing
+    extraction_time_ms: float = 0.0
+    repair_time_ms: float = 0.0
+    total_time_ms: float = 0.0
+
+
+@dataclass
+class PrimarySurfaceSmoothingResult:
+    """
+    Result of primary surface smoothing with boundary re-projection.
+    
+    Per paper Section 4.4:
+    - Two-phase Laplacian smoothing with boundary reprojection to M and ∂H
+    - Boundary vertices are re-projected to part mesh M (inner) or hull mesh ∂H (outer)
+    """
+    # Smoothed mesh
+    mesh: Optional[trimesh.Trimesh] = None
+    num_vertices: int = 0
+    num_faces: int = 0
+    
+    # Smoothing statistics
+    boundary_vertices: int = 0
+    interior_vertices: int = 0
+    smooth_iterations: int = 0
+    damping_factor: float = 0.5
+    
+    # Restored corner vertices (concave corners snapped back after smoothing)
+    restored_corner_positions: Optional[np.ndarray] = None
+    
+    # Extension faces from gap filling (yellow for debugging)
+    fill_face_indices: Optional[np.ndarray] = None
+    
+    # Timing
+    smoothing_time_ms: float = 0.0
+    gap_fill_time_ms: float = 0.0
+    total_time_ms: float = 0.0
+
+
+class PrimarySurfaceExtractionWorker(QThread):
+    """
+    Background worker for primary surface EXTRACTION only (Section 4.3).
+    
+    Implements paper Section 4.3 (Membrane Meshing):
+    - Extract surface using Marching Tetrahedra
+    - Clean mesh (merge vertices, remove degenerates)
+    
+    Does NOT perform smoothing - that's a separate step.
+    The surface is "bounded by construction" by M and ∂H.
+    """
+    
+    progress = pyqtSignal(str)
+    complete = pyqtSignal(object)  # PrimarySurfaceExtractionResult
+    error = pyqtSignal(str)
+    
+    def __init__(self, tet_result):
+        """
+        Initialize primary surface extraction worker.
+        
+        Args:
+            tet_result: TetrahedralMeshResult with primary cut edges
+        """
+        super().__init__()
+        self.tet_result = tet_result
+    
+    def run(self):
+        try:
+            from core.parting_surface import (
+                extract_parting_surface_from_tet_result,
+                repair_parting_surface
+            )
+            from core.tetrahedral_mesh import prepare_parting_surface_data
+            import time
+            
+            result = PrimarySurfaceExtractionResult()
+            total_start = time.time()
+            
+            # =====================================================================
+            # STEP 1: Prepare data structures if needed
+            # =====================================================================
+            if self.tet_result.tet_edge_indices is None:
+                self.progress.emit("Building edge index maps...")
+                self.tet_result = prepare_parting_surface_data(self.tet_result)
+            
+            # =====================================================================
+            # STEP 2: MEMBRANE MESHING (Paper Section 4.3)
+            # 
+            # "We extend the classical marching tetrahedra algorithm to include the 
+            # additional cases needed to generate consistent non-manifold surfaces"
+            #
+            # The surface is bounded by construction by M and ∂H - cut points on
+            # edges touching boundaries are placed ON those boundaries.
+            # =====================================================================
+            self.progress.emit("Section 4.3: Extracting membrane with Marching Tetrahedra...")
+            extraction_start = time.time()
+            
+            extraction_result = extract_parting_surface_from_tet_result(
+                self.tet_result,
+                use_original_vertices=True,
+                prepare_data=False,
+                cut_type='primary',
+                extend_to_primary=False
+            )
+            
+            result.extraction_time_ms = (time.time() - extraction_start) * 1000
+            result.num_tets_processed = extraction_result.num_tets_processed
+            result.num_tets_contributing = extraction_result.num_tets_contributing
+            result.vertex_to_edge = extraction_result.vertex_to_edge
+            
+            if extraction_result.mesh is None or extraction_result.num_faces == 0:
+                self.progress.emit("No primary surface generated")
+                result.total_time_ms = (time.time() - total_start) * 1000
+                self.complete.emit(result)
+                return
+            
+            self.progress.emit(f"Extracted: {extraction_result.num_vertices:,} verts, "
+                             f"{extraction_result.num_faces:,} faces "
+                             f"from {extraction_result.num_tets_contributing} tets")
+            
+            # =====================================================================
+            # STEP 3: CLEAN SURFACE (merge duplicate vertices, remove degenerates)
+            # 
+            # Per paper: "the resulting mesh C is inevitably affected by the quality
+            # and density of the tetrahedral tessellation"
+            # =====================================================================
+            self.progress.emit("Cleaning membrane (merge vertices, remove degenerates)...")
+            repair_start = time.time()
+            
+            repaired_result = repair_parting_surface(
+                extraction_result,
+                merge_vertices=True,
+                merge_threshold=1e-8
+            )
+            
+            result.repair_time_ms = (time.time() - repair_start) * 1000
+            
+            if repaired_result.mesh is None:
+                self.progress.emit("Surface cleaning failed - using unrepaired")
+                result.mesh = extraction_result.mesh
+                result.num_vertices = extraction_result.num_vertices
+                result.num_faces = extraction_result.num_faces
+                result.vertex_boundary_type = extraction_result.vertex_boundary_type
+                result.total_time_ms = (time.time() - total_start) * 1000
+                self.complete.emit(result)
+                return
+            
+            result.mesh = repaired_result.mesh
+            result.num_vertices = repaired_result.num_vertices
+            result.num_faces = repaired_result.num_faces
+            result.vertex_boundary_type = repaired_result.vertex_boundary_type
+            
+            self.progress.emit(f"Cleaned: {result.num_vertices:,} verts, {result.num_faces:,} faces")
+            
+            # Log boundary type info for debugging
+            if result.vertex_boundary_type is not None:
+                n_part = np.sum(result.vertex_boundary_type == -1)
+                n_hull = np.sum(result.vertex_boundary_type == 1) + np.sum(result.vertex_boundary_type == 2)
+                n_interior = np.sum(result.vertex_boundary_type == 0)
+                self.progress.emit(f"Boundary classification: {n_part} inner (M), "
+                                 f"{n_hull} outer (∂H), {n_interior} interior")
+            
+            # =====================================================================
+            # STEP 4: Fix normals for consistent orientation
+            # =====================================================================
+            self.progress.emit("Fixing surface normals...")
+            result.mesh.fix_normals()
+            
+            result.total_time_ms = (time.time() - total_start) * 1000
+            
+            self.progress.emit(
+                f"Extraction complete: {result.num_vertices:,} verts, {result.num_faces:,} faces "
+                f"(extract: {result.extraction_time_ms:.0f}ms, repair: {result.repair_time_ms:.0f}ms)"
+            )
+            
+            self.complete.emit(result)
+            
+        except Exception as e:
+            logger.exception(f"Error in primary surface extraction: {e}")
+            self.error.emit(str(e))
+
+
+class PrimarySurfaceSmoothingWorker(QThread):
+    """
+    Background worker for primary surface SMOOTHING only (Section 4.4).
+    
+    Implements paper Section 4.4 (Membrane Smoothing):
+    - Two-phase Laplacian smoothing with boundary re-projection
+    - Phase 1: Smooth boundary polyline vertices, re-project to M or ∂H
+    - Phase 2: Smooth interior vertices with fixed boundary
+    - Gap filling for floating edges
+    
+    Requires extracted surface from PrimarySurfaceExtractionWorker.
+    """
+    
+    progress = pyqtSignal(str)
+    complete = pyqtSignal(object)  # PrimarySurfaceSmoothingResult
+    error = pyqtSignal(str)
+    
+    def __init__(self, extraction_result, tet_result, part_mesh=None, hull_mesh=None,
+                 smooth_iterations: int = 5, damping_factor: float = 0.5,
+                 use_tet_boundaries: bool = True, feature_aware_smoothing: bool = True):
+        """
+        Initialize primary surface smoothing worker.
+        
+        Args:
+            extraction_result: PrimarySurfaceExtractionResult from extraction step
+            tet_result: TetrahedralMeshResult (for extracting tet boundaries)
+            part_mesh: Original part mesh (fallback if tet boundaries unavailable)
+            hull_mesh: Hull mesh (fallback if tet boundaries unavailable)
+            smooth_iterations: Number of smoothing iterations (per paper: use damping)
+            damping_factor: Smoothing damping factor (0.5 per paper Section 4.4)
+            use_tet_boundaries: If True (default), use tetrahedral boundary surfaces
+                               for re-projection instead of original input meshes.
+            feature_aware_smoothing: If True (default), detect and preserve concave corners.
+        """
+        super().__init__()
+        self.extraction_result = extraction_result
+        self.tet_result = tet_result
+        self.part_mesh = part_mesh
+        self.hull_mesh = hull_mesh
+        self.smooth_iterations = smooth_iterations
+        self.damping_factor = damping_factor
+        self.use_tet_boundaries = use_tet_boundaries
+        self.feature_aware_smoothing = feature_aware_smoothing
+    
+    def run(self):
+        try:
+            from core.surface_propagation import smooth_membrane_with_boundary_reprojection
+            from core.tetrahedral_mesh import extract_labeled_boundary_meshes
+            from core.parting_surface import (
+                detect_floating_boundary_edges,
+                fill_floating_edge_gaps
+            )
+            import time
+            
+            result = PrimarySurfaceSmoothingResult()
+            result.smooth_iterations = self.smooth_iterations
+            result.damping_factor = self.damping_factor
+            
+            total_start = time.time()
+            
+            # Check prerequisites
+            if self.extraction_result.mesh is None:
+                self.progress.emit("No extracted surface to smooth")
+                self.complete.emit(result)
+                return
+            
+            current_mesh = self.extraction_result.mesh.copy()
+            current_boundary_type = self.extraction_result.vertex_boundary_type
+            
+            # =====================================================================
+            # STEP 1: Extract tetrahedral boundary meshes for re-projection
+            # 
+            # Using tet boundaries ensures exact alignment since membrane vertices
+            # come from cut points on tet edges, which lie ON tet boundary faces.
+            # =====================================================================
+            inner_tet_boundary = None
+            outer_tet_boundary = None
+            
+            if self.use_tet_boundaries:
+                self.progress.emit("Extracting tetrahedral boundary meshes...")
+                inner_tet_boundary, outer_tet_boundary = extract_labeled_boundary_meshes(
+                    self.tet_result,
+                    use_original=True  # Use non-inflated vertices for consistency
+                )
+                
+                if inner_tet_boundary is not None:
+                    self.progress.emit(f"  Inner boundary (tet part M): {len(inner_tet_boundary.faces)} faces")
+                else:
+                    self.progress.emit("  WARNING: No inner tet boundary - will use fallback part mesh")
+                
+                if outer_tet_boundary is not None:
+                    self.progress.emit(f"  Outer boundary (tet hull ∂H): {len(outer_tet_boundary.faces)} faces")
+                else:
+                    self.progress.emit("  WARNING: No outer tet boundary - will use fallback hull mesh")
+            
+            # Determine which meshes to use for re-projection
+            part_mesh_for_reprojection = inner_tet_boundary if inner_tet_boundary is not None else self.part_mesh
+            hull_mesh_for_reprojection = outer_tet_boundary if outer_tet_boundary is not None else self.hull_mesh
+            
+            # =====================================================================
+            # STEP 2: MEMBRANE SMOOTHING (Paper Section 4.4)
+            # 
+            # "We perform a Laplacian smoothing that preserves both the boundaries 
+            # between the different patches composing C and the boundaries between 
+            # C and the object M or the boundary ∂H."
+            #
+            # TWO-PHASE SMOOTHING:
+            # Phase 1: Smooth boundary polyline vertices, re-project to M or ∂H
+            # Phase 2: Smooth interior vertices with fixed boundary
+            # =====================================================================
+            if self.smooth_iterations > 0:
+                self.progress.emit(f"Section 4.4: Two-phase smoothing ({self.smooth_iterations} iters, "
+                                 f"λ={self.damping_factor})...")
+                
+                # Log which meshes we're using for re-projection
+                if part_mesh_for_reprojection is not None:
+                    src = "tet boundary" if part_mesh_for_reprojection is inner_tet_boundary else "original"
+                    self.progress.emit(f"  Part mesh M ({src}): {len(part_mesh_for_reprojection.faces)} faces")
+                else:
+                    self.progress.emit("  WARNING: No part mesh M for inner boundary re-projection!")
+                
+                if hull_mesh_for_reprojection is not None:
+                    src = "tet boundary" if hull_mesh_for_reprojection is outer_tet_boundary else "original"
+                    self.progress.emit(f"  Hull mesh ∂H ({src}): {len(hull_mesh_for_reprojection.faces)} faces")
+                else:
+                    self.progress.emit("  WARNING: No hull mesh ∂H for outer boundary re-projection!")
+                
+                smoothing_start = time.time()
+                
+                # Debug: verify vertex count matches boundary type array
+                n_mesh_verts = len(current_mesh.vertices)
+                n_boundary_type = len(current_boundary_type) if current_boundary_type is not None else 0
+                if n_mesh_verts != n_boundary_type:
+                    logger.warning(f"VERTEX COUNT MISMATCH: mesh has {n_mesh_verts} vertices, "
+                                  f"boundary_type has {n_boundary_type} entries")
+                else:
+                    logger.debug(f"Vertex counts match: {n_mesh_verts} vertices")
+                
+                smoothing_result = smooth_membrane_with_boundary_reprojection(
+                    current_mesh,
+                    part_mesh=part_mesh_for_reprojection,
+                    hull_mesh=hull_mesh_for_reprojection,
+                    primary_mesh=None,  # No primary for primary surface smoothing
+                    iterations=self.smooth_iterations,
+                    damping_factor=self.damping_factor,
+                    excluded_vertices=None,
+                    vertex_boundary_type=current_boundary_type,
+                    feature_aware_smoothing=self.feature_aware_smoothing
+                )
+                
+                result.smoothing_time_ms = (time.time() - smoothing_start) * 1000
+                result.boundary_vertices = smoothing_result.boundary_vertices
+                result.interior_vertices = smoothing_result.interior_vertices
+                
+                # Copy restored corner positions for visualization
+                if hasattr(smoothing_result, 'restored_corner_positions'):
+                    result.restored_corner_positions = smoothing_result.restored_corner_positions
+                
+                if smoothing_result.mesh is not None:
+                    current_mesh = smoothing_result.mesh
+                    self.progress.emit(f"Smoothed: {result.boundary_vertices} boundary verts, "
+                                     f"{result.interior_vertices} interior verts")
+                else:
+                    self.progress.emit("Smoothing returned no mesh - using unsmoothed")
+            else:
+                self.progress.emit("Smoothing skipped (iterations=0)")
+            
+            # =====================================================================
+            # STEP 3: Fill floating edge gaps (edges that drifted during smoothing)
+            # =====================================================================
+            if self.smooth_iterations > 0 and part_mesh_for_reprojection is not None:
+                self.progress.emit("Detecting and filling floating edge gaps...")
+                gap_fill_start = time.time()
+                
+                # Record face count before fill (to track which faces are fill triangles)
+                faces_before_fill = len(current_mesh.faces)
+                
+                fill_result = fill_floating_edge_gaps(
+                    membrane_mesh=current_mesh,
+                    part_mesh=part_mesh_for_reprojection,
+                    vertex_boundary_type=current_boundary_type
+                )
+                
+                result.gap_fill_time_ms = (time.time() - gap_fill_start) * 1000
+                
+                if fill_result.floating_edges_found > 0:
+                    self.progress.emit(f"Filled {fill_result.floating_edges_found} floating edges, "
+                                     f"added {fill_result.fill_triangles_added} triangles")
+                    if fill_result.mesh is not None:
+                        current_mesh = fill_result.mesh
+                        
+                        # Record fill face indices for yellow visualization
+                        result.fill_face_indices = np.arange(
+                            faces_before_fill,
+                            faces_before_fill + fill_result.fill_triangles_added
+                        )
+                else:
+                    self.progress.emit("No floating edges detected")
+            
+            # =====================================================================
+            # STEP 4: Fix normals for consistent orientation
+            # =====================================================================
+            self.progress.emit("Fixing surface normals...")
+            current_mesh.fix_normals()
+            
+            # =====================================================================
+            # FINALIZE: Set result and emit completion
+            # =====================================================================
+            result.mesh = current_mesh
+            result.num_vertices = len(current_mesh.vertices)
+            result.num_faces = len(current_mesh.faces)
+            
+            result.total_time_ms = (time.time() - total_start) * 1000
+            
+            # Build timing summary
+            timing_parts = []
+            if self.smooth_iterations > 0:
+                timing_parts.append(f"smooth: {result.smoothing_time_ms:.0f}ms")
+            if result.gap_fill_time_ms > 0:
+                timing_parts.append(f"gap fill: {result.gap_fill_time_ms:.0f}ms")
+            
+            self.progress.emit(
+                f"Smoothing complete: {result.num_vertices:,} verts, {result.num_faces:,} faces "
+                f"({', '.join(timing_parts) if timing_parts else 'no operations'})"
+            )
+            
+            self.complete.emit(result)
+            
+        except Exception as e:
+            logger.exception(f"Error in primary surface smoothing: {e}")
+            self.error.emit(str(e))
 
 
 class ComprehensivePrimarySurfaceWorker(QThread):
@@ -4437,9 +4875,13 @@ class MainWindow(QMainWindow):
         # Secondary cuts state
         self._secondary_cuts_worker = None
         
-        # Parting surface state
+        # Parting surface state (extraction only)
         self._parting_surface_worker = None
-        self._parting_surface_result = None
+        self._parting_surface_result = None  # PrimarySurfaceExtractionResult
+        
+        # Parting surface smoothing state
+        self._parting_surface_smooth_worker = None
+        self._parting_surface_smooth_result = None  # PrimarySurfaceSmoothingResult
         
         # Secondary parting surface state
         self._secondary_parting_surface_worker = None
@@ -4953,6 +5395,8 @@ class MainWindow(QMainWindow):
             self._setup_secondary_cuts_step()
         elif self._active_step == Step.PARTING_SURFACE:
             self._setup_parting_surface_step()
+        elif self._active_step == Step.PARTING_SURFACE_SMOOTH:
+            self._setup_parting_surface_smooth_step()
         elif self._active_step == Step.SECONDARY_SURFACE:
             self._setup_secondary_surface_step()
         elif self._active_step == Step.POURING:
@@ -8428,11 +8872,11 @@ class MainWindow(QMainWindow):
         self._secondary_cuts_worker = None
 
     # ========================================================================
-    # PARTING SURFACE STEP
+    # PARTING SURFACE STEP (Extraction Only)
     # ========================================================================
     
     def _setup_parting_surface_step(self):
-        """Setup the parting surface step UI."""
+        """Setup the parting surface extraction step UI (extraction only, no smoothing)."""
         # Check prerequisites - now requires Dijkstra results (not secondary cuts)
         if self._tet_result is None or self._tet_result.seed_escape_paths is None:
             no_dijkstra_label = QLabel("⚠️ Please run Dijkstra first.")
@@ -8449,7 +8893,7 @@ class MainWindow(QMainWindow):
             return
         
         # Description section
-        info_group = QGroupBox("Primary Parting Surface (Comprehensive)")
+        info_group = QGroupBox("Primary Surface Extraction (Section 4.3)")
         info_group.setStyleSheet(f"""
             QGroupBox {{
                 font-size: 13px;
@@ -8469,11 +8913,11 @@ class MainWindow(QMainWindow):
         info_layout = QVBoxLayout(info_group)
         
         info_text = QLabel(
-            "Generate and smooth the primary parting surface mesh.\n\n"
+            "Extract the primary parting surface using Marching Tetrahedra.\n\n"
             "This step performs:\n"
-            "• Extract surface using Marching Tetrahedra\n"
+            "• Extract surface at primary cut edges\n"
             "• Clean mesh (merge vertices, remove degenerates)\n"
-            "• Smooth with boundary re-projection to part/hull"
+            "• Fix surface normals"
         )
         info_text.setWordWrap(True)
         info_text.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px; line-height: 1.4;')
@@ -8490,90 +8934,14 @@ class MainWindow(QMainWindow):
             n_paths = len(result.seed_escape_paths)
             state_info.add_row(f'Escape paths computed: {n_paths:,}')
         
-        if result.secondary_cut_edges is not None:
-            n_secondary = len(result.secondary_cut_edges)
-            state_info.add_row(f'Secondary cut edges: {n_secondary:,}')
-        
         if result.primary_cut_edges is not None:
             n_primary = len(result.primary_cut_edges)
             state_info.add_row(f'Primary cut edges: {n_primary:,}')
         
         self.context_layout.addWidget(state_info)
         
-        # Smoothing parameters group
-        smooth_group = QGroupBox("Surface Parameters")
-        smooth_group.setStyleSheet(f"""
-            QGroupBox {{
-                font-size: 13px;
-                font-weight: 500;
-                color: {Colors.DARK};
-                border: 1px solid {Colors.BORDER};
-                border-radius: 6px;
-                margin-top: 10px;
-                padding-top: 10px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-                color: {Colors.DARK};
-                background-color: {Colors.LIGHT};
-            }}
-            QGroupBox QLabel {{
-                color: {Colors.DARK};
-                font-size: 12px;
-            }}
-        """)
-        smooth_layout = QFormLayout(smooth_group)
-        smooth_layout.setContentsMargins(12, 12, 12, 12)
-        smooth_layout.setSpacing(10)
-        
-        # Smoothing iterations
-        self.primary_smooth_iterations_spin = QSpinBox()
-        self.primary_smooth_iterations_spin.setRange(0, 50)
-        self.primary_smooth_iterations_spin.setValue(5)
-        self.primary_smooth_iterations_spin.setToolTip("Number of Laplacian smoothing iterations (0 = no smoothing)")
-        smooth_layout.addRow("Smooth iterations:", self.primary_smooth_iterations_spin)
-        
-        # Damping factor
-        self.primary_smooth_damping_spin = QDoubleSpinBox()
-        self.primary_smooth_damping_spin.setRange(0.01, 1.0)
-        self.primary_smooth_damping_spin.setValue(0.5)
-        self.primary_smooth_damping_spin.setSingleStep(0.05)
-        self.primary_smooth_damping_spin.setToolTip("Damping factor (λ) - higher = more smoothing per iteration")
-        smooth_layout.addRow("Damping (λ):", self.primary_smooth_damping_spin)
-        
-        # Feature-aware smoothing checkbox
-        self.primary_feature_aware_cb = QCheckBox("Feature-Aware Smoothing")
-        self.primary_feature_aware_cb.setChecked(True)  # Default: enabled
-        self.primary_feature_aware_cb.setToolTip(
-            "If enabled, concave corners are detected and kept fixed during smoothing.\n"
-            "If disabled, all vertices are smoothened normally without feature detection."
-        )
-        self.primary_feature_aware_cb.setStyleSheet(f"""
-            QCheckBox {{
-                color: {Colors.DARK};
-                font-size: 12px;
-                padding: 4px 0;
-            }}
-            QCheckBox::indicator {{
-                width: 16px;
-                height: 16px;
-                border-radius: 3px;
-                border: 1px solid {Colors.GRAY};
-                background-color: {Colors.WHITE};
-            }}
-            QCheckBox::indicator:checked {{
-                background-color: #9966ff;
-                border: 1px solid #7744dd;
-            }}
-        """)
-        smooth_layout.addRow("", self.primary_feature_aware_cb)
-        
-        self.context_layout.addWidget(smooth_group)
-        
         # Compute button
-        self.parting_surface_btn = QPushButton("🔲 Generate Parting Surface")
+        self.parting_surface_btn = QPushButton("🔲 Extract Primary Surface")
         self.parting_surface_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.parting_surface_btn.setStyleSheet(f"""
             QPushButton {{
@@ -8626,42 +8994,33 @@ class MainWindow(QMainWindow):
         self.parting_surface_stats.hide()
         self.context_layout.addWidget(self.parting_surface_stats)
         
-        # Update UI with current state
+        # Show existing results if available
         self._update_parting_surface_step_ui()
     
     def _update_parting_surface_step_ui(self):
-        """Update parting surface step UI based on current state."""
+        """Update parting surface extraction step UI based on current state."""
         if not hasattr(self, 'parting_surface_stats'):
             return
         
-        # Enable/disable secondary parting surface button based on secondary cuts availability
-        if hasattr(self, 'secondary_parting_surface_btn'):
-            has_secondary = (self._tet_result is not None and 
-                            self._tet_result.secondary_cut_edges is not None and
-                            len(self._tet_result.secondary_cut_edges) > 0)
-            self.secondary_parting_surface_btn.setEnabled(has_secondary)
-            
-            if has_secondary:
-                n_secondary = len(self._tet_result.secondary_cut_edges)
-                self.secondary_parting_surface_btn.setText(f"🔴 Generate Secondary Surface ({n_secondary} edges)")
-            else:
-                self.secondary_parting_surface_btn.setText("🔴 No Secondary Cuts Available")
+        # Show stats if extraction result exists
+        if self._parting_surface_result is not None and self._parting_surface_result.mesh is not None:
+            result = self._parting_surface_result
+            self.parting_surface_stats.clear()
+            self.parting_surface_stats.add_header('Extracted Surface', Colors.SUCCESS)
+            self.parting_surface_stats.add_row(f'Vertices: {result.num_vertices:,}')
+            self.parting_surface_stats.add_row(f'Faces: {result.num_faces:,}')
+            self.parting_surface_stats.add_row(f'Tets contributing: {result.num_tets_contributing:,}/{result.num_tets_processed:,}')
+            self.parting_surface_stats.add_row('')
+            self.parting_surface_stats.add_row(f'⏱ Extraction: {result.extraction_time_ms:.0f}ms')
+            self.parting_surface_stats.add_row(f'⏱ Cleanup: {result.repair_time_ms:.0f}ms')
+            self.parting_surface_stats.add_row(f'Total time: {result.total_time_ms:.0f}ms')
+            self.parting_surface_stats.show()
     
     def _on_run_parting_surface(self):
-        """Start parting surface generation (extract + clean + smooth)."""
+        """Start parting surface extraction (extract + clean only, no smoothing)."""
         if self._tet_result is None:
             QMessageBox.warning(self, "Warning", "No tetrahedral mesh data available")
             return
-        
-        # Get parameters from UI
-        smooth_iterations = getattr(self, 'primary_smooth_iterations_spin', None)
-        smooth_iterations = smooth_iterations.value() if smooth_iterations else 5
-        
-        damping_factor = getattr(self, 'primary_smooth_damping_spin', None)
-        damping_factor = damping_factor.value() if damping_factor else 0.5
-        
-        feature_aware = getattr(self, 'primary_feature_aware_cb', None)
-        feature_aware = feature_aware.isChecked() if feature_aware else True
         
         # Show progress
         self.parting_surface_btn.setEnabled(False)
@@ -8670,18 +9029,8 @@ class MainWindow(QMainWindow):
         self.parting_surface_progress_label.setText("Preparing data structures...")
         self.parting_surface_stats.hide()
         
-        # Start worker thread for PRIMARY parting surface
-        # This does: extraction + cleanup + smoothing
-        hull_mesh = self._hull_result.mesh if self._hull_result is not None else None
-        
-        self._parting_surface_worker = ComprehensivePrimarySurfaceWorker(
-            self._tet_result,
-            part_mesh=self._current_mesh,
-            hull_mesh=hull_mesh,
-            smooth_iterations=smooth_iterations,
-            damping_factor=damping_factor,
-            feature_aware_smoothing=feature_aware
-        )
+        # Start worker thread for PRIMARY parting surface EXTRACTION only
+        self._parting_surface_worker = PrimarySurfaceExtractionWorker(self._tet_result)
         self._parting_surface_worker.progress.connect(self._on_parting_surface_progress)
         self._parting_surface_worker.complete.connect(self._on_parting_surface_complete)
         self._parting_surface_worker.error.connect(self._on_parting_surface_error)
@@ -8693,13 +9042,9 @@ class MainWindow(QMainWindow):
             self.parting_surface_progress_label.setText(message)
     
     def _on_parting_surface_complete(self, result):
-        """Handle comprehensive parting surface complete (extract + repair + smooth)."""
-        # Store result - this is a ComprehensiveSurfaceResult
+        """Handle parting surface extraction complete (PrimarySurfaceExtractionResult)."""
+        # Store result - this is a PrimarySurfaceExtractionResult (extraction only)
         self._parting_surface_result = result
-        
-        # Also store in _primary_smoothing_result for propagation step to use
-        # (propagation uses _primary_smoothing_result.mesh for reference)
-        self._primary_smoothing_result = result
         
         # Reset UI
         self.parting_surface_btn.setEnabled(True)
@@ -8712,9 +9057,9 @@ class MainWindow(QMainWindow):
             self.parting_surface_progress_label.setStyleSheet(f'color: {Colors.WARNING}; font-size: 12px;')
             return
         
-        # Update stats - show comprehensive info
+        # Update stats - show extraction info only
         self.parting_surface_stats.clear()
-        self.parting_surface_stats.add_header('Primary Parting Surface', Colors.SUCCESS)
+        self.parting_surface_stats.add_header('Extracted Primary Surface', Colors.SUCCESS)
         self.parting_surface_stats.add_row(f'Vertices: {result.num_vertices:,}')
         self.parting_surface_stats.add_row(f'Faces: {result.num_faces:,}')
         self.parting_surface_stats.add_row(f'Tets contributing: {result.num_tets_contributing:,}/{result.num_tets_processed:,}')
@@ -8723,25 +9068,17 @@ class MainWindow(QMainWindow):
         self.parting_surface_stats.add_row('')
         self.parting_surface_stats.add_row(f'⏱ Extraction: {result.extraction_time_ms:.0f}ms')
         self.parting_surface_stats.add_row(f'⏱ Cleanup: {result.repair_time_ms:.0f}ms')
-        
-        # Show smoothing stats if smoothing was performed
-        if result.smooth_iterations > 0:
-            self.parting_surface_stats.add_row(f'⏱ Smoothing ({result.smooth_iterations} iter): {result.smoothing_time_ms:.0f}ms')
-            self.parting_surface_stats.add_row(f'   Boundary verts: {result.boundary_vertices:,}')
-            self.parting_surface_stats.add_row(f'   Interior verts: {result.interior_vertices:,}')
-        
-        self.parting_surface_stats.add_row('')
         self.parting_surface_stats.add_row(f'Total time: {result.total_time_ms:.0f}ms')
         self.parting_surface_stats.show()
         
-        # Visualize the parting surface
+        # Visualize the raw (unsmoothed) parting surface
         self._visualize_parting_surface(result)
         
-        # Mark step complete and unlock secondary cuts step (reordered: secondary cuts now comes after primary surface)
+        # Mark step complete and unlock SMOOTHING step (next step in sequence)
         if Step.PARTING_SURFACE in self.step_buttons:
             self.step_buttons[Step.PARTING_SURFACE].set_status('completed')
-        if Step.SECONDARY_CUTS in self.step_buttons:
-            self.step_buttons[Step.SECONDARY_CUTS].set_status('ready')
+        if Step.PARTING_SURFACE_SMOOTH in self.step_buttons:
+            self.step_buttons[Step.PARTING_SURFACE_SMOOTH].set_status('ready')
     
     def _on_parting_surface_error(self, error_msg: str):
         """Handle parting surface generation error."""
@@ -8777,6 +9114,327 @@ class MainWindow(QMainWindow):
                 f"Parting surface generated but visualization failed:\n{str(e)}\n\n"
                 f"Surface has {result.num_vertices:,} vertices and {result.num_faces:,} faces."
             )
+
+    # ========================================================================
+    # PARTING SURFACE SMOOTHING STEP (Section 4.4)
+    # ========================================================================
+    
+    def _setup_parting_surface_smooth_step(self):
+        """Setup the parting surface smoothing step UI (Section 4.4)."""
+        # Check prerequisites - requires extracted surface
+        if self._parting_surface_result is None or self._parting_surface_result.mesh is None:
+            no_surface_label = QLabel("⚠️ Please extract the primary surface first.")
+            no_surface_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_surface_label.setWordWrap(True)
+            self.context_layout.addWidget(no_surface_label)
+            return
+        
+        # Description section
+        info_group = QGroupBox("Membrane Smoothing (Section 4.4)")
+        info_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+        """)
+        info_layout = QVBoxLayout(info_group)
+        
+        info_text = QLabel(
+            "Smooth the extracted parting surface with boundary re-projection.\n\n"
+            "This step performs:\n"
+            "• Two-phase Laplacian smoothing (boundary → interior)\n"
+            "• Re-project boundary vertices to part mesh M or hull ∂H\n"
+            "• Fill floating edge gaps"
+        )
+        info_text.setWordWrap(True)
+        info_text.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px; line-height: 1.4;')
+        info_layout.addWidget(info_text)
+        
+        self.context_layout.addWidget(info_group)
+        
+        # Info about extracted surface
+        result = self._parting_surface_result
+        state_info = StatsBox()
+        state_info.add_header('Extracted Surface', Colors.INFO)
+        state_info.add_row(f'Vertices: {result.num_vertices:,}')
+        state_info.add_row(f'Faces: {result.num_faces:,}')
+        
+        # Count boundary types if available
+        if result.vertex_boundary_type is not None:
+            n_part = np.sum(result.vertex_boundary_type == -1)
+            n_hull = np.sum(result.vertex_boundary_type == 1) + np.sum(result.vertex_boundary_type == 2)
+            n_interior = np.sum(result.vertex_boundary_type == 0)
+            state_info.add_row(f'Boundary (M): {n_part:,} verts')
+            state_info.add_row(f'Boundary (∂H): {n_hull:,} verts')
+            state_info.add_row(f'Interior: {n_interior:,} verts')
+        
+        self.context_layout.addWidget(state_info)
+        
+        # Smoothing parameters group
+        smooth_group = QGroupBox("Smoothing Parameters")
+        smooth_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+                color: {Colors.DARK};
+                background-color: {Colors.LIGHT};
+            }}
+            QGroupBox QLabel {{
+                color: {Colors.DARK};
+                font-size: 12px;
+            }}
+        """)
+        smooth_layout = QFormLayout(smooth_group)
+        smooth_layout.setContentsMargins(12, 12, 12, 12)
+        smooth_layout.setSpacing(10)
+        
+        # Smoothing iterations
+        self.smooth_iterations_spin = QSpinBox()
+        self.smooth_iterations_spin.setRange(0, 50)
+        self.smooth_iterations_spin.setValue(5)
+        self.smooth_iterations_spin.setToolTip("Number of Laplacian smoothing iterations (0 = no smoothing)")
+        smooth_layout.addRow("Iterations:", self.smooth_iterations_spin)
+        
+        # Damping factor
+        self.smooth_damping_spin = QDoubleSpinBox()
+        self.smooth_damping_spin.setRange(0.01, 1.0)
+        self.smooth_damping_spin.setValue(0.5)
+        self.smooth_damping_spin.setSingleStep(0.05)
+        self.smooth_damping_spin.setToolTip("Damping factor (λ) - higher = more smoothing per iteration (paper uses 0.5)")
+        smooth_layout.addRow("Damping (λ):", self.smooth_damping_spin)
+        
+        # Feature-aware smoothing checkbox
+        self.smooth_feature_aware_cb = QCheckBox("Feature-Aware Smoothing")
+        self.smooth_feature_aware_cb.setChecked(True)  # Default: enabled
+        self.smooth_feature_aware_cb.setToolTip(
+            "If enabled, concave corners are detected and kept fixed during smoothing.\n"
+            "If disabled, all vertices are smoothened normally without feature detection."
+        )
+        self.smooth_feature_aware_cb.setStyleSheet(f"""
+            QCheckBox {{
+                color: {Colors.DARK};
+                font-size: 12px;
+                padding: 4px 0;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+                border-radius: 3px;
+                border: 1px solid {Colors.GRAY};
+                background-color: {Colors.WHITE};
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: #9966ff;
+                border: 1px solid #7744dd;
+            }}
+        """)
+        smooth_layout.addRow("", self.smooth_feature_aware_cb)
+        
+        self.context_layout.addWidget(smooth_group)
+        
+        # Smooth button
+        self.smooth_surface_btn = QPushButton("✨ Smooth Surface")
+        self.smooth_surface_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.smooth_surface_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {Colors.PRIMARY};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: #0069d9;
+            }}
+            QPushButton:disabled {{
+                background-color: {Colors.GRAY_LIGHT};
+                color: {Colors.GRAY};
+            }}
+        """)
+        self.smooth_surface_btn.clicked.connect(self._on_run_smooth_surface)
+        self.context_layout.addWidget(self.smooth_surface_btn)
+        
+        # Progress bar
+        self.smooth_surface_progress = QProgressBar()
+        self.smooth_surface_progress.setStyleSheet(f"""
+            QProgressBar {{
+                border: none;
+                border-radius: 4px;
+                background-color: {Colors.LIGHT};
+                height: 8px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {Colors.PRIMARY};
+                border-radius: 4px;
+            }}
+        """)
+        self.smooth_surface_progress.setTextVisible(False)
+        self.smooth_surface_progress.setRange(0, 0)  # Indeterminate
+        self.smooth_surface_progress.hide()
+        self.context_layout.addWidget(self.smooth_surface_progress)
+        
+        # Progress label
+        self.smooth_surface_progress_label = QLabel("")
+        self.smooth_surface_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.smooth_surface_progress_label.hide()
+        self.context_layout.addWidget(self.smooth_surface_progress_label)
+        
+        # Stats (show if computed)
+        self.smooth_surface_stats = StatsBox()
+        self.smooth_surface_stats.hide()
+        self.context_layout.addWidget(self.smooth_surface_stats)
+        
+        # Show existing smoothing results if available
+        self._update_smooth_surface_step_ui()
+    
+    def _update_smooth_surface_step_ui(self):
+        """Update smoothing step UI based on current state."""
+        if not hasattr(self, 'smooth_surface_stats'):
+            return
+        
+        # Show stats if smoothing result exists
+        if self._parting_surface_smooth_result is not None and self._parting_surface_smooth_result.mesh is not None:
+            result = self._parting_surface_smooth_result
+            self.smooth_surface_stats.clear()
+            self.smooth_surface_stats.add_header('Smoothed Surface', Colors.SUCCESS)
+            self.smooth_surface_stats.add_row(f'Vertices: {result.num_vertices:,}')
+            self.smooth_surface_stats.add_row(f'Faces: {result.num_faces:,}')
+            self.smooth_surface_stats.add_row(f'Boundary verts: {result.boundary_vertices:,}')
+            self.smooth_surface_stats.add_row(f'Interior verts: {result.interior_vertices:,}')
+            self.smooth_surface_stats.add_row('')
+            self.smooth_surface_stats.add_row(f'⏱ Smoothing ({result.smooth_iterations} iter): {result.smoothing_time_ms:.0f}ms')
+            if result.gap_fill_time_ms > 0:
+                self.smooth_surface_stats.add_row(f'⏱ Gap fill: {result.gap_fill_time_ms:.0f}ms')
+            self.smooth_surface_stats.add_row(f'Total time: {result.total_time_ms:.0f}ms')
+            self.smooth_surface_stats.show()
+    
+    def _on_run_smooth_surface(self):
+        """Start surface smoothing (smoothing + gap fill only)."""
+        if self._parting_surface_result is None or self._parting_surface_result.mesh is None:
+            QMessageBox.warning(self, "Warning", "No extracted surface available to smooth")
+            return
+        
+        # Get parameters from UI
+        smooth_iterations = getattr(self, 'smooth_iterations_spin', None)
+        smooth_iterations = smooth_iterations.value() if smooth_iterations else 5
+        
+        damping_factor = getattr(self, 'smooth_damping_spin', None)
+        damping_factor = damping_factor.value() if damping_factor else 0.5
+        
+        feature_aware = getattr(self, 'smooth_feature_aware_cb', None)
+        feature_aware = feature_aware.isChecked() if feature_aware else True
+        
+        # Show progress
+        self.smooth_surface_btn.setEnabled(False)
+        self.smooth_surface_progress.show()
+        self.smooth_surface_progress_label.show()
+        self.smooth_surface_progress_label.setText("Preparing smoothing...")
+        self.smooth_surface_stats.hide()
+        
+        # Get meshes for re-projection
+        hull_mesh = self._hull_result.mesh if self._hull_result is not None else None
+        
+        # Start worker thread for smoothing
+        self._parting_surface_smooth_worker = PrimarySurfaceSmoothingWorker(
+            extraction_result=self._parting_surface_result,
+            tet_result=self._tet_result,
+            part_mesh=self._current_mesh,
+            hull_mesh=hull_mesh,
+            smooth_iterations=smooth_iterations,
+            damping_factor=damping_factor,
+            use_tet_boundaries=True,
+            feature_aware_smoothing=feature_aware
+        )
+        self._parting_surface_smooth_worker.progress.connect(self._on_smooth_surface_progress)
+        self._parting_surface_smooth_worker.complete.connect(self._on_smooth_surface_complete)
+        self._parting_surface_smooth_worker.error.connect(self._on_smooth_surface_error)
+        self._parting_surface_smooth_worker.start()
+    
+    def _on_smooth_surface_progress(self, message: str):
+        """Handle surface smoothing progress updates."""
+        if hasattr(self, 'smooth_surface_progress_label'):
+            self.smooth_surface_progress_label.setText(message)
+    
+    def _on_smooth_surface_complete(self, result):
+        """Handle surface smoothing complete (PrimarySurfaceSmoothingResult)."""
+        # Store result
+        self._parting_surface_smooth_result = result
+        
+        # Also store in _primary_smoothing_result for compatibility with other steps
+        self._primary_smoothing_result = result
+        
+        # Reset UI
+        self.smooth_surface_btn.setEnabled(True)
+        self.smooth_surface_progress.hide()
+        self.smooth_surface_progress_label.hide()
+        
+        if result.mesh is None or result.num_faces == 0:
+            self.smooth_surface_progress_label.setText("Smoothing produced no mesh")
+            self.smooth_surface_progress_label.show()
+            self.smooth_surface_progress_label.setStyleSheet(f'color: {Colors.WARNING}; font-size: 12px;')
+            return
+        
+        # Update stats
+        self.smooth_surface_stats.clear()
+        self.smooth_surface_stats.add_header('Smoothed Primary Surface', Colors.SUCCESS)
+        self.smooth_surface_stats.add_row(f'Vertices: {result.num_vertices:,}')
+        self.smooth_surface_stats.add_row(f'Faces: {result.num_faces:,}')
+        self.smooth_surface_stats.add_row(f'Boundary verts: {result.boundary_vertices:,}')
+        self.smooth_surface_stats.add_row(f'Interior verts: {result.interior_vertices:,}')
+        
+        # Show timing breakdown
+        self.smooth_surface_stats.add_row('')
+        self.smooth_surface_stats.add_row(f'⏱ Smoothing ({result.smooth_iterations} iter): {result.smoothing_time_ms:.0f}ms')
+        if result.gap_fill_time_ms > 0:
+            self.smooth_surface_stats.add_row(f'⏱ Gap fill: {result.gap_fill_time_ms:.0f}ms')
+        self.smooth_surface_stats.add_row(f'Total time: {result.total_time_ms:.0f}ms')
+        self.smooth_surface_stats.show()
+        
+        # Visualize the smoothed parting surface
+        self._visualize_parting_surface(result)
+        
+        # Mark step complete and unlock secondary cuts step
+        if Step.PARTING_SURFACE_SMOOTH in self.step_buttons:
+            self.step_buttons[Step.PARTING_SURFACE_SMOOTH].set_status('completed')
+        if Step.SECONDARY_CUTS in self.step_buttons:
+            self.step_buttons[Step.SECONDARY_CUTS].set_status('ready')
+    
+    def _on_smooth_surface_error(self, error_msg: str):
+        """Handle surface smoothing error."""
+        self.smooth_surface_btn.setEnabled(True)
+        self.smooth_surface_progress.hide()
+        self.smooth_surface_progress_label.setText(f"Error: {error_msg}")
+        self.smooth_surface_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+        QMessageBox.critical(self, "Error", f"Surface smoothing failed:\n{error_msg}")
 
     # =========================================================================
     # SECONDARY PARTING SURFACE METHODS
