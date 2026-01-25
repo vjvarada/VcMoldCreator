@@ -2778,8 +2778,12 @@ def find_secondary_cutting_edges(
     both_interior = v0_interior & v1_interior
     
     # For interior edges, check if same label
+    # IMPORTANT: Skip edges where BOTH vertices are on the part surface
+    # These are just surface edges, not edges extending into the mold volume
+    # True secondary cuts need at least one vertex in the interior (not on part surface)
     candidate_edges = []
     n_on_part_surface = 0
+    n_skipped_surface_only = 0
     
     for e_idx in np.where(both_interior)[0]:
         v0, v1 = int(tet_edges[e_idx, 0]), int(tet_edges[e_idx, 1])
@@ -2791,12 +2795,22 @@ def find_secondary_cutting_edges(
         
         # Only consider same-label edges (both H1 or both H2)
         if label0 == label1 and label0 > 0:
+            # Check if both vertices are on the part surface
+            v0_on_surface = v0 in part_surface_vertices
+            v1_on_surface = v1 in part_surface_vertices
+            
+            if v0_on_surface and v1_on_surface:
+                # Skip edges that are entirely on the part surface
+                # These don't extend into the mold volume
+                n_skipped_surface_only += 1
+                continue
+            
             candidate_edges.append((v0, v1, idx0, idx1))
-            if v0 in part_surface_vertices and v1 in part_surface_vertices:
+            if v0_on_surface or v1_on_surface:
                 n_on_part_surface += 1
     
     timing_log['phase3_candidate_edges'] = (time.time() - phase_start) * 1000
-    logger.info(f"Phase 3 (candidate edges): {timing_log['phase3_candidate_edges']:.1f}ms - {len(candidate_edges)} edges ({n_on_part_surface} on part surface)")
+    logger.info(f"Phase 3 (candidate edges): {timing_log['phase3_candidate_edges']:.1f}ms - {len(candidate_edges)} edges ({n_on_part_surface} touch surface, {n_skipped_surface_only} skipped surface-only)")
     
     if len(candidate_edges) == 0 or len(seed_triangles) == 0:
         return []
