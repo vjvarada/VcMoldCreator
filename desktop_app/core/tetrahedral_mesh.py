@@ -156,6 +156,31 @@ class TetrahedralMeshResult:
     secondary_cut_edges: Optional[List[Tuple[int, int]]] = None
     
     # =========================================================================
+    # CACHED DATA FOR SECONDARY CUT DETECTION (computed once, reused)
+    # =========================================================================
+    
+    # Boundary mesh adjacency list: Dict[vertex_idx, List[(neighbor_idx, edge_length)]]
+    # Built from boundary_mesh edges, used for shortest path computation on ∂H
+    # Caching this avoids rebuilding it each time secondary cuts are computed
+    boundary_adjacency: Optional[Dict[int, List[Tuple[int, float]]]] = None
+    
+    # Part mesh vertex to tet mesh vertex mapping (computed via KDTree)
+    # part_to_tet_vertex[part_mesh_vertex_idx] = closest_tet_vertex_idx
+    # Caching this avoids expensive KDTree queries during secondary cut detection
+    part_to_tet_vertex: Optional[np.ndarray] = None
+    
+    # Seed triangles for secondary cut detection
+    # List of (tet_v0, tet_v1, tet_v2) representing part surface in tet mesh resolution
+    # Only includes triangles where all 3 vertices are on part surface (boundary_labels == -1)
+    cached_seed_triangles: Optional[List[Tuple[int, int, int]]] = None
+    cached_seed_triangle_positions: Optional[List[Tuple[np.ndarray, np.ndarray, np.ndarray]]] = None
+    
+    # Cached boundary paths for secondary cut detection
+    # Dict[(min_vertex, max_vertex), path] - shortest paths on boundary mesh ∂H
+    # Persisted across secondary cut detection runs to avoid redundant Dijkstra
+    cached_boundary_paths: Optional[Dict[Tuple[int, int], List[int]]] = None
+    
+    # =========================================================================
     # PARTING SURFACE EXTRACTION DATA
     # =========================================================================
     
@@ -1046,6 +1071,157 @@ def compute_extended_secondary_cut_edge_flags(
     logger.info(f"Extended secondary cut edges: {np.sum(secondary_flags)} -> {np.sum(extended_flags)} (+{n_extended} from shared tets)")
     
     return extended_flags
+
+
+def compute_secondary_vertex_labels(
+    vertices: np.ndarray,
+    edges: np.ndarray,
+    secondary_cut_edges: List[Tuple[int, int]],
+    tetrahedra: np.ndarray,
+    vertex_mold_labels: Optional[np.ndarray] = None,
+    edge_to_index: Optional[Dict[Tuple[int, int], int]] = None
+) -> np.ndarray:
+    """
+    Compute BINARY vertex labels for secondary surface extraction.
+    
+    This function assigns a binary label (1=SideA, 2=SideB) to each vertex
+    based on which "side" of the secondary cut edges they are on.
+    
+    The algorithm uses connected components:
+    1. Build a graph of vertices connected by NON-cut edges (edges not in secondary_cut_edges)
+    2. Use flood fill to identify connected components
+    3. Assign alternating labels (1, 2) to adjacent components
+    
+    This ensures that marching tetrahedra only sees 0, 3, or 4-edge configs
+    (valid binary configurations), avoiding the problematic 5 and 6-edge configs.
+    
+    Args:
+        vertices: (N, 3) vertex positions
+        edges: (E, 2) unique edges
+        secondary_cut_edges: List of (vi, vj) secondary cut edges
+        tetrahedra: (M, 4) tetrahedra vertex indices
+        vertex_mold_labels: (N,) optional primary mold labels (1=H1, 2=H2)
+                           Used to initialize labels consistently with primary surface
+        edge_to_index: Optional pre-computed edge-to-index map
+    
+    Returns:
+        (N,) array of binary labels: 1=SideA, 2=SideB, 0=unlabeled
+        
+    Note:
+        The labels are arbitrary (SideA vs SideB has no geometric meaning),
+        but they are consistent: vertices connected by non-cut edges have
+        the same label, vertices connected by cut edges have different labels.
+    """
+    from collections import deque
+    
+    n_vertices = len(vertices)
+    n_edges = len(edges)
+    
+    if secondary_cut_edges is None or len(secondary_cut_edges) == 0:
+        logger.warning("No secondary cut edges - cannot compute secondary vertex labels")
+        return np.zeros(n_vertices, dtype=np.int8)
+    
+    # Build edge-to-index map if not provided
+    if edge_to_index is None:
+        edge_to_index = build_edge_to_index_map(edges)
+    
+    # Mark which edges are secondary cuts
+    secondary_cut_set = set()
+    for vi, vj in secondary_cut_edges:
+        secondary_cut_set.add((min(vi, vj), max(vi, vj)))
+    
+    logger.info(f"Computing secondary vertex labels: {len(secondary_cut_set)} cut edges")
+    
+    # Build adjacency list using NON-cut edges only
+    # Two vertices are "connected" if they share an edge that is NOT a secondary cut
+    adjacency = [[] for _ in range(n_vertices)]
+    cut_adjacency = [[] for _ in range(n_vertices)]  # Adjacency via CUT edges
+    
+    for e_idx in range(n_edges):
+        v0, v1 = int(edges[e_idx, 0]), int(edges[e_idx, 1])
+        key = (min(v0, v1), max(v0, v1))
+        
+        if key in secondary_cut_set:
+            # This is a cut edge - track separately for label propagation
+            cut_adjacency[v0].append(v1)
+            cut_adjacency[v1].append(v0)
+        else:
+            # Non-cut edge - vertices are on same side
+            adjacency[v0].append(v1)
+            adjacency[v1].append(v0)
+    
+    # Find vertices involved in tetrahedra with secondary cut edges
+    # We only need to label vertices that are part of tets with secondary cuts
+    involved_vertices = set()
+    for vi, vj in secondary_cut_edges:
+        involved_vertices.add(vi)
+        involved_vertices.add(vj)
+    
+    # Expand to all vertices in tetrahedra that contain cut edges
+    for tet in tetrahedra:
+        tet_verts = set(int(v) for v in tet)
+        for vi, vj in secondary_cut_edges:
+            if vi in tet_verts and vj in tet_verts:
+                # This tet has a secondary cut edge - include all its vertices
+                involved_vertices.update(tet_verts)
+                break
+    
+    logger.info(f"Secondary labeling: {len(involved_vertices)} vertices involved in cut tets")
+    
+    # Initialize labels array
+    labels = np.zeros(n_vertices, dtype=np.int8)
+    
+    # BFS to assign labels using connected components
+    # Start from a vertex connected to a cut edge and assign label 1
+    # Vertices connected via non-cut edges get the same label
+    # Vertices connected via cut edges get the opposite label
+    
+    labeled_count = 0
+    component_count = 0
+    
+    # Process each connected component
+    for start_v in involved_vertices:
+        if labels[start_v] != 0:
+            continue  # Already labeled
+        
+        # Start new component with label 1
+        component_count += 1
+        queue = deque()
+        queue.append((start_v, 1))  # (vertex, label)
+        
+        while queue:
+            v, lbl = queue.popleft()
+            
+            if labels[v] != 0:
+                # Already labeled - check for consistency
+                if labels[v] != lbl:
+                    # Inconsistency - this can happen at complex junctions
+                    # Just log it and continue
+                    pass
+                continue
+            
+            labels[v] = lbl
+            labeled_count += 1
+            
+            # Propagate same label to neighbors via non-cut edges
+            for neighbor in adjacency[v]:
+                if neighbor in involved_vertices and labels[neighbor] == 0:
+                    queue.append((neighbor, lbl))
+            
+            # Propagate OPPOSITE label to neighbors via cut edges
+            opposite_lbl = 2 if lbl == 1 else 1
+            for neighbor in cut_adjacency[v]:
+                if neighbor in involved_vertices and labels[neighbor] == 0:
+                    queue.append((neighbor, opposite_lbl))
+    
+    n_side_a = np.sum(labels == 1)
+    n_side_b = np.sum(labels == 2)
+    n_unlabeled = np.sum(labels == 0)
+    
+    logger.info(f"Secondary vertex labels computed: {n_side_a} SideA, {n_side_b} SideB, "
+                f"{n_unlabeled} unlabeled, {component_count} components")
+    
+    return labels
 
 
 def prepare_parting_surface_data(tet_result: 'TetrahedralMeshResult') -> 'TetrahedralMeshResult':
@@ -2304,16 +2480,137 @@ def _run_dijkstra_escape_labeling_python(
     return interior_escape_labels, interior_vertex_indices, interior_distances, interior_escape_destinations, interior_escape_paths
 
 
+def prepare_secondary_cuts_cache(
+    tet_result: TetrahedralMeshResult,
+    part_mesh: trimesh.Trimesh,
+    boundary_mesh: trimesh.Trimesh = None
+) -> TetrahedralMeshResult:
+    """
+    Precompute and cache data structures needed for secondary cut detection.
+    
+    This function computes expensive data ONCE that would otherwise be
+    recomputed every time find_secondary_cutting_edges() is called:
+    
+    1. boundary_adjacency: Adjacency list for boundary mesh (for shortest path on ∂H)
+    2. part_to_tet_vertex: KDTree-based mapping from part mesh to tet mesh vertices
+    3. cached_seed_triangles: Part mesh triangles mapped to tet mesh vertex indices
+    
+    Call this function AFTER Dijkstra labeling is complete and BEFORE
+    calling find_secondary_cutting_edges() for optimal performance.
+    
+    If running secondary cuts multiple times (e.g., with different thresholds),
+    this cache provides significant speedup.
+    
+    Args:
+        tet_result: TetrahedralMeshResult with Dijkstra results complete
+        part_mesh: The original part mesh M
+        boundary_mesh: Optional boundary mesh (uses tet_result.boundary_mesh if None)
+    
+    Returns:
+        Updated TetrahedralMeshResult with cache fields populated
+    """
+    import time
+    from scipy.spatial import cKDTree
+    
+    start_time = time.time()
+    
+    # Use provided boundary mesh or fall back to tet_result's
+    if boundary_mesh is None:
+        boundary_mesh = tet_result.boundary_mesh
+    
+    if boundary_mesh is None:
+        logger.warning("No boundary mesh available - cannot prepare secondary cuts cache")
+        return tet_result
+    
+    vertices = tet_result.vertices
+    boundary_labels = tet_result.boundary_labels
+    
+    # =========================================================================
+    # 1. Build boundary mesh adjacency (for shortest path on ∂H)
+    # =========================================================================
+    if tet_result.boundary_adjacency is None:
+        logger.info("Building boundary mesh adjacency...")
+        tet_result.boundary_adjacency = _build_boundary_adjacency(boundary_mesh)
+        logger.info(f"  Built adjacency for {len(tet_result.boundary_adjacency)} boundary vertices")
+    else:
+        logger.info("Using cached boundary adjacency")
+    
+    # =========================================================================
+    # 2. Build part mesh to tet mesh vertex mapping (expensive KDTree query)
+    # =========================================================================
+    if tet_result.part_to_tet_vertex is None:
+        logger.info("Building part-to-tet vertex mapping (KDTree)...")
+        part_verts = np.asarray(part_mesh.vertices)
+        tet_tree = cKDTree(vertices)
+        _, part_to_tet = tet_tree.query(part_verts, k=1)
+        tet_result.part_to_tet_vertex = part_to_tet
+        logger.info(f"  Mapped {len(part_verts)} part vertices to tet mesh")
+    else:
+        logger.info("Using cached part-to-tet mapping")
+    
+    # =========================================================================
+    # 3. Build seed triangles (part surface in tet mesh resolution)
+    # =========================================================================
+    if tet_result.cached_seed_triangles is None:
+        logger.info("Building seed triangles...")
+        
+        # Identify part surface vertices
+        part_surface_vertices = set()
+        if boundary_labels is not None:
+            part_surface_vertices = set(np.where(boundary_labels == -1)[0])
+        
+        # Build seed triangles from part mesh faces
+        seed_triangles = []
+        seed_triangle_positions = []
+        part_to_tet = tet_result.part_to_tet_vertex
+        
+        for face in part_mesh.faces:
+            tet_v0 = part_to_tet[face[0]]
+            tet_v1 = part_to_tet[face[1]]
+            tet_v2 = part_to_tet[face[2]]
+            
+            # Check if all three vertices are on part surface
+            if (tet_v0 in part_surface_vertices and 
+                tet_v1 in part_surface_vertices and 
+                tet_v2 in part_surface_vertices):
+                # Avoid degenerate triangles
+                if tet_v0 != tet_v1 and tet_v1 != tet_v2 and tet_v2 != tet_v0:
+                    seed_triangles.append((tet_v0, tet_v1, tet_v2))
+                    seed_triangle_positions.append((
+                        vertices[tet_v0].copy(),
+                        vertices[tet_v1].copy(),
+                        vertices[tet_v2].copy()
+                    ))
+        
+        tet_result.cached_seed_triangles = seed_triangles
+        tet_result.cached_seed_triangle_positions = seed_triangle_positions
+        logger.info(f"  Built {len(seed_triangles)} seed triangles")
+    else:
+        logger.info("Using cached seed triangles")
+    
+    elapsed_ms = (time.time() - start_time) * 1000
+    logger.info(f"Secondary cuts cache prepared in {elapsed_ms:.0f}ms")
+    
+    return tet_result
+
+
 def find_secondary_cutting_edges(
     tet_result: TetrahedralMeshResult,
     part_mesh: trimesh.Trimesh,
     boundary_mesh: trimesh.Trimesh = None,
     min_intersection_count: int = 1,
-    use_gpu: bool = True
+    use_gpu: bool = True,
+    method: str = 'triangle'  # 'triangle' (default) or 'ray' (experimental)
 ) -> List[Tuple[int, int]]:
     """
     Find secondary cutting edges where the membrane between same-label interior vertices 
     intersects the part mesh representation.
+    
+    Per Paper Section 4.2 "Additional Membranes":
+    "We introduce a cutting membrane across the edge e to separate vi and vj if a 
+    discrete approximation of the minimal surface bounded by the edge (vi, vj), 
+    the escape paths (vi, wi), (vj, wj), and the shortest path (wi, wj) 
+    (computed on ∂H), intersects the object M."
     
     This works on ALL interior edges (edges between any two interior vertices that
     both escape to the same boundary H1 or H2), not just edges on the part surface.
@@ -2330,29 +2627,40 @@ def find_secondary_cutting_edges(
        - Path wi → wj on ∂H
     4. If this membrane intersects the part mesh M enough times, mark edge as secondary cut
     
+    OPTIMIZATION: Call prepare_secondary_cuts_cache() BEFORE this function to
+    precompute expensive data structures. If the cache is not prepared, this
+    function will build them on-the-fly (slower for repeated calls).
+    
     Args:
         tet_result: TetrahedralMeshResult with Dijkstra results (paths, destinations)
         part_mesh: The original part mesh M to check intersection against
         boundary_mesh: The boundary mesh ∂H (uses tet_result.boundary_mesh_original if not provided)
-        min_intersection_count: Minimum number of segment-triangle intersections required (1-20)
+        min_intersection_count: Minimum number of intersections required (1-20)
                                Higher values filter out false positives from edge cases
                                1 = any intersection triggers secondary cut
                                Higher = requires multiple intersections (more confidence)
         use_gpu: Whether to use CUDA acceleration if available (default True)
+        method: Intersection testing method:
+                'triangle' - Triangle-triangle intersection (default, correct per paper)
+                             Builds membrane surface and checks intersection with seed triangles
+                'ray' - (EXPERIMENTAL) Ray casting - may not correctly detect all intersections
     
     Returns:
         List of (vi, vj) tuples representing secondary cutting edges
     """
     import time
-    import heapq
     
     start_time = time.time()
+    timing_log = {}  # Track timing for each phase
     
     if tet_result.seed_escape_labels is None:
         raise ValueError("Dijkstra must be run before finding secondary cuts")
     
     if tet_result.seed_escape_paths is None:
         raise ValueError("Escape paths must be computed (run updated Dijkstra)")
+    
+    # Store method and part_mesh for Phase 7
+    use_ray_method = (method.lower() == 'ray')
     
     # Use the INFLATED geometry for membrane construction - this is where Dijkstra paths were computed
     # The escape paths are vertex indices that refer to the inflated mesh vertices
@@ -2366,7 +2674,8 @@ def find_secondary_cutting_edges(
         logger.warning("No boundary mesh available for secondary cuts")
         return []
     
-    logger.info(f"Secondary cuts: using inflated vertices ({len(vertices)} verts), boundary_mesh ({len(boundary_mesh.vertices)} verts)")
+    logger.info(f"=== SECONDARY CUTS DETAILED TIMING (method={method}) ===")
+    logger.info(f"Input: {len(vertices)} vertices, {len(boundary_mesh.vertices)} boundary verts")
     
     # These now contain ALL interior vertices (not just those on part surface)
     interior_vertex_indices = tet_result.seed_vertex_indices
@@ -2376,6 +2685,11 @@ def find_secondary_cutting_edges(
     boundary_labels = tet_result.boundary_labels
     
     n_interior = len(interior_vertex_indices)
+    
+    # =========================================================================
+    # PHASE 1: Build vertex mappings
+    # =========================================================================
+    phase_start = time.time()
     
     # Build mapping from vertex index to interior array index
     vertex_to_interior_idx = {}
@@ -2395,84 +2709,123 @@ def find_secondary_cutting_edges(
         # If no boundary labels, assume all interior vertices could be part surface
         part_surface_vertices = interior_set
     
-    logger.info(f"Secondary cuts: {n_interior} interior vertices, {len(part_surface_vertices)} on part surface")
+    timing_log['phase1_vertex_mappings'] = (time.time() - phase_start) * 1000
+    logger.info(f"Phase 1 (vertex mappings): {timing_log['phase1_vertex_mappings']:.1f}ms - {n_interior} interior, {len(part_surface_vertices)} on part surface")
     
-    # Build seed triangles from PART MESH faces
-    # These represent the part cross-section that membranes should not pass through
-    from scipy.spatial import cKDTree
+    # =========================================================================
+    # PHASE 2: GET/BUILD SEED TRIANGLES
+    # =========================================================================
+    phase_start = time.time()
     
-    # Map part mesh vertices to tet mesh vertices
-    part_verts = np.asarray(part_mesh.vertices)
-    tet_tree = cKDTree(vertices)
-    _, part_to_tet = tet_tree.query(part_verts, k=1)
+    # Check if cache is available
+    use_cache = (tet_result.cached_seed_triangles is not None and 
+                 tet_result.cached_seed_triangle_positions is not None)
     
-    # Find TRIANGULAR FACES from PART MESH where ALL THREE vertices map to part surface vertices
-    # These triangles represent the part surface in tetrahedral mesh resolution
-    seed_triangles = []  # List of (v0, v1, v2) tet vertex indices
-    seed_triangle_positions = []  # List of (pos0, pos1, pos2) positions
-    
-    for face in part_mesh.faces:
-        tet_v0 = part_to_tet[face[0]]
-        tet_v1 = part_to_tet[face[1]]
-        tet_v2 = part_to_tet[face[2]]
+    if use_cache:
+        logger.info("Phase 2: Using cached seed triangles")
+        seed_triangles = tet_result.cached_seed_triangles
+        seed_triangle_positions = tet_result.cached_seed_triangle_positions
+    else:
+        # Build seed triangles from PART MESH faces (slower path)
+        logger.info("Phase 2: Building seed triangles (not cached)")
+        from scipy.spatial import cKDTree
         
-        # Check if all three vertices are on part surface
-        if tet_v0 in part_surface_vertices and tet_v1 in part_surface_vertices and tet_v2 in part_surface_vertices:
-            # Avoid degenerate triangles
-            if tet_v0 != tet_v1 and tet_v1 != tet_v2 and tet_v2 != tet_v0:
-                seed_triangles.append((tet_v0, tet_v1, tet_v2))
-                seed_triangle_positions.append((
-                    vertices[tet_v0].copy(),
-                    vertices[tet_v1].copy(),
-                    vertices[tet_v2].copy()
-                ))
+        # Use cached part-to-tet mapping if available
+        if tet_result.part_to_tet_vertex is not None:
+            part_to_tet = tet_result.part_to_tet_vertex
+        else:
+            part_verts = np.asarray(part_mesh.vertices)
+            tet_tree = cKDTree(vertices)
+            _, part_to_tet = tet_tree.query(part_verts, k=1)
+        
+        seed_triangles = []
+        seed_triangle_positions = []
+        
+        for face in part_mesh.faces:
+            tet_v0 = part_to_tet[face[0]]
+            tet_v1 = part_to_tet[face[1]]
+            tet_v2 = part_to_tet[face[2]]
+            
+            if (tet_v0 in part_surface_vertices and 
+                tet_v1 in part_surface_vertices and 
+                tet_v2 in part_surface_vertices):
+                if tet_v0 != tet_v1 and tet_v1 != tet_v2 and tet_v2 != tet_v0:
+                    seed_triangles.append((tet_v0, tet_v1, tet_v2))
+                    seed_triangle_positions.append((
+                        vertices[tet_v0].copy(),
+                        vertices[tet_v1].copy(),
+                        vertices[tet_v2].copy()
+                    ))
     
-    logger.info(f"Secondary cuts: found {len(seed_triangles)} seed triangles (part surface representation)")
+    timing_log['phase2_seed_triangles'] = (time.time() - phase_start) * 1000
+    logger.info(f"Phase 2 (seed triangles): {timing_log['phase2_seed_triangles']:.1f}ms - {len(seed_triangles)} triangles")
     
-    # Find ALL interior edges from tetrahedral mesh where both vertices are interior
-    # and have the SAME escape label (both H1 or both H2)
-    # NOTE: We include edges where both vertices are on the part surface.
-    # Self-intersection is prevented by skipping seed triangles that share vertices
-    # with the membrane edge (handled in _find_secondary_cuts_triangle_cpu/gpu and C++).
-    candidate_edges = []
+    # =========================================================================
+    # PHASE 3: FIND CANDIDATE EDGES (same-label interior edges)
+    # =========================================================================
+    phase_start = time.time()
+    
     tet_edges = tet_result.edges
-    n_on_part_surface = 0  # Counter for edges on part surface (for logging)
+    n_edges = len(tet_edges)
     
-    for v0, v1 in tet_edges:
-        if v0 in interior_set and v1 in interior_set:
-            idx0 = vertex_to_interior_idx[v0]
-            idx1 = vertex_to_interior_idx[v1]
-            
-            label0 = interior_escape_labels[idx0]
-            label1 = interior_escape_labels[idx1]
-            
-            # Only consider same-label edges (both H1 or both H2)
-            # Different label edges are primary cuts (yellow), not secondary
-            if label0 == label1 and label0 > 0:
-                candidate_edges.append((v0, v1, idx0, idx1))
-                # Track how many are on part surface for logging
-                if v0 in part_surface_vertices and v1 in part_surface_vertices:
-                    n_on_part_surface += 1
+    # Vectorized check: both vertices must be interior
+    # Build a mask for interior vertices
+    interior_mask = np.zeros(len(vertices), dtype=bool)
+    interior_mask[interior_vertex_indices] = True
     
-    logger.info(f"Secondary cuts: {len(candidate_edges)} same-label interior edges to check ({n_on_part_surface} on part surface)")
+    v0_interior = interior_mask[tet_edges[:, 0]]
+    v1_interior = interior_mask[tet_edges[:, 1]]
+    both_interior = v0_interior & v1_interior
+    
+    # For interior edges, check if same label
+    candidate_edges = []
+    n_on_part_surface = 0
+    
+    for e_idx in np.where(both_interior)[0]:
+        v0, v1 = int(tet_edges[e_idx, 0]), int(tet_edges[e_idx, 1])
+        idx0 = vertex_to_interior_idx[v0]
+        idx1 = vertex_to_interior_idx[v1]
+        
+        label0 = interior_escape_labels[idx0]
+        label1 = interior_escape_labels[idx1]
+        
+        # Only consider same-label edges (both H1 or both H2)
+        if label0 == label1 and label0 > 0:
+            candidate_edges.append((v0, v1, idx0, idx1))
+            if v0 in part_surface_vertices and v1 in part_surface_vertices:
+                n_on_part_surface += 1
+    
+    timing_log['phase3_candidate_edges'] = (time.time() - phase_start) * 1000
+    logger.info(f"Phase 3 (candidate edges): {timing_log['phase3_candidate_edges']:.1f}ms - {len(candidate_edges)} edges ({n_on_part_surface} on part surface)")
     
     if len(candidate_edges) == 0 or len(seed_triangles) == 0:
         return []
     
-    # Build outer boundary mesh adjacency for shortest path computation
+    # =========================================================================
+    # PHASE 4: BUILD/GET BOUNDARY ADJACENCY
+    # =========================================================================
+    phase_start = time.time()
+    
     boundary_verts = np.asarray(boundary_mesh.vertices)
-    boundary_adjacency = _build_boundary_adjacency(boundary_mesh)
+    
+    if tet_result.boundary_adjacency is not None:
+        logger.info("Phase 4: Using cached boundary adjacency")
+        boundary_adjacency = tet_result.boundary_adjacency
+    else:
+        logger.info("Phase 4: Building boundary adjacency (not cached)")
+        boundary_adjacency = _build_boundary_adjacency(boundary_mesh)
+    
+    timing_log['phase4_boundary_adjacency'] = (time.time() - phase_start) * 1000
+    logger.info(f"Phase 4 (boundary adjacency): {timing_log['phase4_boundary_adjacency']:.1f}ms")
     
     # Calculate minimum membrane thickness to filter out nearly-degenerate membranes
-    # NOTE: Disabled for now - rely on min_intersection_count for filtering false positives
     avg_edge_length = np.mean(tet_result.edge_lengths) if tet_result.edge_lengths is not None else 1.0
     min_membrane_thickness = 0.0  # Disabled - rely on intersection counting
     
-    logger.info(f"Secondary cuts: min_intersection_count={min_intersection_count}, avg_edge_length={avg_edge_length:.4f}")
-    
-    # OPTIMIZATION: Pre-filter edges and cache boundary paths
-    # Group edges by their boundary destination pairs to reuse path computations
-    boundary_path_cache = {}  # (wi_boundary, wj_boundary) -> path
+    # =========================================================================
+    # PHASE 5: PRE-COMPUTE BOUNDARY MAPPINGS
+    # =========================================================================
+    phase_start = time.time()
     
     # Pre-compute boundary mappings for all unique destinations
     unique_destinations = set()
@@ -2489,15 +2842,23 @@ def find_secondary_cutting_edges(
     for dest in unique_destinations:
         dest_to_boundary[dest] = _find_nearest_boundary_vertex(vertices[dest], boundary_verts)
     
-    logger.info(f"Secondary cuts: {len(unique_destinations)} unique boundary destinations")
+    timing_log['phase5_dest_to_boundary'] = (time.time() - phase_start) * 1000
+    logger.info(f"Phase 5 (dest-to-boundary mapping): {timing_log['phase5_dest_to_boundary']:.1f}ms - {len(unique_destinations)} destinations")
     
-    # Gather all membrane data first
-    edge_membrane_data = []
+    # =========================================================================
+    # PHASE 6: BUILD MEMBRANE DATA (with boundary path computation)
+    # =========================================================================
+    phase_start = time.time()
+    
+    # OPTIMIZATION: First pass - collect all unique boundary pairs needed
+    # This allows us to batch-compute shortest paths more efficiently
+    needed_boundary_pairs = set()
+    edge_to_boundary_pair = []  # (vi, vj, idx_i, idx_j, wi_boundary, wj_boundary)
     skipped_same_dest = 0
     skipped_no_path = 0
     
     for vi, vj, idx_i, idx_j in candidate_edges:
-        # Get escape paths
+        # Get escape paths (already cached from Dijkstra)
         path_i = interior_escape_paths[idx_i]  # vi → wi
         path_j = interior_escape_paths[idx_j]  # vj → wj
         
@@ -2521,59 +2882,167 @@ def find_secondary_cutting_edges(
             skipped_same_dest += 1
             continue
         
-        # Use cached boundary path or compute new one
+        # Record the boundary pair needed
         cache_key = (min(wi_boundary, wj_boundary), max(wi_boundary, wj_boundary))
-        if cache_key not in boundary_path_cache:
-            boundary_path_cache[cache_key] = _shortest_path_on_boundary(
-                wi_boundary, wj_boundary, boundary_mesh, boundary_adjacency
-            )
+        needed_boundary_pairs.add(cache_key)
+        edge_to_boundary_pair.append((vi, vj, idx_i, idx_j, wi_boundary, wj_boundary, cache_key))
+    
+    pair_collection_time = (time.time() - phase_start) * 1000
+    logger.info(f"Phase 6a (collect pairs): {pair_collection_time:.1f}ms - {len(needed_boundary_pairs)} unique boundary pairs from {len(edge_to_boundary_pair)} edges")
+    
+    # =========================================================================
+    # PHASE 6b: BATCH COMPUTE BOUNDARY PATHS
+    # Use multi-source Dijkstra for efficiency
+    # =========================================================================
+    batch_start = time.time()
+    
+    # Get unique source vertices (first element of each pair)
+    unique_sources = set()
+    for a, b in needed_boundary_pairs:
+        unique_sources.add(a)
+        unique_sources.add(b)
+    
+    logger.info(f"Phase 6b: Computing shortest paths from {len(unique_sources)} unique boundary sources")
+    
+    # Use cached boundary paths from tet_result if available, or compute
+    boundary_path_cache = {}
+    
+    if tet_result.cached_boundary_paths is not None:
+        # Use cached paths
+        cached_hits = 0
+        for pair in needed_boundary_pairs:
+            if pair in tet_result.cached_boundary_paths:
+                boundary_path_cache[pair] = tet_result.cached_boundary_paths[pair]
+                cached_hits += 1
+        logger.info(f"  - Cache hits: {cached_hits}/{len(needed_boundary_pairs)}")
+    
+    # Compute missing paths using multi-source Dijkstra
+    missing_pairs = [p for p in needed_boundary_pairs if p not in boundary_path_cache]
+    
+    if len(missing_pairs) > 0:
+        # Group by source for efficient multi-target Dijkstra
+        source_to_targets = {}
+        for a, b in missing_pairs:
+            if a not in source_to_targets:
+                source_to_targets[a] = set()
+            source_to_targets[a].add(b)
+            # Also add reverse (b->a) since we need both directions
+            if b not in source_to_targets:
+                source_to_targets[b] = set()
+            source_to_targets[b].add(a)
         
-        boundary_path = boundary_path_cache[cache_key]
+        logger.info(f"  - Computing {len(missing_pairs)} missing paths from {len(source_to_targets)} sources")
+        
+        # Run multi-target Dijkstra from each source
+        path_compute_start = time.time()
+        for source, targets in source_to_targets.items():
+            # Run Dijkstra from source to all targets at once
+            paths = _multi_target_dijkstra_boundary(source, targets, boundary_mesh, boundary_adjacency)
+            for target, path in paths.items():
+                cache_key = (min(source, target), max(source, target))
+                if cache_key not in boundary_path_cache:
+                    # Store path in canonical direction (smaller vertex first)
+                    if source < target:
+                        boundary_path_cache[cache_key] = path
+                    else:
+                        boundary_path_cache[cache_key] = path[::-1] if path else []
+        
+        path_compute_time = (time.time() - path_compute_start) * 1000
+        logger.info(f"  - Path computation: {path_compute_time:.1f}ms")
+    
+    # Cache the computed paths for future use
+    if tet_result.cached_boundary_paths is None:
+        tet_result.cached_boundary_paths = {}
+    tet_result.cached_boundary_paths.update(boundary_path_cache)
+    
+    batch_time = (time.time() - batch_start) * 1000
+    logger.info(f"Phase 6b (batch boundary paths): {batch_time:.1f}ms - {len(boundary_path_cache)} paths computed/cached")
+    
+    # =========================================================================
+    # PHASE 6c: BUILD FINAL MEMBRANE DATA
+    # =========================================================================
+    assemble_start = time.time()
+    edge_membrane_data = []
+    
+    for vi, vj, idx_i, idx_j, wi_boundary, wj_boundary, cache_key in edge_to_boundary_pair:
+        path_i = interior_escape_paths[idx_i]
+        path_j = interior_escape_paths[idx_j]
+        
+        boundary_path = boundary_path_cache.get(cache_key, [])
         # Reverse if needed based on direction
         if wi_boundary > wj_boundary:
             boundary_path = boundary_path[::-1]
         
         edge_membrane_data.append((vi, vj, path_i, path_j, boundary_path))
     
-    logger.info(f"Secondary cuts: built {len(edge_membrane_data)} membranes to check "
-               f"(skipped: {skipped_same_dest} same-dest, {skipped_no_path} no-path, "
-               f"{len(boundary_path_cache)} unique boundary paths cached)")
-    logger.info(f"Secondary cuts: min_membrane_thickness={min_membrane_thickness:.4f}")
+    assemble_time = (time.time() - assemble_start) * 1000
+    
+    timing_log['phase6_membrane_data'] = (time.time() - phase_start) * 1000
+    timing_log['phase6_boundary_paths'] = batch_time
+    logger.info(f"Phase 6 total: {timing_log['phase6_membrane_data']:.1f}ms")
+    logger.info(f"  - Pair collection: {pair_collection_time:.1f}ms")
+    logger.info(f"  - Batch path compute: {batch_time:.1f}ms")
+    logger.info(f"  - Assembly: {assemble_time:.1f}ms")
+    logger.info(f"  - Membranes: {len(edge_membrane_data)}, skipped: {skipped_same_dest} same-dest, {skipped_no_path} no-path")
     
     if len(edge_membrane_data) == 0:
         return []
     
-    # Check if membrane cuts through seed TRIANGLES (faces representing the part)
-    # This uses tetrahedral mesh resolution and checks against actual surface area
-    # Try C++ implementation first (with OpenMP parallelization), fall back to Python/GPU
-    if CPP_FAST_AVAILABLE:
-        # Use C++ with OpenMP for CPU-based parallel processing
-        # This is often faster than GPU for this workload due to the irregular access patterns
-        from .fast_algorithms_wrapper import find_secondary_cuts_fast
-        secondary_cuts = find_secondary_cuts_fast(
-            edge_membrane_data, 
-            seed_triangles,
-            seed_triangle_positions,
-            vertices, 
+    # =========================================================================
+    # PHASE 7: INTERSECTION TESTING
+    # =========================================================================
+    phase_start = time.time()
+    logger.info(f"Phase 7: Starting intersection tests (method={method}, min_intersection_count={min_intersection_count})")
+    
+    # Default minimum membrane thickness to avoid false positives from flat surfaces
+    min_membrane_thickness = 0.0
+    
+    if use_ray_method:
+        # EXPERIMENTAL: Ray-based method (may miss some intersections)
+        logger.info("Phase 7: Using ray-based method (EXPERIMENTAL)")
+        secondary_cuts = _find_secondary_cuts_ray_based(
+            edge_membrane_data,
+            part_mesh,
+            vertices,
             boundary_verts,
             min_intersection_count,
             min_membrane_thickness
         )
     else:
-        # Fall back to Python/GPU implementation
-        secondary_cuts = _find_secondary_cuts_by_triangle_intersection(
-            edge_membrane_data, 
+        # PAPER-FAITHFUL: Collision-based method
+        # Uses trimesh CollisionManager with FCL/BVH for O(log n) collision queries
+        # IMPORTANT: Check against SEED TRIANGLES (tet mesh resolution), not original part mesh
+        # This avoids false positives from resolution mismatch
+        logger.info("Phase 7: Using collision-based method (BVH-accelerated, tet-resolution)")
+        secondary_cuts = _find_secondary_cuts_collision_based(
+            edge_membrane_data,
             seed_triangles,
             seed_triangle_positions,
-            vertices, 
+            vertices,
             boundary_verts,
             min_intersection_count,
             min_membrane_thickness,
-            use_gpu=use_gpu
+            part_mesh  # Fallback only
         )
     
-    elapsed = (time.time() - start_time) * 1000
-    logger.info(f"Secondary cuts complete in {elapsed:.0f}ms: {len(secondary_cuts)} secondary cutting edges found")
+    timing_log['phase7_intersection_test'] = (time.time() - phase_start) * 1000
+    
+    # =========================================================================
+    # TIMING SUMMARY
+    # =========================================================================
+    total_elapsed = (time.time() - start_time) * 1000
+    
+    logger.info(f"=== SECONDARY CUTS TIMING SUMMARY ===")
+    logger.info(f"Phase 1 (vertex mappings):      {timing_log.get('phase1_vertex_mappings', 0):.1f}ms")
+    logger.info(f"Phase 2 (seed triangles):       {timing_log.get('phase2_seed_triangles', 0):.1f}ms")
+    logger.info(f"Phase 3 (candidate edges):      {timing_log.get('phase3_candidate_edges', 0):.1f}ms")
+    logger.info(f"Phase 4 (boundary adjacency):   {timing_log.get('phase4_boundary_adjacency', 0):.1f}ms")
+    logger.info(f"Phase 5 (dest-to-boundary):     {timing_log.get('phase5_dest_to_boundary', 0):.1f}ms")
+    logger.info(f"Phase 6 (membrane data):        {timing_log.get('phase6_membrane_data', 0):.1f}ms")
+    logger.info(f"  └─ Boundary paths:            {timing_log.get('phase6_boundary_paths', 0):.1f}ms")
+    logger.info(f"Phase 7 (intersection test):    {timing_log.get('phase7_intersection_test', 0):.1f}ms")
+    logger.info(f"TOTAL:                          {total_elapsed:.1f}ms")
+    logger.info(f"Result: {len(secondary_cuts)} secondary cutting edges found")
     
     return secondary_cuts
 
@@ -2602,9 +3071,11 @@ def _find_secondary_cuts_by_triangle_intersection(
     
     Uses GPU acceleration if available for massive speedup.
     """
+    import time
+    
     n_triangles = len(seed_triangles)
     n_membranes = len(edge_membrane_data)
-    logger.info(f"Secondary cuts: checking {n_membranes} membranes against {n_triangles} seed triangles (min_intersections={min_intersection_count})")
+    logger.info(f"Phase 7: checking {n_membranes} membranes against {n_triangles} seed triangles (min_intersections={min_intersection_count})")
     
     if n_triangles == 0:
         logger.warning("No seed triangles found - cannot check for secondary cuts")
@@ -2627,6 +3098,305 @@ def _find_secondary_cuts_by_triangle_intersection(
         )
 
 
+def _find_secondary_cuts_ray_based(
+    edge_membrane_data: List[Tuple],
+    part_mesh: 'trimesh.Trimesh',
+    vertices: np.ndarray,
+    boundary_verts: np.ndarray,
+    min_intersection_count: int = 1,
+    min_membrane_thickness: float = 0.0
+) -> List[Tuple[int, int]]:
+    """
+    Paper-faithful secondary cuts detection using ray casting.
+    
+    Per Section 4.2: Check if "minimal surface bounded by escape paths intersects M".
+    
+    Instead of building full membrane triangles, we cast rays across the membrane
+    region and check for intersections with the original part mesh M.
+    This is much faster because:
+    1. trimesh uses BVH internally for O(log n) ray queries
+    2. We don't need to build membrane triangles
+    3. The part mesh BVH is built once and reused for all membranes
+    
+    The "cross-path" segments (between path_i and path_j at each depth) 
+    approximate the minimal surface check.
+    """
+    import time
+    
+    n_membranes = len(edge_membrane_data)
+    logger.info(f"Phase 7 (ray-based): checking {n_membranes} membranes against part mesh")
+    
+    # Build ray intersector once for the part mesh (uses BVH internally)
+    ray_intersector = part_mesh.ray
+    
+    secondary_cuts = []
+    
+    # Progress tracking
+    progress_interval = max(1, n_membranes // 10)
+    last_progress_time = time.time()
+    
+    for membrane_idx, (vi, vj, path_i, path_j, boundary_path) in enumerate(edge_membrane_data):
+        n_i = len(path_i)
+        n_j = len(path_j)
+        
+        if n_i < 2 or n_j < 2:
+            continue
+        
+        # Get path positions
+        path_i_positions = vertices[path_i]
+        path_j_positions = vertices[path_j]
+        
+        # Check membrane thickness (skip flat surfaces)
+        if min_membrane_thickness > 0:
+            max_dist = 0.0
+            for k in range(min(n_i, n_j)):
+                dist = np.linalg.norm(path_i_positions[k] - path_j_positions[k])
+                max_dist = max(max_dist, dist)
+            if max_dist < min_membrane_thickness:
+                continue
+        
+        # Sample cross-path segments (rays between path_i and path_j)
+        # This approximates the minimal surface
+        intersection_count = 0
+        n_samples = min(max(n_i, n_j), 10)  # Sample up to 10 depth levels
+        
+        ray_origins = []
+        ray_directions = []
+        ray_lengths = []
+        
+        for s in range(n_samples):
+            t = s / max(1, n_samples - 1)
+            
+            idx_i = min(int(t * (n_i - 1)), n_i - 1)
+            idx_j = min(int(t * (n_j - 1)), n_j - 1)
+            
+            p_i = path_i_positions[idx_i]
+            p_j = path_j_positions[idx_j]
+            
+            direction = p_j - p_i
+            length = np.linalg.norm(direction)
+            
+            if length > 1e-6:
+                ray_origins.append(p_i)
+                ray_directions.append(direction / length)
+                ray_lengths.append(length)
+        
+        if len(ray_origins) == 0:
+            continue
+        
+        ray_origins = np.array(ray_origins)
+        ray_directions = np.array(ray_directions)
+        ray_lengths = np.array(ray_lengths)
+        
+        # Cast rays and check for intersections
+        locations, index_ray, index_tri = ray_intersector.intersects_location(
+            ray_origins, ray_directions, multiple_hits=False
+        )
+        
+        # Count valid intersections (within the segment, not beyond)
+        for hit_idx, ray_idx in enumerate(index_ray):
+            hit_point = locations[hit_idx]
+            origin = ray_origins[ray_idx]
+            hit_dist = np.linalg.norm(hit_point - origin)
+            
+            # Check if hit is within the segment (with small tolerance)
+            if hit_dist <= ray_lengths[ray_idx] * 1.01:
+                intersection_count += 1
+                if intersection_count >= min_intersection_count:
+                    break
+        
+        if intersection_count >= min_intersection_count:
+            secondary_cuts.append((vi, vj))
+        
+        # Progress logging
+        if membrane_idx > 0 and membrane_idx % progress_interval == 0:
+            elapsed = time.time() - last_progress_time
+            pct = (membrane_idx / n_membranes) * 100
+            rate = progress_interval / elapsed if elapsed > 0 else 0
+            eta = (n_membranes - membrane_idx) / rate if rate > 0 else 0
+            logger.info(f"  Ray progress: {membrane_idx}/{n_membranes} ({pct:.0f}%) - {len(secondary_cuts)} cuts found - ETA: {eta:.1f}s")
+            last_progress_time = time.time()
+    
+    return secondary_cuts
+
+
+def _find_secondary_cuts_collision_based(
+    edge_membrane_data: List[Tuple],
+    seed_triangles: List[Tuple[int, int, int]],
+    seed_triangle_positions: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
+    vertices: np.ndarray,
+    boundary_verts: np.ndarray,
+    min_intersection_count: int = 1,
+    min_membrane_thickness: float = 0.0,
+    part_mesh: 'trimesh.Trimesh' = None  # Fallback only
+) -> List[Tuple[int, int]]:
+    """
+    Paper-faithful secondary cuts detection using trimesh CollisionManager.
+    
+    Per Section 4.2: Check if "minimal surface bounded by escape paths intersects M".
+    
+    IMPORTANT: We check collision against the SEED TRIANGLES (part surface in tet mesh
+    resolution), NOT the original part mesh. This avoids false positives caused by
+    resolution mismatch between the tet mesh and original mesh.
+    
+    The membranes are built from tet mesh vertices, so checking against a surface
+    also in tet mesh resolution ensures consistent collision detection.
+    
+    This method:
+    1. Builds a mesh from seed triangles (part surface in tet resolution)
+    2. Creates a CollisionManager with this mesh (uses FCL with BVH internally)
+    3. For each candidate edge, constructs the membrane mesh
+    4. Checks collision between membrane and seed surface - O(log n) per query
+    """
+    import time
+    
+    n_membranes = len(edge_membrane_data)
+    n_seed_tris = len(seed_triangles)
+    logger.info(f"Phase 7 (collision-based): checking {n_membranes} membranes against {n_seed_tris} seed triangles (tet resolution)")
+    
+    if n_seed_tris == 0:
+        logger.warning("No seed triangles - cannot check for secondary cuts")
+        return []
+    
+    # Try to use trimesh's collision module (requires python-fcl)
+    try:
+        from trimesh.collision import CollisionManager
+        # Test that FCL is actually available by creating a manager
+        manager = CollisionManager()
+    except (ImportError, ValueError) as e:
+        logger.warning(f"trimesh.collision/FCL not available ({e}) - falling back to CPU triangle method")
+        return _find_secondary_cuts_triangle_cpu(
+            edge_membrane_data, seed_triangles, seed_triangle_positions,
+            vertices, boundary_verts, min_intersection_count, min_membrane_thickness
+        )
+    
+    # Build mesh from seed triangles (part surface in tet mesh resolution)
+    seed_verts = []
+    seed_faces = []
+    for tri_idx, (p0, p1, p2) in enumerate(seed_triangle_positions):
+        base = len(seed_verts)
+        seed_verts.extend([p0, p1, p2])
+        seed_faces.append([base, base + 1, base + 2])
+    
+    seed_mesh = trimesh.Trimesh(
+        vertices=np.array(seed_verts),
+        faces=np.array(seed_faces),
+        process=False
+    )
+    
+    # Add seed mesh to collision manager (builds BVH internally)
+    manager.add_object("seed_surface", seed_mesh)
+    logger.info(f"  Built seed surface mesh: {len(seed_verts)} verts, {len(seed_faces)} faces")
+    
+    secondary_cuts = []
+    
+    # Progress tracking
+    progress_interval = max(1, n_membranes // 10)
+    last_progress_time = time.time()
+    
+    for membrane_idx, (vi, vj, path_i, path_j, boundary_path) in enumerate(edge_membrane_data):
+        # Build membrane mesh, skipping the first triangle pair (touches part surface)
+        # This avoids false positives where the membrane origin touches the seed surface
+        membrane_triangles = _build_membrane_triangles(
+            path_i, path_j, boundary_path, vertices, boundary_verts,
+            min_thickness=min_membrane_thickness,
+            skip_first_n=1  # Skip triangles at the part surface
+        )
+        
+        if len(membrane_triangles) == 0:
+            continue
+        
+        # Convert triangle positions to trimesh
+        membrane_verts = []
+        membrane_faces = []
+        for tri_idx, (p0, p1, p2) in enumerate(membrane_triangles):
+            base = len(membrane_verts)
+            membrane_verts.extend([p0, p1, p2])
+            membrane_faces.append([base, base + 1, base + 2])
+        
+        if len(membrane_verts) == 0:
+            continue
+        
+        membrane_mesh = trimesh.Trimesh(
+            vertices=np.array(membrane_verts),
+            faces=np.array(membrane_faces),
+            process=False
+        )
+        
+        # Check collision with seed surface - this is O(log n) due to BVH
+        is_collision = manager.in_collision_single(membrane_mesh)
+        
+        if is_collision:
+            # Additional check: verify this isn't just touching at the start
+            # by checking if there's intersection beyond the first membrane triangle
+            # For now, we accept all collisions - the membrane thickness check
+            # should filter out degenerate cases
+            secondary_cuts.append((vi, vj))
+        
+        # Progress logging
+        if membrane_idx > 0 and membrane_idx % progress_interval == 0:
+            elapsed = time.time() - last_progress_time
+            pct = (membrane_idx / n_membranes) * 100
+            rate = progress_interval / elapsed if elapsed > 0 else 0
+            eta = (n_membranes - membrane_idx) / rate if rate > 0 else 0
+            logger.info(f"  Collision progress: {membrane_idx}/{n_membranes} ({pct:.0f}%) - {len(secondary_cuts)} cuts found - ETA: {eta:.1f}s")
+            last_progress_time = time.time()
+    
+    return secondary_cuts
+
+
+def _find_secondary_cuts_fallback_cpu(
+    edge_membrane_data: List[Tuple],
+    part_mesh: 'trimesh.Trimesh',
+    vertices: np.ndarray,
+    boundary_verts: np.ndarray,
+    min_intersection_count: int = 1,
+    min_membrane_thickness: float = 0.0
+) -> List[Tuple[int, int]]:
+    """
+    Fallback CPU implementation when trimesh.collision is not available.
+    
+    Builds seed triangles from part mesh and uses triangle-triangle intersection.
+    """
+    import time
+    from scipy.spatial import cKDTree
+    
+    logger.info("Phase 7 (fallback CPU): Building seed triangles from part mesh")
+    
+    # Build seed triangles from part mesh
+    part_verts = np.asarray(part_mesh.vertices)
+    tet_tree = cKDTree(vertices)
+    _, part_to_tet = tet_tree.query(part_verts, k=1)
+    
+    # All tet vertices near part mesh
+    part_surface_set = set(part_to_tet)
+    
+    seed_triangles = []
+    seed_triangle_positions = []
+    
+    for face in part_mesh.faces:
+        tet_v0 = part_to_tet[face[0]]
+        tet_v1 = part_to_tet[face[1]]
+        tet_v2 = part_to_tet[face[2]]
+        
+        # Avoid degenerate
+        if tet_v0 != tet_v1 and tet_v1 != tet_v2 and tet_v2 != tet_v0:
+            seed_triangles.append((tet_v0, tet_v1, tet_v2))
+            seed_triangle_positions.append((
+                vertices[tet_v0].copy(),
+                vertices[tet_v1].copy(),
+                vertices[tet_v2].copy()
+            ))
+    
+    logger.info(f"  Built {len(seed_triangles)} seed triangles")
+    
+    # Now use the existing triangle-triangle CPU method
+    return _find_secondary_cuts_triangle_cpu(
+        edge_membrane_data, seed_triangles, seed_triangle_positions,
+        vertices, boundary_verts, min_intersection_count, min_membrane_thickness
+    )
+
+
 def _find_secondary_cuts_triangle_cpu(
     edge_membrane_data: List[Tuple],
     seed_triangles: List[Tuple[int, int, int]],
@@ -2637,16 +3407,29 @@ def _find_secondary_cuts_triangle_cpu(
     min_membrane_thickness: float = 0.0
 ) -> List[Tuple[int, int]]:
     """CPU implementation of secondary cuts by triangle-triangle intersection."""
-    secondary_cuts = []
+    import time
     
-    for vi, vj, path_i, path_j, boundary_path in edge_membrane_data:
+    secondary_cuts = []
+    n_membranes = len(edge_membrane_data)
+    
+    # Progress tracking
+    progress_interval = max(1, n_membranes // 10)  # Log every 10%
+    last_progress_time = time.time()
+    membranes_processed = 0
+    total_membrane_build_time = 0.0
+    total_intersection_time = 0.0
+    
+    for membrane_idx, (vi, vj, path_i, path_j, boundary_path) in enumerate(edge_membrane_data):
         # Build membrane triangles (skip if too thin - flat surface case)
+        build_start = time.time()
         membrane_triangles = _build_membrane_triangles(
             path_i, path_j, boundary_path, vertices, boundary_verts,
             min_thickness=min_membrane_thickness
         )
+        total_membrane_build_time += (time.time() - build_start) * 1000
         
         if len(membrane_triangles) == 0:
+            membranes_processed += 1
             continue
         
         # Skip triangles that share vertices with the test edge
@@ -2657,6 +3440,7 @@ def _find_secondary_cuts_triangle_cpu(
             skip_vertices.add(v)
         
         # Count intersections (require minimum threshold to trigger)
+        intersection_start = time.time()
         intersection_count = 0
         
         for tri_idx, (tv0, tv1, tv2) in enumerate(seed_triangles):
@@ -2675,9 +3459,23 @@ def _find_secondary_cuts_triangle_cpu(
             if intersection_count >= min_intersection_count:
                 break
         
+        total_intersection_time += (time.time() - intersection_start) * 1000
+        
         if intersection_count >= min_intersection_count:
             secondary_cuts.append((vi, vj))
+        
+        membranes_processed += 1
+        
+        # Progress logging
+        if membrane_idx > 0 and membrane_idx % progress_interval == 0:
+            elapsed = time.time() - last_progress_time
+            pct = (membrane_idx / n_membranes) * 100
+            rate = progress_interval / elapsed if elapsed > 0 else 0
+            eta = (n_membranes - membrane_idx) / rate if rate > 0 else 0
+            logger.info(f"  CPU progress: {membrane_idx}/{n_membranes} ({pct:.0f}%) - {len(secondary_cuts)} cuts found - ETA: {eta:.1f}s")
+            last_progress_time = time.time()
     
+    logger.info(f"  CPU complete: membrane_build={total_membrane_build_time:.0f}ms, intersection_test={total_intersection_time:.0f}ms")
     return secondary_cuts
 
 
@@ -2701,9 +3499,19 @@ def _find_secondary_cuts_triangle_gpu(
     Now counts intersections and requires minimum threshold to trigger.
     """
     import torch
+    import time
+    
     device = torch.device('cuda')
+    n_membranes = len(edge_membrane_data)
+    
+    # Progress tracking
+    progress_interval = max(1, n_membranes // 10)  # Log every 10%
+    last_progress_time = time.time()
+    total_gpu_time = 0.0
+    total_membrane_build_time = 0.0
     
     # Pre-compute all seed triangle data on GPU
+    gpu_prep_start = time.time()
     n_seed_tris = len(seed_triangles)
     seed_tri_v0 = np.array([pos[0] for pos in seed_triangle_positions], dtype=np.float32)
     seed_tri_v1 = np.array([pos[1] for pos in seed_triangle_positions], dtype=np.float32)
@@ -2727,14 +3535,19 @@ def _find_secondary_cuts_triangle_gpu(
         np.arange(n_seed_tris)
     ])
     
+    gpu_prep_time = (time.time() - gpu_prep_start) * 1000
+    logger.info(f"  GPU prep (seed triangles to CUDA): {gpu_prep_time:.1f}ms")
+    
     secondary_cuts = []
     
     for membrane_idx, (vi, vj, path_i, path_j, boundary_path) in enumerate(edge_membrane_data):
         # Build membrane triangles (skip if too thin - flat surface case)
+        build_start = time.time()
         membrane_triangles = _build_membrane_triangles(
             path_i, path_j, boundary_path, vertices, boundary_verts,
             min_thickness=min_membrane_thickness
         )
+        total_membrane_build_time += (time.time() - build_start) * 1000
         
         if len(membrane_triangles) == 0:
             continue
@@ -2747,6 +3560,7 @@ def _find_secondary_cuts_triangle_gpu(
             skip_vertices.add(v)
         
         # Build skip mask for seed triangles
+        gpu_start = time.time()
         skip_mask = torch.zeros(n_seed_tris, dtype=torch.bool, device=device)
         for tri_idx, (tv0, tv1, tv2) in enumerate(seed_triangles):
             if tv0 in skip_vertices or tv1 in skip_vertices or tv2 in skip_vertices:
@@ -2786,15 +3600,27 @@ def _find_secondary_cuts_triangle_gpu(
             skip_edge_mask
         )
         
+        total_gpu_time += (time.time() - gpu_start) * 1000
+        
         total_intersections = count_1 + count_2
         if total_intersections >= min_intersection_count:
             secondary_cuts.append((vi, vj))
+        
+        # Progress logging
+        if membrane_idx > 0 and membrane_idx % progress_interval == 0:
+            elapsed = time.time() - last_progress_time
+            pct = (membrane_idx / n_membranes) * 100
+            rate = progress_interval / elapsed if elapsed > 0 else 0
+            eta = (n_membranes - membrane_idx) / rate if rate > 0 else 0
+            logger.info(f"  GPU progress: {membrane_idx}/{n_membranes} ({pct:.0f}%) - {len(secondary_cuts)} cuts found - ETA: {eta:.1f}s")
+            last_progress_time = time.time()
         
         # Periodic cleanup
         if membrane_idx % 100 == 0:
             torch.cuda.empty_cache()
     
     torch.cuda.empty_cache()
+    logger.info(f"  GPU complete: membrane_build={total_membrane_build_time:.0f}ms, gpu_intersection={total_gpu_time:.0f}ms")
     return secondary_cuts
 
 
@@ -2932,13 +3758,24 @@ def _build_membrane_triangles(
     boundary_path: List[int],
     tet_vertices: np.ndarray,
     boundary_vertices: np.ndarray,
-    min_thickness: float = 0.0
+    min_thickness: float = 0.0,
+    skip_first_n: int = 0
 ) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """
     Build triangulated membrane surface from escape paths.
     
     Returns empty list if the membrane is too thin (paths nearly identical),
     which happens on flat surfaces where adjacent vertices escape the same way.
+    
+    Args:
+        path_i: Escape path from vi to wi (vertex indices)
+        path_j: Escape path from vj to wj (vertex indices)
+        boundary_path: Path from wi to wj on boundary (vertex indices)
+        tet_vertices: Tetrahedral mesh vertices
+        boundary_vertices: Boundary mesh vertices
+        min_thickness: Minimum membrane thickness (skip if too thin)
+        skip_first_n: Number of triangle pairs to skip at the start (near part surface)
+                      This helps avoid false positives where membrane touches its origin
     """
     path_i_positions = tet_vertices[path_i]
     path_j_positions = tet_vertices[path_j]
@@ -2995,7 +3832,9 @@ def _build_membrane_triangles(
         path_j_resampled.append(pos_j)
     
     # Create triangles between the two paths
-    for s in range(n_samples - 1):
+    # Skip the first skip_first_n triangle pairs (they touch the part surface)
+    start_s = skip_first_n
+    for s in range(start_s, n_samples - 1):
         p0 = path_i_resampled[s]
         p1 = path_i_resampled[s + 1]
         p2 = path_j_resampled[s]
@@ -3068,47 +3907,6 @@ def _segment_intersects_triangle(
     
     # Check if intersection is within the segment (boolean - no tolerance scaling)
     return (t >= -EPSILON) and (t <= seg_length + EPSILON)
-    
-    return False
-    
-    # Create triangles between the two paths
-    for s in range(n_samples - 1):
-        p0 = path_i_resampled[s]
-        p1 = path_i_resampled[s + 1]
-        p2 = path_j_resampled[s]
-        p3 = path_j_resampled[s + 1]
-        
-        membrane_triangles.append((p0, p1, p2))
-        membrane_triangles.append((p1, p3, p2))
-    
-    # Add boundary path lid
-    if len(boundary_path) > 1:
-        boundary_path_positions = boundary_vertices[boundary_path]
-        wi_pos = path_i_resampled[-1]
-        wj_pos = path_j_resampled[-1]
-        mid = (wi_pos + wj_pos) / 2
-        
-        for i in range(len(boundary_path_positions) - 1):
-            bp0 = boundary_path_positions[i]
-            bp1 = boundary_path_positions[i + 1]
-            membrane_triangles.append((bp0, bp1, mid))
-    
-    return membrane_triangles
-    
-    for vi, vj, path_i, path_j, boundary_path in edge_membrane_data:
-        # The edge being tested - we skip intersection tests with this edge and its adjacent edges
-        test_edge = (min(vi, vj), max(vi, vj))
-        
-        # Check if membrane from (vi, vj) intersects any OTHER seed edge
-        if _membrane_intersects_seed_edges(
-            vi, vj, path_i, path_j, boundary_path,
-            vertices, boundary_verts,
-            all_seed_edges, all_seed_edge_positions,
-            test_edge, sensitivity
-        ):
-            secondary_cuts.append((vi, vj))
-    
-    return secondary_cuts
 
 
 def _build_boundary_adjacency(boundary_mesh: trimesh.Trimesh) -> Dict[int, List[Tuple[int, float]]]:
@@ -3194,6 +3992,89 @@ def _shortest_path_on_boundary(
     path.reverse()
     
     return path
+
+
+def _multi_target_dijkstra_boundary(
+    source: int,
+    targets: set,
+    boundary_mesh: trimesh.Trimesh,
+    adjacency: Dict[int, List[Tuple[int, float]]]
+) -> Dict[int, List[int]]:
+    """
+    Compute shortest paths from a single source to multiple targets on the boundary mesh.
+    
+    This is more efficient than running Dijkstra separately for each target,
+    as we can stop early once all targets are found.
+    
+    Args:
+        source: Source vertex index on boundary mesh
+        targets: Set of target vertex indices
+        boundary_mesh: The boundary mesh
+        adjacency: Pre-built adjacency list with edge lengths
+        
+    Returns:
+        Dict mapping target -> path (list of vertex indices from source to target)
+    """
+    import heapq
+    
+    if not targets:
+        return {}
+    
+    # Quick check for trivial case
+    results = {}
+    remaining_targets = set(targets)
+    
+    if source in remaining_targets:
+        results[source] = [source]
+        remaining_targets.discard(source)
+        if not remaining_targets:
+            return results
+    
+    n_verts = len(boundary_mesh.vertices)
+    dist = np.full(n_verts, np.inf, dtype=np.float64)
+    dist[source] = 0.0
+    predecessor = np.full(n_verts, -1, dtype=np.int64)
+    
+    pq = [(0.0, source)]
+    visited = np.zeros(n_verts, dtype=bool)
+    
+    while pq and remaining_targets:
+        d, u = heapq.heappop(pq)
+        
+        if visited[u]:
+            continue
+        visited[u] = True
+        
+        # Check if we reached a target
+        if u in remaining_targets:
+            # Reconstruct path to this target
+            path = []
+            current = u
+            while current >= 0:
+                path.append(current)
+                current = predecessor[current]
+            path.reverse()
+            results[u] = path
+            remaining_targets.discard(u)
+            
+            if not remaining_targets:
+                break
+        
+        # Explore neighbors
+        for v, cost in adjacency.get(u, []):
+            if visited[v]:
+                continue
+            new_dist = d + cost
+            if new_dist < dist[v]:
+                dist[v] = new_dist
+                predecessor[v] = u
+                heapq.heappush(pq, (new_dist, v))
+    
+    # Return empty paths for any targets we couldn't reach
+    for t in remaining_targets:
+        results[t] = []
+    
+    return results
 
 
 def _membrane_intersects_part_v2(

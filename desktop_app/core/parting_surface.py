@@ -1113,6 +1113,12 @@ def extract_parting_surface_from_tet_result(
     if tet_result.tet_edge_indices is None:
         raise ValueError("tet_edge_indices not computed - run prepare_parting_surface_data first")
     
+    # Determine which vertex labels to use for label-derived cuts
+    # - PRIMARY: Use vertex_mold_labels (H1 vs H2)
+    # - SECONDARY: Compute binary labels based on cut edge sidedness
+    vertex_labels_for_cuts = None
+    use_label_derived_cuts = False
+    
     # Compute appropriate cut edge flags based on cut_type
     if cut_type == 'primary':
         if tet_result.primary_cut_edges is None:
@@ -1124,6 +1130,11 @@ def extract_parting_surface_from_tet_result(
             tet_result.edge_to_index
         )
         logger.info(f"Extracting PRIMARY parting surface ({np.sum(cut_flags)} edges)")
+        
+        # PRIMARY: Use vertex_mold_labels for label-derived cuts
+        use_label_derived_cuts = True
+        vertex_labels_for_cuts = tet_result.vertex_mold_labels
+        
     elif cut_type == 'secondary':
         if tet_result.secondary_cut_edges is None:
             logger.warning("No secondary cut edges found")
@@ -1147,11 +1158,41 @@ def extract_parting_surface_from_tet_result(
                 tet_result.edge_to_index
             )
             logger.info(f"Extracting SECONDARY parting surface ({np.sum(cut_flags)} edges)")
+        
+        # SECONDARY: Compute BINARY vertex labels based on cut edge sidedness
+        # This ensures we only get valid 0/3/4-edge configs (no 5/6-edge)
+        logger.info("Computing binary vertex labels for secondary surface...")
+        secondary_vertex_labels = tm.compute_secondary_vertex_labels(
+            tet_result.vertices,
+            tet_result.edges,
+            tet_result.secondary_cut_edges,
+            tet_result.tetrahedra,
+            vertex_mold_labels=tet_result.vertex_mold_labels,
+            edge_to_index=tet_result.edge_to_index
+        )
+        
+        # Check if we got valid labels
+        n_labeled = np.sum(secondary_vertex_labels > 0)
+        if n_labeled > 0:
+            use_label_derived_cuts = True
+            vertex_labels_for_cuts = secondary_vertex_labels
+            logger.info(f"Using binary labels for secondary surface ({n_labeled} vertices labeled)")
+        else:
+            # Fallback to raw cut_edge_flags if labeling failed
+            logger.warning("Secondary vertex labeling failed - falling back to raw cut_edge_flags")
+            use_label_derived_cuts = False
+            vertex_labels_for_cuts = None
+        
     else:  # 'both'
         if tet_result.cut_edge_flags is None:
             raise ValueError("cut_edge_flags not computed - run prepare_parting_surface_data first")
         cut_flags = tet_result.cut_edge_flags
         logger.info(f"Extracting combined (PRIMARY + SECONDARY) parting surface ({np.sum(cut_flags)} edges)")
+        
+        # 'both': Use vertex_mold_labels for primary portion
+        # Secondary edges may still produce inconsistent configs, but primary will be clean
+        use_label_derived_cuts = True
+        vertex_labels_for_cuts = tet_result.vertex_mold_labels
     
     # Build full vertex_escape_distances array from seed data if available
     # seed_distances is indexed by interior vertex index, we need global vertex index
@@ -1177,11 +1218,6 @@ def extract_parting_surface_from_tet_result(
     else:
         logger.info("No seed_distances available - will use midpoint cut point placement")
     
-    # CRITICAL: For secondary surfaces, do NOT derive cuts from vertex_mold_labels
-    # because secondary cuts connect vertices with the SAME label (both H1 or both H2).
-    # Primary surfaces need label-derived cuts for consistency.
-    use_label_derived_cuts = (cut_type == 'primary')
-    
     return extract_parting_surface(
         vertices=tet_result.vertices,
         tetrahedra=tet_result.tetrahedra,
@@ -1191,9 +1227,9 @@ def extract_parting_surface_from_tet_result(
         use_original_vertices=use_original_vertices,
         vertices_original=tet_result.vertices_original,
         boundary_labels=tet_result.boundary_labels,  # Pass for boundary-aware cut point placement
-        vertex_mold_labels=tet_result.vertex_mold_labels,  # Pass for direct label-based config computation
+        vertex_mold_labels=vertex_labels_for_cuts,  # Pass computed labels (primary OR secondary)
         vertex_escape_distances=vertex_escape_distances,  # Pass for weighted cut point placement
-        use_label_derived_cuts=use_label_derived_cuts  # Only True for primary surface
+        use_label_derived_cuts=use_label_derived_cuts  # Now True for BOTH primary and secondary
     )
 
 

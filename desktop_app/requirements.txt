@@ -9,6 +9,9 @@ trimesh>=4.0.0
 numpy>=1.24.0
 scipy>=1.11.0
 
+# Collision Detection (required for secondary cuts detection)
+python-fcl>=0.7.0
+
 # Mesh Repair (MeshLib - high-performance mesh repair)
 meshlib>=3.0.0
 

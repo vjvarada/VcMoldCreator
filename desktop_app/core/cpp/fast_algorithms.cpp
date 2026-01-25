@@ -703,11 +703,33 @@ SecondaryCutsResult find_secondary_cuts_cpp(
     std::vector<std::array<Vec3, 3>> seed_tris(n_seed_triangles);
     std::vector<std::array<int64_t, 3>> seed_verts(n_seed_triangles);
     
+    // OPTIMIZATION: Pre-compute bounding boxes for seed triangles (AABB culling)
+    struct AABB {
+        Vec3 min_pt;
+        Vec3 max_pt;
+    };
+    std::vector<AABB> seed_aabbs(n_seed_triangles);
+    
     for (int64_t t = 0; t < n_seed_triangles; t++) {
         seed_tris[t][0] = {seed_tri_buf(t, 0, 0), seed_tri_buf(t, 0, 1), seed_tri_buf(t, 0, 2)};
         seed_tris[t][1] = {seed_tri_buf(t, 1, 0), seed_tri_buf(t, 1, 1), seed_tri_buf(t, 1, 2)};
         seed_tris[t][2] = {seed_tri_buf(t, 2, 0), seed_tri_buf(t, 2, 1), seed_tri_buf(t, 2, 2)};
         seed_verts[t] = {seed_vert_buf(t, 0), seed_vert_buf(t, 1), seed_vert_buf(t, 2)};
+        
+        // Compute AABB for this seed triangle
+        const auto& v0 = seed_tris[t][0];
+        const auto& v1 = seed_tris[t][1];
+        const auto& v2 = seed_tris[t][2];
+        seed_aabbs[t].min_pt = {
+            std::min({v0[0], v1[0], v2[0]}),
+            std::min({v0[1], v1[1], v2[1]}),
+            std::min({v0[2], v1[2], v2[2]})
+        };
+        seed_aabbs[t].max_pt = {
+            std::max({v0[0], v1[0], v2[0]}),
+            std::max({v0[1], v1[1], v2[1]}),
+            std::max({v0[2], v1[2], v2[2]})
+        };
     }
     
     // Get raw pointers for faster access
@@ -769,6 +791,18 @@ SecondaryCutsResult find_secondary_cuts_cpp(
         
         if (membrane_triangles.empty()) continue;
         
+        // OPTIMIZATION: Compute membrane AABB for fast culling
+        Vec3 mem_min = {1e30, 1e30, 1e30};
+        Vec3 mem_max = {-1e30, -1e30, -1e30};
+        for (const auto& tri : membrane_triangles) {
+            for (const auto& v : tri) {
+                for (int d = 0; d < 3; d++) {
+                    mem_min[d] = std::min(mem_min[d], v[d]);
+                    mem_max[d] = std::max(mem_max[d], v[d]);
+                }
+            }
+        }
+        
         // Build skip vertices set (vertices adjacent to edge)
         std::unordered_set<int64_t> skip_vertices;
         skip_vertices.insert(vi);
@@ -782,6 +816,14 @@ SecondaryCutsResult find_secondary_cuts_cpp(
         int64_t intersection_count = 0;
         
         for (int64_t t = 0; t < n_seed_triangles; t++) {
+            // OPTIMIZATION: AABB culling - skip if bounding boxes don't overlap
+            const auto& seed_bb = seed_aabbs[t];
+            if (mem_max[0] < seed_bb.min_pt[0] || mem_min[0] > seed_bb.max_pt[0] ||
+                mem_max[1] < seed_bb.min_pt[1] || mem_min[1] > seed_bb.max_pt[1] ||
+                mem_max[2] < seed_bb.min_pt[2] || mem_min[2] > seed_bb.max_pt[2]) {
+                continue;  // No overlap, skip this seed triangle
+            }
+            
             // Skip triangles sharing vertices with membrane edge
             const auto& sv = seed_verts[t];
             if (skip_vertices.count(sv[0]) || skip_vertices.count(sv[1]) || skip_vertices.count(sv[2])) {
