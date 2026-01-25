@@ -1159,29 +1159,19 @@ def extract_parting_surface_from_tet_result(
             )
             logger.info(f"Extracting SECONDARY parting surface ({np.sum(cut_flags)} edges)")
         
-        # SECONDARY: Compute BINARY vertex labels based on cut edge sidedness
-        # This ensures we only get valid 0/3/4-edge configs (no 5/6-edge)
-        logger.info("Computing binary vertex labels for secondary surface...")
-        secondary_vertex_labels = tm.compute_secondary_vertex_labels(
-            tet_result.vertices,
-            tet_result.edges,
-            tet_result.secondary_cut_edges,
-            tet_result.tetrahedra,
-            vertex_mold_labels=tet_result.vertex_mold_labels,
-            edge_to_index=tet_result.edge_to_index
-        )
-        
-        # Check if we got valid labels
-        n_labeled = np.sum(secondary_vertex_labels > 0)
-        if n_labeled > 0:
-            use_label_derived_cuts = True
-            vertex_labels_for_cuts = secondary_vertex_labels
-            logger.info(f"Using binary labels for secondary surface ({n_labeled} vertices labeled)")
-        else:
-            # Fallback to raw cut_edge_flags if labeling failed
-            logger.warning("Secondary vertex labeling failed - falling back to raw cut_edge_flags")
-            use_label_derived_cuts = False
-            vertex_labels_for_cuts = None
+        # SECONDARY: Use pre-computed cut_edge_flags directly (NOT label-derived!)
+        # 
+        # CRITICAL: For secondary surfaces, we CANNOT derive cuts from vertex labels because:
+        # 1. Secondary vertex labels are only assigned to vertices in tets with secondary cuts
+        # 2. Other vertices remain labeled 0 (unlabeled)
+        # 3. Label-derived cuts require BOTH endpoints to have labels 1 or 2
+        # 4. This would exclude edges where one endpoint is unlabeled (label 0)
+        # 
+        # Therefore, we MUST use the pre-computed cut_flags which correctly mark
+        # all secondary cut edges (and primary edges in shared tets if extend_to_primary=True)
+        use_label_derived_cuts = False
+        vertex_labels_for_cuts = None
+        logger.info("SECONDARY surface: Using pre-computed cut_edge_flags (NOT label-derived)")
         
     else:  # 'both'
         if tet_result.cut_edge_flags is None:

@@ -2014,14 +2014,13 @@ class SecondaryCutsWorker(QThread):
             cache_time = (time.time() - start_time) * 1000
             self.progress.emit(f"Detecting secondary cuts ({gpu_status}, min_intersections={self.min_intersection_count})...")
             
-            # Use triangle-based method (builds discrete membrane surface, checks intersection)
+            # Use collision-based method (FCL/BVH with fallback to triangle intersection)
             # Per paper Section 4.2: check if "minimal surface bounded by escape paths intersects M"
             secondary_cuts = find_secondary_cutting_edges(
                 self.tet_result,
                 self.part_mesh,
                 min_intersection_count=self.min_intersection_count,
-                use_gpu=self.use_gpu,
-                method='triangle'  # Builds triangulated membrane, checks intersection with part
+                use_gpu=self.use_gpu
             )
             
             # Store results in tet_result
@@ -2600,12 +2599,16 @@ class SecondarySurfaceExtractionWorker(QThread):
             self.progress.emit("Extracting secondary surface with Marching Tetrahedra...")
             extraction_start = time.time()
             
+            # Per paper Section 4.2-4.3:
+            # Secondary membranes connect to the PRIMARY parting surface (not hull)
+            # extend_to_primary=True includes primary edges in shared tetrahedra
+            # so the secondary surface can connect to the primary surface
             extraction_result = extract_parting_surface_from_tet_result(
                 self.tet_result,
                 use_original_vertices=True,
                 prepare_data=False,
                 cut_type='secondary',  # Use secondary cut edges
-                extend_to_primary=False  # Don't include primary connections for now
+                extend_to_primary=True  # Include primary edges in shared tets for connectivity
             )
             
             result.extraction_time_ms = (time.time() - extraction_start) * 1000

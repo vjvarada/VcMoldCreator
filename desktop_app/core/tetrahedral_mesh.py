@@ -2599,8 +2599,7 @@ def find_secondary_cutting_edges(
     part_mesh: trimesh.Trimesh,
     boundary_mesh: trimesh.Trimesh = None,
     min_intersection_count: int = 1,
-    use_gpu: bool = True,
-    method: str = 'triangle'  # 'triangle' (default) or 'ray' (experimental)
+    use_gpu: bool = True
 ) -> List[Tuple[int, int]]:
     """
     Find secondary cutting edges where the membrane between same-label interior vertices 
@@ -2639,11 +2638,7 @@ def find_secondary_cutting_edges(
                                Higher values filter out false positives from edge cases
                                1 = any intersection triggers secondary cut
                                Higher = requires multiple intersections (more confidence)
-        use_gpu: Whether to use CUDA acceleration if available (default True)
-        method: Intersection testing method:
-                'triangle' - Triangle-triangle intersection (default, correct per paper)
-                             Builds membrane surface and checks intersection with seed triangles
-                'ray' - (EXPERIMENTAL) Ray casting - may not correctly detect all intersections
+        use_gpu: Whether to use CUDA acceleration if available (default True, used as fallback)
     
     Returns:
         List of (vi, vj) tuples representing secondary cutting edges
@@ -2659,9 +2654,6 @@ def find_secondary_cutting_edges(
     if tet_result.seed_escape_paths is None:
         raise ValueError("Escape paths must be computed (run updated Dijkstra)")
     
-    # Store method and part_mesh for Phase 7
-    use_ray_method = (method.lower() == 'ray')
-    
     # Use the INFLATED geometry for membrane construction - this is where Dijkstra paths were computed
     # The escape paths are vertex indices that refer to the inflated mesh vertices
     vertices = tet_result.vertices  # Inflated mesh for membrane geometry
@@ -2674,7 +2666,7 @@ def find_secondary_cutting_edges(
         logger.warning("No boundary mesh available for secondary cuts")
         return []
     
-    logger.info(f"=== SECONDARY CUTS DETAILED TIMING (method={method}) ===")
+    logger.info(f"=== SECONDARY CUTS DETAILED TIMING ===")
     logger.info(f"Input: {len(vertices)} vertices, {len(boundary_mesh.vertices)} boundary verts")
     
     # These now contain ALL interior vertices (not just those on part surface)
@@ -3003,41 +2995,27 @@ def find_secondary_cutting_edges(
         return []
     
     # =========================================================================
-    # PHASE 7: INTERSECTION TESTING
+    # PHASE 7: INTERSECTION TESTING (Collision-based with FCL/BVH)
     # =========================================================================
     phase_start = time.time()
-    logger.info(f"Phase 7: Starting intersection tests (method={method}, min_intersection_count={min_intersection_count})")
+    logger.info(f"Phase 7: Starting collision-based intersection tests (min_intersection_count={min_intersection_count})")
     
     # Default minimum membrane thickness to avoid false positives from flat surfaces
     min_membrane_thickness = 0.0
     
-    if use_ray_method:
-        # EXPERIMENTAL: Ray-based method (may miss some intersections)
-        logger.info("Phase 7: Using ray-based method (EXPERIMENTAL)")
-        secondary_cuts = _find_secondary_cuts_ray_based(
-            edge_membrane_data,
-            part_mesh,
-            vertices,
-            boundary_verts,
-            min_intersection_count,
-            min_membrane_thickness
-        )
-    else:
-        # PAPER-FAITHFUL: Collision-based method
-        # Uses trimesh CollisionManager with FCL/BVH for O(log n) collision queries
-        # IMPORTANT: Check against SEED TRIANGLES (tet mesh resolution), not original part mesh
-        # This avoids false positives from resolution mismatch
-        logger.info("Phase 7: Using collision-based method (BVH-accelerated, tet-resolution)")
-        secondary_cuts = _find_secondary_cuts_collision_based(
-            edge_membrane_data,
-            seed_triangles,
-            seed_triangle_positions,
-            vertices,
-            boundary_verts,
-            min_intersection_count,
-            min_membrane_thickness,
-            part_mesh  # Fallback only
-        )
+    # Uses trimesh CollisionManager with FCL/BVH for O(log n) collision queries
+    # IMPORTANT: Check against SEED TRIANGLES (tet mesh resolution), not original part mesh
+    # This avoids false positives from resolution mismatch
+    secondary_cuts = _find_secondary_cuts_collision_based(
+        edge_membrane_data,
+        seed_triangles,
+        seed_triangle_positions,
+        vertices,
+        boundary_verts,
+        min_intersection_count,
+        min_membrane_thickness,
+        use_gpu  # For fallback to triangle method if FCL unavailable
+    )
     
     timing_log['phase7_intersection_test'] = (time.time() - phase_start) * 1000
     
@@ -3061,179 +3039,6 @@ def find_secondary_cutting_edges(
     return secondary_cuts
 
 
-def _find_secondary_cuts_by_triangle_intersection(
-    edge_membrane_data: List[Tuple],
-    seed_triangles: List[Tuple[int, int, int]],
-    seed_triangle_positions: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
-    vertices: np.ndarray,
-    boundary_verts: np.ndarray,
-    min_intersection_count: int = 1,
-    min_membrane_thickness: float = 0.0,
-    use_gpu: bool = True
-) -> List[Tuple[int, int]]:
-    """
-    Find secondary cuts by checking if membranes intersect seed TRIANGLES (faces).
-    
-    This approach checks if the membrane surface cuts through the triangular faces
-    formed by seed vertices, which represent the part surface in tetrahedral mesh
-    resolution. This is more robust than checking individual edges.
-    
-    Args:
-        min_intersection_count: Minimum number of segment-triangle intersections required (1-20)
-        min_membrane_thickness: Skip membranes thinner than this (avoids false positives
-                               on flat surfaces where escape paths are nearly identical)
-    
-    Uses GPU acceleration if available for massive speedup.
-    """
-    import time
-    
-    n_triangles = len(seed_triangles)
-    n_membranes = len(edge_membrane_data)
-    logger.info(f"Phase 7: checking {n_membranes} membranes against {n_triangles} seed triangles (min_intersections={min_intersection_count})")
-    
-    if n_triangles == 0:
-        logger.warning("No seed triangles found - cannot check for secondary cuts")
-        return []
-    
-    # Check GPU availability
-    gpu_available = use_gpu and CUDA_AVAILABLE and TORCH_AVAILABLE
-    
-    if gpu_available:
-        logger.info("Secondary cuts: Using GPU acceleration")
-        return _find_secondary_cuts_triangle_gpu(
-            edge_membrane_data, seed_triangles, seed_triangle_positions,
-            vertices, boundary_verts, min_intersection_count, min_membrane_thickness
-        )
-    else:
-        logger.info("Secondary cuts: Using CPU")
-        return _find_secondary_cuts_triangle_cpu(
-            edge_membrane_data, seed_triangles, seed_triangle_positions,
-            vertices, boundary_verts, min_intersection_count, min_membrane_thickness
-        )
-
-
-def _find_secondary_cuts_ray_based(
-    edge_membrane_data: List[Tuple],
-    part_mesh: 'trimesh.Trimesh',
-    vertices: np.ndarray,
-    boundary_verts: np.ndarray,
-    min_intersection_count: int = 1,
-    min_membrane_thickness: float = 0.0
-) -> List[Tuple[int, int]]:
-    """
-    Paper-faithful secondary cuts detection using ray casting.
-    
-    Per Section 4.2: Check if "minimal surface bounded by escape paths intersects M".
-    
-    Instead of building full membrane triangles, we cast rays across the membrane
-    region and check for intersections with the original part mesh M.
-    This is much faster because:
-    1. trimesh uses BVH internally for O(log n) ray queries
-    2. We don't need to build membrane triangles
-    3. The part mesh BVH is built once and reused for all membranes
-    
-    The "cross-path" segments (between path_i and path_j at each depth) 
-    approximate the minimal surface check.
-    """
-    import time
-    
-    n_membranes = len(edge_membrane_data)
-    logger.info(f"Phase 7 (ray-based): checking {n_membranes} membranes against part mesh")
-    
-    # Build ray intersector once for the part mesh (uses BVH internally)
-    ray_intersector = part_mesh.ray
-    
-    secondary_cuts = []
-    
-    # Progress tracking
-    progress_interval = max(1, n_membranes // 10)
-    last_progress_time = time.time()
-    
-    for membrane_idx, (vi, vj, path_i, path_j, boundary_path) in enumerate(edge_membrane_data):
-        n_i = len(path_i)
-        n_j = len(path_j)
-        
-        if n_i < 2 or n_j < 2:
-            continue
-        
-        # Get path positions
-        path_i_positions = vertices[path_i]
-        path_j_positions = vertices[path_j]
-        
-        # Check membrane thickness (skip flat surfaces)
-        if min_membrane_thickness > 0:
-            max_dist = 0.0
-            for k in range(min(n_i, n_j)):
-                dist = np.linalg.norm(path_i_positions[k] - path_j_positions[k])
-                max_dist = max(max_dist, dist)
-            if max_dist < min_membrane_thickness:
-                continue
-        
-        # Sample cross-path segments (rays between path_i and path_j)
-        # This approximates the minimal surface
-        intersection_count = 0
-        n_samples = min(max(n_i, n_j), 10)  # Sample up to 10 depth levels
-        
-        ray_origins = []
-        ray_directions = []
-        ray_lengths = []
-        
-        for s in range(n_samples):
-            t = s / max(1, n_samples - 1)
-            
-            idx_i = min(int(t * (n_i - 1)), n_i - 1)
-            idx_j = min(int(t * (n_j - 1)), n_j - 1)
-            
-            p_i = path_i_positions[idx_i]
-            p_j = path_j_positions[idx_j]
-            
-            direction = p_j - p_i
-            length = np.linalg.norm(direction)
-            
-            if length > 1e-6:
-                ray_origins.append(p_i)
-                ray_directions.append(direction / length)
-                ray_lengths.append(length)
-        
-        if len(ray_origins) == 0:
-            continue
-        
-        ray_origins = np.array(ray_origins)
-        ray_directions = np.array(ray_directions)
-        ray_lengths = np.array(ray_lengths)
-        
-        # Cast rays and check for intersections
-        locations, index_ray, index_tri = ray_intersector.intersects_location(
-            ray_origins, ray_directions, multiple_hits=False
-        )
-        
-        # Count valid intersections (within the segment, not beyond)
-        for hit_idx, ray_idx in enumerate(index_ray):
-            hit_point = locations[hit_idx]
-            origin = ray_origins[ray_idx]
-            hit_dist = np.linalg.norm(hit_point - origin)
-            
-            # Check if hit is within the segment (with small tolerance)
-            if hit_dist <= ray_lengths[ray_idx] * 1.01:
-                intersection_count += 1
-                if intersection_count >= min_intersection_count:
-                    break
-        
-        if intersection_count >= min_intersection_count:
-            secondary_cuts.append((vi, vj))
-        
-        # Progress logging
-        if membrane_idx > 0 and membrane_idx % progress_interval == 0:
-            elapsed = time.time() - last_progress_time
-            pct = (membrane_idx / n_membranes) * 100
-            rate = progress_interval / elapsed if elapsed > 0 else 0
-            eta = (n_membranes - membrane_idx) / rate if rate > 0 else 0
-            logger.info(f"  Ray progress: {membrane_idx}/{n_membranes} ({pct:.0f}%) - {len(secondary_cuts)} cuts found - ETA: {eta:.1f}s")
-            last_progress_time = time.time()
-    
-    return secondary_cuts
-
-
 def _find_secondary_cuts_collision_based(
     edge_membrane_data: List[Tuple],
     seed_triangles: List[Tuple[int, int, int]],
@@ -3242,7 +3047,7 @@ def _find_secondary_cuts_collision_based(
     boundary_verts: np.ndarray,
     min_intersection_count: int = 1,
     min_membrane_thickness: float = 0.0,
-    part_mesh: 'trimesh.Trimesh' = None  # Fallback only
+    use_gpu: bool = True  # For fallback to triangle-based method
 ) -> List[Tuple[int, int]]:
     """
     Paper-faithful secondary cuts detection using trimesh CollisionManager.
@@ -3278,11 +3083,19 @@ def _find_secondary_cuts_collision_based(
         # Test that FCL is actually available by creating a manager
         manager = CollisionManager()
     except (ImportError, ValueError) as e:
-        logger.warning(f"trimesh.collision/FCL not available ({e}) - falling back to CPU triangle method")
-        return _find_secondary_cuts_triangle_cpu(
-            edge_membrane_data, seed_triangles, seed_triangle_positions,
-            vertices, boundary_verts, min_intersection_count, min_membrane_thickness
-        )
+        logger.warning(f"trimesh.collision/FCL not available ({e}) - falling back to triangle method")
+        # Choose GPU or CPU based on availability
+        gpu_available = use_gpu and CUDA_AVAILABLE and TORCH_AVAILABLE
+        if gpu_available:
+            return _find_secondary_cuts_triangle_gpu(
+                edge_membrane_data, seed_triangles, seed_triangle_positions,
+                vertices, boundary_verts, min_intersection_count, min_membrane_thickness
+            )
+        else:
+            return _find_secondary_cuts_triangle_cpu(
+                edge_membrane_data, seed_triangles, seed_triangle_positions,
+                vertices, boundary_verts, min_intersection_count, min_membrane_thickness
+            )
     
     # Build mesh from seed triangles (part surface in tet mesh resolution)
     seed_verts = []
@@ -3372,58 +3185,6 @@ def _find_secondary_cuts_collision_based(
             last_progress_time = time.time()
     
     return secondary_cuts
-
-
-def _find_secondary_cuts_fallback_cpu(
-    edge_membrane_data: List[Tuple],
-    part_mesh: 'trimesh.Trimesh',
-    vertices: np.ndarray,
-    boundary_verts: np.ndarray,
-    min_intersection_count: int = 1,
-    min_membrane_thickness: float = 0.0
-) -> List[Tuple[int, int]]:
-    """
-    Fallback CPU implementation when trimesh.collision is not available.
-    
-    Builds seed triangles from part mesh and uses triangle-triangle intersection.
-    """
-    import time
-    from scipy.spatial import cKDTree
-    
-    logger.info("Phase 7 (fallback CPU): Building seed triangles from part mesh")
-    
-    # Build seed triangles from part mesh
-    part_verts = np.asarray(part_mesh.vertices)
-    tet_tree = cKDTree(vertices)
-    _, part_to_tet = tet_tree.query(part_verts, k=1)
-    
-    # All tet vertices near part mesh
-    part_surface_set = set(part_to_tet)
-    
-    seed_triangles = []
-    seed_triangle_positions = []
-    
-    for face in part_mesh.faces:
-        tet_v0 = part_to_tet[face[0]]
-        tet_v1 = part_to_tet[face[1]]
-        tet_v2 = part_to_tet[face[2]]
-        
-        # Avoid degenerate
-        if tet_v0 != tet_v1 and tet_v1 != tet_v2 and tet_v2 != tet_v0:
-            seed_triangles.append((tet_v0, tet_v1, tet_v2))
-            seed_triangle_positions.append((
-                vertices[tet_v0].copy(),
-                vertices[tet_v1].copy(),
-                vertices[tet_v2].copy()
-            ))
-    
-    logger.info(f"  Built {len(seed_triangles)} seed triangles")
-    
-    # Now use the existing triangle-triangle CPU method
-    return _find_secondary_cuts_triangle_cpu(
-        edge_membrane_data, seed_triangles, seed_triangle_positions,
-        vertices, boundary_verts, min_intersection_count, min_membrane_thickness
-    )
 
 
 def _find_secondary_cuts_triangle_cpu(
@@ -4105,145 +3866,3 @@ def _multi_target_dijkstra_boundary(
     
     return results
 
-
-def _membrane_intersects_part_v2(
-    vi: int, vj: int,
-    path_i: List[int], path_j: List[int],
-    boundary_path: List[int],
-    tet_vertices: np.ndarray,
-    boundary_vertices: np.ndarray,
-    part_mesh: trimesh.Trimesh,
-    distance_tolerance: float,
-    sensitivity: float
-) -> bool:
-    """
-    Check if the membrane surface bounded by the given paths intersects the part mesh.
-    
-    The membrane is bounded by 4 edges (all paths go OUTWARD from seeds):
-    1. Edge (vi, vj) - on the part surface (inner boundary)
-    2. Path vi → wi - escape path from seed vi outward to boundary point wi
-    3. Path vj → wj - escape path from seed vj outward to boundary point wj
-    4. Path wi → wj - shortest path on outer boundary ∂H
-    
-    Visually:
-    
-        wi -----(boundary path)---- wj
-        ↑                            ↑
-     path_i                       path_j
-     (outward)                   (outward)
-        |                            |
-        vi -----(part edge)------- vj
-    
-    If this membrane passes THROUGH the part mesh, the mold cannot separate
-    without cutting through the part at this edge → secondary cut needed.
-    """
-    # Get positions of escape path vertices (paths contain tet mesh vertex indices)
-    # path_i: [vi, v1, v2, ..., wi] - from seed OUTWARD to boundary
-    # path_j: [vj, v1, v2, ..., wj] - from seed OUTWARD to boundary
-    path_i_positions = tet_vertices[path_i]
-    path_j_positions = tet_vertices[path_j]
-    
-    # Get boundary path positions (indices into boundary mesh)
-    # boundary_path: [wi_idx, ..., wj_idx] on the outer boundary mesh
-    if len(boundary_path) > 0:
-        boundary_path_positions = boundary_vertices[boundary_path]
-    else:
-        boundary_path_positions = np.empty((0, 3))
-    
-    # The membrane is a quadrilateral-like surface with 4 sides:
-    # Side 1: vi → vj (part surface edge) - implicit, connects the two seeds
-    # Side 2: vi → wi (path_i going outward)
-    # Side 3: wi → wj (boundary path)
-    # Side 4: wj → vj (NOT the reverse of path_j, but the boundary path connects to vj via path_j end)
-    
-    # Sample points across the membrane surface
-    # The key sampling is between the two OUTWARD paths (path_i and path_j)
-    sample_points = []
-    
-    n_i = len(path_i_positions)
-    n_j = len(path_j_positions)
-    
-    if n_i < 1 or n_j < 1:
-        return False
-    
-    # Sample across the "ribbon" between the two outward escape paths
-    # At each depth level t (0=seeds, 1=boundary), sample across from path_i to path_j
-    n_depth_samples = max(n_i, n_j, 5)
-    
-    for s in range(n_depth_samples):
-        t = s / max(1, n_depth_samples - 1)
-        
-        # Get position along path_i at parameter t (0=vi, 1=wi)
-        idx_i = min(int(t * (n_i - 1)), n_i - 1)
-        pos_i = path_i_positions[idx_i]
-        
-        # Get position along path_j at parameter t (0=vj, 1=wj)
-        idx_j = min(int(t * (n_j - 1)), n_j - 1)
-        pos_j = path_j_positions[idx_j]
-        
-        # Sample across the ribbon at this depth (between the two paths)
-        for u in [0.2, 0.35, 0.5, 0.65, 0.8]:
-            sample = pos_i * (1 - u) + pos_j * u
-            sample_points.append(sample)
-    
-    # Also sample the "top" of the membrane (boundary path wi → wj)
-    if len(boundary_path_positions) > 1:
-        wi_pos = path_i_positions[-1] if n_i > 0 else None
-        wj_pos = path_j_positions[-1] if n_j > 0 else None
-        
-        if wi_pos is not None and wj_pos is not None:
-            # Sample along the boundary path and slightly inward
-            for i in range(len(boundary_path_positions)):
-                bp = boundary_path_positions[i]
-                # Sample points between boundary and the membrane interior
-                # (toward the midpoint of the escape paths)
-                mid_depth_i = path_i_positions[n_i // 2] if n_i > 1 else path_i_positions[0]
-                mid_depth_j = path_j_positions[n_j // 2] if n_j > 1 else path_j_positions[0]
-                interior_target = (mid_depth_i + mid_depth_j) / 2
-                
-                for t in [0.2, 0.4]:
-                    sample = bp * (1 - t) + interior_target * t
-                    sample_points.append(sample)
-    
-    if len(sample_points) == 0:
-        return False
-    
-    sample_points = np.array(sample_points)
-    
-    # Filter out points that are ON the part surface (seeds are on the surface)
-    # We only want to check interior membrane points
-    try:
-        _, distances_to_surface, _ = part_mesh.nearest.on_surface(sample_points)
-        
-        # Only keep points that are NOT on the surface
-        surface_threshold = distance_tolerance * 0.1
-        interior_mask = distances_to_surface > surface_threshold
-        
-        if not np.any(interior_mask):
-            # All samples are on the surface - no interior to check
-            return False
-        
-        interior_samples = sample_points[interior_mask]
-        
-        # Check if any interior sample point is INSIDE the part mesh
-        inside = part_mesh.contains(interior_samples)
-        n_inside = np.sum(inside)
-        
-        if n_inside > 0:
-            logger.debug(f"Edge ({vi}, {vj}): {n_inside}/{len(interior_samples)} membrane samples inside part")
-            return True
-        
-        # With higher sensitivity, check for samples close to surface
-        if sensitivity > 0.3:
-            interior_distances = distances_to_surface[interior_mask]
-            n_close = np.sum(interior_distances < distance_tolerance)
-            threshold_fraction = 0.1 * (1.0 - sensitivity)
-            if n_close > len(interior_distances) * threshold_fraction:
-                logger.debug(f"Edge ({vi}, {vj}): {n_close}/{len(interior_distances)} samples within tolerance")
-                return True
-                
-                
-    except Exception as e:
-        logger.warning(f"Error checking membrane intersection: {e}")
-    
-    return False
