@@ -2458,13 +2458,14 @@ class PrimarySurfaceSmoothingWorker(QThread):
                 fill_result = fill_floating_edge_gaps(
                     membrane_mesh=current_mesh,
                     part_mesh=part_mesh_for_reprojection,
-                    vertex_boundary_type=current_boundary_type
+                    vertex_boundary_type=current_boundary_type,
+                    collar_all_inner_edges=True  # Collar ALL inner edges for robust CSG
                 )
                 
                 result.gap_fill_time_ms = (time.time() - gap_fill_start) * 1000
                 
-                if fill_result.floating_edges_found > 0:
-                    self.progress.emit(f"Filled {fill_result.floating_edges_found} floating edges, "
+                if fill_result.fill_triangles_added > 0:
+                    self.progress.emit(f"Collared {fill_result.boundary_edges_checked} inner edges, "
                                      f"added {fill_result.fill_triangles_added} triangles")
                     if fill_result.mesh is not None:
                         current_mesh = fill_result.mesh
@@ -2939,13 +2940,14 @@ class CombinedSurfaceSmoothingWorker(QThread):
             fill_result = fill_floating_edge_gaps(
                 membrane_mesh=current_mesh,
                 part_mesh=part_mesh,
-                vertex_boundary_type=current_boundary_type
+                vertex_boundary_type=current_boundary_type,
+                collar_all_inner_edges=True  # Collar ALL inner edges for robust CSG
             )
             
             gap_fill_time_ms = (time.time() - gap_fill_start) * 1000
             
-            if fill_result.floating_edges_found > 0:
-                self.progress.emit(f"{label}: Filled {fill_result.floating_edges_found} floating edges, "
+            if fill_result.fill_triangles_added > 0:
+                self.progress.emit(f"{label}: Collared {fill_result.boundary_edges_checked} inner edges, "
                                  f"added {fill_result.fill_triangles_added} triangles")
                 if fill_result.mesh is not None:
                     current_mesh = fill_result.mesh
@@ -3264,11 +3266,12 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                 fill_result = fill_floating_edge_gaps(
                     membrane_mesh=current_mesh,
                     part_mesh=part_mesh_for_reprojection,
-                    vertex_boundary_type=current_boundary_type
+                    vertex_boundary_type=current_boundary_type,
+                    collar_all_inner_edges=True  # Collar ALL inner edges for robust CSG
                 )
                 
-                if fill_result.floating_edges_found > 0:
-                    self.progress.emit(f"Filled {fill_result.floating_edges_found} floating edges, "
+                if fill_result.fill_triangles_added > 0:
+                    self.progress.emit(f"Collared {fill_result.boundary_edges_checked} inner edges, "
                                      f"added {fill_result.fill_triangles_added} triangles")
                     if fill_result.mesh is not None:
                         current_mesh = fill_result.mesh
@@ -3615,20 +3618,21 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
                 # === Fill floating edge gaps after smoothing ===
                 from core.parting_surface import fill_floating_edge_gaps
                 
-                self.progress.emit("Detecting and filling floating edge gaps...")
+                self.progress.emit("Creating collar extension on inner boundary...")
                 fill_result = fill_floating_edge_gaps(
                     membrane_mesh=current_mesh,
                     part_mesh=self.part_mesh,
-                    vertex_boundary_type=None  # Use distance-based detection
+                    vertex_boundary_type=None,  # Use distance-based detection
+                    collar_all_inner_edges=True  # Collar ALL inner edges for robust CSG
                 )
                 
-                if fill_result.floating_edges_found > 0:
-                    self.progress.emit(f"Filled {fill_result.floating_edges_found} floating edges, "
+                if fill_result.fill_triangles_added > 0:
+                    self.progress.emit(f"Collared {fill_result.boundary_edges_checked} inner edges, "
                                      f"added {fill_result.fill_triangles_added} triangles")
                     if fill_result.mesh is not None:
                         current_mesh = fill_result.mesh
                 else:
-                    self.progress.emit("No floating edges detected")
+                    self.progress.emit("No inner boundary edges found")
                 
                 result.mesh = current_mesh
                 result.num_vertices = len(current_mesh.vertices)
@@ -3943,21 +3947,22 @@ class MembraneSmoothingWorker(QThread):
             if result.mesh is not None and self.part_mesh is not None:
                 from core.parting_surface import fill_floating_edge_gaps
                 
-                self.progress.emit("Detecting and filling floating edge gaps...")
+                self.progress.emit("Creating collar extension on inner boundary...")
                 fill_result = fill_floating_edge_gaps(
                     membrane_mesh=result.mesh,
                     part_mesh=self.part_mesh,
-                    vertex_boundary_type=None  # Use distance-based detection
+                    vertex_boundary_type=None,  # Use distance-based detection
+                    collar_all_inner_edges=True  # Collar ALL inner edges for robust CSG
                 )
                 
-                if fill_result.floating_edges_found > 0:
-                    self.progress.emit(f"Filled {fill_result.floating_edges_found} floating edges, "
+                if fill_result.fill_triangles_added > 0:
+                    self.progress.emit(f"Collared {fill_result.boundary_edges_checked} inner edges, "
                                      f"added {fill_result.fill_triangles_added} triangles")
                     if fill_result.mesh is not None:
                         result.mesh = fill_result.mesh
                         result.final_vertices = len(fill_result.mesh.vertices)
                 else:
-                    self.progress.emit("No floating edges detected")
+                    self.progress.emit("No inner boundary edges found")
             
             elapsed = (time.time() - start_time) * 1000
             

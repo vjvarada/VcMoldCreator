@@ -2035,7 +2035,8 @@ def fill_floating_edge_gaps(
     floating_edges: Optional[List[FloatingEdgeInfo]] = None,
     tolerance_fraction: float = FLOATING_EDGE_TOLERANCE_FRACTION,
     min_tolerance: float = FLOATING_EDGE_MIN_TOLERANCE,
-    collar_depth: float = 0.5
+    collar_depth: float = 0.5,
+    collar_all_inner_edges: bool = True
 ) -> FloatingEdgeFillingResult:
     """
     Fill gaps using Collar/Flange Extension method for robust CSG operations.
@@ -2043,8 +2044,8 @@ def fill_floating_edge_gaps(
     This approach creates a "collar" that extends the membrane boundary INTO
     the part mesh, ensuring watertight contact for Boolean operations:
     
-    1. Detect floating boundary edges (part-boundary edges not touching part)
-    2. For each floating edge, project endpoints onto the part surface
+    1. Find ALL boundary edges on the part boundary (vertex_boundary_type == -1)
+    2. For each edge, project endpoints onto the part surface
     3. Offset the projected points slightly INTO the part (along inward normal)
     4. Create triangular collar connecting original edge to offset points
     
@@ -2059,6 +2060,8 @@ def fill_floating_edge_gaps(
         tolerance_fraction: Fraction of edge length as tolerance
         min_tolerance: Minimum absolute tolerance in mm
         collar_depth: How far to extend INTO the part (mm), default 0.5mm
+        collar_all_inner_edges: If True (default), create collars for ALL inner boundary
+                                edges, not just floating ones. This ensures robust CSG.
     
     Returns:
         FloatingEdgeFillingResult with the patched mesh
@@ -2073,7 +2076,89 @@ def fill_floating_edge_gaps(
         logger.warning("Missing membrane or part mesh for collar extension")
         return result
     
-    # Detect floating edges if not provided
+    vertices_arr = np.array(membrane_mesh.vertices, dtype=np.float64)
+    faces_arr = np.array(membrane_mesh.faces, dtype=np.int64)
+    n_verts = len(vertices_arr)
+    
+    # Find ALL boundary edges (edges that appear in only one face)
+    edge_to_faces = {}
+    for fi, face in enumerate(faces_arr):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            if edge_key not in edge_to_faces:
+                edge_to_faces[edge_key] = []
+            edge_to_faces[edge_key].append(fi)
+    
+    boundary_edges = [
+        (v0, v1) for (v0, v1), flist in edge_to_faces.items() 
+        if len(flist) == 1
+    ]
+    
+    if len(boundary_edges) == 0:
+        logger.info("No boundary edges found on membrane")
+        result.mesh = membrane_mesh
+        result.vertices = np.array(membrane_mesh.vertices)
+        result.faces = np.array(membrane_mesh.faces)
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    # Check if we have boundary type information
+    has_boundary_type = (
+        vertex_boundary_type is not None and 
+        len(vertex_boundary_type) >= n_verts
+    )
+    
+    # Filter to only part-boundary edges (where BOTH vertices have type -1)
+    if has_boundary_type:
+        part_boundary_edges = []
+        for v0, v1 in boundary_edges:
+            bt0 = vertex_boundary_type[v0] if v0 < len(vertex_boundary_type) else 0
+            bt1 = vertex_boundary_type[v1] if v1 < len(vertex_boundary_type) else 0
+            if bt0 == -1 and bt1 == -1:
+                part_boundary_edges.append((v0, v1))
+        
+        logger.info(f"Found {len(part_boundary_edges)}/{len(boundary_edges)} boundary edges on part (type -1)")
+    else:
+        # No boundary type info - use distance-based classification
+        logger.info("No vertex_boundary_type provided - using distance-based classification")
+        
+        # Get all unique boundary vertices
+        boundary_vert_set = set()
+        for v0, v1 in boundary_edges:
+            boundary_vert_set.add(v0)
+            boundary_vert_set.add(v1)
+        boundary_vert_list = sorted(boundary_vert_set)
+        boundary_positions = vertices_arr[boundary_vert_list]
+        
+        # Project to part surface
+        _, boundary_distances, _ = trimesh.proximity.closest_point(part_mesh, boundary_positions)
+        
+        # Consider "on part" if within 1% of mesh bbox diagonal
+        bbox_diag = np.linalg.norm(np.ptp(vertices_arr, axis=0))
+        on_part_threshold = bbox_diag * 0.01
+        
+        part_boundary_verts = set()
+        for i, vi in enumerate(boundary_vert_list):
+            if boundary_distances[i] < on_part_threshold:
+                part_boundary_verts.add(vi)
+        
+        part_boundary_edges = [
+            (v0, v1) for v0, v1 in boundary_edges
+            if v0 in part_boundary_verts and v1 in part_boundary_verts
+        ]
+        
+        logger.info(f"Distance-based: {len(part_boundary_edges)}/{len(boundary_edges)} boundary edges on part")
+    
+    if len(part_boundary_edges) == 0:
+        logger.info("No part-boundary edges found - no collar needed")
+        result.mesh = membrane_mesh
+        result.vertices = np.array(membrane_mesh.vertices)
+        result.faces = np.array(membrane_mesh.faces)
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    # Also run floating edge detection for statistics
     if floating_edges is None:
         floating_edges = detect_floating_boundary_edges(
             membrane_mesh, part_mesh, vertex_boundary_type,
@@ -2081,11 +2166,23 @@ def fill_floating_edge_gaps(
         )
     
     result.floating_edges_info = floating_edges
-    result.boundary_edges_checked = len(floating_edges)
     result.floating_edges_found = len([e for e in floating_edges if e.is_floating])
     
-    if result.floating_edges_found == 0:
-        logger.info("No floating edges found - no collar needed")
+    # Decide which edges to collar
+    if collar_all_inner_edges:
+        # Collar ALL part-boundary edges for robust CSG
+        edges_to_collar = part_boundary_edges
+        logger.info(f"Creating collars for ALL {len(edges_to_collar)} inner boundary edges (robust CSG mode)")
+    else:
+        # Only collar floating edges (old behavior)
+        floating_edge_set = set(e.edge for e in floating_edges if e.is_floating)
+        edges_to_collar = [e for e in part_boundary_edges if e in floating_edge_set or (e[1], e[0]) in floating_edge_set]
+        logger.info(f"Creating collars for {len(edges_to_collar)} floating edges only")
+    
+    result.boundary_edges_checked = len(part_boundary_edges)
+    
+    if len(edges_to_collar) == 0:
+        logger.info("No edges to collar")
         result.mesh = membrane_mesh
         result.vertices = np.array(membrane_mesh.vertices)
         result.faces = np.array(membrane_mesh.faces)
@@ -2099,39 +2196,29 @@ def fill_floating_edge_gaps(
     
     new_vertex_indices = []  # Track new collar vertices
     
-    # Collect all unique floating boundary vertices
-    floating_vertex_set = set()
-    for edge_info in floating_edges:
-        if edge_info.is_floating:
-            floating_vertex_set.add(edge_info.edge[0])
-            floating_vertex_set.add(edge_info.edge[1])
+    # Collect all unique vertices that need collar points
+    collar_vertex_set = set()
+    for v0, v1 in edges_to_collar:
+        collar_vertex_set.add(v0)
+        collar_vertex_set.add(v1)
     
-    floating_vertices = sorted(floating_vertex_set)
+    collar_vertices = sorted(collar_vertex_set)
     
-    if len(floating_vertices) == 0:
-        result.mesh = membrane_mesh
-        result.vertices = np.array(membrane_mesh.vertices)
-        result.faces = np.array(membrane_mesh.faces)
-        result.processing_time_ms = (time.time() - start) * 1000
-        return result
+    # Get positions of collar vertices
+    collar_positions = np.array([vertices[vi] for vi in collar_vertices])
     
-    # Get positions of floating vertices
-    floating_positions = np.array([vertices[vi] for vi in floating_vertices])
-    
-    # Project all floating vertices onto part surface
+    # Project all collar vertices onto part surface
     closest_pts, closest_dists, closest_faces = trimesh.proximity.closest_point(
-        part_mesh, floating_positions
+        part_mesh, collar_positions
     )
     
     # Compute inward normals at the closest points (into the part)
-    # Use the face normal at the closest face, pointing INTO the part
     part_face_normals = part_mesh.face_normals
     
     # Build mapping: original vertex -> collar vertex index
-    # Also create the collar vertices (projected + offset into part)
-    vertex_to_collar = {}  # orig_vert_idx -> collar_vert_idx
+    vertex_to_collar = {}
     
-    for i, vi in enumerate(floating_vertices):
+    for i, vi in enumerate(collar_vertices):
         closest_pt = closest_pts[i]
         closest_face = closest_faces[i]
         
@@ -2148,15 +2235,10 @@ def fill_floating_edge_gaps(
         vertex_to_collar[vi] = collar_idx
         new_vertex_indices.append(collar_idx)
     
-    # For each floating edge, create collar triangles
+    # For each edge to collar, create collar triangles
     edges_filled = 0
     
-    for edge_info in floating_edges:
-        if not edge_info.is_floating:
-            continue
-        
-        v0, v1 = edge_info.edge
-        
+    for v0, v1 in edges_to_collar:
         # Get collar vertices
         c0 = vertex_to_collar.get(v0)
         c1 = vertex_to_collar.get(v1)
@@ -2204,7 +2286,8 @@ def fill_floating_edge_gaps(
     
     result.processing_time_ms = (time.time() - start) * 1000
     
-    logger.info(f"Collar extension: {edges_filled}/{result.floating_edges_found} edges filled, "
+    logger.info(f"Collar extension: {edges_filled} edges collared "
+                f"({result.floating_edges_found} were floating), "
                 f"{result.fill_triangles_added} triangles added, "
                 f"{result.new_vertices_added} collar vertices (depth={collar_depth}mm) "
                 f"in {result.processing_time_ms:.1f}ms")
@@ -2242,19 +2325,20 @@ def fill_floating_edge_gaps_parting_surface(
         logger.warning("Missing surface or part mesh for floating edge filling")
         return surface
     
-    logger.info(f"Using collar extension method for floating edge gap filling (depth={collar_depth}mm)")
+    logger.info(f"Using collar extension method for ALL inner boundary edges (depth={collar_depth}mm)")
     
-    # Call the core filling function
+    # Call the core filling function - collar ALL inner boundary edges
     fill_result = fill_floating_edge_gaps(
         membrane_mesh=surface.mesh,
         part_mesh=part_mesh,
         vertex_boundary_type=surface.vertex_boundary_type,
         tolerance_fraction=tolerance_fraction,
         min_tolerance=min_tolerance,
-        collar_depth=collar_depth
+        collar_depth=collar_depth,
+        collar_all_inner_edges=True  # Always collar all inner edges for robust CSG
     )
     
-    if fill_result.mesh is None or fill_result.floating_edges_found == 0:
+    if fill_result.mesh is None or fill_result.fill_triangles_added == 0:
         # No changes made
         return surface
     
@@ -2285,7 +2369,7 @@ def fill_floating_edge_gaps_parting_surface(
         extraction_time_ms=surface.extraction_time_ms + fill_result.processing_time_ms
     )
     
-    logger.info(f"Floating edge gaps filled: {fill_result.floating_edges_found} edges, "
+    logger.info(f"Collar extension complete: {fill_result.boundary_edges_checked} inner edges collared, "
                 f"{fill_result.fill_triangles_added} triangles added")
     
     return result
