@@ -25,6 +25,10 @@ manifold3d>=2.3.0
 # Tetrahedral meshing (required for parting surface computation)
 pytetwild>=0.1.0
 
+# Geodesic computation (for high-quality geodesic paths on meshes)
+# Uses the Heat Method and Edge Flip algorithms from geometry-central
+potpourri3d>=1.0.0
+
 # GPU acceleration (optional - for faster distance computation)
 # Install with CUDA support: pip install torch --index-url https://download.pytorch.org/whl/cu121
 torch>=2.0.0

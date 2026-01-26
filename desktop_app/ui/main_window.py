@@ -2797,7 +2797,10 @@ class CombinedSurfaceSmoothingWorker(QThread):
                     self.progress.emit("  WARNING: No outer tet boundary - will use fallback hull mesh")
             
             # Determine which meshes to use for re-projection
-            part_mesh_for_reprojection = inner_tet_boundary if inner_tet_boundary is not None else self.part_mesh
+            # UPDATE: Use ACTUAL part mesh instead of tetrahedral inner boundary
+            # The tetrahedral inner boundary is a simplified version that may not match
+            # the original part surface exactly, especially for complex features.
+            part_mesh_for_reprojection = self.part_mesh  # Use actual part mesh
             hull_mesh_for_reprojection = outer_tet_boundary if outer_tet_boundary is not None else self.hull_mesh
             
             # =====================================================================
@@ -2823,8 +2826,10 @@ class CombinedSurfaceSmoothingWorker(QThread):
                 self.progress.emit("No primary surface to smooth")
             
             # =====================================================================
-            # STEP 3: SMOOTH SECONDARY SURFACE (if exists)
+            # STEP 3: SKIP SECONDARY SURFACE SMOOTHING
             # =====================================================================
+            # Per user request: Only smooth primary surface, not secondary surface
+            # Secondary surfaces are kept as extracted without smoothing
             has_secondary = (self.secondary_extraction_result is not None and
                            self.secondary_extraction_result.mesh is not None and
                            self.secondary_extraction_result.num_faces > 0)
@@ -2832,23 +2837,23 @@ class CombinedSurfaceSmoothingWorker(QThread):
             if has_secondary:
                 self.progress.emit("")
                 self.progress.emit("=" * 50)
-                self.progress.emit("SMOOTHING SECONDARY SURFACE")
+                self.progress.emit("SECONDARY SURFACE (NO SMOOTHING)")
                 self.progress.emit("=" * 50)
+                self.progress.emit("Secondary surface smoothing skipped per configuration")
                 
-                result.secondary_mesh, result.secondary_num_vertices, result.secondary_num_faces, \
-                    result.secondary_boundary_vertices, result.secondary_interior_vertices, \
-                    result.secondary_smoothing_time_ms, result.secondary_gap_fill_time_ms, \
-                    result.secondary_fill_face_indices, result.secondary_restored_corner_positions = \
-                    self._smooth_single_surface(
-                        self.secondary_extraction_result.mesh.copy(),
-                        self.secondary_extraction_result.vertex_boundary_type,
-                        part_mesh_for_reprojection,
-                        hull_mesh_for_reprojection,
-                        "SECONDARY"
-                    )
+                # Copy unsmoothed secondary surface to result
+                result.secondary_mesh = self.secondary_extraction_result.mesh.copy()
+                result.secondary_num_vertices = len(result.secondary_mesh.vertices)
+                result.secondary_num_faces = len(result.secondary_mesh.faces)
+                result.secondary_boundary_vertices = 0
+                result.secondary_interior_vertices = 0
+                result.secondary_smoothing_time_ms = 0.0
+                result.secondary_gap_fill_time_ms = 0.0
+                result.secondary_fill_face_indices = None
+                result.secondary_restored_corner_positions = None
             else:
                 self.progress.emit("")
-                self.progress.emit("No secondary surface to smooth (skipping)")
+                self.progress.emit("No secondary surface to process (skipping)")
             
             # =====================================================================
             # FINALIZE

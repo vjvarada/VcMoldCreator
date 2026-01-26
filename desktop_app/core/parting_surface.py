@@ -73,8 +73,11 @@ PRIMARY_MIN_ISLAND_AREA_FRACTION = 0.01  # Islands with area < 1% of total are r
 # An edge is "floating" if its MIDPOINT is not on the part surface.
 # This is mathematically optimal because the midpoint of a chord is where
 # maximum deviation from a curve occurs.
-FLOATING_EDGE_TOLERANCE_FRACTION = 0.05  # Edge is floating if midpoint is > 5% of edge length from part
-FLOATING_EDGE_MIN_TOLERANCE = 0.01       # Minimum tolerance in mm (for very short edges)
+#
+# For CSG operations to produce manifold results, there must be NO gaps between
+# the parting surface and the part mesh. We use extremely tight tolerances.
+FLOATING_EDGE_TOLERANCE_FRACTION = 0.001  # Edge is floating if midpoint is > 0.1% of edge length from part
+FLOATING_EDGE_MIN_TOLERANCE = 1e-6        # Minimum tolerance: 1 nanometer (essentially zero for CSG)
 
 
 # =============================================================================
@@ -2032,21 +2035,21 @@ def fill_floating_edge_gaps(
     floating_edges: Optional[List[FloatingEdgeInfo]] = None,
     tolerance_fraction: float = FLOATING_EDGE_TOLERANCE_FRACTION,
     min_tolerance: float = FLOATING_EDGE_MIN_TOLERANCE,
-    n_samples: int = 7
+    collar_depth: float = 0.5
 ) -> FloatingEdgeFillingResult:
     """
-    Fill gaps created by floating boundary edges using in-plane raycasting.
+    Fill gaps using Collar/Flange Extension method for robust CSG operations.
     
-    For each floating edge (v0, v1):
-    1. Get the triangle that contains this boundary edge
-    2. Sample N points along the edge
-    3. Compute projection direction: perpendicular to edge, in triangle plane,
-       pointing from edge midpoint toward triangle centroid
-    4. Raycast from each sample point toward part surface
-    5. Create triangles connecting edge points to their ray hit points
+    This approach creates a "collar" that extends the membrane boundary INTO
+    the part mesh, ensuring watertight contact for Boolean operations:
     
-    This creates a "curtain" that follows the part surface's concave regions
-    properly (unlike closest-point projection which misses concavities).
+    1. Detect floating boundary edges (part-boundary edges not touching part)
+    2. For each floating edge, project endpoints onto the part surface
+    3. Offset the projected points slightly INTO the part (along inward normal)
+    4. Create triangular collar connecting original edge to offset points
+    
+    The collar creates overlap with the part mesh, which CSG libraries like
+    manifold3d handle robustly (vs. trying to achieve exact coincident geometry).
     
     Args:
         membrane_mesh: The smoothed membrane mesh with floating edges
@@ -2055,7 +2058,7 @@ def fill_floating_edge_gaps(
         floating_edges: Pre-detected floating edges (or None to detect)
         tolerance_fraction: Fraction of edge length as tolerance
         min_tolerance: Minimum absolute tolerance in mm
-        n_samples: Number of sample points along each floating edge (5-10)
+        collar_depth: How far to extend INTO the part (mm), default 0.5mm
     
     Returns:
         FloatingEdgeFillingResult with the patched mesh
@@ -2067,7 +2070,7 @@ def fill_floating_edge_gaps(
     result.floating_edges_info = []
     
     if membrane_mesh is None or part_mesh is None:
-        logger.warning("Missing membrane or part mesh for floating edge filling")
+        logger.warning("Missing membrane or part mesh for collar extension")
         return result
     
     # Detect floating edges if not provided
@@ -2082,7 +2085,7 @@ def fill_floating_edge_gaps(
     result.floating_edges_found = len([e for e in floating_edges if e.is_floating])
     
     if result.floating_edges_found == 0:
-        logger.info("No floating edges found - no fill needed")
+        logger.info("No floating edges found - no collar needed")
         result.mesh = membrane_mesh
         result.vertices = np.array(membrane_mesh.vertices)
         result.faces = np.array(membrane_mesh.faces)
@@ -2093,196 +2096,91 @@ def fill_floating_edge_gaps(
     vertices = list(membrane_mesh.vertices)
     faces = list(membrane_mesh.faces)
     n_orig_verts = len(vertices)
-    n_orig_faces = len(faces)
     
-    new_vertex_indices = []  # Track which new vertices should be constrained to part
+    new_vertex_indices = []  # Track new collar vertices
     
-    # For each floating edge, create ribbon fill using raycast
+    # Collect all unique floating boundary vertices
+    floating_vertex_set = set()
+    for edge_info in floating_edges:
+        if edge_info.is_floating:
+            floating_vertex_set.add(edge_info.edge[0])
+            floating_vertex_set.add(edge_info.edge[1])
+    
+    floating_vertices = sorted(floating_vertex_set)
+    
+    if len(floating_vertices) == 0:
+        result.mesh = membrane_mesh
+        result.vertices = np.array(membrane_mesh.vertices)
+        result.faces = np.array(membrane_mesh.faces)
+        result.processing_time_ms = (time.time() - start) * 1000
+        return result
+    
+    # Get positions of floating vertices
+    floating_positions = np.array([vertices[vi] for vi in floating_vertices])
+    
+    # Project all floating vertices onto part surface
+    closest_pts, closest_dists, closest_faces = trimesh.proximity.closest_point(
+        part_mesh, floating_positions
+    )
+    
+    # Compute inward normals at the closest points (into the part)
+    # Use the face normal at the closest face, pointing INTO the part
+    part_face_normals = part_mesh.face_normals
+    
+    # Build mapping: original vertex -> collar vertex index
+    # Also create the collar vertices (projected + offset into part)
+    vertex_to_collar = {}  # orig_vert_idx -> collar_vert_idx
+    
+    for i, vi in enumerate(floating_vertices):
+        closest_pt = closest_pts[i]
+        closest_face = closest_faces[i]
+        
+        # Get face normal (points outward from part surface)
+        face_normal = part_face_normals[closest_face]
+        
+        # Offset INTO the part (opposite of face normal)
+        inward_normal = -face_normal
+        collar_pt = closest_pt + collar_depth * inward_normal
+        
+        # Add collar vertex
+        collar_idx = len(vertices)
+        vertices.append(collar_pt)
+        vertex_to_collar[vi] = collar_idx
+        new_vertex_indices.append(collar_idx)
+    
+    # For each floating edge, create collar triangles
     edges_filled = 0
-    edges_skipped = 0
     
     for edge_info in floating_edges:
         if not edge_info.is_floating:
             continue
         
-        # Need face info for raycast direction
-        if edge_info.face_normal is None or edge_info.face_centroid is None:
-            logger.debug(f"Skipping edge {edge_info.edge} - no face info")
-            edges_skipped += 1
-            continue
-        
         v0, v1 = edge_info.edge
-        p0 = np.array(edge_info.v0_pos)
-        p1 = np.array(edge_info.v1_pos)
-        face_normal = np.array(edge_info.face_normal)
-        face_centroid = np.array(edge_info.face_centroid)
         
-        # Compute edge direction and midpoint
-        edge_dir = p1 - p0
-        edge_len = np.linalg.norm(edge_dir)
-        if edge_len < 1e-8:
-            edges_skipped += 1
-            continue
-        edge_dir = edge_dir / edge_len
-        edge_midpoint = 0.5 * (p0 + p1)
+        # Get collar vertices
+        c0 = vertex_to_collar.get(v0)
+        c1 = vertex_to_collar.get(v1)
         
-        # Compute projection direction:
-        # 1. Perpendicular to edge, in the triangle plane
-        # 2. Pointing from edge midpoint toward face centroid
-        
-        # in_plane_perp = cross(face_normal, edge_dir) gives a vector perpendicular
-        # to the edge and lying in the triangle plane
-        in_plane_perp = np.cross(face_normal, edge_dir)
-        perp_len = np.linalg.norm(in_plane_perp)
-        if perp_len < 1e-8:
-            edges_skipped += 1
-            continue
-        in_plane_perp = in_plane_perp / perp_len
-        
-        # Check direction: should point from edge midpoint toward face centroid
-        to_centroid = face_centroid - edge_midpoint
-        if np.dot(in_plane_perp, to_centroid) < 0:
-            in_plane_perp = -in_plane_perp
-        
-        # Now in_plane_perp points from the edge INTO the triangle (toward interior)
-        # We want to raycast in the OPPOSITE direction (away from triangle, toward part)
-        ray_direction = -in_plane_perp
-        
-        # Sample points along the edge
-        t_values = np.linspace(0.0, 1.0, n_samples)
-        edge_points = np.array([p0 + t * (p1 - p0) for t in t_values])
-        
-        # === CHECK WHICH POINTS ARE ALREADY ON/INSIDE THE PART SURFACE ===
-        # Points already on the part don't need raycasting - use them directly
-        # Points inside the part should be skipped to avoid crossing triangles
-        
-        # First, find closest point on part surface for each sample
-        closest_pts, closest_dists, _ = trimesh.proximity.closest_point(part_mesh, edge_points)
-        
-        # Tolerance for "on surface" - use the same tolerance as floating edge detection
-        on_surface_tolerance = max(edge_len * tolerance_fraction, min_tolerance)
-        
-        # Classify each sample point
-        point_status = []  # 'floating', 'on_surface', 'inside'
-        for i in range(n_samples):
-            dist_to_part = closest_dists[i]
-            
-            if dist_to_part <= on_surface_tolerance:
-                # Point is on the part surface - use closest point directly
-                point_status.append('on_surface')
-            else:
-                # Check if point is INSIDE the part by seeing if ray hits immediately
-                # (hit distance very small means we're inside looking out)
-                # We'll handle this during raycasting
-                point_status.append('floating')
-        
-        # Raycast only from floating points
-        floating_indices = [i for i, status in enumerate(point_status) if status == 'floating']
-        
-        if len(floating_indices) > 0:
-            ray_origins = edge_points[floating_indices]
-            ray_directions = np.tile(ray_direction, (len(floating_indices), 1))
-            
-            # Find intersections with part mesh
-            try:
-                locations, index_ray, index_tri = part_mesh.ray.intersects_location(
-                    ray_origins=ray_origins,
-                    ray_directions=ray_directions,
-                    multiple_hits=False  # Only first hit
-                )
-            except Exception as e:
-                logger.debug(f"Ray intersection failed for edge {edge_info.edge}: {e}")
-                locations = np.array([])
-                index_ray = np.array([])
-        else:
-            locations = np.array([])
-            index_ray = np.array([])
-        
-        # Build mapping: which original sample index hit where
-        ray_hit_map = {}  # original_sample_index -> hit_location
-        for i, local_ray_idx in enumerate(index_ray):
-            original_idx = floating_indices[local_ray_idx]
-            hit_location = locations[i]
-            hit_distance = np.linalg.norm(hit_location - edge_points[original_idx])
-            
-            # Skip if hit is too close (point might be inside the part)
-            # A very short hit distance suggests we're inside looking out
-            if hit_distance < on_surface_tolerance:
-                point_status[original_idx] = 'inside'
-            else:
-                ray_hit_map[original_idx] = hit_location
-        
-        # Build vertex indices for the ribbon
-        # Edge side: endpoints use existing v0, v1; intermediate points are new
-        # Projected side: from ray hits OR closest points for on_surface
-        edge_vert_indices = []
-        proj_vert_indices = []
-        valid_samples = []  # Track which samples have both edge and projection
-        
-        for i in range(n_samples):
-            status = point_status[i]
-            
-            # Skip points that are inside the part
-            if status == 'inside':
-                continue
-            
-            # Edge vertex
-            if i == 0:
-                edge_idx = v0
-            elif i == n_samples - 1:
-                edge_idx = v1
-            else:
-                # Intermediate point on edge - add as new vertex
-                edge_idx = len(vertices)
-                vertices.append(edge_points[i].copy())
-            
-            # Projection vertex
-            if status == 'on_surface':
-                # Point is already on surface - use closest point
-                proj_idx = len(vertices)
-                vertices.append(closest_pts[i].copy())
-                new_vertex_indices.append(proj_idx)
-                
-                edge_vert_indices.append(edge_idx)
-                proj_vert_indices.append(proj_idx)
-                valid_samples.append(i)
-                
-            elif i in ray_hit_map:
-                # Ray hit the part surface
-                proj_idx = len(vertices)
-                vertices.append(ray_hit_map[i].copy())
-                new_vertex_indices.append(proj_idx)
-                
-                edge_vert_indices.append(edge_idx)
-                proj_vert_indices.append(proj_idx)
-                valid_samples.append(i)
-            else:
-                # Ray missed and point not on surface - skip
-                # Remove intermediate edge vertex if we added one
-                if i != 0 and i != n_samples - 1:
-                    vertices.pop()
-        
-        if len(valid_samples) < 2:
-            logger.debug(f"Not enough ray hits for edge {edge_info.edge} ({len(valid_samples)} hits)")
-            edges_skipped += 1
+        if c0 is None or c1 is None:
+            logger.debug(f"Missing collar vertex for edge ({v0}, {v1})")
             continue
         
-        # Create triangles connecting edge to projection
-        # For consecutive valid samples, create quad (2 triangles)
-        for j in range(len(valid_samples) - 1):
-            e_curr = edge_vert_indices[j]
-            e_next = edge_vert_indices[j + 1]
-            p_curr = proj_vert_indices[j]
-            p_next = proj_vert_indices[j + 1]
-            
-            # Create 2 triangles forming a quad
-            # Winding should match the original face normal direction
-            # Triangle 1: e_curr -> p_curr -> p_next
-            faces.append([e_curr, p_curr, p_next])
-            # Triangle 2: e_curr -> p_next -> e_next
-            faces.append([e_curr, p_next, e_next])
-            result.fill_triangles_added += 2
+        # Create two triangles forming a quad collar:
+        #
+        #   v0 -------- v1     (original membrane edge)
+        #    |\        /|
+        #    | \      / |
+        #    |  \    /  |
+        #    |   \  /   |
+        #    |    \/    |
+        #   c0 -------- c1     (collar edge, inside part)
+        #
+        # Triangle 1: v0 -> c0 -> c1
+        # Triangle 2: v0 -> c1 -> v1
         
+        faces.append([v0, c0, c1])
+        faces.append([v0, c1, v1])
+        result.fill_triangles_added += 2
         edges_filled += 1
     
     result.new_vertices_added = len(vertices) - n_orig_verts
@@ -2299,16 +2197,17 @@ def fill_floating_edge_gaps(
         result.vertices = np.array(result.mesh.vertices)
         result.faces = np.array(result.mesh.faces)
     except Exception as e:
-        logger.error(f"Failed to create filled mesh: {e}")
+        logger.error(f"Failed to create collar mesh: {e}")
         result.mesh = membrane_mesh
         result.vertices = np.array(membrane_mesh.vertices)
         result.faces = np.array(membrane_mesh.faces)
     
     result.processing_time_ms = (time.time() - start) * 1000
     
-    logger.info(f"Floating edge fill: {edges_filled}/{result.floating_edges_found} edges filled "
-                f"({edges_skipped} skipped), {result.fill_triangles_added} triangles added, "
-                f"{result.new_vertices_added} new vertices in {result.processing_time_ms:.1f}ms")
+    logger.info(f"Collar extension: {edges_filled}/{result.floating_edges_found} edges filled, "
+                f"{result.fill_triangles_added} triangles added, "
+                f"{result.new_vertices_added} collar vertices (depth={collar_depth}mm) "
+                f"in {result.processing_time_ms:.1f}ms")
     
     return result
 
@@ -2317,10 +2216,11 @@ def fill_floating_edge_gaps_parting_surface(
     surface: 'PartingSurfaceResult',
     part_mesh: trimesh.Trimesh,
     tolerance_fraction: float = FLOATING_EDGE_TOLERANCE_FRACTION,
-    min_tolerance: float = FLOATING_EDGE_MIN_TOLERANCE
+    min_tolerance: float = FLOATING_EDGE_MIN_TOLERANCE,
+    collar_depth: float = 0.5
 ) -> 'PartingSurfaceResult':
     """
-    Fill floating edge gaps in a PartingSurfaceResult.
+    Fill floating edge gaps in a PartingSurfaceResult using collar extension.
     
     This is a wrapper around fill_floating_edge_gaps that integrates with
     the PartingSurfaceResult data structure used in the pipeline.
@@ -2333,6 +2233,7 @@ def fill_floating_edge_gaps_parting_surface(
         part_mesh: The part mesh to connect to
         tolerance_fraction: Fraction of edge length as tolerance (default 5%)
         min_tolerance: Minimum absolute tolerance in mm
+        collar_depth: How far to extend INTO the part (mm), default 0.5mm
     
     Returns:
         Updated PartingSurfaceResult with floating edges filled
@@ -2341,13 +2242,16 @@ def fill_floating_edge_gaps_parting_surface(
         logger.warning("Missing surface or part mesh for floating edge filling")
         return surface
     
+    logger.info(f"Using collar extension method for floating edge gap filling (depth={collar_depth}mm)")
+    
     # Call the core filling function
     fill_result = fill_floating_edge_gaps(
         membrane_mesh=surface.mesh,
         part_mesh=part_mesh,
         vertex_boundary_type=surface.vertex_boundary_type,
         tolerance_fraction=tolerance_fraction,
-        min_tolerance=min_tolerance
+        min_tolerance=min_tolerance,
+        collar_depth=collar_depth
     )
     
     if fill_result.mesh is None or fill_result.floating_edges_found == 0:
