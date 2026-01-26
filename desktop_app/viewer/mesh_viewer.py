@@ -5031,6 +5031,43 @@ class MeshViewer(QWidget):
         print(f"   Number of neighbors: {len(neighbors)}")
         print(f"   Is boundary triangle: {'YES' if is_boundary else 'NO'}")
         
+        # Check which edges of this triangle are actually mesh boundary edges
+        print(f"\n🔺 MESH BOUNDARY EDGE CHECK:")
+        edges = [(v0_idx, v1_idx), (v1_idx, v2_idx), (v2_idx, v0_idx)]
+        edge_names = ["V0→V1", "V1→V2", "V2→V0"]
+        
+        # Build edge-to-face count for entire mesh
+        edge_face_count = {}
+        for fi, face in enumerate(mesh.faces):
+            for i in range(3):
+                e0, e1 = int(face[i]), int(face[(i + 1) % 3])
+                edge_key = (min(e0, e1), max(e0, e1))
+                edge_face_count[edge_key] = edge_face_count.get(edge_key, 0) + 1
+        
+        for (e0, e1), edge_name in zip(edges, edge_names):
+            edge_key = (min(e0, e1), max(e0, e1))
+            face_count = edge_face_count.get(edge_key, 0)
+            is_mesh_boundary = (face_count == 1)
+            status = "🔴 MESH BOUNDARY (1 face)" if is_mesh_boundary else f"⚪ Interior ({face_count} faces)"
+            print(f"   {edge_name} [{e0}→{e1}]: {status}")
+        
+        # For each vertex, check if it has ANY mesh boundary edges
+        print(f"\n🔍 VERTEX BOUNDARY EDGE CHECK:")
+        for vi, v_idx in enumerate([v0_idx, v1_idx, v2_idx]):
+            # Find all edges containing this vertex
+            vertex_boundary_edges = []
+            for (e0, e1), count in edge_face_count.items():
+                if count == 1 and (e0 == v_idx or e1 == v_idx):
+                    other = e1 if e0 == v_idx else e0
+                    vertex_boundary_edges.append(other)
+            
+            if len(vertex_boundary_edges) == 0:
+                print(f"   V{vi} [{v_idx}]: ❌ NO mesh boundary edges (interior vertex)")
+            elif len(vertex_boundary_edges) == 1:
+                print(f"   V{vi} [{v_idx}]: ⚠️  1 mesh boundary edge (to vertex {vertex_boundary_edges[0]}) - NO FAN POSSIBLE")
+            else:
+                print(f"   V{vi} [{v_idx}]: ✅ {len(vertex_boundary_edges)} mesh boundary edges (to vertices {vertex_boundary_edges}) - fan should exist")
+        
         # Vertex boundary types if available
         if self._triangle_debug_boundary_type_ref is not None:
             bt = self._triangle_debug_boundary_type_ref
@@ -5045,12 +5082,118 @@ class MeshViewer(QWidget):
         if self._part_mesh_ref is not None:
             try:
                 pts = np.array([v0, v1, v2, centroid])
-                _, distances, _ = trimesh.proximity.closest_point(self._part_mesh_ref, pts)
+                closest_pts, distances, closest_faces = trimesh.proximity.closest_point(self._part_mesh_ref, pts)
                 print(f"\n📏 DISTANCE TO PART MESH:")
                 print(f"   V0 distance: {distances[0]:.6f}")
                 print(f"   V1 distance: {distances[1]:.6f}")
                 print(f"   V2 distance: {distances[2]:.6f}")
                 print(f"   Centroid distance: {distances[3]:.6f}")
+                
+                # ========================================================
+                # COLLAR EXTENSION DEBUG INFO
+                # ========================================================
+                print(f"\n🔧 COLLAR EXTENSION DEBUG:")
+                part_face_normals = self._part_mesh_ref.face_normals
+                
+                for vi, (v_idx, v, closest_pt, closest_face, dist) in enumerate(zip(
+                    [v0_idx, v1_idx, v2_idx], [v0, v1, v2], closest_pts[:3], closest_faces[:3], distances[:3]
+                )):
+                    print(f"\n   --- Vertex V{vi} [{v_idx}] ---")
+                    print(f"   Position: [{v[0]:.6f}, {v[1]:.6f}, {v[2]:.6f}]")
+                    print(f"   Closest pt on part: [{closest_pt[0]:.6f}, {closest_pt[1]:.6f}, {closest_pt[2]:.6f}]")
+                    print(f"   Distance to part: {dist:.6f}")
+                    
+                    # Part normal at closest point
+                    if closest_face < len(part_face_normals):
+                        part_normal = part_face_normals[closest_face]
+                        print(f"   Part normal at closest: [{part_normal[0]:.4f}, {part_normal[1]:.4f}, {part_normal[2]:.4f}]")
+                        
+                        # Into-part direction
+                        into_part = -part_normal
+                        print(f"   Into-part direction: [{into_part[0]:.4f}, {into_part[1]:.4f}, {into_part[2]:.4f}]")
+                        
+                        # Collar point (closest + 2mm into part)
+                        collar_depth = 2.0
+                        collar_pt = closest_pt + collar_depth * into_part
+                        print(f"   Collar point (2mm depth): [{collar_pt[0]:.6f}, {collar_pt[1]:.6f}, {collar_pt[2]:.6f}]")
+                        
+                        # Check if collar point is inside part
+                        try:
+                            inside = self._part_mesh_ref.contains([collar_pt])[0]
+                            inside_status = "✅ INSIDE" if inside else "❌ OUTSIDE"
+                            print(f"   Collar point containment: {inside_status}")
+                            
+                            # Try opposite direction
+                            alt_collar_pt = closest_pt - collar_depth * into_part
+                            alt_inside = self._part_mesh_ref.contains([alt_collar_pt])[0]
+                            alt_status = "✅ INSIDE" if alt_inside else "❌ OUTSIDE"
+                            print(f"   Alt collar (opposite dir): {alt_status}")
+                        except Exception as ce:
+                            print(f"   Containment check failed: {ce}")
+                        
+                        # Direction from vertex to closest point
+                        to_part_dir = closest_pt - v
+                        to_part_len = np.linalg.norm(to_part_dir)
+                        if to_part_len > 1e-8:
+                            to_part_dir_unit = to_part_dir / to_part_len
+                            print(f"   Dir vertex→closest: [{to_part_dir_unit[0]:.4f}, {to_part_dir_unit[1]:.4f}, {to_part_dir_unit[2]:.4f}]")
+                            
+                            # Angle between into_part and to_part_dir
+                            angle = np.degrees(np.arccos(np.clip(np.dot(into_part, to_part_dir_unit), -1, 1)))
+                            print(f"   Angle (into_part vs vertex→closest): {angle:.1f}°")
+                
+                # ========================================================
+                # INNER BOUNDARY EDGE ANALYSIS
+                # ========================================================
+                if self._triangle_debug_boundary_type_ref is not None:
+                    bt = self._triangle_debug_boundary_type_ref
+                    print(f"\n🔲 INNER BOUNDARY EDGE ANALYSIS:")
+                    
+                    edges = [(v0_idx, v1_idx, v0, v1), (v1_idx, v2_idx, v1, v2), (v2_idx, v0_idx, v2, v0)]
+                    edge_names = ["V0→V1", "V1→V2", "V2→V0"]
+                    
+                    for (idx_a, idx_b, va, vb), edge_name in zip(edges, edge_names):
+                        bt_a = bt[idx_a] if idx_a < len(bt) else 0
+                        bt_b = bt[idx_b] if idx_b < len(bt) else 0
+                        
+                        # Check if edge touches inner boundary (part)
+                        is_inner_edge = (bt_a == -1 or bt_b == -1)
+                        edge_type = "INNER BOUNDARY" if is_inner_edge else "INTERIOR"
+                        
+                        # Edge midpoint and direction
+                        edge_mid = (va + vb) / 2
+                        edge_dir = vb - va
+                        edge_len = np.linalg.norm(edge_dir)
+                        
+                        print(f"\n   --- Edge {edge_name} ({edge_type}) ---")
+                        print(f"   Vertices: [{idx_a}] bt={bt_a} → [{idx_b}] bt={bt_b}")
+                        print(f"   Edge length: {edge_len:.6f}")
+                        print(f"   Edge midpoint: [{edge_mid[0]:.6f}, {edge_mid[1]:.6f}, {edge_mid[2]:.6f}]")
+                        
+                        if is_inner_edge:
+                            # This edge needs collar - compute collar direction for midpoint
+                            mid_closest, mid_dist, mid_face = trimesh.proximity.closest_point(
+                                self._part_mesh_ref, [edge_mid]
+                            )
+                            mid_closest = mid_closest[0]
+                            mid_dist = mid_dist[0]
+                            mid_face = mid_face[0]
+                            
+                            print(f"   Closest pt (midpoint): [{mid_closest[0]:.6f}, {mid_closest[1]:.6f}, {mid_closest[2]:.6f}]")
+                            print(f"   Distance to part: {mid_dist:.6f}")
+                            
+                            if mid_face < len(part_face_normals):
+                                mid_part_normal = part_face_normals[mid_face]
+                                mid_into_part = -mid_part_normal
+                                collar_pt = mid_closest + collar_depth * mid_into_part
+                                
+                                try:
+                                    inside = self._part_mesh_ref.contains([collar_pt])[0]
+                                    status = "✅ INSIDE" if inside else "❌ OUTSIDE"
+                                    print(f"   Collar at midpoint: {status}")
+                                except Exception:
+                                    pass
+                                
             except Exception as e:
                 print(f"\n📏 DISTANCE TO PART: Error computing - {e}")
         

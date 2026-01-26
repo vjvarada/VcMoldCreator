@@ -2328,7 +2328,7 @@ class PrimarySurfaceSmoothingWorker(QThread):
             from core.tetrahedral_mesh import extract_labeled_boundary_meshes
             from core.parting_surface import (
                 detect_floating_boundary_edges,
-                fill_floating_edge_gaps
+                create_robust_collar_extension
             )
             import time
             
@@ -2449,24 +2449,26 @@ class PrimarySurfaceSmoothingWorker(QThread):
             # STEP 3: Fill floating edge gaps (edges that drifted during smoothing)
             # =====================================================================
             if self.smooth_iterations > 0 and part_mesh_for_reprojection is not None:
-                self.progress.emit("Detecting and filling floating edge gaps...")
+                self.progress.emit("Creating robust collar extension for inner boundary...")
                 gap_fill_start = time.time()
                 
                 # Record face count before fill (to track which faces are fill triangles)
                 faces_before_fill = len(current_mesh.faces)
                 
-                fill_result = fill_floating_edge_gaps(
+                # Use new robust collar extension
+                fill_result = create_robust_collar_extension(
                     membrane_mesh=current_mesh,
                     part_mesh=part_mesh_for_reprojection,
                     vertex_boundary_type=current_boundary_type,
-                    collar_all_inner_edges=True  # Collar ALL inner edges for robust CSG
+                    collar_depth=0.5,  # 0.5mm collar depth
+                    fan_subdivisions=4  # Subdivisions for convex corner fans
                 )
                 
                 result.gap_fill_time_ms = (time.time() - gap_fill_start) * 1000
                 
                 if fill_result.fill_triangles_added > 0:
-                    self.progress.emit(f"Collared {fill_result.boundary_edges_checked} inner edges, "
-                                     f"added {fill_result.fill_triangles_added} triangles")
+                    self.progress.emit(f"Created collar extension: "
+                                     f"{fill_result.fill_triangles_added} triangles added")
                     if fill_result.mesh is not None:
                         current_mesh = fill_result.mesh
                         
@@ -2476,7 +2478,7 @@ class PrimarySurfaceSmoothingWorker(QThread):
                             faces_before_fill + fill_result.fill_triangles_added
                         )
                 else:
-                    self.progress.emit("No floating edges detected")
+                    self.progress.emit("No inner boundary edges for collar")
             
             # =====================================================================
             # STEP 4: Fix normals for consistent orientation
@@ -2764,7 +2766,7 @@ class CombinedSurfaceSmoothingWorker(QThread):
             from core.tetrahedral_mesh import extract_labeled_boundary_meshes
             from core.parting_surface import (
                 detect_floating_boundary_edges,
-                fill_floating_edge_gaps
+                create_robust_collar_extension
             )
             import time
             
@@ -2884,7 +2886,7 @@ class CombinedSurfaceSmoothingWorker(QThread):
              smoothing_time_ms, gap_fill_time_ms, fill_face_indices, restored_corner_positions)
         """
         from core.surface_propagation import smooth_membrane_with_boundary_reprojection
-        from core.parting_surface import fill_floating_edge_gaps
+        from core.parting_surface import create_robust_collar_extension
         import time
         
         current_mesh = mesh
@@ -2932,23 +2934,25 @@ class CombinedSurfaceSmoothingWorker(QThread):
         
         # Phase 2: Fill floating edge gaps
         if self.smooth_iterations > 0 and part_mesh is not None:
-            self.progress.emit(f"{label}: Detecting and filling floating edge gaps...")
+            self.progress.emit(f"{label}: Creating robust collar extension...")
             gap_fill_start = time.time()
             
             faces_before_fill = len(current_mesh.faces)
             
-            fill_result = fill_floating_edge_gaps(
+            # Use new robust collar extension
+            fill_result = create_robust_collar_extension(
                 membrane_mesh=current_mesh,
                 part_mesh=part_mesh,
                 vertex_boundary_type=current_boundary_type,
-                collar_all_inner_edges=True  # Collar ALL inner edges for robust CSG
+                collar_depth=0.5,
+                fan_subdivisions=4
             )
             
             gap_fill_time_ms = (time.time() - gap_fill_start) * 1000
             
             if fill_result.fill_triangles_added > 0:
-                self.progress.emit(f"{label}: Collared {fill_result.boundary_edges_checked} inner edges, "
-                                 f"added {fill_result.fill_triangles_added} triangles")
+                self.progress.emit(f"{label}: Created collar: "
+                                 f"{fill_result.fill_triangles_added} triangles")
                 if fill_result.mesh is not None:
                     current_mesh = fill_result.mesh
                     fill_face_indices = np.arange(
@@ -3256,23 +3260,24 @@ class ComprehensivePrimarySurfaceWorker(QThread):
             if self.smooth_iterations > 0 and part_mesh_for_reprojection is not None:
                 from core.parting_surface import (
                     detect_floating_boundary_edges,
-                    fill_floating_edge_gaps
+                    create_robust_collar_extension
                 )
-                self.progress.emit("Detecting and filling floating edge gaps...")
+                self.progress.emit("Creating robust collar extension...")
                 
                 # Record face count before fill (to track which faces are fill triangles)
                 faces_before_fill = len(current_mesh.faces)
                 
-                fill_result = fill_floating_edge_gaps(
+                fill_result = create_robust_collar_extension(
                     membrane_mesh=current_mesh,
                     part_mesh=part_mesh_for_reprojection,
                     vertex_boundary_type=current_boundary_type,
-                    collar_all_inner_edges=True  # Collar ALL inner edges for robust CSG
+                    collar_depth=0.5,
+                    fan_subdivisions=4
                 )
                 
                 if fill_result.fill_triangles_added > 0:
-                    self.progress.emit(f"Collared {fill_result.boundary_edges_checked} inner edges, "
-                                     f"added {fill_result.fill_triangles_added} triangles")
+                    self.progress.emit(f"Created collar: "
+                                     f"{fill_result.fill_triangles_added} triangles")
                     if fill_result.mesh is not None:
                         current_mesh = fill_result.mesh
                         
@@ -3616,19 +3621,20 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
                     pass  # current_mesh unchanged
                 
                 # === Fill floating edge gaps after smoothing ===
-                from core.parting_surface import fill_floating_edge_gaps
+                from core.parting_surface import create_robust_collar_extension
                 
-                self.progress.emit("Creating collar extension on inner boundary...")
-                fill_result = fill_floating_edge_gaps(
+                self.progress.emit("Creating robust collar extension...")
+                fill_result = create_robust_collar_extension(
                     membrane_mesh=current_mesh,
                     part_mesh=self.part_mesh,
                     vertex_boundary_type=None,  # Use distance-based detection
-                    collar_all_inner_edges=True  # Collar ALL inner edges for robust CSG
+                    collar_depth=0.5,
+                    fan_subdivisions=4
                 )
                 
                 if fill_result.fill_triangles_added > 0:
-                    self.progress.emit(f"Collared {fill_result.boundary_edges_checked} inner edges, "
-                                     f"added {fill_result.fill_triangles_added} triangles")
+                    self.progress.emit(f"Created collar: "
+                                     f"{fill_result.fill_triangles_added} triangles")
                     if fill_result.mesh is not None:
                         current_mesh = fill_result.mesh
                 else:
@@ -3945,19 +3951,20 @@ class MembraneSmoothingWorker(QThread):
             
             # Fill floating edge gaps after smoothing
             if result.mesh is not None and self.part_mesh is not None:
-                from core.parting_surface import fill_floating_edge_gaps
+                from core.parting_surface import create_robust_collar_extension
                 
-                self.progress.emit("Creating collar extension on inner boundary...")
-                fill_result = fill_floating_edge_gaps(
+                self.progress.emit("Creating robust collar extension...")
+                fill_result = create_robust_collar_extension(
                     membrane_mesh=result.mesh,
                     part_mesh=self.part_mesh,
                     vertex_boundary_type=None,  # Use distance-based detection
-                    collar_all_inner_edges=True  # Collar ALL inner edges for robust CSG
+                    collar_depth=0.5,
+                    fan_subdivisions=4
                 )
                 
                 if fill_result.fill_triangles_added > 0:
-                    self.progress.emit(f"Collared {fill_result.boundary_edges_checked} inner edges, "
-                                     f"added {fill_result.fill_triangles_added} triangles")
+                    self.progress.emit(f"Created collar: "
+                                     f"{fill_result.fill_triangles_added} triangles")
                     if fill_result.mesh is not None:
                         result.mesh = fill_result.mesh
                         result.final_vertices = len(fill_result.mesh.vertices)
@@ -5746,12 +5753,45 @@ class MainWindow(QMainWindow):
         parting_mesh = None
         vertex_boundary_type = None
         
-        # Try to get the primary parting surface
-        if self._parting_surface_result is not None and hasattr(self._parting_surface_result, 'mesh'):
+        # Check for smoothed results in order of preference:
+        # 1. Combined smoothing result (has both primary and secondary)
+        # 2. Primary-only smoothing result
+        # 3. Unsmoothed parting surface result (fallback)
+        
+        # First check for combined smoothing result (CombinedSurfaceSmoothingResult)
+        if hasattr(self, '_combined_smooth_result') and self._combined_smooth_result is not None:
+            if hasattr(self._combined_smooth_result, 'primary_mesh') and self._combined_smooth_result.primary_mesh is not None:
+                parting_mesh = self._combined_smooth_result.primary_mesh
+                logger.info(f"🔍 Using COMBINED SMOOTHED primary_mesh for triangle debug "
+                           f"({self._combined_smooth_result.primary_num_vertices} verts, "
+                           f"{self._combined_smooth_result.primary_num_faces} faces)")
+        
+        # If no combined result, check for primary-only smoothing result (PrimarySurfaceSmoothingResult)
+        if parting_mesh is None and self._primary_smoothing_result is not None:
+            if hasattr(self._primary_smoothing_result, 'mesh') and self._primary_smoothing_result.mesh is not None:
+                parting_mesh = self._primary_smoothing_result.mesh
+                logger.info(f"🔍 Using PRIMARY SMOOTHED mesh for triangle debug "
+                           f"({self._primary_smoothing_result.num_vertices} verts, "
+                           f"{self._primary_smoothing_result.num_faces} faces)")
+                # Try to get vertex boundary type from smoothing result
+                if hasattr(self._primary_smoothing_result, 'vertex_boundary_type'):
+                    vertex_boundary_type = self._primary_smoothing_result.vertex_boundary_type
+        
+        # Fall back to unsmoothed parting surface if no smoothed result
+        if parting_mesh is None and self._parting_surface_result is not None and hasattr(self._parting_surface_result, 'mesh'):
             parting_mesh = self._parting_surface_result.mesh
+            logger.info(f"🔍 Using UNSMOOTHED parting surface for triangle debug (no smoothed result available)")
             # Try to get vertex boundary type if available
             if hasattr(self._parting_surface_result, 'vertex_boundary_type'):
                 vertex_boundary_type = self._parting_surface_result.vertex_boundary_type
+        
+        # Fall back to parting surface result's boundary type if we don't have it yet
+        if vertex_boundary_type is None and self._parting_surface_result is not None:
+            if hasattr(self._parting_surface_result, 'vertex_boundary_type'):
+                vertex_boundary_type = self._parting_surface_result.vertex_boundary_type
+        
+        if parting_mesh is None:
+            logger.warning("🔍 No parting surface mesh available for triangle debug")
         
         # Get the part mesh (original imported mesh)
         part_mesh = self._current_mesh
