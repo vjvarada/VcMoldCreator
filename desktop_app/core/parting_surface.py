@@ -2041,13 +2041,16 @@ def fill_floating_edge_gaps(
     """
     Fill gaps using Collar/Flange Extension method for robust CSG operations.
     
-    This approach creates a "collar" that extends the membrane boundary INTO
-    the part mesh, ensuring watertight contact for Boolean operations:
+    This approach creates a "collar" that extends the membrane's INNER boundary
+    (part boundary only, NOT hull boundary) INTO the part mesh, ensuring 
+    watertight contact for Boolean operations:
     
-    1. Find ALL boundary edges on the part boundary (vertex_boundary_type == -1)
+    1. Find boundary edges where BOTH vertices are on part boundary (type -1)
+       Explicitly EXCLUDE hull boundary edges (types 1, 2)
     2. For each edge, project endpoints onto the part surface
     3. Offset the projected points slightly INTO the part (along inward normal)
     4. Create triangular collar connecting original edge to offset points
+    5. At sharp corners, add fan triangles to properly close the collar
     
     The collar creates overlap with the part mesh, which CSG libraries like
     manifold3d handle robustly (vs. trying to achieve exact coincident geometry).
@@ -2106,52 +2109,86 @@ def fill_floating_edge_gaps(
     # Check if we have boundary type information
     has_boundary_type = (
         vertex_boundary_type is not None and 
-        len(vertex_boundary_type) >= n_verts
+        len(vertex_boundary_type) > 0
     )
     
-    # Filter to only part-boundary edges (where BOTH vertices have type -1)
-    if has_boundary_type:
-        part_boundary_edges = []
-        for v0, v1 in boundary_edges:
-            bt0 = vertex_boundary_type[v0] if v0 < len(vertex_boundary_type) else 0
-            bt1 = vertex_boundary_type[v1] if v1 < len(vertex_boundary_type) else 0
-            if bt0 == -1 and bt1 == -1:
-                part_boundary_edges.append((v0, v1))
+    # Get all unique boundary vertices for distance-based classification
+    boundary_vert_set = set()
+    for v0, v1 in boundary_edges:
+        boundary_vert_set.add(v0)
+        boundary_vert_set.add(v1)
+    boundary_vert_list = sorted(boundary_vert_set)
+    boundary_positions = vertices_arr[boundary_vert_list]
+    
+    # ALWAYS compute distances to part mesh for robust detection
+    # This helps catch vertices added during smoothing that don't have boundary type
+    _, part_distances, _ = trimesh.proximity.closest_point(part_mesh, boundary_positions)
+    
+    # Build distance map for quick lookup
+    vert_to_part_dist = {}
+    for i, vi in enumerate(boundary_vert_list):
+        vert_to_part_dist[vi] = part_distances[i]
+    
+    # Compute threshold based on mesh scale
+    bbox_diag = np.linalg.norm(np.ptp(vertices_arr, axis=0))
+    # Use 2% of bbox diagonal - more generous to catch smoothing-displaced vertices
+    on_part_threshold = bbox_diag * 0.02
+    
+    logger.info(f"Inner boundary detection: bbox_diag={bbox_diag:.2f}mm, "
+               f"distance_threshold={on_part_threshold:.4f}mm")
+    
+    # HYBRID CLASSIFICATION:
+    # 1. If vertex has boundary_type == -1 → definitely inner boundary
+    # 2. If vertex has boundary_type == 1 or 2 → definitely outer (hull) boundary
+    # 3. If vertex has no boundary_type (new vertex) or type 0 → use distance to part
+    #    - Close to part AND far from hull → inner boundary
+    
+    part_boundary_edges = []
+    hull_boundary_edges = 0
+    distance_detected_edges = 0
+    mixed_boundary_edges = 0
+    
+    for v0, v1 in boundary_edges:
+        # Get boundary types (use -999 for "unknown/new vertex")
+        bt0 = vertex_boundary_type[v0] if (has_boundary_type and v0 < len(vertex_boundary_type)) else -999
+        bt1 = vertex_boundary_type[v1] if (has_boundary_type and v1 < len(vertex_boundary_type)) else -999
         
-        logger.info(f"Found {len(part_boundary_edges)}/{len(boundary_edges)} boundary edges on part (type -1)")
-    else:
-        # No boundary type info - use distance-based classification
-        logger.info("No vertex_boundary_type provided - using distance-based classification")
+        # Check if either vertex is definitely on hull boundary
+        if bt0 in (1, 2) or bt1 in (1, 2):
+            hull_boundary_edges += 1
+            continue
         
-        # Get all unique boundary vertices
-        boundary_vert_set = set()
-        for v0, v1 in boundary_edges:
-            boundary_vert_set.add(v0)
-            boundary_vert_set.add(v1)
-        boundary_vert_list = sorted(boundary_vert_set)
-        boundary_positions = vertices_arr[boundary_vert_list]
+        # Check if BOTH vertices are definitely on part boundary (type -1)
+        if bt0 == -1 and bt1 == -1:
+            part_boundary_edges.append((v0, v1))
+            continue
         
-        # Project to part surface
-        _, boundary_distances, _ = trimesh.proximity.closest_point(part_mesh, boundary_positions)
+        # At least one vertex has unknown or interior type (0, -999)
+        # Use distance-based detection for these
+        dist0 = vert_to_part_dist.get(v0, float('inf'))
+        dist1 = vert_to_part_dist.get(v1, float('inf'))
         
-        # Consider "on part" if within 1% of mesh bbox diagonal
-        bbox_diag = np.linalg.norm(np.ptp(vertices_arr, axis=0))
-        on_part_threshold = bbox_diag * 0.01
+        # Check if BOTH vertices are close to part mesh
+        v0_near_part = dist0 < on_part_threshold
+        v1_near_part = dist1 < on_part_threshold
         
-        part_boundary_verts = set()
-        for i, vi in enumerate(boundary_vert_list):
-            if boundary_distances[i] < on_part_threshold:
-                part_boundary_verts.add(vi)
+        # Also accept if one has type -1 and the other is close to part
+        v0_is_inner = (bt0 == -1) or (bt0 in (0, -999) and v0_near_part)
+        v1_is_inner = (bt1 == -1) or (bt1 in (0, -999) and v1_near_part)
         
-        part_boundary_edges = [
-            (v0, v1) for v0, v1 in boundary_edges
-            if v0 in part_boundary_verts and v1 in part_boundary_verts
-        ]
-        
-        logger.info(f"Distance-based: {len(part_boundary_edges)}/{len(boundary_edges)} boundary edges on part")
+        if v0_is_inner and v1_is_inner:
+            part_boundary_edges.append((v0, v1))
+            if bt0 != -1 or bt1 != -1:
+                distance_detected_edges += 1
+        else:
+            mixed_boundary_edges += 1
+    
+    logger.info(f"Boundary edge classification: {len(part_boundary_edges)} inner "
+               f"({distance_detected_edges} detected by distance), "
+               f"{hull_boundary_edges} outer (hull), {mixed_boundary_edges} excluded")
     
     if len(part_boundary_edges) == 0:
-        logger.info("No part-boundary edges found - no collar needed")
+        logger.info("No inner/part-boundary edges found - no collar needed")
         result.mesh = membrane_mesh
         result.vertices = np.array(membrane_mesh.vertices)
         result.faces = np.array(membrane_mesh.faces)
@@ -2204,6 +2241,45 @@ def fill_floating_edge_gaps(
     
     collar_vertices = sorted(collar_vertex_set)
     
+    # Build adjacency: which collar edges are incident to each vertex
+    vertex_to_edges = {vi: [] for vi in collar_vertices}
+    for v0, v1 in edges_to_collar:
+        vertex_to_edges[v0].append((v0, v1))
+        vertex_to_edges[v1].append((v0, v1))
+    
+    # Identify corner vertices (vertices with more than 2 incident collar edges)
+    # or vertices with exactly 2 edges at a sharp angle
+    corner_vertices = set()
+    for vi in collar_vertices:
+        if len(vertex_to_edges[vi]) >= 2:
+            # Check if this is a sharp corner (angle < 150 degrees)
+            edges = vertex_to_edges[vi]
+            if len(edges) == 2:
+                # Get the two edge directions
+                e1, e2 = edges
+                # Get the "other" vertex in each edge
+                other1 = e1[1] if e1[0] == vi else e1[0]
+                other2 = e2[1] if e2[0] == vi else e2[0]
+                
+                dir1 = vertices_arr[other1] - vertices_arr[vi]
+                dir2 = vertices_arr[other2] - vertices_arr[vi]
+                
+                len1 = np.linalg.norm(dir1)
+                len2 = np.linalg.norm(dir2)
+                
+                if len1 > 1e-8 and len2 > 1e-8:
+                    dir1 /= len1
+                    dir2 /= len2
+                    cos_angle = np.dot(dir1, dir2)
+                    # If angle < 150 degrees (cos > -0.866), it's a corner
+                    if cos_angle > -0.866:
+                        corner_vertices.add(vi)
+            elif len(edges) > 2:
+                # More than 2 edges meeting - definitely a corner
+                corner_vertices.add(vi)
+    
+    logger.debug(f"Detected {len(corner_vertices)} corner vertices needing fan triangles")
+    
     # Get positions of collar vertices
     collar_positions = np.array([vertices[vi] for vi in collar_vertices])
     
@@ -2217,6 +2293,7 @@ def fill_floating_edge_gaps(
     
     # Build mapping: original vertex -> collar vertex index
     vertex_to_collar = {}
+    collar_vertex_positions = {}  # Store positions for corner fan computation
     
     for i, vi in enumerate(collar_vertices):
         closest_pt = closest_pts[i]
@@ -2233,6 +2310,7 @@ def fill_floating_edge_gaps(
         collar_idx = len(vertices)
         vertices.append(collar_pt)
         vertex_to_collar[vi] = collar_idx
+        collar_vertex_positions[vi] = collar_pt
         new_vertex_indices.append(collar_idx)
     
     # For each edge to collar, create collar triangles
@@ -2265,6 +2343,81 @@ def fill_floating_edge_gaps(
         result.fill_triangles_added += 2
         edges_filled += 1
     
+    # Add fan triangles at corner vertices to close gaps
+    fan_triangles_added = 0
+    for vi in corner_vertices:
+        edges = vertex_to_edges[vi]
+        if len(edges) < 2:
+            continue
+        
+        # Get all adjacent collar vertices for this corner
+        adjacent_collar_verts = []
+        for e in edges:
+            other = e[1] if e[0] == vi else e[0]
+            c_other = vertex_to_collar.get(other)
+            if c_other is not None:
+                adjacent_collar_verts.append(c_other)
+        
+        if len(adjacent_collar_verts) < 2:
+            continue
+        
+        # Get the collar vertex for this corner
+        c_vi = vertex_to_collar.get(vi)
+        if c_vi is None:
+            continue
+        
+        # Sort adjacent collar vertices by angle around c_vi for proper fan order
+        c_vi_pos = np.array(vertices[c_vi])
+        
+        # Compute angles of each adjacent collar vertex relative to c_vi
+        # Use the first vertex direction as reference
+        ref_pos = np.array(vertices[adjacent_collar_verts[0]]) - c_vi_pos
+        ref_len = np.linalg.norm(ref_pos)
+        if ref_len < 1e-8:
+            continue
+        ref_dir = ref_pos / ref_len
+        
+        # Find a perpendicular direction for angle computation
+        up = np.array([0, 0, 1])
+        if abs(np.dot(ref_dir, up)) > 0.9:
+            up = np.array([1, 0, 0])
+        perp = np.cross(ref_dir, up)
+        perp /= np.linalg.norm(perp)
+        
+        # Compute angle for each adjacent vertex
+        angles = []
+        for c_adj in adjacent_collar_verts:
+            adj_pos = np.array(vertices[c_adj]) - c_vi_pos
+            adj_len = np.linalg.norm(adj_pos)
+            if adj_len < 1e-8:
+                angles.append(0.0)
+                continue
+            adj_dir = adj_pos / adj_len
+            
+            # Angle in the reference plane
+            cos_a = np.dot(adj_dir, ref_dir)
+            sin_a = np.dot(adj_dir, perp)
+            angle = np.arctan2(sin_a, cos_a)
+            angles.append(angle)
+        
+        # Sort by angle
+        sorted_indices = np.argsort(angles)
+        sorted_collar_verts = [adjacent_collar_verts[i] for i in sorted_indices]
+        
+        # Create fan triangles from c_vi to consecutive pairs of adjacent collar vertices
+        # This fills the gap at the corner
+        for i in range(len(sorted_collar_verts) - 1):
+            c_a = sorted_collar_verts[i]
+            c_b = sorted_collar_verts[i + 1]
+            
+            # Fan triangle: c_vi -> c_a -> c_b
+            faces.append([c_vi, c_a, c_b])
+            fan_triangles_added += 1
+    
+    result.fill_triangles_added += fan_triangles_added
+    if fan_triangles_added > 0:
+        logger.debug(f"Added {fan_triangles_added} fan triangles at {len(corner_vertices)} corners")
+    
     result.new_vertices_added = len(vertices) - n_orig_verts
     result.part_constrained_vertices = np.array(new_vertex_indices, dtype=np.int64)
     
@@ -2288,7 +2441,7 @@ def fill_floating_edge_gaps(
     
     logger.info(f"Collar extension: {edges_filled} edges collared "
                 f"({result.floating_edges_found} were floating), "
-                f"{result.fill_triangles_added} triangles added, "
+                f"{result.fill_triangles_added} triangles added (incl. {fan_triangles_added} corner fans), "
                 f"{result.new_vertices_added} collar vertices (depth={collar_depth}mm) "
                 f"in {result.processing_time_ms:.1f}ms")
     
