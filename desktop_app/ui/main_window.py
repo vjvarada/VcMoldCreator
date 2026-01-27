@@ -2259,7 +2259,35 @@ class PrimarySurfaceExtractionWorker(QThread):
                                  f"{n_hull} outer (∂H), {n_interior} interior")
             
             # =====================================================================
-            # STEP 4: Fix normals for consistent orientation
+            # STEP 4: Remove small disconnected islands (noise fragments)
+            # 
+            # Primary surface should ideally be a single connected component, but
+            # isolated tetrahedra with valid configurations can create disconnected
+            # patches. Remove these to ensure clean CSG operations.
+            # =====================================================================
+            self.progress.emit("Removing small isolated fragments...")
+            from core.parting_surface import remove_small_islands
+            
+            cleaned_result = remove_small_islands(
+                repaired_result,
+                min_triangles=10,  # Keep patches with at least 10 triangles
+                min_area_fraction=0.01  # Keep patches with at least 1% of total area
+            )
+            
+            if cleaned_result.mesh is not None:
+                result.mesh = cleaned_result.mesh
+                result.num_vertices = cleaned_result.num_vertices
+                result.num_faces = cleaned_result.num_faces
+                # vertex_boundary_type may be None after island removal
+                # but we can try to preserve it if only the main component remains
+                if cleaned_result.num_vertices == repaired_result.num_vertices:
+                    result.vertex_boundary_type = repaired_result.vertex_boundary_type
+                else:
+                    result.vertex_boundary_type = None
+                    self.progress.emit("Note: boundary type info invalidated by island removal")
+            
+            # =====================================================================
+            # STEP 5: Fix normals for consistent orientation
             # =====================================================================
             self.progress.emit("Fixing surface normals...")
             result.mesh.fix_normals()
@@ -2425,6 +2453,29 @@ class SecondarySurfaceExtractionWorker(QThread):
                 result.num_faces = repaired_result.num_faces
                 result.vertex_boundary_type = repaired_result.vertex_boundary_type
                 self.progress.emit(f"Cleaned: {result.num_vertices:,} verts, {result.num_faces:,} faces")
+            
+            # =====================================================================
+            # STEP 4: Remove small disconnected islands (noise fragments)
+            # 
+            # Secondary surfaces may have small isolated patches from orphan edges
+            # or tetrahedra with isolated valid configurations. Remove these to
+            # prevent issues during smoothing and CSG operations.
+            # =====================================================================
+            self.progress.emit("Removing small isolated fragments...")
+            from core.parting_surface import remove_small_islands
+            
+            # Use smaller thresholds for secondary (we want to keep more patches)
+            cleaned_result = remove_small_islands(
+                repaired_result,
+                min_triangles=5,  # Keep patches with at least 5 triangles
+                min_area_fraction=0.005  # Keep patches with at least 0.5% of total area
+            )
+            
+            if cleaned_result.mesh is not None:
+                result.mesh = cleaned_result.mesh
+                result.num_vertices = cleaned_result.num_vertices
+                result.num_faces = cleaned_result.num_faces
+                # Note: vertex_boundary_type may be None after island removal
             
             result.total_time_ms = (time.time() - total_start) * 1000
             

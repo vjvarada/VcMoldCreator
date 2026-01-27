@@ -1546,6 +1546,112 @@ def repair_parting_surface_with_part(
     return repair_parting_surface(surface, merge_vertices=True)
 
 
+def remove_small_islands(
+    surface: PartingSurfaceResult,
+    min_triangles: int = PRIMARY_MIN_ISLAND_TRIANGLES,
+    min_area_fraction: float = PRIMARY_MIN_ISLAND_AREA_FRACTION
+) -> PartingSurfaceResult:
+    """
+    Remove small disconnected components (islands) from the parting surface.
+    
+    Small islands are typically noise from isolated tetrahedra with valid
+    configurations that don't connect to the main surface. These can cause
+    issues during smoothing and CSG operations.
+    
+    This is particularly important for SECONDARY surfaces which may have
+    multiple disconnected patches - we keep all significant patches but
+    remove tiny noise fragments.
+    
+    Args:
+        surface: PartingSurfaceResult to clean
+        min_triangles: Minimum triangles to keep an island (default: 10)
+        min_area_fraction: Minimum area fraction of total (default: 0.01 = 1%)
+    
+    Returns:
+        Cleaned PartingSurfaceResult with small islands removed
+    """
+    if surface.mesh is None or len(surface.mesh.faces) == 0:
+        return surface
+    
+    try:
+        mesh = surface.mesh.copy()
+        
+        # Split into connected components
+        try:
+            components = mesh.split(only_watertight=False)
+        except Exception as e:
+            logger.warning(f"Could not split mesh for island removal: {e}")
+            return surface
+        
+        if len(components) <= 1:
+            # Only one component - nothing to remove
+            return surface
+        
+        # Calculate total area for percentage threshold
+        total_area = sum(c.area for c in components)
+        min_area = total_area * min_area_fraction
+        
+        # Identify components to keep
+        # Keep a component if it has enough triangles OR enough area
+        kept_components = []
+        removed_count = 0
+        removed_triangles = 0
+        removed_area = 0.0
+        
+        for comp in components:
+            n_tris = len(comp.faces)
+            area = comp.area
+            
+            if n_tris >= min_triangles or area >= min_area:
+                kept_components.append(comp)
+            else:
+                removed_count += 1
+                removed_triangles += n_tris
+                removed_area += area
+        
+        if removed_count == 0:
+            # Nothing to remove
+            return surface
+        
+        logger.info(f"Removing {removed_count} small islands "
+                   f"({removed_triangles} triangles, {removed_area:.2f} area)")
+        
+        if len(kept_components) == 0:
+            logger.warning("All components were too small - keeping original mesh")
+            return surface
+        
+        # Merge kept components back into a single mesh
+        if len(kept_components) == 1:
+            combined = kept_components[0]
+        else:
+            combined = trimesh.util.concatenate(kept_components)
+        
+        # Build result
+        # Note: vertex_boundary_type is invalidated because vertices are re-indexed
+        # If needed, the caller should track vertex_boundary_type through this operation
+        result = PartingSurfaceResult(
+            mesh=combined,
+            vertices=np.array(combined.vertices),
+            faces=np.array(combined.faces),
+            vertex_to_edge=None,  # Invalidated
+            vertex_boundary_type=None,  # Invalidated by component merge
+            num_vertices=len(combined.vertices),
+            num_faces=len(combined.faces),
+            num_tets_processed=surface.num_tets_processed,
+            num_tets_contributing=surface.num_tets_contributing,
+            extraction_time_ms=surface.extraction_time_ms
+        )
+        
+        logger.info(f"Island removal complete: {len(components)} -> {len(kept_components)} components, "
+                   f"{surface.num_faces} -> {result.num_faces} faces")
+        
+        return result
+        
+    except Exception as e:
+        logger.warning(f"Island removal failed: {e}")
+        return surface
+
+
 # =============================================================================
 # GAP CLOSING BETWEEN PARTING SURFACE AND PART
 # =============================================================================

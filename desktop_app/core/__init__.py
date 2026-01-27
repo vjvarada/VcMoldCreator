@@ -60,6 +60,7 @@ from core.parting_surface import (
     smooth_parting_surface,
     repair_parting_surface,
     remove_small_boundary_loops,
+    remove_small_islands,
     close_parting_surface_gaps,
     PartingSurfaceResult,
     SmallHoleRemovalResult,
