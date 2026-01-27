@@ -3595,9 +3595,8 @@ def create_robust_collar_extension(
         collar_angle = np.arccos(collar_cos)
         collar_angle_deg = np.degrees(collar_angle)
         
-        logger.info(f"Isolated tip {vi}: collar_angle={collar_angle_deg:.1f}°")
-        logger.info(f"  c_a_pos={c_a_pos}, c_b_pos={c_b_pos}")
-        logger.info(f"  c_other_a_pos={c_other_a_pos}, c_other_b_pos={c_other_b_pos}")
+        logger.debug(f"Isolated tip {vi}: collar_angle={collar_angle_deg:.1f}°")
+        logger.debug(f"  c_a_pos={c_a_pos}, c_b_pos={c_b_pos}")
         
         # =======================================================================
         # SIMPLE ROBUST APPROACH: Slerp in the plane of c_a, vi, c_b
@@ -3630,8 +3629,8 @@ def create_robust_collar_extension(
         
         dot_with_outward = np.dot(mid_collar_dir, outward_dir)
         
-        logger.info(f"  outward_dir={outward_dir}")
-        logger.info(f"  mid_collar_dir={mid_collar_dir}, dot_with_outward={dot_with_outward:.3f}")
+        logger.debug(f"  outward_dir={outward_dir}")
+        logger.debug(f"  mid_collar_dir={mid_collar_dir}, dot_with_outward={dot_with_outward:.3f}")
         
         # =======================================================================
         # COMPUTE FAN PLANE - ALL ARC VERTICES WILL LIE IN THIS PLANE
@@ -3649,7 +3648,7 @@ def create_robust_collar_extension(
         
         if fan_plane_len < 1e-8:
             # Collar directions are nearly parallel - no fan needed, just connect directly
-            logger.info(f"  Collar directions parallel, creating single triangle")
+            logger.debug(f"  Collar directions parallel, creating single triangle")
             e1 = c_a_pos - vi_pos
             e2 = c_b_pos - vi_pos
             tri_normal = np.cross(e1, e2)
@@ -3667,8 +3666,8 @@ def create_robust_collar_extension(
         if np.dot(fan_plane_normal, ref_normal) < 0:
             fan_plane_normal = -fan_plane_normal
         
-        logger.info(f"  fan_plane_normal={fan_plane_normal}")
-        logger.info(f"  dot(fan_plane_normal, ref_normal)={np.dot(fan_plane_normal, ref_normal):.3f}")
+        logger.debug(f"  fan_plane_normal={fan_plane_normal}")
+        logger.debug(f"  dot(fan_plane_normal, ref_normal)={np.dot(fan_plane_normal, ref_normal):.3f}")
         
         # =======================================================================
         # CREATE PLANAR ARC VERTICES
@@ -3686,7 +3685,7 @@ def create_robust_collar_extension(
         else:
             n_subs = max(2, fan_subdivisions - 1)
         
-        logger.info(f"  collar_angle={collar_angle_deg:.1f}°, n_subs={n_subs}")
+        logger.debug(f"  n_subs={n_subs}")
         
         # Create arc points using SLERP but KEEP THEM IN THE FAN PLANE
         arc_collars = [c_a]
@@ -3775,7 +3774,7 @@ def create_robust_collar_extension(
         arc_collars.append(c_b)
         arc_positions.append(c_b_pos.copy())
         
-        logger.info(f"  arc_collars count: {len(arc_collars)}")
+        logger.debug(f"  arc_collars count: {len(arc_collars)}")
         
         # =======================================================================
         # CREATE FAN TRIANGLES - ALL SHOULD HAVE CONSISTENT NORMALS
@@ -3821,7 +3820,7 @@ def create_robust_collar_extension(
             triangles_added += 1
         
         tip_fan_triangles_created += triangles_added
-        logger.info(f"  Created {triangles_added} fan triangles")
+        logger.debug(f"  Tip {vi}: created {triangles_added} fan triangles")
     
     logger.info(f"Created {tip_fan_triangles_created} fan triangles at {len(isolated_tip_vertices)} isolated tips "
                f"({tip_arc_vertices_created} arc vertices)")
@@ -6513,319 +6512,6 @@ class FlangeCreationResult:
     
     # Timing
     processing_time_ms: float = 0.0
-
-
-@dataclass
-class BoundaryExtensionResult:
-    """Result of extending membrane boundary to touch the part mesh."""
-    mesh: Optional[trimesh.Trimesh] = None
-    
-    # Statistics
-    boundary_vertices_found: int = 0
-    extension_faces_added: int = 0
-    extension_vertices_added: int = 0
-    vertices_already_touching: int = 0
-    
-    # Face indices of the extension triangles (for yellow coloring)
-    extension_face_indices: Optional[np.ndarray] = None
-    
-    # Gap distances
-    avg_gap_distance: float = 0.0
-    max_gap_distance: float = 0.0
-    
-    # Timing
-    processing_time_ms: float = 0.0
-
-
-def extend_membrane_to_part(
-    membrane_mesh: trimesh.Trimesh,
-    part_mesh: trimesh.Trimesh,
-    touch_threshold: float = 0.1,
-    inner_boundary_max_dist: float = None
-) -> BoundaryExtensionResult:
-    """
-    Extend the membrane INNER boundary edges to touch the part mesh surface.
-    
-    This function finds ONLY the inner boundary edges of the membrane (edges that
-    should touch the part, NOT the outer boundary on the hull) and creates 
-    triangular faces to close any gaps between the membrane and part.
-    
-    Inner boundary detection:
-    - Boundary vertices closer to the part than to the hull centroid are "inner"
-    - We only extend inner boundary edges, leaving outer (hull) boundary alone
-    
-    The new extension faces are tracked separately so they can be colored yellow
-    for debugging.
-    
-    Args:
-        membrane_mesh: The membrane mesh (blue parting surface)
-        part_mesh: The part/object surface to extend towards
-        touch_threshold: Distance threshold - vertices closer than this are 
-                        considered "touching" the part already
-        inner_boundary_max_dist: Max distance from part for a boundary to be
-                                 considered "inner". Auto-computed if None.
-    
-    Returns:
-        BoundaryExtensionResult with extended mesh and extension face indices
-    """
-    import time
-    from scipy.spatial import cKDTree
-    
-    start = time.time()
-    result = BoundaryExtensionResult()
-    
-    if membrane_mesh is None or part_mesh is None:
-        return result
-    
-    if len(membrane_mesh.faces) == 0 or len(part_mesh.faces) == 0:
-        result.mesh = membrane_mesh
-        return result
-    
-    vertices = membrane_mesh.vertices.copy()
-    faces = list(membrane_mesh.faces)
-    n_original_faces = len(faces)
-    
-    # Build part mesh KD-tree for nearest point queries
-    part_tree = cKDTree(part_mesh.vertices)
-    
-    # Compute mesh scale for auto-thresholds
-    mesh_diagonal = np.linalg.norm(part_mesh.bounds[1] - part_mesh.bounds[0])
-    if inner_boundary_max_dist is None:
-        # Inner boundary should be within ~5% of mesh diagonal from part
-        inner_boundary_max_dist = mesh_diagonal * 0.05
-    
-    # === Step 1: Find ALL boundary edges ===
-    edge_to_faces = {}
-    for fi, face in enumerate(faces):
-        for i in range(3):
-            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-            edge_key = (min(v0, v1), max(v0, v1))
-            if edge_key not in edge_to_faces:
-                edge_to_faces[edge_key] = []
-            edge_to_faces[edge_key].append(fi)
-    
-    # Boundary edges have only 1 adjacent face
-    all_boundary_edges = [(e[0], e[1]) for e, flist in edge_to_faces.items() if len(flist) == 1]
-    
-    if len(all_boundary_edges) == 0:
-        logger.info("No boundary edges found - membrane is closed")
-        result.mesh = membrane_mesh
-        result.processing_time_ms = (time.time() - start) * 1000
-        return result
-    
-    # Get unique boundary vertices
-    all_boundary_vertices = set()
-    for e in all_boundary_edges:
-        all_boundary_vertices.add(e[0])
-        all_boundary_vertices.add(e[1])
-    all_boundary_vertices = list(all_boundary_vertices)
-    
-    # === Step 2: Classify boundary vertices as INNER vs OUTER ===
-    # Inner boundary: vertices that are relatively close to the part surface
-    # Outer boundary: vertices far from part (on the hull boundary)
-    
-    boundary_positions = vertices[all_boundary_vertices]
-    distances_to_part, nearest_part_indices = part_tree.query(boundary_positions)
-    
-    # Inner boundary vertices are those within inner_boundary_max_dist of the part
-    is_inner_boundary = distances_to_part < inner_boundary_max_dist
-    
-    inner_boundary_vertices = set(all_boundary_vertices[i] for i in range(len(all_boundary_vertices)) 
-                                   if is_inner_boundary[i])
-    outer_boundary_count = len(all_boundary_vertices) - len(inner_boundary_vertices)
-    
-    logger.info(f"Boundary classification: {len(inner_boundary_vertices)} inner, "
-                f"{outer_boundary_count} outer (threshold: {inner_boundary_max_dist:.3f}mm)")
-    
-    if len(inner_boundary_vertices) == 0:
-        logger.info("No inner boundary vertices found - membrane fully connects to hull")
-        result.mesh = membrane_mesh
-        result.processing_time_ms = (time.time() - start) * 1000
-        return result
-    
-    # === Step 3: Filter to INNER boundary edges only ===
-    # An edge is an inner boundary edge if BOTH vertices are inner boundary vertices
-    inner_boundary_edges = []
-    for e0, e1 in all_boundary_edges:
-        if e0 in inner_boundary_vertices and e1 in inner_boundary_vertices:
-            inner_boundary_edges.append((e0, e1))
-    
-    if len(inner_boundary_edges) == 0:
-        logger.info("No complete inner boundary edges found")
-        result.mesh = membrane_mesh
-        result.processing_time_ms = (time.time() - start) * 1000
-        return result
-    
-    result.boundary_vertices_found = len(inner_boundary_vertices)
-    
-    # === Step 4: Find inner boundary vertices that need extension (have gap to part) ===
-    inner_boundary_list = list(inner_boundary_vertices)
-    inner_positions = vertices[inner_boundary_list]
-    inner_distances, inner_nearest_indices = part_tree.query(inner_positions)
-    
-    # Find vertices that need extension (not touching part)
-    needs_extension_mask = inner_distances > touch_threshold
-    
-    result.vertices_already_touching = int(np.sum(~needs_extension_mask))
-    
-    if not np.any(needs_extension_mask):
-        logger.info(f"All {len(inner_boundary_list)} inner boundary vertices already touch part")
-        result.mesh = membrane_mesh
-        result.processing_time_ms = (time.time() - start) * 1000
-        return result
-    
-    # Track gap distances
-    gap_distances = inner_distances[needs_extension_mask]
-    result.avg_gap_distance = float(np.mean(gap_distances))
-    result.max_gap_distance = float(np.max(gap_distances))
-    
-    logger.info(f"Found {np.sum(needs_extension_mask)} inner boundary vertices with gaps "
-                f"(avg gap: {result.avg_gap_distance:.3f}mm, max: {result.max_gap_distance:.3f}mm)")
-    
-    # === Step 5: Create mapping from inner boundary vertex to nearest part point ===
-    vertex_to_part_vertex = {}  # membrane boundary vertex -> new vertex index (part projection)
-    new_vertices = list(vertices)
-    
-    # Create lookup for inner boundary vertex index
-    inner_bv_to_idx = {bv: i for i, bv in enumerate(inner_boundary_list)}
-    
-    for bv in inner_boundary_vertices:
-        idx = inner_bv_to_idx[bv]
-        if needs_extension_mask[idx]:
-            # Get nearest point on part (use actual closest point, not just vertex)
-            nearest_part_idx = inner_nearest_indices[idx]
-            part_point = part_mesh.vertices[nearest_part_idx]
-            
-            # Add as new vertex
-            new_vertex_idx = len(new_vertices)
-            new_vertices.append(part_point)
-            vertex_to_part_vertex[bv] = new_vertex_idx
-    
-    result.extension_vertices_added = len(new_vertices) - len(vertices)
-    
-    # === Step 6: Create extension triangles along INNER boundary edges only ===
-    # Build edge-to-face mapping to find adjacent face for normal consistency
-    boundary_edge_to_face = {}
-    for fi, face in enumerate(faces):
-        for i in range(3):
-            v0_f, v1_f = int(face[i]), int(face[(i + 1) % 3])
-            edge_key = (min(v0_f, v1_f), max(v0_f, v1_f))
-            if edge_key not in boundary_edge_to_face:
-                boundary_edge_to_face[edge_key] = []
-            boundary_edge_to_face[edge_key].append(fi)
-    
-    # Pre-compute face normals for the membrane
-    membrane_normals = membrane_mesh.face_normals
-    
-    def get_adjacent_face_normal(e0_idx, e1_idx):
-        """Get the normal of the face adjacent to boundary edge (e0, e1)"""
-        edge_key = (min(e0_idx, e1_idx), max(e0_idx, e1_idx))
-        face_list = boundary_edge_to_face.get(edge_key, [])
-        if len(face_list) == 1:
-            return membrane_normals[face_list[0]]
-        return None
-    
-    def compute_triangle_normal(v0_pos, v1_pos, v2_pos):
-        """Compute the normal of triangle (v0, v1, v2)"""
-        edge1 = v1_pos - v0_pos
-        edge2 = v2_pos - v0_pos
-        normal = np.cross(edge1, edge2)
-        length = np.linalg.norm(normal)
-        if length > 1e-10:
-            return normal / length
-        return np.array([0, 0, 1])  # Default if degenerate
-    
-    def create_consistent_triangle(v0_idx, v1_idx, v2_idx, adjacent_normal):
-        """
-        Create triangle with winding consistent with adjacent face normal.
-        
-        Per research: check dot product of new triangle normal with adjacent.
-        If negative, flip winding to maintain surface continuity.
-        """
-        v0_pos = np.array(new_vertices[v0_idx])
-        v1_pos = np.array(new_vertices[v1_idx])
-        v2_pos = np.array(new_vertices[v2_idx])
-        
-        tri_normal = compute_triangle_normal(v0_pos, v1_pos, v2_pos)
-        
-        if adjacent_normal is not None:
-            dot = np.dot(tri_normal, adjacent_normal)
-            # If normal is opposite to neighbor (dot < 0), flip winding
-            if dot < 0:
-                return [v0_idx, v2_idx, v1_idx]  # Flip winding
-        
-        return [v0_idx, v1_idx, v2_idx]
-    
-    extension_faces = []
-    skipped_folds = 0
-    
-    for e0, e1 in inner_boundary_edges:
-        e0_needs = e0 in vertex_to_part_vertex
-        e1_needs = e1 in vertex_to_part_vertex
-        
-        # Get adjacent face normal for consistency checking
-        adj_normal = get_adjacent_face_normal(e0, e1)
-        
-        if e0_needs and e1_needs:
-            # Both vertices need extension - create a quad (2 triangles)
-            p0 = vertex_to_part_vertex[e0]  # part projection of e0
-            p1 = vertex_to_part_vertex[e1]  # part projection of e1
-            
-            # Create 2 triangles forming a quad with consistent normals
-            tri1 = create_consistent_triangle(e0, e1, p1, adj_normal)
-            tri2 = create_consistent_triangle(e0, p1, p0, adj_normal)
-            
-            extension_faces.append(tri1)
-            extension_faces.append(tri2)
-            
-        elif e0_needs and not e1_needs:
-            # Only e0 needs extension - create single triangle to close gap
-            p0 = vertex_to_part_vertex[e0]
-            tri = create_consistent_triangle(e0, e1, p0, adj_normal)
-            extension_faces.append(tri)
-            
-        elif not e0_needs and e1_needs:
-            # Only e1 needs extension - create single triangle
-            p1 = vertex_to_part_vertex[e1]
-            tri = create_consistent_triangle(e0, e1, p1, adj_normal)
-            extension_faces.append(tri)
-        # If neither needs extension, the edge already touches part - no face needed
-    
-    if skipped_folds > 0:
-        logger.info(f"Skipped {skipped_folds} triangles that would cause folds")
-    
-    if len(extension_faces) == 0:
-        logger.info("No extension faces needed - inner boundary already touches part")
-        result.mesh = membrane_mesh
-        result.processing_time_ms = (time.time() - start) * 1000
-        return result
-    
-    result.extension_faces_added = len(extension_faces)
-    
-    # === Step 7: Combine original mesh with extension faces ===
-    all_faces = faces + extension_faces
-    
-    # Track which faces are the extension (for yellow coloring)
-    extension_start_idx = n_original_faces
-    result.extension_face_indices = np.arange(extension_start_idx, 
-                                               extension_start_idx + len(extension_faces))
-    
-    # Create combined mesh
-    combined_mesh = trimesh.Trimesh(
-        vertices=np.array(new_vertices),
-        faces=np.array(all_faces),
-        process=False
-    )
-    combined_mesh.remove_unreferenced_vertices()
-    
-    result.mesh = combined_mesh
-    result.processing_time_ms = (time.time() - start) * 1000
-    
-    logger.info(f"Inner boundary extension: added {result.extension_faces_added} faces, "
-                f"{result.extension_vertices_added} vertices "
-                f"in {result.processing_time_ms:.1f}ms")
-    
-    return result
 
 
 def create_inner_boundary_flange(
