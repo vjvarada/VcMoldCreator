@@ -3268,6 +3268,8 @@ def create_robust_collar_extension(
             
             # For isolated tips, compute collar direction perpendicular to this edge
             # This ensures each of the two edges at a tip gets a DIFFERENT collar direction
+            # CRITICAL: Keep the collar vertex in the plane of the membrane face so
+            # the resulting fan triangles are co-planar with the membrane.
             if vi in isolated_tip_set:
                 # Collar direction is perpendicular to edge, in the plane of the face
                 # perp = face_normal × edge_dir (points "outward" from triangle)
@@ -3275,6 +3277,8 @@ def create_robust_collar_extension(
                 perp_len = np.linalg.norm(perp_dir)
                 
                 logger.debug(f"ISOLATED TIP {vi} processing edge {edge_key}:")
+                logger.debug(f"  face_normal={face_normal}")
+                logger.debug(f"  edge_dir={edge_dir}")
                 logger.debug(f"  perp_dir={perp_dir}, len={perp_len}")
                 
                 if perp_len > 1e-8:
@@ -3296,47 +3300,99 @@ def create_robust_collar_extension(
                         # If perp_dir points toward third vertex, flip it
                         if dot_to_third > 0:
                             perp_dir = -perp_dir
-                            logger.debug(f"  FLIPPED perp_dir")
+                            logger.debug(f"  FLIPPED perp_dir (was pointing toward third vertex)")
                     
-                    # Project vi along this perpendicular direction, then project to part
-                    collar_offset_pt = vi_pos + collar_depth * 2 * perp_dir  # Start further out
+                    # =========================================================
+                    # NEW APPROACH: Stay in the membrane plane
+                    # =========================================================
+                    # The collar vertex should be in the plane of the membrane face.
+                    # This ensures the fan triangles will be co-planar with the face.
+                    #
+                    # We move from vi in the perp_dir (which is in the face plane),
+                    # then offset along -face_normal to go "into" the part.
+                    #
+                    # Final position = vi + d1*perp_dir + d2*(-face_normal)
+                    # where d1 is horizontal distance and d2 is depth into part
                     
+                    # First, try collar in the membrane plane (no depth offset)
+                    planar_collar_pt = vi_pos + collar_depth * perp_dir
+                    
+                    # Check if this point is inside the part
                     try:
-                        closest_pts, _, closest_faces = trimesh.proximity.closest_point(part_mesh, [collar_offset_pt])
-                        closest_pt = closest_pts[0]
-                        closest_face = closest_faces[0]
-                        
-                        if closest_face < len(part_face_normals):
-                            part_normal = part_face_normals[closest_face]
-                        else:
-                            part_normal = -perp_dir
-                        
-                        into_part = -part_normal
-                        into_part_len = np.linalg.norm(into_part)
-                        if into_part_len > 1e-8:
-                            into_part = into_part / into_part_len
-                        
-                        collar_pt = closest_pt + collar_depth * into_part
+                        inside_planar = part_mesh.contains([planar_collar_pt])[0]
+                    except:
+                        inside_planar = False
+                    
+                    if inside_planar:
+                        # Great - the planar point is already inside
+                        collar_pt = planar_collar_pt
+                        logger.debug(f"  Planar collar inside part: {collar_pt}")
+                    else:
+                        # Try adding depth offset along -face_normal (into part)
+                        # This keeps us roughly co-planar while going into the part
+                        depth_offset_pt = planar_collar_pt - collar_depth * face_normal
                         
                         try:
-                            inside = part_mesh.contains([collar_pt])[0]
-                            if not inside:
-                                alt_pt = closest_pt - collar_depth * into_part
-                                if part_mesh.contains([alt_pt])[0]:
-                                    collar_pt = alt_pt
+                            inside_depth = part_mesh.contains([depth_offset_pt])[0]
                         except:
-                            pass
+                            inside_depth = False
                         
-                        collar_idx = len(vertices)
-                        vertices.append(collar_pt.copy())
-                        edge_endpoint_collar[edge_key][vi] = collar_idx
-                        collar_vertices_created += 1
-                        logger.debug(f"  SUCCESS: collar_idx={collar_idx}")
-                        continue
-                        
-                    except Exception as e:
-                        logger.debug(f"  FAILED isolated tip collar: {e}")
-                        # Fall through to normal method
+                        if inside_depth:
+                            collar_pt = depth_offset_pt
+                            logger.debug(f"  Depth-offset collar inside part: {collar_pt}")
+                        else:
+                            # Try opposite face normal direction
+                            alt_depth_pt = planar_collar_pt + collar_depth * face_normal
+                            try:
+                                inside_alt = part_mesh.contains([alt_depth_pt])[0]
+                            except:
+                                inside_alt = False
+                            
+                            if inside_alt:
+                                collar_pt = alt_depth_pt
+                                logger.debug(f"  Alt depth-offset collar inside part: {collar_pt}")
+                            else:
+                                # Fallback: project to part and offset, but try to stay near plane
+                                closest_pts, _, closest_faces = trimesh.proximity.closest_point(
+                                    part_mesh, [planar_collar_pt])
+                                closest_pt = closest_pts[0]
+                                closest_face = closest_faces[0]
+                                
+                                if closest_face < len(part_face_normals):
+                                    part_normal = part_face_normals[closest_face]
+                                else:
+                                    part_normal = face_normal
+                                
+                                # Offset into part
+                                into_part = -part_normal
+                                into_part_len = np.linalg.norm(into_part)
+                                if into_part_len > 1e-8:
+                                    into_part = into_part / into_part_len
+                                
+                                projected_pt = closest_pt + collar_depth * into_part
+                                
+                                try:
+                                    inside_proj = part_mesh.contains([projected_pt])[0]
+                                    if inside_proj:
+                                        collar_pt = projected_pt
+                                    else:
+                                        alt_proj = closest_pt - collar_depth * into_part
+                                        if part_mesh.contains([alt_proj])[0]:
+                                            collar_pt = alt_proj
+                                        else:
+                                            collar_pt = planar_collar_pt  # Last resort
+                                except:
+                                    collar_pt = planar_collar_pt
+                                
+                                logger.debug(f"  Fallback projected collar: {collar_pt}")
+                    
+                    collar_idx = len(vertices)
+                    vertices.append(collar_pt.copy())
+                    edge_endpoint_collar[edge_key][vi] = collar_idx
+                    collar_vertices_created += 1
+                    logger.debug(f"  SUCCESS: collar_idx={collar_idx}, pos={collar_pt}")
+                    continue
+                    
                 else:
                     logger.debug(f"  perp_len too small, falling back to normal method")
             
