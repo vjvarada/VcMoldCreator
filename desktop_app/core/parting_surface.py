@@ -3021,6 +3021,7 @@ def fill_floating_edge_gaps(
 def create_robust_collar_extension(
     membrane_mesh: trimesh.Trimesh,
     part_mesh: trimesh.Trimesh,
+    hull_mesh: Optional[trimesh.Trimesh] = None,
     vertex_boundary_type: Optional[np.ndarray] = None,
     collar_depth: float = 0.5,
     fan_subdivisions: int = 4
@@ -3047,6 +3048,7 @@ def create_robust_collar_extension(
     Args:
         membrane_mesh: The smoothed membrane mesh
         part_mesh: The part mesh to connect to
+        hull_mesh: The hull mesh (optional but recommended for accurate boundary detection)
         vertex_boundary_type: Array with -1=part, 0=interior, 1/2=hull
         collar_depth: How far to extend into part (mm)
         fan_subdivisions: Number of subdivisions for convex corner fans
@@ -3099,29 +3101,82 @@ def create_robust_collar_extension(
     
     logger.info(f"Found {len(boundary_edges)} mesh boundary edges")
     
+    # =========================================================================
     # Classify boundary edges as inner (part) or outer (hull)
-    # STRICT LOGIC: Only collar edges where AT LEAST ONE vertex is definitively on part (-1)
+    # =========================================================================
+    # ROBUST LOGIC: Use multiple criteria to determine inner vs outer:
+    # 1. If vertex_boundary_type is available and reliable, use it
+    # 2. If hull_mesh is available, compare distances: closer to part = inner
+    # 3. Fallback to absolute distance threshold
+    
     has_boundary_type = vertex_boundary_type is not None and len(vertex_boundary_type) > 0
+    has_hull_mesh = hull_mesh is not None
     
     inner_boundary_edges = []
     outer_boundary_edges = 0
     ambiguous_edges = 0
     
-    # Pre-compute distances to part for distance-based fallback
-    if not has_boundary_type or True:  # Always compute for fallback
-        boundary_verts = list(set([v for e in boundary_edges for v in e]))
-        boundary_vert_positions = vertices_arr[boundary_verts]
-        closest_pts, dists_to_part, _ = trimesh.proximity.closest_point(part_mesh, boundary_vert_positions)
-        vert_to_part_dist = {v: d for v, d in zip(boundary_verts, dists_to_part)}
+    # Pre-compute distances to part for ALL boundary vertices
+    boundary_verts = list(set([v for e in boundary_edges for v in e]))
+    boundary_vert_positions = vertices_arr[boundary_verts]
     
-    # Threshold for "close to part" - edges very close to part are inner
+    # Distance to part mesh
+    _, dists_to_part, _ = trimesh.proximity.closest_point(part_mesh, boundary_vert_positions)
+    vert_to_part_dist = {v: d for v, d in zip(boundary_verts, dists_to_part)}
+    
+    # Distance to hull mesh (if available) - this is the KEY for robust classification
+    vert_to_hull_dist = {}
+    if has_hull_mesh:
+        _, dists_to_hull, _ = trimesh.proximity.closest_point(hull_mesh, boundary_vert_positions)
+        vert_to_hull_dist = {v: d for v, d in zip(boundary_verts, dists_to_hull)}
+        logger.info(f"Hull mesh available for boundary classification")
+    
+    # Threshold for "close to part" - only used as absolute fallback
     part_proximity_threshold = 0.5  # mm
     
     for v0, v1 in boundary_edges:
         is_inner = False
         is_outer = False
         
-        if has_boundary_type:
+        # Get distances
+        d0_part = vert_to_part_dist.get(v0, 999)
+        d1_part = vert_to_part_dist.get(v1, 999)
+        d0_hull = vert_to_hull_dist.get(v0, 999) if has_hull_mesh else 999
+        d1_hull = vert_to_hull_dist.get(v1, 999) if has_hull_mesh else 999
+        
+        # =====================================================================
+        # PRIMARY: Use hull vs part distance comparison (most reliable after smoothing)
+        # =====================================================================
+        if has_hull_mesh:
+            # Inner edge: BOTH vertices are closer to part than to hull
+            # Outer edge: BOTH vertices are closer to hull than to part
+            # Mixed: one vertex is closer to each - use the edge midpoint distance
+            
+            v0_closer_to_part = d0_part < d0_hull
+            v1_closer_to_part = d1_part < d1_hull
+            
+            if v0_closer_to_part and v1_closer_to_part:
+                # Both vertices closer to part - definitely inner
+                is_inner = True
+            elif not v0_closer_to_part and not v1_closer_to_part:
+                # Both vertices closer to hull - definitely outer
+                is_outer = True
+            else:
+                # Mixed - check edge midpoint
+                midpoint = (vertices_arr[v0] + vertices_arr[v1]) / 2
+                _, mid_dist_part, _ = trimesh.proximity.closest_point(part_mesh, [midpoint])
+                _, mid_dist_hull, _ = trimesh.proximity.closest_point(hull_mesh, [midpoint])
+                
+                if mid_dist_part[0] < mid_dist_hull[0]:
+                    is_inner = True
+                else:
+                    is_outer = True
+                    ambiguous_edges += 1
+        
+        # =====================================================================
+        # SECONDARY: Use vertex_boundary_type if available and no hull mesh
+        # =====================================================================
+        elif has_boundary_type:
             bt0 = vertex_boundary_type[v0] if v0 < len(vertex_boundary_type) else 0
             bt1 = vertex_boundary_type[v1] if v1 < len(vertex_boundary_type) else 0
             
@@ -3131,24 +3186,22 @@ def create_robust_collar_extension(
             # Definite outer: both vertices are on hull boundary
             elif bt0 in (1, 2) and bt1 in (1, 2):
                 is_outer = True
-            # Mixed or ambiguous: one hull + one interior, or both interior
+            # One is hull - treat as outer
             elif bt0 in (1, 2) or bt1 in (1, 2):
-                # One is hull - treat as outer
                 is_outer = True
             else:
                 # Both are interior (type 0) - use distance fallback
-                d0 = vert_to_part_dist.get(v0, 999)
-                d1 = vert_to_part_dist.get(v1, 999)
-                if d0 < part_proximity_threshold or d1 < part_proximity_threshold:
+                if d0_part < part_proximity_threshold or d1_part < part_proximity_threshold:
                     is_inner = True
                 else:
                     ambiguous_edges += 1
-                    is_outer = True  # Err on side of caution - don't collar ambiguous
+                    is_outer = True
+        
+        # =====================================================================
+        # FALLBACK: Pure distance heuristic (no hull mesh, no boundary type)
+        # =====================================================================
         else:
-            # No boundary type info - use pure distance heuristic
-            d0 = vert_to_part_dist.get(v0, 999)
-            d1 = vert_to_part_dist.get(v1, 999)
-            if d0 < part_proximity_threshold or d1 < part_proximity_threshold:
+            if d0_part < part_proximity_threshold or d1_part < part_proximity_threshold:
                 is_inner = True
             else:
                 is_outer = True

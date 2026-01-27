@@ -2456,9 +2456,11 @@ class PrimarySurfaceSmoothingWorker(QThread):
                 faces_before_fill = len(current_mesh.faces)
                 
                 # Use new robust collar extension
+                # Pass hull_mesh for accurate inner/outer boundary classification
                 fill_result = create_robust_collar_extension(
                     membrane_mesh=current_mesh,
                     part_mesh=part_mesh_for_reprojection,
+                    hull_mesh=hull_mesh_for_reprojection,
                     vertex_boundary_type=current_boundary_type,
                     collar_depth=0.5,  # 0.5mm collar depth
                     fan_subdivisions=4  # Subdivisions for convex corner fans
@@ -2940,9 +2942,11 @@ class CombinedSurfaceSmoothingWorker(QThread):
             faces_before_fill = len(current_mesh.faces)
             
             # Use new robust collar extension
+            # Pass hull_mesh for accurate inner/outer boundary classification
             fill_result = create_robust_collar_extension(
                 membrane_mesh=current_mesh,
                 part_mesh=part_mesh,
+                hull_mesh=hull_mesh,
                 vertex_boundary_type=current_boundary_type,
                 collar_depth=0.5,
                 fan_subdivisions=4
@@ -3267,9 +3271,11 @@ class ComprehensivePrimarySurfaceWorker(QThread):
                 # Record face count before fill (to track which faces are fill triangles)
                 faces_before_fill = len(current_mesh.faces)
                 
+                # Pass hull_mesh for accurate inner/outer boundary classification
                 fill_result = create_robust_collar_extension(
                     membrane_mesh=current_mesh,
                     part_mesh=part_mesh_for_reprojection,
+                    hull_mesh=hull_mesh_for_reprojection,
                     vertex_boundary_type=current_boundary_type,
                     collar_depth=0.5,
                     fan_subdivisions=4
@@ -3624,9 +3630,11 @@ class ComprehensiveSecondarySurfaceWorker(QThread):
                 from core.parting_surface import create_robust_collar_extension
                 
                 self.progress.emit("Creating robust collar extension...")
+                # Pass hull_mesh for accurate inner/outer boundary classification
                 fill_result = create_robust_collar_extension(
                     membrane_mesh=current_mesh,
                     part_mesh=self.part_mesh,
+                    hull_mesh=self.hull_mesh,
                     vertex_boundary_type=None,  # Use distance-based detection
                     collar_depth=0.5,
                     fan_subdivisions=4
@@ -3954,9 +3962,11 @@ class MembraneSmoothingWorker(QThread):
                 from core.parting_surface import create_robust_collar_extension
                 
                 self.progress.emit("Creating robust collar extension...")
+                # Pass hull_mesh for accurate inner/outer boundary classification
                 fill_result = create_robust_collar_extension(
                     membrane_mesh=result.mesh,
                     part_mesh=self.part_mesh,
+                    hull_mesh=self.hull_mesh,
                     vertex_boundary_type=None,  # Use distance-based detection
                     collar_depth=0.5,
                     fan_subdivisions=4
@@ -9791,7 +9801,7 @@ class MainWindow(QMainWindow):
         # Smoothing iterations
         self.smooth_iterations_spin = QSpinBox()
         self.smooth_iterations_spin.setRange(0, 50)
-        self.smooth_iterations_spin.setValue(5)
+        self.smooth_iterations_spin.setValue(50)
         self.smooth_iterations_spin.setToolTip("Number of Laplacian smoothing iterations (0 = no smoothing)")
         smooth_layout.addRow("Iterations:", self.smooth_iterations_spin)
         
