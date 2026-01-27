@@ -67,6 +67,18 @@ from core.parting_surface import (
     MARCHING_TET_TABLE,
     TET_EDGES,
 )
+from core.secondary_membrane import (
+    classify_secondary_membranes_by_mold_half,
+    compute_secondary_vertex_labels_with_primary_awareness,
+    compute_extended_secondary_cut_flags_improved,
+    find_primary_adjacent_edges_in_secondary_tets,
+    find_orphan_primary_cut_edges,
+    find_all_unused_primary_edges,
+    analyze_orphan_edges_for_secondary,
+    find_orphan_edge_clusters,
+    create_enhanced_secondary_cut_edges,
+    SecondaryMembraneInfo,
+)
 
 __all__ = [
     'STLLoader',
@@ -131,4 +143,15 @@ __all__ = [
     'GapClosingResult',
     'MARCHING_TET_TABLE',
     'TET_EDGES',
+    # Secondary membrane
+    'classify_secondary_membranes_by_mold_half',
+    'compute_secondary_vertex_labels_with_primary_awareness',
+    'compute_extended_secondary_cut_flags_improved',
+    'find_primary_adjacent_edges_in_secondary_tets',
+    'find_orphan_primary_cut_edges',
+    'find_all_unused_primary_edges',
+    'analyze_orphan_edges_for_secondary',
+    'find_orphan_edge_clusters',
+    'create_enhanced_secondary_cut_edges',
+    'SecondaryMembraneInfo',
 ]

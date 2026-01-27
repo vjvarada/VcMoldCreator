@@ -1078,7 +1078,9 @@ def extract_parting_surface_from_tet_result(
     use_original_vertices: bool = True,
     prepare_data: bool = True,
     cut_type: str = 'both',
-    extend_to_primary: bool = True
+    extend_to_primary: bool = True,
+    use_improved_secondary: bool = True,
+    include_orphan_primary_in_secondary: bool = True
 ) -> PartingSurfaceResult:
     """
     Convenience function to extract parting surface from a TetrahedralMeshResult.
@@ -1090,6 +1092,11 @@ def extract_parting_surface_from_tet_result(
         cut_type: Which cut edges to use: 'primary', 'secondary', or 'both'
         extend_to_primary: If True and cut_type='secondary', extend secondary surface
                           to connect with primary surface in shared tetrahedra
+        use_improved_secondary: If True, use the improved secondary membrane module
+                               that properly handles primary-secondary junction tetrahedra
+        include_orphan_primary_in_secondary: If True and cut_type='secondary', include
+                                            orphan primary edges (edges not used by primary
+                                            surface due to invalid tet configurations)
     
     Returns:
         PartingSurfaceResult
@@ -1143,38 +1150,72 @@ def extract_parting_surface_from_tet_result(
             logger.warning("No secondary cut edges found")
             return PartingSurfaceResult()
         
-        if extend_to_primary:
-            # Use extended flags that include primary edges in shared tets
+        # Determine which secondary edges to use
+        # If include_orphan_primary_in_secondary=True, we enhance the secondary edges
+        # with orphan primary edges (primary edges not used by primary surface)
+        from . import secondary_membrane as sm
+        
+        if include_orphan_primary_in_secondary and use_improved_secondary:
+            # Create enhanced secondary edges including orphan primary edges
+            enhanced_secondary_edges = sm.create_enhanced_secondary_cut_edges(
+                tet_result,
+                include_orphan_primary=True
+            )
+            logger.info(f"Enhanced secondary edges: {len(enhanced_secondary_edges)} "
+                       f"(original: {len(tet_result.secondary_cut_edges)})")
+        else:
+            enhanced_secondary_edges = tet_result.secondary_cut_edges
+        
+        if extend_to_primary and use_improved_secondary:
+            # Use IMPROVED extended flags that only include adjacent primary edges
+            cut_flags = sm.compute_extended_secondary_cut_flags_improved(
+                tet_result,
+                enhanced_secondary_edges,
+                include_junction_primary_edges=True
+            )
+            logger.info(f"Extracting IMPROVED EXTENDED SECONDARY parting surface ({np.sum(cut_flags)} edges)")
+        elif extend_to_primary:
+            # Use original extended flags that include primary edges in shared tets
             cut_flags = tm.compute_extended_secondary_cut_edge_flags(
                 tet_result.edges,
                 tet_result.tetrahedra,
                 tet_result.tet_edge_indices,
                 tet_result.primary_cut_edges,
-                tet_result.secondary_cut_edges,
+                enhanced_secondary_edges,
                 tet_result.edge_to_index
             )
             logger.info(f"Extracting EXTENDED SECONDARY parting surface ({np.sum(cut_flags)} edges, connected to primary)")
         else:
             cut_flags = tm.compute_secondary_cut_edge_flags(
                 tet_result.edges,
-                tet_result.secondary_cut_edges,
+                enhanced_secondary_edges,
                 tet_result.edge_to_index
             )
             logger.info(f"Extracting SECONDARY parting surface ({np.sum(cut_flags)} edges)")
         
-        # SECONDARY: Use pre-computed cut_edge_flags directly (NOT label-derived!)
-        # 
-        # CRITICAL: For secondary surfaces, we CANNOT derive cuts from vertex labels because:
-        # 1. Secondary vertex labels are only assigned to vertices in tets with secondary cuts
-        # 2. Other vertices remain labeled 0 (unlabeled)
-        # 3. Label-derived cuts require BOTH endpoints to have labels 1 or 2
-        # 4. This would exclude edges where one endpoint is unlabeled (label 0)
-        # 
-        # Therefore, we MUST use the pre-computed cut_flags which correctly mark
-        # all secondary cut edges (and primary edges in shared tets if extend_to_primary=True)
+        # SECONDARY: Use pre-computed cut_edge_flags directly (NOT label-derived)
+        #
+        # IMPORTANT: For secondary surfaces, we MUST use the pre-computed cut_edge_flags
+        # directly because:
+        # 1. Secondary cuts connect vertices with the SAME escape label (both H1 or both H2)
+        # 2. Label-derived cuts look for vertices with DIFFERENT labels (1 vs 2)
+        # 3. The BFS-based label propagation doesn't guarantee all vertices get labeled
+        # 4. Using label-derived cuts for secondary causes edges to be missed when:
+        #    - Vertices have label=0 (not involved in propagation)
+        #    - The condition "label0 in (1,2) and label1 in (1,2)" fails
+        #
+        # The cut_edge_flags are already computed correctly based on:
+        # - Original secondary_cut_edges (edges with same escape label but divergent paths)
+        # - Enhanced edges including orphan primary edges (unused by primary surface)
+        # - Junction primary edges (connecting secondary to primary at shared tets)
+        #
+        # The marching tetrahedra algorithm will use these flags directly to determine
+        # which edges are cut, regardless of vertex labels.
+        
         use_label_derived_cuts = False
         vertex_labels_for_cuts = None
-        logger.info("SECONDARY surface: Using pre-computed cut_edge_flags (NOT label-derived)")
+        logger.info("SECONDARY surface: Using pre-computed cut_edge_flags directly "
+                   f"({np.sum(cut_flags)} cut edges, NOT label-derived)")
         
     else:  # 'both'
         if tet_result.cut_edge_flags is None:
@@ -1220,9 +1261,9 @@ def extract_parting_surface_from_tet_result(
         use_original_vertices=use_original_vertices,
         vertices_original=tet_result.vertices_original,
         boundary_labels=tet_result.boundary_labels,  # Pass for boundary-aware cut point placement
-        vertex_mold_labels=vertex_labels_for_cuts,  # Pass computed labels (primary OR secondary)
+        vertex_mold_labels=vertex_labels_for_cuts,  # Pass computed labels (primary only, None for secondary)
         vertex_escape_distances=vertex_escape_distances,  # Pass for weighted cut point placement
-        use_label_derived_cuts=use_label_derived_cuts  # Now True for BOTH primary and secondary
+        use_label_derived_cuts=use_label_derived_cuts  # True for PRIMARY, False for SECONDARY
     )
 
 
