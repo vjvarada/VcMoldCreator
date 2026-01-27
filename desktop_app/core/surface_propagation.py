@@ -1236,7 +1236,9 @@ def smooth_membrane_with_boundary_reprojection(
     excluded_vertices: Optional[np.ndarray] = None,
     use_fast_smoothing: bool = True,
     vertex_boundary_type: Optional[np.ndarray] = None,
-    feature_aware_smoothing: bool = True
+    feature_aware_smoothing: bool = True,
+    reproject_to_hull: bool = True,
+    reproject_to_primary: bool = False
 ) -> SmoothingResult:
     """
     Smooth the membrane surface following the algorithm from Section 4.4 of the paper.
@@ -1273,6 +1275,12 @@ def smooth_membrane_with_boundary_reprojection(
                              If None, falls back to distance-based classification
         feature_aware_smoothing: If True (default), detect concave corners and keep them fixed.
                                 If False, smooth all vertices normally without feature detection.
+        reproject_to_hull: If True (default), re-project hull boundary vertices to hull mesh.
+                          If False, hull boundary vertices are free to move during smoothing.
+                          Use False for secondary surfaces where only part re-projection is needed.
+        reproject_to_primary: If True, re-project non-part boundary vertices to primary mesh
+                             (if primary_mesh is provided and they are close enough).
+                             Use True for secondary surfaces to connect to primary membrane.
     
     Returns:
         SmoothingResult with smoothed mesh and statistics
@@ -1373,6 +1381,14 @@ def smooth_membrane_with_boundary_reprojection(
         # Use the vertex_boundary_type from extraction (per paper Section 4.4)
         logger.info("Using vertex_boundary_type for boundary classification (per paper Section 4.4)")
         
+        # Count vertex_boundary_type values for ALL membrane vertices (not just boundary)
+        if vertex_boundary_type is not None:
+            n_type_part = np.sum(vertex_boundary_type == -1)
+            n_type_hull = np.sum((vertex_boundary_type == 1) | (vertex_boundary_type == 2))
+            n_type_interior = np.sum(vertex_boundary_type == 0)
+            logger.info(f"vertex_boundary_type distribution (all {len(vertex_boundary_type)} verts): "
+                       f"{n_type_part} part (-1), {n_type_hull} hull (1/2), {n_type_interior} interior (0)")
+        
         for vi in boundary_verts:
             bt = vertex_boundary_type[vi]
             if bt == -1:
@@ -1380,26 +1396,32 @@ def smooth_membrane_with_boundary_reprojection(
                 boundary_surface[vi] = 'part'
             elif bt in (1, 2):
                 # OUTER boundary - originally on hull boundary ∂H (H1 or H2)
-                boundary_surface[vi] = 'hull'
+                # For SECONDARY with reproject_to_primary: re-project to primary membrane
+                # For PRIMARY: re-project to hull
+                if reproject_to_primary and primary_mesh is not None:
+                    boundary_surface[vi] = 'primary'
+                else:
+                    boundary_surface[vi] = 'hull'
             elif bt == 0:
-                # Type 0 = either:
-                # 1. Interior midpoint of an edge where both tet verts were interior/boundary zone
-                # 2. Boundary zone vertex on hull (grey zone between H1 and H2)
-                #
-                # Since this vertex is on the MEMBRANE BOUNDARY (not interior), it should
-                # be re-projected to the hull. The boundary zone is ON the hull surface,
-                # not inside the volume. Mark as hull for re-projection.
-                boundary_surface[vi] = 'hull'
+                # Type 0 = interior midpoint of an edge where both tet verts were interior
+                # For SECONDARY with reproject_to_primary: re-project to primary membrane
+                # For PRIMARY: boundary zone on hull → re-project to hull
+                # For SECONDARY without primary: free to move (marked as hull but filtered later)
+                if reproject_to_primary and primary_mesh is not None:
+                    boundary_surface[vi] = 'primary'
+                else:
+                    boundary_surface[vi] = 'hull'
             else:
                 # Unexpected value - use fallback
                 boundary_surface[vi] = 'patch'
         
         part_count = sum(1 for s in boundary_surface.values() if s == 'part')
         hull_count = sum(1 for s in boundary_surface.values() if s == 'hull')
+        primary_count = sum(1 for s in boundary_surface.values() if s == 'primary')
         patch_count = sum(1 for s in boundary_surface.values() if s == 'patch')
         
-        logger.info(f"Boundary classification (from extraction): {part_count} to part (inner), "
-                   f"{hull_count} to hull (outer, including boundary zone), {patch_count} patch (needs fallback)")
+        logger.info(f"Boundary classification (from extraction): {part_count} to part, "
+                   f"{hull_count} to hull, {primary_count} to primary, {patch_count} patch")
         
         # For 'patch' vertices, use NEIGHBOR PROPAGATION first, then distance as last resort
         # This is important because the inflated hull CONTAINS the part mesh, so interior-
@@ -1608,7 +1630,10 @@ def smooth_membrane_with_boundary_reprojection(
         if surface_type in ('part', 'closest_part', 'propagated_part'):
             part_boundary_indices.append(vi)
         elif surface_type in ('hull', 'closest_hull', 'propagated_hull'):
-            hull_boundary_indices.append(vi)
+            # Only add to hull re-projection list if reproject_to_hull is True
+            if reproject_to_hull:
+                hull_boundary_indices.append(vi)
+            # Otherwise, these vertices are free to move during smoothing
         elif surface_type in ('primary', 'closest_primary'):
             primary_boundary_indices.append(vi)
     
@@ -1616,8 +1641,22 @@ def smooth_membrane_with_boundary_reprojection(
     hull_boundary_indices = np.array(hull_boundary_indices, dtype=np.int64)
     primary_boundary_indices = np.array(primary_boundary_indices, dtype=np.int64)
     
-    logger.info(f"Batched re-projection: {len(part_boundary_indices)} part, "
-               f"{len(hull_boundary_indices)} hull, {len(primary_boundary_indices)} primary")
+    # Count how many boundary vertices are FREE (not re-projected anywhere)
+    n_free_boundary = len(boundary_verts) - len(part_boundary_indices) - len(hull_boundary_indices) - len(primary_boundary_indices)
+    
+    if reproject_to_hull:
+        logger.info(f"Batched re-projection: {len(part_boundary_indices)} part, "
+                   f"{len(hull_boundary_indices)} hull, {len(primary_boundary_indices)} primary, "
+                   f"{n_free_boundary} free")
+    else:
+        logger.info(f"Batched re-projection: {len(part_boundary_indices)} part only "
+                   f"(hull re-projection disabled: {len(boundary_verts) - len(part_boundary_indices)} boundary verts free to move)")
+    
+    # Summary of what will happen during smoothing
+    logger.info(f"Smoothing summary: {len(part_boundary_indices)} verts re-projected to part, "
+               f"{len(interior_verts)} interior verts free, "
+               f"{len(boundary_verts) - len(part_boundary_indices)} other boundary verts "
+               f"{'re-projected to hull/primary' if reproject_to_hull else 'free to move'}")
     
     # === Feature detection is now done inline for part boundary only ===
     # The new approach analyzes membrane-part connections directly rather than
@@ -1756,9 +1795,15 @@ def smooth_membrane_with_boundary_reprojection(
             return False
         
         # Get closest points on part mesh for all membrane vertices
-        part_prox = ProximityQuery(part_mesh)
-        query_positions = membrane_positions[membrane_indices]
-        closest_pts, distances, triangle_ids = part_prox.on_surface(query_positions)
+        # Use try/except to handle rtree errors that can occur with certain mesh configurations
+        try:
+            part_prox = ProximityQuery(part_mesh)
+            query_positions = membrane_positions[membrane_indices]
+            closest_pts, distances, triangle_ids = part_prox.on_surface(query_positions)
+        except Exception as e:
+            logger.warning(f"ProximityQuery failed in concave vertex detection: {e}")
+            logger.warning("Skipping concave corner detection - all part boundary vertices will be smoothed normally")
+            return set()
         
         # Tolerance for being "at" a vertex or edge vs. on face interior
         # Use a small fraction of mesh scale

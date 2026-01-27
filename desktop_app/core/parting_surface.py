@@ -3267,16 +3267,25 @@ def create_robust_collar_extension(
     boundary_verts = list(set([v for e in boundary_edges for v in e]))
     boundary_vert_positions = vertices_arr[boundary_verts]
     
-    # Distance to part mesh
-    _, dists_to_part, _ = trimesh.proximity.closest_point(part_mesh, boundary_vert_positions)
-    vert_to_part_dist = {v: d for v, d in zip(boundary_verts, dists_to_part)}
+    # Distance to part mesh - wrap in try/except for rtree errors
+    try:
+        _, dists_to_part, _ = trimesh.proximity.closest_point(part_mesh, boundary_vert_positions)
+        vert_to_part_dist = {v: d for v, d in zip(boundary_verts, dists_to_part)}
+    except Exception as e:
+        logger.warning(f"closest_point to part failed: {e}")
+        logger.warning("Collar extension skipped due to proximity query failure")
+        return CollarExtensionResult(mesh=membrane_mesh, original_vertices=len(vertices))
     
     # Distance to hull mesh (if available) - this is the KEY for robust classification
     vert_to_hull_dist = {}
     if has_hull_mesh:
-        _, dists_to_hull, _ = trimesh.proximity.closest_point(hull_mesh, boundary_vert_positions)
-        vert_to_hull_dist = {v: d for v, d in zip(boundary_verts, dists_to_hull)}
-        logger.info(f"Hull mesh available for boundary classification")
+        try:
+            _, dists_to_hull, _ = trimesh.proximity.closest_point(hull_mesh, boundary_vert_positions)
+            vert_to_hull_dist = {v: d for v, d in zip(boundary_verts, dists_to_hull)}
+            logger.info(f"Hull mesh available for boundary classification")
+        except Exception as e:
+            logger.warning(f"closest_point to hull failed: {e}")
+            has_hull_mesh = False
     
     # Threshold for "close to part" - only used as absolute fallback
     part_proximity_threshold = 0.5  # mm
@@ -3598,9 +3607,14 @@ def create_robust_collar_extension(
             
             # Normal collar creation (non-isolated tip or fallback)
             # Project and offset into part
-            closest_pts, _, closest_faces = trimesh.proximity.closest_point(part_mesh, [vi_pos])
-            closest_pt = closest_pts[0]
-            closest_face = closest_faces[0]
+            try:
+                closest_pts, _, closest_faces = trimesh.proximity.closest_point(part_mesh, [vi_pos])
+                closest_pt = closest_pts[0]
+                closest_face = closest_faces[0]
+            except Exception as e:
+                logger.warning(f"closest_point failed for vertex {vi}: {e}")
+                # Fallback: skip this vertex for collar creation
+                continue
             
             if closest_face < len(part_face_normals):
                 part_normal = part_face_normals[closest_face]

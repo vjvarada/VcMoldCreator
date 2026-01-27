@@ -2644,10 +2644,11 @@ class CombinedSurfaceSmoothingWorker(QThread):
                 self.progress.emit("No primary surface to smooth")
             
             # =====================================================================
-            # STEP 3: SKIP SECONDARY SURFACE SMOOTHING
+            # STEP 3: SMOOTH SECONDARY SURFACE
             # =====================================================================
-            # Per user request: Only smooth primary surface, not secondary surface
-            # Secondary surfaces are kept as extracted without smoothing
+            # Smooth secondary surface with same algorithm as primary
+            # Re-project appropriate vertices to part mesh or hull
+            # Note: Collar creation for secondary surfaces is deferred to a later step
             has_secondary = (self.secondary_extraction_result is not None and
                            self.secondary_extraction_result.mesh is not None and
                            self.secondary_extraction_result.num_faces > 0)
@@ -2655,20 +2656,26 @@ class CombinedSurfaceSmoothingWorker(QThread):
             if has_secondary:
                 self.progress.emit("")
                 self.progress.emit("=" * 50)
-                self.progress.emit("SECONDARY SURFACE (NO SMOOTHING)")
+                self.progress.emit("SMOOTHING SECONDARY SURFACE")
                 self.progress.emit("=" * 50)
-                self.progress.emit("Secondary surface smoothing skipped per configuration")
                 
-                # Copy unsmoothed secondary surface to result
-                result.secondary_mesh = self.secondary_extraction_result.mesh.copy()
-                result.secondary_num_vertices = len(result.secondary_mesh.vertices)
-                result.secondary_num_faces = len(result.secondary_mesh.faces)
-                result.secondary_boundary_vertices = 0
-                result.secondary_interior_vertices = 0
-                result.secondary_smoothing_time_ms = 0.0
-                result.secondary_gap_fill_time_ms = 0.0
-                result.secondary_fill_face_indices = None
-                result.secondary_restored_corner_positions = None
+                # Use the smoothed primary mesh for secondary boundary re-projection
+                # Secondary membrane boundaries should connect to primary membrane
+                primary_mesh_for_secondary = result.primary_mesh
+                
+                # Smooth secondary surface (without collar creation)
+                result.secondary_mesh, result.secondary_num_vertices, result.secondary_num_faces, \
+                    result.secondary_boundary_vertices, result.secondary_interior_vertices, \
+                    result.secondary_smoothing_time_ms, result.secondary_gap_fill_time_ms, \
+                    result.secondary_fill_face_indices, result.secondary_restored_corner_positions = \
+                    self._smooth_single_surface_no_collar(
+                        self.secondary_extraction_result.mesh.copy(),
+                        self.secondary_extraction_result.vertex_boundary_type,
+                        part_mesh_for_reprojection,
+                        hull_mesh_for_reprojection,
+                        primary_mesh_for_secondary,
+                        "SECONDARY"
+                    )
             else:
                 self.progress.emit("")
                 self.progress.emit("No secondary surface to process (skipping)")
@@ -2778,6 +2785,101 @@ class CombinedSurfaceSmoothingWorker(QThread):
                     )
             else:
                 self.progress.emit(f"{label}: No floating edges detected")
+        
+        # Fix normals
+        current_mesh.fix_normals()
+        
+        return (
+            current_mesh,
+            len(current_mesh.vertices),
+            len(current_mesh.faces),
+            boundary_vertices,
+            interior_vertices,
+            smoothing_time_ms,
+            gap_fill_time_ms,
+            fill_face_indices,
+            restored_corner_positions
+        )
+
+    def _smooth_single_surface_no_collar(self, mesh, vertex_boundary_type, part_mesh, hull_mesh, primary_mesh, label: str):
+        """
+        Smooth a single surface mesh WITHOUT collar creation.
+        
+        This is used for secondary surfaces where collar creation is deferred
+        to a later step. Part boundary vertices are re-projected to the part mesh,
+        and other boundary vertices are re-projected to the primary membrane if close.
+        
+        Args:
+            mesh: The mesh to smooth
+            vertex_boundary_type: Array tracking boundary type for each vertex
+            part_mesh: Part mesh for re-projection of part boundary vertices
+            hull_mesh: Hull mesh (not used for re-projection, but passed for consistency)
+            primary_mesh: Primary membrane mesh for re-projection of non-part boundary vertices
+            label: Label for progress messages
+        
+        Returns tuple of:
+            (mesh, num_vertices, num_faces, boundary_vertices, interior_vertices,
+             smoothing_time_ms, gap_fill_time_ms, fill_face_indices, restored_corner_positions)
+        """
+        from core.surface_propagation import smooth_membrane_with_boundary_reprojection
+        import time
+        
+        current_mesh = mesh
+        current_boundary_type = vertex_boundary_type
+        
+        smoothing_time_ms = 0.0
+        gap_fill_time_ms = 0.0
+        boundary_vertices = 0
+        interior_vertices = 0
+        fill_face_indices = None
+        restored_corner_positions = None
+        
+        # Phase 1: Laplacian smoothing with boundary re-projection
+        # For secondary surfaces:
+        #   - Part boundary vertices (type=-1) → re-project to part mesh
+        #   - Other boundary vertices → re-project to primary membrane if close
+        #   - Interior vertices → free to smooth
+        if self.smooth_iterations > 0:
+            self.progress.emit(f"{label}: Two-phase smoothing ({self.smooth_iterations} iters, λ={self.damping_factor})...")
+            if primary_mesh is not None:
+                self.progress.emit(f"{label}: Re-projecting to part mesh + primary membrane")
+            else:
+                self.progress.emit(f"{label}: Re-projecting to part mesh only (no primary mesh available)")
+            
+            smoothing_start = time.time()
+            
+            smoothing_result = smooth_membrane_with_boundary_reprojection(
+                current_mesh,
+                part_mesh=part_mesh,
+                hull_mesh=hull_mesh,
+                primary_mesh=primary_mesh,  # Pass primary mesh for secondary boundary re-projection
+                iterations=self.smooth_iterations,
+                damping_factor=self.damping_factor,
+                excluded_vertices=None,
+                vertex_boundary_type=current_boundary_type,
+                feature_aware_smoothing=self.feature_aware_smoothing,
+                reproject_to_hull=False,  # Secondary: don't re-project to hull
+                reproject_to_primary=True  # Secondary: re-project non-part boundaries to primary
+            )
+            
+            smoothing_time_ms = (time.time() - smoothing_start) * 1000
+            boundary_vertices = smoothing_result.boundary_vertices
+            interior_vertices = smoothing_result.interior_vertices
+            
+            if hasattr(smoothing_result, 'restored_corner_positions'):
+                restored_corner_positions = smoothing_result.restored_corner_positions
+            
+            if smoothing_result.mesh is not None:
+                current_mesh = smoothing_result.mesh
+                self.progress.emit(f"{label}: Smoothed {boundary_vertices} boundary verts, {interior_vertices} interior verts")
+            else:
+                self.progress.emit(f"{label}: Smoothing returned no mesh - using unsmoothed")
+        else:
+            self.progress.emit(f"{label}: Smoothing skipped (iterations=0)")
+        
+        # Phase 2: Skip collar creation for secondary surfaces
+        # Collar creation will be handled in a separate step later
+        self.progress.emit(f"{label}: Collar creation deferred (will be handled separately)")
         
         # Fix normals
         current_mesh.fix_normals()
