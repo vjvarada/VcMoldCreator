@@ -378,18 +378,21 @@ def _smooth_displaced_vertices(
     displacement: np.ndarray = None
 ) -> np.ndarray:
     """
-    Smooth the displaced vertex positions using peak-preserving Laplacian smoothing.
+    Smooth the displaced vertex positions using peak-attracting Laplacian smoothing.
     
-    This reduces jagged mesh artifacts by averaging each vertex's position
-    with its neighbors, while keeping local extrema (peaks and valleys) fixed
-    to preserve the full sinusoidal amplitude.
+    This creates rounded dome-like peaks and valleys by:
+    1. Keeping local extrema (peaks/valleys) fixed at full amplitude
+    2. Pulling nearby vertices TOWARD the extrema, not just averaging
+    
+    For vertices near a peak, the smoothing is weighted to favor higher neighbors,
+    creating a rounded dome. For valleys, it favors lower neighbors.
     
     Args:
         vertices: (N, 3) all vertex positions (will be copied)
         band_indices: (K,) indices of band vertices to smooth
         faces: (F, 3) face indices of the mesh
         iterations: Number of smoothing iterations
-        displacement: (N,) displacement values used to identify extrema
+        displacement: (N,) displacement values used to identify extrema and weight
     
     Returns:
         (N, 3) smoothed vertex positions
@@ -400,7 +403,6 @@ def _smooth_displaced_vertices(
     smoothed_verts = vertices.copy()
     
     # Build adjacency for band vertices only
-    # Create a mapping from global index to band index
     band_set = set(band_indices.tolist())
     global_to_band = {g: b for b, g in enumerate(band_indices)}
     
@@ -409,13 +411,11 @@ def _smooth_displaced_vertices(
     neighbors = [[] for _ in range(n_band)]
     
     for face in faces:
-        # Check which vertices of this face are in the band
         band_verts_in_face = []
         for v in face:
             if v in band_set:
                 band_verts_in_face.append(global_to_band[v])
         
-        # Add edges between band vertices in this face
         for i in range(len(band_verts_in_face)):
             for j in range(i + 1, len(band_verts_in_face)):
                 bi, bj = band_verts_in_face[i], band_verts_in_face[j]
@@ -424,9 +424,9 @@ def _smooth_displaced_vertices(
                 if bi not in neighbors[bj]:
                     neighbors[bj].append(bi)
     
-    # Identify local extrema (peaks and valleys) based on displacement values
-    # These vertices will be kept fixed during smoothing to preserve amplitude
-    is_extremum = np.zeros(n_band, dtype=bool)
+    # Identify local extrema and their type (peak=+1, valley=-1, neither=0)
+    extremum_type = np.zeros(n_band, dtype=np.int8)
+    band_displacements = np.zeros(n_band)
     
     if displacement is not None:
         band_displacements = displacement[band_indices]
@@ -436,37 +436,100 @@ def _smooth_displaced_vertices(
                 my_disp = band_displacements[i]
                 neighbor_disps = [band_displacements[n] for n in neighbors[i]]
                 
-                # Check if this vertex is a local maximum (peak)
                 is_local_max = all(my_disp >= nd for nd in neighbor_disps)
-                # Check if this vertex is a local minimum (valley)
                 is_local_min = all(my_disp <= nd for nd in neighbor_disps)
                 
-                is_extremum[i] = is_local_max or is_local_min
+                if is_local_max:
+                    extremum_type[i] = 1  # Peak
+                elif is_local_min:
+                    extremum_type[i] = -1  # Valley
     
-    n_extrema = np.sum(is_extremum)
-    logger.debug(f"  Found {n_extrema} local extrema (peaks/valleys) to preserve")
+    n_peaks = np.sum(extremum_type == 1)
+    n_valleys = np.sum(extremum_type == -1)
+    logger.debug(f"  Found {n_peaks} peaks and {n_valleys} valleys to preserve")
     
-    # Laplacian smoothing iterations on 3D positions
-    # Skip extrema to preserve full amplitude at peaks and valleys
-    damping = 0.5  # Blend factor with neighbors
+    # Peak-attracting smoothing iterations
+    damping = 0.5
     
     for _ in range(iterations):
         new_positions = smoothed_verts.copy()
+        
         for i in range(n_band):
-            # Skip extrema - keep them at original displaced position
-            if is_extremum[i]:
+            # Skip extrema - keep them fixed
+            if extremum_type[i] != 0:
                 continue
-                
+            
+            if len(neighbors[i]) == 0:
+                continue
+            
             global_idx = band_indices[i]
-            if len(neighbors[i]) > 0:
-                # Average neighbor positions (in global coordinates)
-                neighbor_global_indices = [band_indices[n] for n in neighbors[i]]
-                neighbor_avg = np.mean(smoothed_verts[neighbor_global_indices], axis=0)
-                # Blend current position with neighbor average
-                new_positions[global_idx] = (
-                    (1.0 - damping) * smoothed_verts[global_idx] + 
-                    damping * neighbor_avg
-                )
+            my_disp = band_displacements[i]
+            
+            # Compute weights for each neighbor based on displacement
+            # Neighbors with displacement in the same direction (toward extremum) get higher weight
+            neighbor_positions = []
+            neighbor_weights = []
+            
+            for n in neighbors[i]:
+                n_global = band_indices[n]
+                n_disp = band_displacements[n]
+                
+                # Weight based on how much "more extreme" the neighbor is
+                # For positive displacement (near peak): favor higher neighbors
+                # For negative displacement (near valley): favor lower neighbors
+                if my_disp >= 0:
+                    # Near a peak - favor neighbors with higher displacement
+                    weight = 1.0 + max(0, n_disp - my_disp)
+                else:
+                    # Near a valley - favor neighbors with lower (more negative) displacement
+                    weight = 1.0 + max(0, my_disp - n_disp)
+                
+                neighbor_positions.append(smoothed_verts[n_global])
+                neighbor_weights.append(weight)
+            
+            # Normalize weights
+            total_weight = sum(neighbor_weights)
+            if total_weight > 0:
+                neighbor_weights = [w / total_weight for w in neighbor_weights]
+            
+            # Weighted average of neighbor positions
+            weighted_avg = np.zeros(3)
+            for pos, w in zip(neighbor_positions, neighbor_weights):
+                weighted_avg += w * pos
+            
+            # Blend current position with weighted neighbor average
+            new_positions[global_idx] = (
+                (1.0 - damping) * smoothed_verts[global_idx] + 
+                damping * weighted_avg
+            )
+        
+        smoothed_verts = new_positions
+    
+    # Final pass: smooth the extrema (peaks/valleys) to round off sharp points
+    # Now that neighbors have been pulled toward extrema, averaging the extrema
+    # with their elevated neighbors creates a smooth rounded dome
+    # Apply same number of iterations as the main smoothing
+    for _ in range(iterations):
+        new_positions = smoothed_verts.copy()
+        for i in range(n_band):
+            if extremum_type[i] == 0:  # Skip non-extrema
+                continue
+            
+            if len(neighbors[i]) == 0:
+                continue
+            
+            global_idx = band_indices[i]
+            
+            # Simple average of neighbor positions (they've been pulled up/down already)
+            neighbor_global_indices = [band_indices[n] for n in neighbors[i]]
+            neighbor_avg = np.mean(smoothed_verts[neighbor_global_indices], axis=0)
+            
+            # Blend with neighbors to round off the peak/valley
+            # Use same damping factor for consistency
+            new_positions[global_idx] = (
+                (1.0 - damping) * smoothed_verts[global_idx] + 
+                damping * neighbor_avg
+            )
         smoothed_verts = new_positions
     
     return smoothed_verts
