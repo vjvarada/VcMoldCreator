@@ -1641,6 +1641,22 @@ def smooth_membrane_with_boundary_reprojection(
     hull_boundary_indices = np.array(hull_boundary_indices, dtype=np.int64)
     primary_boundary_indices = np.array(primary_boundary_indices, dtype=np.int64)
     
+    # Detect "transition vertices" - primary-bound vertices that have part-bound neighbors along boundary edges.
+    # These need dual re-projection: first to part, then to primary, to ensure smooth transition.
+    part_boundary_set = set(part_boundary_indices)
+    transition_vertex_indices = []
+    if len(primary_boundary_indices) > 0 and len(part_boundary_indices) > 0:
+        for vi in primary_boundary_indices:
+            neighbors_along_boundary = boundary_neighbors.get(vi, set())
+            # Check if any boundary neighbor is part-bound
+            if neighbors_along_boundary & part_boundary_set:
+                transition_vertex_indices.append(vi)
+    transition_vertex_indices = np.array(transition_vertex_indices, dtype=np.int64)
+    
+    if len(transition_vertex_indices) > 0:
+        logger.info(f"Detected {len(transition_vertex_indices)} transition vertices "
+                   f"(primary-bound with part-bound neighbors) for dual re-projection")
+    
     # Count how many boundary vertices are FREE (not re-projected anywhere)
     n_free_boundary = len(boundary_verts) - len(part_boundary_indices) - len(hull_boundary_indices) - len(primary_boundary_indices)
     
@@ -1981,6 +1997,28 @@ def smooth_membrane_with_boundary_reprojection(
         
         # Re-project to primary mesh (for secondary surfaces, excluding concave corners)
         if len(primary_boundary_indices) > 0 and primary_mesh is not None:
+            # DUAL RE-PROJECTION for transition vertices:
+            # Vertices on edges connecting to part-bound vertices need to be projected
+            # to part FIRST, then to primary. This ensures the secondary membrane
+            # maintains a smooth transition at the part boundary interface.
+            if len(transition_vertex_indices) > 0 and part_mesh is not None:
+                if part_feature_types is not None:
+                    # Use feature-aware reprojection for transition vertices to part
+                    vertices = reproject_with_feature_awareness(
+                        vertices=vertices,
+                        boundary_indices=transition_vertex_indices,
+                        target_mesh=part_mesh,
+                        feature_types=part_feature_types,
+                        sharp_edge_info=part_sharp_edge_info,
+                        search_radius=search_radius
+                    )
+                elif part_proximity is not None:
+                    # Fallback to standard reprojection
+                    transition_positions = vertices[transition_vertex_indices]
+                    closest_pts, _, _ = part_proximity.on_surface(transition_positions)
+                    vertices[transition_vertex_indices] = closest_pts
+            
+            # Now project ALL primary vertices to primary mesh (including transition vertices)
             if primary_feature_types is not None:
                 # Use feature-aware reprojection to skip concave corners
                 vertices = reproject_with_feature_awareness(
