@@ -63,24 +63,35 @@ applyTo: '**'
 - PyQt6 for desktop app
 - VS Code as primary editor
 
-### Virtual Environment (IMPORTANT!)
-**ALWAYS activate the virtual environment before running any Python commands!**
+### Virtual Environment (CRITICAL - READ THIS!)
 
+⚠️ **MANDATORY: ALWAYS use the virtual environment for ALL Python operations!** ⚠️
+
+**For running Python commands:**
 ```powershell
-# Activate virtual environment FIRST before any Python command
-cd c:\Users\VijayRaghavVarada\Documents\Github\VcMoldCreator
-.\.venv\Scripts\Activate.ps1
-
-# Then navigate and run Python commands
-cd desktop_app
-python main.py
+# Use the venv Python directly:
+c:\Users\VijayRaghavVarada\Documents\Github\VcMoldCreator\.venv\Scripts\python.exe <script>
 ```
 
-The virtual environment is located at:
-- Path: `c:\Users\VijayRaghavVarada\Documents\Github\VcMoldCreator\.venv\`
-- Activation: `.\.venv\Scripts\Activate.ps1` (PowerShell) from project root
+**For installing packages:**
+```powershell
+# Use the venv pip directly - NEVER use system pip:
+c:\Users\VijayRaghavVarada\Documents\Github\VcMoldCreator\.venv\Scripts\pip.exe install <package>
+```
 
-**Never run Python directly without activating the venv first!**
+**Virtual Environment Location:**
+- Path: `c:\Users\VijayRaghavVarada\Documents\Github\VcMoldCreator\.venv\`
+- Python: `.venv\Scripts\python.exe`
+- Pip: `.venv\Scripts\pip.exe`
+
+**⛔ NEVER DO:**
+- `pip install <package>` (uses system pip)
+- `python <script>` without activating venv first
+
+**✅ ALWAYS DO:**
+- `.venv\Scripts\pip.exe install <package>`
+- `.venv\Scripts\python.exe <script>`
+- Or activate first: `.\.venv\Scripts\Activate.ps1`
 
 ---
 

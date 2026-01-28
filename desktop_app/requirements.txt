@@ -32,3 +32,6 @@ potpourri3d>=1.0.0
 # GPU acceleration (optional - for faster distance computation)
 # Install with CUDA support: pip install torch --index-url https://download.pytorch.org/whl/cu121
 torch>=2.0.0
+
+# Perlin noise (for registration textures on mold seams)
+noise>=1.2.0
