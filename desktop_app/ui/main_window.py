@@ -3174,8 +3174,7 @@ class RegistrationPatternWorker(QThread):
     
     def __init__(self, parting_surface, part_mesh, hull_mesh, vertex_boundary_type,
                  hull_offset_fraction: float, band_width_fraction: float,
-                 noise_amplitude_mm: float, noise_interval_mm: float,
-                 smoothing_iterations: int = 2):
+                 noise_amplitude_mm: float, noise_interval_mm: float):
         """
         Initialize registration pattern worker.
         
@@ -3188,7 +3187,6 @@ class RegistrationPatternWorker(QThread):
             band_width_fraction: Fraction of bbox diagonal for band width
             noise_amplitude_mm: Pattern amplitude in mm
             noise_interval_mm: Pattern wavelength in mm
-            smoothing_iterations: Number of smoothing passes to reduce jaggedness
         """
         super().__init__()
         self.parting_surface = parting_surface
@@ -3199,11 +3197,10 @@ class RegistrationPatternWorker(QThread):
         self.band_width_fraction = band_width_fraction
         self.noise_amplitude_mm = noise_amplitude_mm
         self.noise_interval_mm = noise_interval_mm
-        self.smoothing_iterations = smoothing_iterations
     
     def run(self):
         try:
-            from core.perlin_registration import apply_registration_noise
+            from core.registration_marks import apply_registration_noise
             
             self.progress.emit("Applying sinusoidal pattern...")
             
@@ -3215,8 +3212,7 @@ class RegistrationPatternWorker(QThread):
                 hull_offset_fraction=self.hull_offset_fraction,
                 band_width_fraction=self.band_width_fraction,
                 noise_amplitude_mm=self.noise_amplitude_mm,
-                noise_interval_mm=self.noise_interval_mm,
-                smoothing_iterations=self.smoothing_iterations
+                noise_interval_mm=self.noise_interval_mm
             )
             
             self.progress.emit(
@@ -6509,7 +6505,7 @@ class MainWindow(QMainWindow):
         
         # Restore registration noise result
         if session.get('registration_noise_result'):
-            from core.perlin_registration import PerlinRegistrationResult
+            from core.registration_marks import PerlinRegistrationResult
             self._registration_noise_result = type('Result', (), {})()
             for k, v in session['registration_noise_result'].items():
                 if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
@@ -8448,18 +8444,6 @@ class MainWindow(QMainWindow):
         self.noise_hull_offset_spin.setToolTip("Position of band center (0%=at part, 100%=at hull)")
         noise_params_layout.addRow("Hull Offset:", self.noise_hull_offset_spin)
         
-        # Smoothing iterations
-        self.noise_smoothing_spin = QSpinBox()
-        self.noise_smoothing_spin.setRange(0, 10)
-        self.noise_smoothing_spin.setValue(2)  # Default: 2 iterations
-        self.noise_smoothing_spin.setToolTip(
-            "Number of smoothing passes to reduce jaggedness.\n"
-            "0 = no smoothing (may have sharp transitions)\n"
-            "2 = default, smooth ridges\n"
-            "5+ = very smooth, may reduce pattern definition"
-        )
-        noise_params_layout.addRow("Smoothing:", self.noise_smoothing_spin)
-        
         self.context_layout.addWidget(noise_params_group)
         
         # Apply button
@@ -8563,7 +8547,6 @@ class MainWindow(QMainWindow):
         interval = self.noise_interval_spin.value()
         band_width_pct = self.noise_band_width_spin.value() / 100.0
         hull_offset_pct = self.noise_hull_offset_spin.value() / 100.0
-        smoothing_iterations = self.noise_smoothing_spin.value()
         
         # Get the smoothed primary surface and its vertex_boundary_type
         parting_surface = self._combined_smooth_result.primary_mesh
@@ -8590,8 +8573,7 @@ class MainWindow(QMainWindow):
             hull_offset_fraction=hull_offset_pct,
             band_width_fraction=band_width_pct,
             noise_amplitude_mm=amplitude,
-            noise_interval_mm=interval,
-            smoothing_iterations=smoothing_iterations
+            noise_interval_mm=interval
         )
         self._registration_worker.progress.connect(self._on_registration_progress)
         self._registration_worker.complete.connect(self._on_registration_complete)

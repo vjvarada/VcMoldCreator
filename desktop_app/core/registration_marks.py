@@ -1,5 +1,5 @@
 """
-Sinusoidal Registration Module
+Registration Marks Module
 
 Adds sinusoidal displacement patterns to the parting surface to create registration
 features that help align mold halves during assembly.
@@ -9,8 +9,8 @@ From the paper (Section 5):
 > pieces to improve alignment. Aligning surfaces with regular features is less 
 > error-prone in contrast to flat or very smooth surfaces."
 
-The sinusoidal pattern creates smooth, regular ridges that follow the hull contour,
-making it easy for mold halves to snap together correctly.
+The sinusoidal pattern creates smooth, regular dome-shaped ridges that follow the 
+hull contour, making it easy for mold halves to snap together correctly.
 
 The pattern is applied in a band around an intermediate convex hull (at 50% distance
 between the part and outer hull), not across the entire interior surface.
@@ -66,7 +66,6 @@ class SinusoidalRegistrationResult:
     # Parameters used
     amplitude: float
     wavelength: float
-    smoothing_iterations: int
     
     # Timing
     computation_time_ms: float
@@ -134,7 +133,6 @@ def apply_registration_noise(
     logger.info(f"  Band width: {band_width:.2f}mm ({band_width_fraction*100:.1f}% of diagonal)")
     logger.info(f"  Amplitude: +/-{noise_amplitude_mm:.2f}mm")
     logger.info(f"  Wavelength: {noise_interval_mm:.2f}mm")
-    logger.info(f"  Smoothing iterations: {smoothing_iterations}")
     
     # Step 1: Find interior vertices (vertex_boundary_type == 0)
     interior_mask = vertex_boundary_type == 0
@@ -144,7 +142,7 @@ def apply_registration_noise(
     if n_interior == 0:
         logger.warning("No interior vertices found - cannot apply pattern")
         return _create_empty_result(parting_surface, vertices, band_width, 0.0,
-                                     noise_amplitude_mm, noise_interval_mm, smoothing_iterations, start_time)
+                                     noise_amplitude_mm, noise_interval_mm, start_time)
     
     # Step 2: Compute distance from each interior vertex to part mesh
     logger.info("  Computing distances to part mesh...")
@@ -173,7 +171,7 @@ def apply_registration_noise(
         logger.warning("No vertices found in registration band - check parameters")
         return _create_empty_result(parting_surface, vertices, band_width,
                                      hull_offset_fraction * bbox_diag,
-                                     noise_amplitude_mm, noise_interval_mm, smoothing_iterations, start_time)
+                                     noise_amplitude_mm, noise_interval_mm, start_time)
     
     # Step 5: Compute vertex normals for displacement direction
     logger.info("  Computing vertex normals...")
@@ -215,8 +213,16 @@ def apply_registration_noise(
     # Get the closest hull points for vertices in band (for contour-following)
     band_closest_hull = closest_hull[in_band_mask]
     
-    # Compute raw sinusoidal pattern
-    pattern_values = _compute_sinusoidal_pattern(band_positions, noise_interval_mm, band_closest_hull)
+    # Compute dome-shaped pattern with pre-smoothed parameterization
+    # This creates inherently smooth domes by smoothing the arc-length before computing pattern
+    pattern_values = _compute_sinusoidal_pattern(
+        band_positions, 
+        noise_interval_mm, 
+        band_closest_hull,
+        band_indices=band_interior_indices,
+        faces=faces,
+        smoothing_iterations=smoothing_iterations
+    )
     
     # Apply displacement: pattern_value * amplitude * falloff (FULL amplitude)
     band_displacements = pattern_values * noise_amplitude_mm * falloff
@@ -229,20 +235,7 @@ def apply_registration_noise(
         band_positions + band_displacements[:, np.newaxis] * band_normals
     )
     
-    # Step 7: Smooth the displaced mesh vertices to reduce jaggedness
-    # This preserves the sinusoidal amplitude while smoothing mesh artifacts
-    # Peak-preserving: local extrema (peaks/valleys) are kept fixed
-    if smoothing_iterations > 0:
-        logger.info(f"  Smoothing displaced vertices ({smoothing_iterations} iterations)...")
-        modified_vertices = _smooth_displaced_vertices(
-            modified_vertices,
-            band_interior_indices,
-            faces,
-            smoothing_iterations,
-            displacement  # Pass displacement to identify peaks/valleys
-        )
-    
-    # Step 8: Create modified mesh
+    # Step 7: Create modified mesh
     modified_mesh = trimesh.Trimesh(vertices=modified_vertices, faces=faces)
     
     # Compute statistics
@@ -265,7 +258,6 @@ def apply_registration_noise(
         n_modified_vertices=n_in_band,
         amplitude=noise_amplitude_mm,
         wavelength=noise_interval_mm,
-        smoothing_iterations=smoothing_iterations,
         computation_time_ms=elapsed_ms
     )
 
@@ -277,7 +269,6 @@ def _create_empty_result(
     band_center_distance: float,
     amplitude: float,
     wavelength: float,
-    smoothing_iterations: int,
     start_time: float
 ) -> SinusoidalRegistrationResult:
     """Create an empty result when no vertices are modified."""
@@ -293,7 +284,6 @@ def _create_empty_result(
         n_modified_vertices=0,
         amplitude=amplitude,
         wavelength=wavelength,
-        smoothing_iterations=smoothing_iterations,
         computation_time_ms=(time.time() - start_time) * 1000
     )
 
@@ -305,21 +295,26 @@ def _create_empty_result(
 def _compute_sinusoidal_pattern(
     positions: np.ndarray,
     interval_mm: float,
-    closest_hull: np.ndarray = None
+    closest_hull: np.ndarray = None,
+    band_indices: np.ndarray = None,
+    faces: np.ndarray = None,
+    smoothing_iterations: int = 2
 ) -> np.ndarray:
     """
-    Compute sinusoidal pattern creating ridges that follow the hull contour.
+    Compute dome-shaped pattern creating smooth ridges that follow the hull contour.
     
-    Uses arc-length along the hull boundary to create waves that naturally
-    follow the curved contour. This is computed by:
-    1. Finding the plane of the hull points (using PCA to get normal)
-    2. Computing angular position around the centroid in that plane
-    3. Converting angle to arc-length and applying sinusoid
+    Creates clean dome shapes by:
+    1. Computing arc-length parameterization around the hull
+    2. Smoothing the arc-length values on the mesh to remove discretization noise
+    3. Computing a raised-cosine dome profile for smooth peaks and valleys
     
     Args:
         positions: (N, 3) vertex positions
         interval_mm: Distance between ridge peaks in mm
         closest_hull: (N, 3) closest points on hull surface for each vertex
+        band_indices: (N,) global indices of band vertices (for smoothing)
+        faces: (F, 3) mesh faces (for smoothing)
+        smoothing_iterations: Iterations to smooth the parameterization
     
     Returns:
         (N,) pattern values in range [-1, 1]
@@ -332,19 +327,16 @@ def _compute_sinusoidal_pattern(
         primary_axis = eigenvectors[:, 2]
         projection = np.dot(centered, primary_axis)
         frequency = 2.0 * np.pi / interval_mm
-        return np.sin(frequency * projection)
+        return np.cos(frequency * projection)  # cos for dome at center
     
     # Compute centroid of hull points
     centroid = np.mean(closest_hull, axis=0)
     hull_centered = closest_hull - centroid
     
     # Use PCA to find the plane of the hull points
-    # The smallest eigenvector is the normal to the plane
     cov = np.cov(hull_centered.T)
     eigenvalues, eigenvectors = np.linalg.eigh(cov)
     
-    # Normal to the hull point cloud plane (smallest eigenvalue)
-    plane_normal = eigenvectors[:, 0]
     # Two axes in the plane (largest eigenvalues)
     axis1 = eigenvectors[:, 2]  # Primary direction in plane
     axis2 = eigenvectors[:, 1]  # Secondary direction in plane
@@ -353,60 +345,78 @@ def _compute_sinusoidal_pattern(
     proj_x = np.dot(hull_centered, axis1)
     proj_y = np.dot(hull_centered, axis2)
     
-    # Compute angular position around centroid (arc-length parameterization)
+    # Compute angular position around centroid
     angles = np.arctan2(proj_y, proj_x)  # Range [-pi, pi]
     
     # Compute approximate radius for arc-length conversion
     radii = np.sqrt(proj_x**2 + proj_y**2)
     mean_radius = np.mean(radii) if np.mean(radii) > 1e-6 else 1.0
     
-    # Convert angle to arc-length: s = r * theta
-    arc_length = mean_radius * angles
+    # Total circumference of the pattern band
+    total_circumference = 2.0 * np.pi * mean_radius
     
-    # Compute sinusoidal pattern based on arc-length
-    frequency = 2.0 * np.pi / interval_mm
+    # Adjust frequency to ensure an INTEGER number of waves around the circumference
+    # This prevents start/end point overlap or gaps
+    raw_num_waves = total_circumference / interval_mm
+    num_waves = max(1, round(raw_num_waves))  # At least 1 wave, rounded to nearest integer
+    
+    # Adjusted interval that fits exactly
+    adjusted_interval = total_circumference / num_waves
+    
+    logger.debug(f"  Circumference: {total_circumference:.2f}mm, "
+                 f"requested interval: {interval_mm:.2f}mm, "
+                 f"waves: {num_waves}, adjusted interval: {adjusted_interval:.2f}mm")
+    
+    # Convert angle to arc-length: shift angles from [-pi, pi] to [0, 2*pi]
+    # This gives continuous arc-length from 0 to circumference
+    angles_shifted = angles + np.pi  # Now in range [0, 2*pi]
+    arc_length = mean_radius * angles_shifted
+    
+    # Compute dome pattern using sine with adjusted frequency
+    # Using sin() places zero-crossings at the seam (arc_length=0 and arc_length=circumference)
+    # This avoids double-peaks or artifacts at the start/end junction
+    frequency = 2.0 * np.pi * num_waves / total_circumference
     pattern = np.sin(frequency * arc_length)
+    
+    # Smooth the PATTERN values (not arc-length) to avoid seam discontinuity issues
+    # Arc-length has a discontinuity at 0/circumference, but sin() values are continuous
+    # because sin(0) = sin(2πn) = 0 at the seam
+    if band_indices is not None and faces is not None and smoothing_iterations > 0:
+        pattern = _smooth_scalar_field(
+            pattern, band_indices, faces, smoothing_iterations
+        )
     
     return pattern
 
 
-def _smooth_displaced_vertices(
-    vertices: np.ndarray,
+def _smooth_scalar_field(
+    values: np.ndarray,
     band_indices: np.ndarray,
     faces: np.ndarray,
-    iterations: int = 2,
-    displacement: np.ndarray = None
+    iterations: int
 ) -> np.ndarray:
     """
-    Smooth the displaced vertex positions using peak-attracting Laplacian smoothing.
+    Smooth a scalar field on the mesh using Laplacian smoothing.
     
-    This creates rounded dome-like peaks and valleys by:
-    1. Keeping local extrema (peaks/valleys) fixed at full amplitude
-    2. Pulling nearby vertices TOWARD the extrema, not just averaging
-    
-    For vertices near a peak, the smoothing is weighted to favor higher neighbors,
-    creating a rounded dome. For valleys, it favors lower neighbors.
+    This is used to smooth the arc-length parameterization before computing
+    the pattern, resulting in smoother dome shapes.
     
     Args:
-        vertices: (N, 3) all vertex positions (will be copied)
-        band_indices: (K,) indices of band vertices to smooth
-        faces: (F, 3) face indices of the mesh
+        values: (K,) scalar values for band vertices
+        band_indices: (K,) global indices of band vertices
+        faces: (F, 3) mesh faces
         iterations: Number of smoothing iterations
-        displacement: (N,) displacement values used to identify extrema and weight
     
     Returns:
-        (N, 3) smoothed vertex positions
+        (K,) smoothed scalar values
     """
-    if len(band_indices) == 0 or iterations <= 0:
-        return vertices
+    if len(values) == 0 or iterations <= 0:
+        return values
     
-    smoothed_verts = vertices.copy()
-    
-    # Build adjacency for band vertices only
+    # Build adjacency for band vertices
     band_set = set(band_indices.tolist())
     global_to_band = {g: b for b, g in enumerate(band_indices)}
     
-    # Build neighbor list for band vertices
     n_band = len(band_indices)
     neighbors = [[] for _ in range(n_band)]
     
@@ -424,115 +434,19 @@ def _smooth_displaced_vertices(
                 if bi not in neighbors[bj]:
                     neighbors[bj].append(bi)
     
-    # Identify local extrema and their type (peak=+1, valley=-1, neither=0)
-    extremum_type = np.zeros(n_band, dtype=np.int8)
-    band_displacements = np.zeros(n_band)
-    
-    if displacement is not None:
-        band_displacements = displacement[band_indices]
-        
-        for i in range(n_band):
-            if len(neighbors[i]) > 0:
-                my_disp = band_displacements[i]
-                neighbor_disps = [band_displacements[n] for n in neighbors[i]]
-                
-                is_local_max = all(my_disp >= nd for nd in neighbor_disps)
-                is_local_min = all(my_disp <= nd for nd in neighbor_disps)
-                
-                if is_local_max:
-                    extremum_type[i] = 1  # Peak
-                elif is_local_min:
-                    extremum_type[i] = -1  # Valley
-    
-    n_peaks = np.sum(extremum_type == 1)
-    n_valleys = np.sum(extremum_type == -1)
-    logger.debug(f"  Found {n_peaks} peaks and {n_valleys} valleys to preserve")
-    
-    # Peak-attracting smoothing iterations
+    # Laplacian smoothing
+    smoothed = values.copy()
     damping = 0.5
     
     for _ in range(iterations):
-        new_positions = smoothed_verts.copy()
-        
+        new_values = smoothed.copy()
         for i in range(n_band):
-            # Skip extrema - keep them fixed
-            if extremum_type[i] != 0:
-                continue
-            
-            if len(neighbors[i]) == 0:
-                continue
-            
-            global_idx = band_indices[i]
-            my_disp = band_displacements[i]
-            
-            # Compute weights for each neighbor based on displacement
-            # Neighbors with displacement in the same direction (toward extremum) get higher weight
-            neighbor_positions = []
-            neighbor_weights = []
-            
-            for n in neighbors[i]:
-                n_global = band_indices[n]
-                n_disp = band_displacements[n]
-                
-                # Weight based on how much "more extreme" the neighbor is
-                # For positive displacement (near peak): favor higher neighbors
-                # For negative displacement (near valley): favor lower neighbors
-                if my_disp >= 0:
-                    # Near a peak - favor neighbors with higher displacement
-                    weight = 1.0 + max(0, n_disp - my_disp)
-                else:
-                    # Near a valley - favor neighbors with lower (more negative) displacement
-                    weight = 1.0 + max(0, my_disp - n_disp)
-                
-                neighbor_positions.append(smoothed_verts[n_global])
-                neighbor_weights.append(weight)
-            
-            # Normalize weights
-            total_weight = sum(neighbor_weights)
-            if total_weight > 0:
-                neighbor_weights = [w / total_weight for w in neighbor_weights]
-            
-            # Weighted average of neighbor positions
-            weighted_avg = np.zeros(3)
-            for pos, w in zip(neighbor_positions, neighbor_weights):
-                weighted_avg += w * pos
-            
-            # Blend current position with weighted neighbor average
-            new_positions[global_idx] = (
-                (1.0 - damping) * smoothed_verts[global_idx] + 
-                damping * weighted_avg
-            )
-        
-        smoothed_verts = new_positions
+            if len(neighbors[i]) > 0:
+                neighbor_avg = np.mean([smoothed[n] for n in neighbors[i]])
+                new_values[i] = (1.0 - damping) * smoothed[i] + damping * neighbor_avg
+        smoothed = new_values
     
-    # Final pass: smooth the extrema (peaks/valleys) to round off sharp points
-    # Now that neighbors have been pulled toward extrema, averaging the extrema
-    # with their elevated neighbors creates a smooth rounded dome
-    # Apply same number of iterations as the main smoothing
-    for _ in range(iterations):
-        new_positions = smoothed_verts.copy()
-        for i in range(n_band):
-            if extremum_type[i] == 0:  # Skip non-extrema
-                continue
-            
-            if len(neighbors[i]) == 0:
-                continue
-            
-            global_idx = band_indices[i]
-            
-            # Simple average of neighbor positions (they've been pulled up/down already)
-            neighbor_global_indices = [band_indices[n] for n in neighbors[i]]
-            neighbor_avg = np.mean(smoothed_verts[neighbor_global_indices], axis=0)
-            
-            # Blend with neighbors to round off the peak/valley
-            # Use same damping factor for consistency
-            new_positions[global_idx] = (
-                (1.0 - damping) * smoothed_verts[global_idx] + 
-                damping * neighbor_avg
-            )
-        smoothed_verts = new_positions
-    
-    return smoothed_verts
+    return smoothed
 
 
 # ============================================================================
