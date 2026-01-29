@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QFileDialog, QScrollArea, QCheckBox,
     QPlainTextEdit, QSplitter, QDialog, QSlider, QSpinBox,
     QRadioButton, QButtonGroup, QGroupBox, QSizePolicy,
-    QDoubleSpinBox
+    QDoubleSpinBox, QComboBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
@@ -75,6 +75,7 @@ class Step(Enum):
     SECONDARY_CUTS = 'secondary-cuts'  # Secondary cutting edges detection (after primary extraction)
     SECONDARY_SURFACE = 'secondary-surface'  # Secondary surface: extraction only (no smoothing)
     PARTING_SURFACE_SMOOTH = 'parting-surface-smooth'  # Smooth BOTH primary and secondary surfaces together
+    REGISTRATION_NOISE = 'registration-noise'  # Add registration patterns for mold alignment
     POURING = 'pouring'                # Pouring direction optimization (final step)
 
 
@@ -90,6 +91,7 @@ STEPS = [
     {'id': Step.SECONDARY_CUTS, 'icon': '✂️', 'title': 'Secondary Cuts', 'description': 'Detect secondary cutting edges where membrane intersects part'},
     {'id': Step.SECONDARY_SURFACE, 'icon': '🔴', 'title': 'Secondary Surface', 'description': 'Extract secondary parting surfaces using Marching Tetrahedra'},
     {'id': Step.PARTING_SURFACE_SMOOTH, 'icon': '✨', 'title': 'Smooth Surfaces', 'description': 'Smooth both primary and secondary surfaces with boundary re-projection'},
+    {'id': Step.REGISTRATION_NOISE, 'icon': '🔑', 'title': 'Registration Pattern', 'description': 'Add registration pattern to parting surface for mold alignment'},
     {'id': Step.POURING, 'icon': '🧪', 'title': 'Pouring Directions', 'description': 'Optimize silicone/resin pouring directions for each mold half'},
 ]
 
@@ -2510,6 +2512,7 @@ class CombinedSurfaceSmoothingResult:
     primary_gap_fill_time_ms: float = 0.0
     primary_fill_face_indices: Optional[np.ndarray] = None
     primary_restored_corner_positions: Optional[np.ndarray] = None
+    primary_vertex_boundary_type: Optional[np.ndarray] = None  # (N,) -1=part, 0=interior, 1/2=hull
     
     # Smoothed SECONDARY mesh (may be None if no secondary surface)
     secondary_mesh: Optional[trimesh.Trimesh] = None
@@ -2521,6 +2524,7 @@ class CombinedSurfaceSmoothingResult:
     secondary_gap_fill_time_ms: float = 0.0
     secondary_fill_face_indices: Optional[np.ndarray] = None
     secondary_restored_corner_positions: Optional[np.ndarray] = None
+    secondary_vertex_boundary_type: Optional[np.ndarray] = None  # (N,) -1=part, 0=interior, 1/2=hull
     
     # Shared parameters
     smooth_iterations: int = 0
@@ -2632,7 +2636,8 @@ class CombinedSurfaceSmoothingWorker(QThread):
                 result.primary_mesh, result.primary_num_vertices, result.primary_num_faces, \
                     result.primary_boundary_vertices, result.primary_interior_vertices, \
                     result.primary_smoothing_time_ms, result.primary_gap_fill_time_ms, \
-                    result.primary_fill_face_indices, result.primary_restored_corner_positions = \
+                    result.primary_fill_face_indices, result.primary_restored_corner_positions, \
+                    result.primary_vertex_boundary_type = \
                     self._smooth_single_surface(
                         self.primary_extraction_result.mesh.copy(),
                         self.primary_extraction_result.vertex_boundary_type,
@@ -2667,7 +2672,8 @@ class CombinedSurfaceSmoothingWorker(QThread):
                 result.secondary_mesh, result.secondary_num_vertices, result.secondary_num_faces, \
                     result.secondary_boundary_vertices, result.secondary_interior_vertices, \
                     result.secondary_smoothing_time_ms, result.secondary_gap_fill_time_ms, \
-                    result.secondary_fill_face_indices, result.secondary_restored_corner_positions = \
+                    result.secondary_fill_face_indices, result.secondary_restored_corner_positions, \
+                    result.secondary_vertex_boundary_type = \
                     self._smooth_single_surface_no_collar(
                         self.secondary_extraction_result.mesh.copy(),
                         self.secondary_extraction_result.vertex_boundary_type,
@@ -2705,7 +2711,8 @@ class CombinedSurfaceSmoothingWorker(QThread):
         
         Returns tuple of:
             (mesh, num_vertices, num_faces, boundary_vertices, interior_vertices,
-             smoothing_time_ms, gap_fill_time_ms, fill_face_indices, restored_corner_positions)
+             smoothing_time_ms, gap_fill_time_ms, fill_face_indices, restored_corner_positions,
+             vertex_boundary_type)
         """
         from core.surface_propagation import smooth_membrane_with_boundary_reprojection
         from core.parting_surface import create_robust_collar_extension
@@ -2798,7 +2805,8 @@ class CombinedSurfaceSmoothingWorker(QThread):
             smoothing_time_ms,
             gap_fill_time_ms,
             fill_face_indices,
-            restored_corner_positions
+            restored_corner_positions,
+            current_boundary_type  # Return the vertex_boundary_type for downstream use
         )
 
     def _smooth_single_surface_no_collar(self, mesh, vertex_boundary_type, part_mesh, hull_mesh, primary_mesh, label: str):
@@ -2819,7 +2827,8 @@ class CombinedSurfaceSmoothingWorker(QThread):
         
         Returns tuple of:
             (mesh, num_vertices, num_faces, boundary_vertices, interior_vertices,
-             smoothing_time_ms, gap_fill_time_ms, fill_face_indices, restored_corner_positions)
+             smoothing_time_ms, gap_fill_time_ms, fill_face_indices, restored_corner_positions,
+             vertex_boundary_type)
         """
         from core.surface_propagation import smooth_membrane_with_boundary_reprojection
         import time
@@ -2893,7 +2902,8 @@ class CombinedSurfaceSmoothingWorker(QThread):
             smoothing_time_ms,
             gap_fill_time_ms,
             fill_face_indices,
-            restored_corner_positions
+            restored_corner_positions,
+            current_boundary_type  # Return the vertex_boundary_type for downstream use
         )
 
 
@@ -3152,6 +3162,66 @@ class MembraneSmoothingWorker(QThread):
             
         except Exception as e:
             logger.exception(f"Error in membrane smoothing: {e}")
+            self.error.emit(str(e))
+
+
+class RegistrationPatternWorker(QThread):
+    """Background worker for applying sinusoidal registration patterns to parting surface."""
+    
+    progress = pyqtSignal(str)
+    complete = pyqtSignal(object)  # SinusoidalRegistrationResult
+    error = pyqtSignal(str)
+    
+    def __init__(self, parting_surface, part_mesh, hull_mesh, vertex_boundary_type,
+                 hull_offset_fraction: float, band_width_fraction: float,
+                 noise_amplitude_mm: float, noise_interval_mm: float):
+        """
+        Initialize registration pattern worker.
+        
+        Args:
+            parting_surface: The smoothed parting surface mesh
+            part_mesh: The original part mesh (for distance computation)
+            hull_mesh: The outer hull mesh (for distance computation)
+            vertex_boundary_type: (N,) array - -1=part, 0=interior, 1/2=hull
+            hull_offset_fraction: Fraction of distance from part to hull for band center
+            band_width_fraction: Fraction of bbox diagonal for band width
+            noise_amplitude_mm: Pattern amplitude in mm
+            noise_interval_mm: Pattern wavelength in mm
+        """
+        super().__init__()
+        self.parting_surface = parting_surface
+        self.part_mesh = part_mesh
+        self.hull_mesh = hull_mesh
+        self.vertex_boundary_type = vertex_boundary_type
+        self.hull_offset_fraction = hull_offset_fraction
+        self.band_width_fraction = band_width_fraction
+        self.noise_amplitude_mm = noise_amplitude_mm
+        self.noise_interval_mm = noise_interval_mm
+    
+    def run(self):
+        try:
+            from core.registration_marks import apply_registration_noise
+
+            self.progress.emit("Applying sinusoidal pattern...")
+
+            result = apply_registration_noise(
+                parting_surface=self.parting_surface,
+                part_mesh=self.part_mesh,
+                hull_mesh=self.hull_mesh,
+                vertex_boundary_type=self.vertex_boundary_type,
+                hull_offset_fraction=self.hull_offset_fraction,
+                band_width_fraction=self.band_width_fraction,
+                noise_amplitude_mm=self.noise_amplitude_mm,
+                noise_interval_mm=self.noise_interval_mm
+            )
+
+            self.progress.emit(
+                f"Applied sinusoidal pattern to {result.n_modified_vertices} vertices"
+            )
+            self.complete.emit(result)
+
+        except Exception as e:
+            logger.exception(f"Error applying registration pattern: {e}")
             self.error.emit(str(e))
 
 
@@ -4497,6 +4567,13 @@ class MainWindow(QMainWindow):
         self._pouring_worker: Optional[MoldAwarePouringDirectionWorker] = None
         self._mold_aware_pouring_result = None  # MoldAwarePouringDirections
         
+        # Registration noise state
+        self._registration_noise_result = None  # SinusoidalRegistrationResult
+        self._registration_worker = None
+        
+        # Combined surface smoothing state
+        self._combined_smooth_result = None  # CombinedSurfaceSmoothingResult
+        
         # Inflated hull state
         self._hull_worker: Optional[HullWorker] = None
         self._hull_result: Optional[InflatedHullResult] = None
@@ -5078,6 +5155,8 @@ class MainWindow(QMainWindow):
             self._setup_parting_surface_smooth_step()
         elif self._active_step == Step.SECONDARY_SURFACE:
             self._setup_secondary_surface_step()
+        elif self._active_step == Step.REGISTRATION_NOISE:
+            self._setup_registration_noise_step()
         elif self._active_step == Step.POURING:
             self._setup_pouring_step()
         
@@ -6149,7 +6228,7 @@ class MainWindow(QMainWindow):
             return data
         
         session = {
-            'version': 1,
+            'version': 2,  # Incremented version for new fields
             'filename': self._loaded_filename,
             'active_step': self._active_step.value if self._active_step else None,
             
@@ -6177,15 +6256,30 @@ class MainWindow(QMainWindow):
             'tet_edge_length_fac': self._tet_edge_length_fac,
             'tet_optimize': self._tet_optimize,
             
-            # Parting surface
+            # Parting surface (extraction only)
             'parting_surface_result': result_to_dict(self._parting_surface_result),
             'primary_smoothing_result': result_to_dict(self._primary_smoothing_result),
+            
+            # Combined smoothing result (has both primary and secondary smoothed meshes + vertex_boundary_type)
+            'combined_smooth_result': result_to_dict(
+                self._combined_smooth_result if hasattr(self, '_combined_smooth_result') else None
+            ),
             
             # Secondary surface
             'secondary_parting_surface_result': result_to_dict(self._secondary_parting_surface_result),
             'propagation_result': result_to_dict(self._propagation_result),
             'secondary_smoothing_result': result_to_dict(self._secondary_smoothing_result),
             'secondary_surface_result': result_to_dict(self._secondary_surface_result),
+            
+            # Registration noise
+            'registration_noise_result': result_to_dict(
+                self._registration_noise_result if hasattr(self, '_registration_noise_result') else None
+            ),
+            
+            # Pouring direction
+            'mold_aware_pouring_result': result_to_dict(
+                self._mold_aware_pouring_result if hasattr(self, '_mold_aware_pouring_result') else None
+            ),
         }
         
         return session
@@ -6366,8 +6460,31 @@ class MainWindow(QMainWindow):
                 else:
                     setattr(self._primary_smoothing_result, k, v)
         
+        # Restore combined smoothing result (needed for registration noise step)
+        if session.get('combined_smooth_result'):
+            self._combined_smooth_result = CombinedSurfaceSmoothingResult()
+            for k, v in session['combined_smooth_result'].items():
+                if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
+                    setattr(self._combined_smooth_result, k, dict_to_mesh(v))
+                elif isinstance(v, np.ndarray):
+                    setattr(self._combined_smooth_result, k, v)
+                elif isinstance(v, list) and k.endswith('_type'):
+                    # vertex_boundary_type arrays may be stored as lists
+                    setattr(self._combined_smooth_result, k, np.array(v))
+                else:
+                    setattr(self._combined_smooth_result, k, v)
+        
         # Show primary parting surface in viewer
-        if self._primary_smoothing_result and hasattr(self._primary_smoothing_result, 'mesh') and self._primary_smoothing_result.mesh:
+        # Prefer combined_smooth_result since it contains both meshes and vertex_boundary_type
+        if hasattr(self, '_combined_smooth_result') and self._combined_smooth_result is not None:
+            if hasattr(self._combined_smooth_result, 'primary_mesh') and self._combined_smooth_result.primary_mesh is not None:
+                self.mesh_viewer.set_parting_surface(self._combined_smooth_result.primary_mesh)
+                self.display_options.show_parting_surface_options(show_primary=True)
+                # Also show secondary if available
+                if hasattr(self._combined_smooth_result, 'secondary_mesh') and self._combined_smooth_result.secondary_mesh is not None:
+                    self.mesh_viewer.set_secondary_parting_surface(self._combined_smooth_result.secondary_mesh)
+                    self.display_options.show_parting_surface_options(show_primary=True, show_secondary=True)
+        elif self._primary_smoothing_result and hasattr(self._primary_smoothing_result, 'mesh') and self._primary_smoothing_result.mesh:
             self.mesh_viewer.set_parting_surface(self._primary_smoothing_result.mesh)
             self.display_options.show_parting_surface_options(show_primary=True)
         elif self._parting_surface_result and hasattr(self._parting_surface_result, 'mesh') and self._parting_surface_result.mesh:
@@ -6375,17 +6492,111 @@ class MainWindow(QMainWindow):
             self.display_options.show_parting_surface_options(show_primary=True)
         
         # Restore secondary surface results
+        if session.get('secondary_parting_surface_result'):
+            from core.parting_surface import PartingSurfaceResult
+            self._secondary_parting_surface_result = dict_to_result(session['secondary_parting_surface_result'], PartingSurfaceResult)
+        
+        if session.get('propagation_result'):
+            self._propagation_result = type('Result', (), {})()
+            for k, v in session['propagation_result'].items():
+                if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
+                    setattr(self._propagation_result, k, dict_to_mesh(v))
+                elif isinstance(v, list):
+                    setattr(self._propagation_result, k, np.array(v))
+                else:
+                    setattr(self._propagation_result, k, v)
+        
+        if session.get('secondary_smoothing_result'):
+            self._secondary_smoothing_result = type('Result', (), {})()
+            for k, v in session['secondary_smoothing_result'].items():
+                if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
+                    setattr(self._secondary_smoothing_result, k, dict_to_mesh(v))
+                elif isinstance(v, list):
+                    setattr(self._secondary_smoothing_result, k, np.array(v))
+                else:
+                    setattr(self._secondary_smoothing_result, k, v)
+        
         if session.get('secondary_surface_result'):
             self._secondary_surface_result = type('Result', (), session['secondary_surface_result'])()
             for k, v in session['secondary_surface_result'].items():
                 if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
                     setattr(self._secondary_surface_result, k, dict_to_mesh(v))
+                elif isinstance(v, list):
+                    setattr(self._secondary_surface_result, k, np.array(v))
                 else:
                     setattr(self._secondary_surface_result, k, v)
             
             if self._secondary_surface_result and hasattr(self._secondary_surface_result, 'mesh') and self._secondary_surface_result.mesh:
                 self.mesh_viewer.set_secondary_parting_surface(self._secondary_surface_result.mesh)
                 self.display_options.show_parting_surface_options(show_primary=True, show_secondary=True)
+        
+        # Restore registration noise result
+        if session.get('registration_noise_result'):
+            from core.registration_marks import SinusoidalRegistrationResult
+            self._registration_noise_result = type('Result', (), {})()
+            for k, v in session['registration_noise_result'].items():
+                if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
+                    setattr(self._registration_noise_result, k, dict_to_mesh(v))
+                elif isinstance(v, np.ndarray):
+                    setattr(self._registration_noise_result, k, v)
+                elif isinstance(v, list):
+                    # Convert lists back to numpy arrays
+                    setattr(self._registration_noise_result, k, np.array(v))
+                else:
+                    setattr(self._registration_noise_result, k, v)
+
+            # Update viewer with noisy parting surface if available
+            if hasattr(self._registration_noise_result, 'mesh') and self._registration_noise_result.mesh is not None:
+                self.mesh_viewer.set_parting_surface(self._registration_noise_result.mesh)
+                self.display_options.show_parting_surface_options(show_primary=True)
+        
+        # Restore pouring direction result
+        if session.get('mold_aware_pouring_result'):
+            self._mold_aware_pouring_result = type('Result', (), {})()
+            for k, v in session['mold_aware_pouring_result'].items():
+                if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
+                    setattr(self._mold_aware_pouring_result, k, dict_to_mesh(v))
+                elif isinstance(v, np.ndarray):
+                    setattr(self._mold_aware_pouring_result, k, v)
+                elif isinstance(v, list):
+                    # Convert lists back to numpy arrays (for direction vectors etc.)
+                    setattr(self._mold_aware_pouring_result, k, np.array(v))
+                else:
+                    setattr(self._mold_aware_pouring_result, k, v)
+            
+            # Visualize pouring direction arrows if we have the data
+            try:
+                result = self._mold_aware_pouring_result
+                if (hasattr(result, 'h1_silicone_direction') and result.h1_silicone_direction is not None and
+                    hasattr(result, 'h2_silicone_direction') and result.h2_silicone_direction is not None and
+                    hasattr(result, 'resin_direction') and result.resin_direction is not None):
+                    
+                    # Get mesh centroids for arrow positioning
+                    h1_centroid = getattr(result, 'h1_centroid', None)
+                    h2_centroid = getattr(result, 'h2_centroid', None)
+                    part_centroid = getattr(result, 'part_centroid', None)
+                    
+                    # If centroids aren't stored, use part mesh centroid as fallback
+                    if part_centroid is None and self._current_mesh is not None:
+                        part_centroid = self._current_mesh.centroid
+                    if h1_centroid is None:
+                        h1_centroid = part_centroid
+                    if h2_centroid is None:
+                        h2_centroid = part_centroid
+                    
+                    if part_centroid is not None:
+                        self.mesh_viewer.set_pouring_arrows(
+                            h1_direction=np.array(result.h1_silicone_direction),
+                            h2_direction=np.array(result.h2_silicone_direction),
+                            resin_direction=np.array(result.resin_direction),
+                            h1_centroid=np.array(h1_centroid) if h1_centroid is not None else part_centroid,
+                            h2_centroid=np.array(h2_centroid) if h2_centroid is not None else part_centroid,
+                            part_centroid=np.array(part_centroid)
+                        )
+                        if hasattr(self.display_options, 'show_pouring_option'):
+                            self.display_options.show_pouring_option(True)
+            except Exception as e:
+                logger.warning(f"Could not restore pouring direction visualization: {e}")
         
         # Restore step statuses
         step_status = session.get('step_status', {})
@@ -8183,6 +8394,313 @@ class MainWindow(QMainWindow):
             self.pouring_calc_btn.setText("🔄 Recalculate")
 
     # =========================================================================
+    # REGISTRATION NOISE STEP
+    # =========================================================================
+    
+    def _setup_registration_noise_step(self):
+        """Setup the registration noise step UI (Sinusoidal pattern for mold alignment)."""
+        # Check prerequisites - need smoothed primary surface
+        has_smoothed_surface = (
+            self._combined_smooth_result is not None and
+            self._combined_smooth_result.primary_mesh is not None
+        )
+        
+        if not has_smoothed_surface:
+            no_data_label = QLabel("⚠️ Please smooth the parting surface first.")
+            no_data_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            no_data_label.setWordWrap(True)
+            self.context_layout.addWidget(no_data_label)
+            return
+        
+        # Header
+        header = QLabel("🔑 Registration Pattern")
+        header.setStyleSheet(f"""
+            font-size: 14px;
+            font-weight: 500;
+            color: {Colors.DARK};
+        """)
+        self.context_layout.addWidget(header)
+        
+        # Description
+        desc = QLabel(
+            "Add registration patterns to the parting surface to create features that help "
+            "align mold halves during assembly. Patterns are applied in a band around the intermediate "
+            "hull (50% between part and outer hull). Creates smooth sinusoidal ridges that follow the "
+            "hull contour."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"""
+            font-size: 12px;
+            color: {Colors.GRAY};
+            margin-bottom: 8px;
+        """)
+        self.context_layout.addWidget(desc)
+        
+        # Show current surface stats
+        surface_info = StatsBox()
+        surface_info.add_header('Smoothed Primary Surface', Colors.INFO)
+        surface_info.add_row(f'Vertices: {self._combined_smooth_result.primary_num_vertices:,}')
+        surface_info.add_row(f'Interior vertices: {self._combined_smooth_result.primary_interior_vertices:,}')
+        self.context_layout.addWidget(surface_info)
+        
+        # Parameters group
+        noise_params_group = QGroupBox("Parameters")
+        noise_params_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 12px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 8px;
+                padding-top: 8px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+            QLabel {{
+                color: {Colors.DARK};
+                font-size: 12px;
+            }}
+        """)
+        noise_params_layout = QFormLayout(noise_params_group)
+        noise_params_layout.setContentsMargins(12, 16, 12, 12)
+        noise_params_layout.setSpacing(8)
+        
+        # Amplitude spinbox (±mm)
+        self.noise_amplitude_spin = QDoubleSpinBox()
+        self.noise_amplitude_spin.setRange(0.5, 20.0)
+        self.noise_amplitude_spin.setValue(5.0)  # Default: ±5mm
+        self.noise_amplitude_spin.setSuffix(" mm")
+        self.noise_amplitude_spin.setSingleStep(0.5)
+        self.noise_amplitude_spin.setToolTip("Noise amplitude (peak displacement from surface)")
+        noise_params_layout.addRow("Amplitude (±):", self.noise_amplitude_spin)
+        
+        # Interval spinbox (wavelength in mm)
+        self.noise_interval_spin = QDoubleSpinBox()
+        self.noise_interval_spin.setRange(2.0, 50.0)
+        self.noise_interval_spin.setValue(10.0)  # Default: 10mm
+        self.noise_interval_spin.setSuffix(" mm")
+        self.noise_interval_spin.setSingleStep(1.0)
+        self.noise_interval_spin.setToolTip("Distance between noise bumps")
+        noise_params_layout.addRow("Interval:", self.noise_interval_spin)
+        
+        # Band width (% of bbox diagonal)
+        self.noise_band_width_spin = QDoubleSpinBox()
+        self.noise_band_width_spin.setRange(1.0, 20.0)
+        self.noise_band_width_spin.setValue(5.0)  # Default: 5%
+        self.noise_band_width_spin.setSuffix(" %")
+        self.noise_band_width_spin.setSingleStep(0.5)
+        self.noise_band_width_spin.setToolTip("Width of the noise band (% of bounding box diagonal)")
+        noise_params_layout.addRow("Band Width:", self.noise_band_width_spin)
+        
+        # Hull offset (% between part and hull)
+        self.noise_hull_offset_spin = QDoubleSpinBox()
+        self.noise_hull_offset_spin.setRange(10.0, 90.0)
+        self.noise_hull_offset_spin.setValue(50.0)  # Default: 50%
+        self.noise_hull_offset_spin.setSuffix(" %")
+        self.noise_hull_offset_spin.setSingleStep(5.0)
+        self.noise_hull_offset_spin.setToolTip("Position of band center (0%=at part, 100%=at hull)")
+        noise_params_layout.addRow("Hull Offset:", self.noise_hull_offset_spin)
+        
+        self.context_layout.addWidget(noise_params_group)
+        
+        # Apply button
+        self.noise_apply_btn = QPushButton("🔑 Apply Registration Pattern")
+        self.noise_apply_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #9966ff;
+                color: {Colors.WHITE};
+                border: none;
+                border-radius: 6px;
+                padding: 10px 16px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: #8855ee;
+            }}
+            QPushButton:pressed {{
+                background-color: #7744dd;
+            }}
+            QPushButton:disabled {{
+                background-color: {Colors.GRAY};
+            }}
+        """)
+        self.noise_apply_btn.clicked.connect(self._on_apply_registration_noise)
+        self.context_layout.addWidget(self.noise_apply_btn)
+        
+        # Skip button (noise is optional)
+        self.noise_skip_btn = QPushButton("⏭️ Skip (No Pattern)")
+        self.noise_skip_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                color: {Colors.GRAY};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                padding: 8px 12px;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{
+                background-color: {Colors.LIGHT};
+                color: {Colors.DARK};
+            }}
+        """)
+        self.noise_skip_btn.clicked.connect(self._on_skip_registration_noise)
+        self.context_layout.addWidget(self.noise_skip_btn)
+        
+        # Progress label
+        self.noise_progress_label = QLabel("")
+        self.noise_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.noise_progress_label.hide()
+        self.context_layout.addWidget(self.noise_progress_label)
+        
+        # Results stats box
+        self.noise_stats = StatsBox()
+        self.noise_stats.hide()
+        self.context_layout.addWidget(self.noise_stats)
+        
+        # Update UI if we already have results
+        self._update_registration_noise_step_ui()
+    
+    def _update_registration_noise_step_ui(self):
+        """Update registration noise step UI based on current state."""
+        if not hasattr(self, 'noise_stats'):
+            return
+        
+        if hasattr(self, '_registration_noise_result') and self._registration_noise_result is not None:
+            result = self._registration_noise_result
+            self.noise_stats.clear()
+            self.noise_stats.show()
+
+            pattern_name = getattr(result, 'pattern_type', 'sinusoidal')
+            self.noise_stats.add_header(f'✅ Registration Pattern ({pattern_name})', Colors.SUCCESS)
+            self.noise_stats.add_row(f'Modified vertices: {result.n_modified_vertices:,}')
+
+            # Displacement stats
+            non_zero = result.displacement[result.modified_mask]
+            if len(non_zero) > 0:
+                self.noise_stats.add_row(f'Displacement range: [{non_zero.min():.2f}, {non_zero.max():.2f}] mm')
+                self.noise_stats.add_row(f'Mean |displacement|: {np.mean(np.abs(non_zero)):.2f} mm')
+
+            self.noise_stats.add_row(f'Band center: {result.band_center_distance:.2f} mm from part')
+            self.noise_stats.add_row(f'Band width: {result.band_width:.2f} mm')
+            self.noise_stats.add_row(f'Time: {result.computation_time_ms:.0f} ms')
+
+            self.noise_apply_btn.setText("🔄 Reapply Pattern")
+    
+    def _on_apply_registration_noise(self):
+        """Apply registration pattern to the smoothed parting surface."""
+        if self._combined_smooth_result is None or self._combined_smooth_result.primary_mesh is None:
+            return
+        
+        if self._current_mesh is None or self._hull_result is None:
+            QMessageBox.warning(
+                self, "Missing Data",
+                "Part mesh and hull mesh are required for registration pattern."
+            )
+            return
+        
+        # Get parameters
+        amplitude = self.noise_amplitude_spin.value()
+        interval = self.noise_interval_spin.value()
+        band_width_pct = self.noise_band_width_spin.value() / 100.0
+        hull_offset_pct = self.noise_hull_offset_spin.value() / 100.0
+        
+        # Get the smoothed primary surface and its vertex_boundary_type
+        parting_surface = self._combined_smooth_result.primary_mesh
+        vertex_boundary_type = self._combined_smooth_result.primary_vertex_boundary_type
+        
+        if vertex_boundary_type is None:
+            # Fallback: classify based on distance
+            logger.warning("No vertex_boundary_type available, using fallback classification")
+            vertex_boundary_type = np.zeros(len(parting_surface.vertices), dtype=np.int8)
+        
+        # Disable buttons during computation
+        self.noise_apply_btn.setEnabled(False)
+        self.noise_skip_btn.setEnabled(False)
+        self.noise_progress_label.setText("Applying sinusoidal pattern...")
+        self.noise_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.noise_progress_label.show()
+        
+        # Create and start worker thread
+        self._registration_worker = RegistrationPatternWorker(
+            parting_surface=parting_surface,
+            part_mesh=self._current_mesh,
+            hull_mesh=self._hull_result.mesh,
+            vertex_boundary_type=vertex_boundary_type,
+            hull_offset_fraction=hull_offset_pct,
+            band_width_fraction=band_width_pct,
+            noise_amplitude_mm=amplitude,
+            noise_interval_mm=interval
+        )
+        self._registration_worker.progress.connect(self._on_registration_progress)
+        self._registration_worker.complete.connect(self._on_registration_complete)
+        self._registration_worker.error.connect(self._on_registration_error)
+        self._registration_worker.start()
+    
+    def _on_registration_progress(self, message: str):
+        """Handle progress updates from registration worker."""
+        self.noise_progress_label.setText(message)
+    
+    def _on_registration_complete(self, result):
+        """Handle successful registration pattern completion."""
+        # Store result
+        self._registration_noise_result = result
+        
+        # Update visualization - replace the smoothed surface with the noisy one
+        self.mesh_viewer.set_parting_surface(result.mesh)
+        
+        # Update stats
+        self._update_registration_noise_step_ui()
+        
+        # Mark step complete and unlock pouring
+        if Step.REGISTRATION_NOISE in self.step_buttons:
+            self.step_buttons[Step.REGISTRATION_NOISE].set_status('completed')
+        if Step.POURING in self.step_buttons:
+            self.step_buttons[Step.POURING].set_status('ready')
+        
+        pattern_type = getattr(result, 'pattern_type', 'sinusoidal')
+        self.noise_progress_label.setText(
+            f"✅ Applied {pattern_type} pattern to {result.n_modified_vertices} vertices"
+        )
+        self.noise_progress_label.setStyleSheet(f'color: {Colors.SUCCESS}; font-size: 12px;')
+        
+        # Re-enable buttons
+        self.noise_apply_btn.setEnabled(True)
+        self.noise_skip_btn.setEnabled(True)
+    
+    def _on_registration_error(self, error_msg: str):
+        """Handle registration pattern error."""
+        logger.error(f"Registration pattern error: {error_msg}")
+        self.noise_progress_label.setText(f"❌ Error: {error_msg}")
+        self.noise_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+        
+        # Re-enable buttons
+        self.noise_apply_btn.setEnabled(True)
+        self.noise_skip_btn.setEnabled(True)
+    
+    def _on_skip_registration_noise(self):
+        """Skip the registration noise step (noise is optional)."""
+        # Mark step complete and unlock pouring
+        if Step.REGISTRATION_NOISE in self.step_buttons:
+            self.step_buttons[Step.REGISTRATION_NOISE].set_status('completed')
+        if Step.POURING in self.step_buttons:
+            self.step_buttons[Step.POURING].set_status('ready')
+        
+        self.noise_progress_label.setText("⏭️ Skipped - no pattern applied")
+        self.noise_progress_label.show()
+
+    # =========================================================================
     # SECONDARY CUTS STEP
     # =========================================================================
     
@@ -9202,11 +9720,11 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logger.exception(f"Error visualizing smoothed secondary surface: {e}")
         
-        # Mark step complete and unlock POURING step (not secondary cuts - that's already done)
+        # Mark step complete and unlock REGISTRATION_NOISE step (not POURING directly)
         if Step.PARTING_SURFACE_SMOOTH in self.step_buttons:
             self.step_buttons[Step.PARTING_SURFACE_SMOOTH].set_status('completed')
-        if Step.POURING in self.step_buttons:
-            self.step_buttons[Step.POURING].set_status('ready')
+        if Step.REGISTRATION_NOISE in self.step_buttons:
+            self.step_buttons[Step.REGISTRATION_NOISE].set_status('ready')
     
     def _on_smooth_surface_complete(self, result):
         """Handle surface smoothing complete (PrimarySurfaceSmoothingResult)."""
