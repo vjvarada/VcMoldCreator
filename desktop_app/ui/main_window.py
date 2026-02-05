@@ -874,10 +874,11 @@ class MoldAwarePouringDirectionWorker(QThread):
 
 
 class HardShellWorker(QThread):
-    """Background worker for generating hard shell geometry (prism + extended collar)."""
+    """Background worker for generating hard shell geometry (prism + CSG cavity + collar + split into halves)."""
     
     progress = pyqtSignal(str)
-    complete = pyqtSignal(object, object)  # (HardShellPrismResult, OuterCollarResult)
+    # (HardShellPrismResult, shell_with_cavity, OuterCollarResult, shell_half_1, shell_half_2, success)
+    complete = pyqtSignal(object, object, object, object, object, bool)
     error = pyqtSignal(str)
     
     def __init__(
@@ -899,39 +900,71 @@ class HardShellWorker(QThread):
         try:
             from core.mold_fabrication import (
                 create_hard_shell_prism,
-                create_outer_collar_extension
+                create_shell_with_cavity,
+                create_outer_collar_extension,
+                split_shell_with_membrane
             )
             
             logger.info(f"Generating hard shell with wall_thickness={self.wall_thickness}mm")
             
-            # Step 1: Create the prism (paper Section 5 - aligned with pouring direction)
-            # The prism is offset from the inner hull by wall_thickness
-            self.progress.emit("Creating hard shell prism (aligned with pouring direction)...")
-            prism_result = create_hard_shell_prism(
-                self.inner_hull,
-                self.pouring_direction,
-                wall_thickness=self.wall_thickness,
-                margin=0.0  # wall_thickness is the full offset
-            )
-            logger.info(f"Hard shell prism: {prism_result.vertex_count} vertices, "
-                       f"silhouette has {len(prism_result.silhouette_2d)} points")
-            
-            # Step 2: Create outer collar extension (extend parting surface 2x wall_thickness
-            # so it fully passes through the prism boundary)
-            self.progress.emit("Creating outer collar extension (2x offset for full cut)...")
-            collar_extension_distance = self.wall_thickness * 2.0
+            # Step 1: Create the outer collar extension (extend parting surface outward)
+            # This extends the parting surface by 2x wall_thickness to fully cut through the shell
+            self.progress.emit("Creating outer collar extension...")
+            extension_distance = self.wall_thickness * 2.5  # Extend beyond the prism
             collar_result = create_outer_collar_extension(
                 self.parting_surface,
                 self.inner_hull,
                 self.vertex_boundary_type,
                 self.pouring_direction,
-                extension_distance=collar_extension_distance
+                extension_distance=extension_distance
             )
-            logger.info(f"Outer collar: {collar_result.collar_vertex_count} new vertices, "
-                       f"extended {collar_extension_distance}mm")
+            logger.info(f"Outer collar extension: +{collar_result.collar_vertex_count} vertices, "
+                       f"+{collar_result.collar_face_count} faces, extended {extension_distance:.1f}mm")
+            
+            # Step 2: Create the prism (paper Section 5 - aligned with pouring direction)
+            self.progress.emit("Creating hard shell prism (aligned with pouring direction)...")
+            prism_result = create_hard_shell_prism(
+                self.inner_hull,
+                self.pouring_direction,
+                wall_thickness=self.wall_thickness,
+                margin=0.0
+            )
+            logger.info(f"Hard shell prism: {prism_result.vertex_count} vertices, "
+                       f"silhouette has {len(prism_result.silhouette_2d)} points")
+            
+            # Step 3: CSG subtraction - shell = prism - hull
+            self.progress.emit("Performing CSG: subtracting hull from prism...")
+            shell_with_cavity, csg_time_ms, csg_success = create_shell_with_cavity(
+                prism_result.prism_mesh,
+                self.inner_hull
+            )
+            
+            shell_half_1 = None
+            shell_half_2 = None
+            
+            if csg_success and shell_with_cavity is not None:
+                logger.info(f"CSG cavity complete: shell has {len(shell_with_cavity.vertices)} vertices, "
+                           f"{len(shell_with_cavity.faces)} faces in {csg_time_ms:.1f}ms")
+                
+                # Step 4: Split shell into two halves using the outer collar membrane
+                self.progress.emit("Splitting shell into two halves using membrane...")
+                shell_half_1, shell_half_2, split_time_ms, split_success = split_shell_with_membrane(
+                    shell_with_cavity,
+                    collar_result.mesh,
+                    self.pouring_direction
+                )
+                
+                if split_success:
+                    logger.info(f"Shell split complete in {split_time_ms:.1f}ms")
+                    logger.info(f"  Half 1: {len(shell_half_1.vertices)} verts, {len(shell_half_1.faces)} faces")
+                    logger.info(f"  Half 2: {len(shell_half_2.vertices)} verts, {len(shell_half_2.faces)} faces")
+                else:
+                    logger.warning("Shell splitting failed - halves may be incomplete")
+            else:
+                logger.warning("CSG cavity subtraction failed - cannot split shell")
             
             self.progress.emit(f"Hard shell generation complete")
-            self.complete.emit(prism_result, collar_result)
+            self.complete.emit(prism_result, shell_with_cavity, collar_result, shell_half_1, shell_half_2, csg_success)
             
         except Exception as e:
             logger.exception(f"Error generating hard shell: {e}")
@@ -4073,6 +4106,13 @@ class DisplayOptionsPanel(QFrame):
     # Feature classification debug signal
     show_feature_debug_changed = pyqtSignal(bool)  # Toggle sharp edge/corner visualization
     
+    # Hard shell visibility signals
+    show_shell_with_cavity_changed = pyqtSignal(bool)  # Toggle shell with cavity
+    show_hard_shell_prism_changed = pyqtSignal(bool)  # Toggle hard shell prism (debug)
+    show_outer_collar_changed = pyqtSignal(bool)  # Toggle outer collar extension visibility
+    show_shell_half_1_changed = pyqtSignal(bool)  # Toggle shell half 1 (upper half)
+    show_shell_half_2_changed = pyqtSignal(bool)  # Toggle shell half 2 (lower half)
+    
     # Individual feature type visibility signals
     # Target mesh features:
     show_feature_sharp_edges_changed = pyqtSignal(bool)  # Yellow lines - sharp edges on target
@@ -4436,6 +4476,54 @@ class DisplayOptionsPanel(QFrame):
         self.feature_type_checkboxes_container.hide()
         layout.addWidget(self.feature_type_checkboxes_container)
         
+        # Hard shell section separator
+        self.hard_shell_separator = QFrame()
+        self.hard_shell_separator.setFixedHeight(1)
+        self.hard_shell_separator.setStyleSheet("background-color: #3a3f47;")
+        self.hard_shell_separator.hide()
+        layout.addWidget(self.hard_shell_separator)
+        
+        # Hard shell section label
+        self.hard_shell_label = QLabel('Hard Shell')
+        self.hard_shell_label.setStyleSheet("font-size: 10px; font-weight: bold; padding-top: 4px; color: rgba(255, 255, 255, 0.7);")
+        self.hard_shell_label.hide()
+        layout.addWidget(self.hard_shell_label)
+        
+        # Shell with cavity checkbox
+        self.show_shell_cavity_cb = QCheckBox('Shell with Cavity')
+        self.show_shell_cavity_cb.setChecked(True)
+        self.show_shell_cavity_cb.stateChanged.connect(lambda s: self.show_shell_with_cavity_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_shell_cavity_cb.hide()
+        layout.addWidget(self.show_shell_cavity_cb)
+        
+        # Hard shell prism (debug) checkbox
+        self.show_prism_cb = QCheckBox('Prism (Debug)')
+        self.show_prism_cb.setChecked(False)
+        self.show_prism_cb.stateChanged.connect(lambda s: self.show_hard_shell_prism_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_prism_cb.hide()
+        layout.addWidget(self.show_prism_cb)
+        
+        # Outer collar extension checkbox
+        self.show_outer_collar_cb = QCheckBox('Outer Collar')
+        self.show_outer_collar_cb.setChecked(False)
+        self.show_outer_collar_cb.stateChanged.connect(lambda s: self.show_outer_collar_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_outer_collar_cb.hide()
+        layout.addWidget(self.show_outer_collar_cb)
+        
+        # Shell half 1 (upper, teal) checkbox
+        self.show_shell_half_1_cb = QCheckBox('Shell Half 1 (Teal)')
+        self.show_shell_half_1_cb.setChecked(True)  # Shown by default
+        self.show_shell_half_1_cb.stateChanged.connect(lambda s: self.show_shell_half_1_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_shell_half_1_cb.hide()
+        layout.addWidget(self.show_shell_half_1_cb)
+        
+        # Shell half 2 (lower, coral) checkbox
+        self.show_shell_half_2_cb = QCheckBox('Shell Half 2 (Coral)')
+        self.show_shell_half_2_cb.setChecked(True)  # Shown by default
+        self.show_shell_half_2_cb.stateChanged.connect(lambda s: self.show_shell_half_2_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_shell_half_2_cb.hide()
+        layout.addWidget(self.show_shell_half_2_cb)
+        
         # Store reference to feature debug data (set externally)
         self._feature_debug_data = None
         self._mesh_viewer = None
@@ -4598,6 +4686,46 @@ class DisplayOptionsPanel(QFrame):
         self._mesh_viewer = mesh_viewer
         self._feature_debug_data = feature_debug_data
     
+    def show_hard_shell_options(self, show_cavity: bool = False, show_prism: bool = False, show_collar: bool = False, show_halves: bool = False):
+        """Show or hide the hard shell visibility checkboxes."""
+        show_any = show_cavity or show_prism or show_collar or show_halves
+        
+        if show_any:
+            self.hard_shell_separator.show()
+            self.hard_shell_label.show()
+        else:
+            self.hard_shell_separator.hide()
+            self.hard_shell_label.hide()
+        
+        if show_cavity:
+            self.show_shell_cavity_cb.show()
+            self.show_shell_cavity_cb.setChecked(False)  # Hidden by default, halves are shown
+        else:
+            self.show_shell_cavity_cb.hide()
+        
+        if show_prism:
+            self.show_prism_cb.show()
+            self.show_prism_cb.setChecked(False)  # Hidden by default
+        else:
+            self.show_prism_cb.hide()
+        
+        if show_collar:
+            self.show_outer_collar_cb.show()
+            self.show_outer_collar_cb.setChecked(False)  # Hidden by default
+        else:
+            self.show_outer_collar_cb.hide()
+        
+        if show_halves:
+            self.show_shell_half_1_cb.show()
+            self.show_shell_half_1_cb.setChecked(True)  # Shown by default
+            self.show_shell_half_2_cb.show()
+            self.show_shell_half_2_cb.setChecked(True)  # Shown by default
+        else:
+            self.show_shell_half_1_cb.hide()
+            self.show_shell_half_2_cb.hide()
+        
+        self.adjustSize()
+    
     def show_feature_debug_option(self, show: bool = True):
         """Show or hide the feature debug checkbox."""
         if show:
@@ -4639,7 +4767,11 @@ class MainWindow(QMainWindow):
         # Hard shell state
         self._hard_shell_worker = None
         self._hard_shell_prism_result = None  # HardShellPrismResult
-        self._outer_collar_result = None  # OuterCollarResult
+        self._shell_with_cavity = None  # trimesh after CSG subtraction (prism - hull)
+        self._outer_collar_result = None  # OuterCollarResult (extended parting surface)
+        self._shell_half_1 = None  # Upper half of split shell (manifold)
+        self._shell_half_2 = None  # Lower half of split shell (manifold)
+        self._csg_success = False
         
         # Registration noise state
         self._registration_noise_result = None  # SinusoidalRegistrationResult
@@ -5060,6 +5192,23 @@ class MainWindow(QMainWindow):
         )
         self.display_options.show_feature_restored_corners_changed.connect(
             lambda show: self.mesh_viewer.set_feature_restored_corners_visible(show)
+        )
+        
+        # Hard shell visibility signals
+        self.display_options.show_shell_with_cavity_changed.connect(
+            self._on_toggle_shell_cavity
+        )
+        self.display_options.show_hard_shell_prism_changed.connect(
+            self._on_toggle_prism
+        )
+        self.display_options.show_outer_collar_changed.connect(
+            self._on_toggle_outer_collar
+        )
+        self.display_options.show_shell_half_1_changed.connect(
+            self._on_toggle_shell_half_1
+        )
+        self.display_options.show_shell_half_2_changed.connect(
+            self._on_toggle_shell_half_2
         )
         
         return wrapper
@@ -5922,19 +6071,6 @@ class MainWindow(QMainWindow):
         self.shell_stats.hide()
         self.context_layout.addWidget(self.shell_stats)
         
-        # Visibility checkboxes
-        self.show_prism_checkbox = QCheckBox("Show Hard Shell Prism")
-        self.show_prism_checkbox.setChecked(True)
-        self.show_prism_checkbox.toggled.connect(self._on_toggle_prism)
-        self.show_prism_checkbox.hide()
-        self.context_layout.addWidget(self.show_prism_checkbox)
-        
-        self.show_outer_collar_checkbox = QCheckBox("Show Extended Parting Surface")
-        self.show_outer_collar_checkbox.setChecked(True)
-        self.show_outer_collar_checkbox.toggled.connect(self._on_toggle_outer_collar)
-        self.show_outer_collar_checkbox.hide()
-        self.context_layout.addWidget(self.show_outer_collar_checkbox)
-        
         self._update_hard_shell_step_ui()
 
     def _update_hard_shell_step_ui(self):
@@ -5943,33 +6079,54 @@ class MainWindow(QMainWindow):
             return
         
         has_prism = self._hard_shell_prism_result is not None
-        has_collar = self._outer_collar_result is not None
+        has_cavity = self._shell_with_cavity is not None and self._csg_success
+        has_collar = self._outer_collar_result is not None and self._outer_collar_result.collar_vertex_count > 0
+        has_halves = self._shell_half_1 is not None and self._shell_half_2 is not None
         
-        if has_prism and has_collar:
+        if has_prism:
             prism_result = self._hard_shell_prism_result
-            collar_result = self._outer_collar_result
             
             self.shell_stats.clear()
             self.shell_stats.show()
             
-            self.shell_stats.add_header('Hard Shell Generated', Colors.SUCCESS)
+            if has_halves:
+                self.shell_stats.add_header('Hard Shell Split into Two Halves', Colors.SUCCESS)
+                self.shell_stats.add_row(f'Half 1: {len(self._shell_half_1.vertices):,} verts, {len(self._shell_half_1.faces):,} faces')
+                self.shell_stats.add_row(f'Half 2: {len(self._shell_half_2.vertices):,} verts, {len(self._shell_half_2.faces):,} faces')
+                
+                # Show hard shell options with halves
+                self.display_options.show_hard_shell_options(show_cavity=has_cavity, show_prism=True, show_collar=has_collar, show_halves=True)
+                self.display_options.show()
+            elif has_cavity:
+                self.shell_stats.add_header('Hard Shell with Cavity Created', Colors.SUCCESS)
+                self.shell_stats.add_row(f'Shell: {len(self._shell_with_cavity.vertices):,} verts, {len(self._shell_with_cavity.faces):,} faces')
+                
+                # Show hard shell options in display panel (including collar)
+                self.display_options.show_hard_shell_options(show_cavity=True, show_prism=True, show_collar=has_collar, show_halves=False)
+                self.display_options.show()
+            else:
+                self.shell_stats.add_header('Hard Shell Generated', Colors.WARNING if not self._csg_success else Colors.SUCCESS)
+                if not self._csg_success:
+                    self.shell_stats.add_row('⚠️ CSG subtraction failed - showing prism only')
+                # Still show display options for prism and collar
+                self.display_options.show_hard_shell_options(show_cavity=False, show_prism=True, show_collar=has_collar, show_halves=False)
+                self.display_options.show()
             
-            # Prism stats (main hard shell per paper)
-            self.shell_stats.add_row(f'Prism: {prism_result.vertex_count:,} vertices, {prism_result.face_count:,} faces')
+            # Show collar details if available
+            if has_collar:
+                collar = self._outer_collar_result
+                self.shell_stats.add_row(f'Collar: +{collar.collar_vertex_count:,} verts, +{collar.collar_face_count:,} faces')
+                self.shell_stats.add_row(f'  Extended: {collar.extension_distance:.1f} mm')
+                self.shell_stats.add_row(f'  Outer edges processed: {collar.n_outer_boundary_edges_processed}')
+                
+            # Always show prism details
+            self.shell_stats.add_row(f'Prism: {prism_result.vertex_count:,} verts, {prism_result.face_count:,} faces')
             self.shell_stats.add_row(f'Silhouette: {len(prism_result.silhouette_2d)} vertices')
             self.shell_stats.add_row(f'Prism height: {prism_result.prism_height:.1f} mm')
-            self.shell_stats.add_row(f'Wall offset: {prism_result.wall_thickness:.1f} mm')
-            
-            # Collar stats
-            self.shell_stats.add_row(f'Collar extension: {collar_result.extension_distance:.1f} mm (2x offset)')
-            self.shell_stats.add_row(f'Collar vertices: +{collar_result.collar_vertex_count}')
-            
-            total_time = prism_result.computation_time_ms + collar_result.computation_time_ms
-            self.shell_stats.add_row(f'Time: {total_time:.0f}ms')
+            self.shell_stats.add_row(f'Prism offset: {prism_result.wall_thickness:.1f} mm')
+            self.shell_stats.add_row(f'Time: {prism_result.computation_time_ms:.0f}ms')
             
             self.shell_generate_btn.setText("Regenerate")
-            self.show_prism_checkbox.show()
-            self.show_outer_collar_checkbox.show()
 
     def _on_generate_hard_shell(self):
         """Start hard shell generation."""
@@ -5997,9 +6154,16 @@ class MainWindow(QMainWindow):
         self.shell_progress_label.show()
         
         self._hard_shell_prism_result = None
+        self._shell_with_cavity = None
         self._outer_collar_result = None
+        self._shell_half_1 = None
+        self._shell_half_2 = None
+        self._csg_success = False
         self.mesh_viewer.remove_hard_shell_prism()
-        self.mesh_viewer.remove_outer_collar_surface()
+        self.mesh_viewer.remove_shell_with_cavity()
+        self.mesh_viewer.remove_outer_collar()
+        self.mesh_viewer.remove_shell_half_1()
+        self.mesh_viewer.remove_shell_half_2()
         
         self._hard_shell_worker = HardShellWorker(
             parting_surface,
@@ -6018,21 +6182,41 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'shell_progress_label'):
             self.shell_progress_label.setText(message)
 
-    def _on_hard_shell_complete(self, prism_result, collar_result):
+    def _on_hard_shell_complete(self, prism_result, shell_with_cavity, collar_result, shell_half_1, shell_half_2, csg_success):
         self._hard_shell_prism_result = prism_result
+        self._shell_with_cavity = shell_with_cavity
         self._outer_collar_result = collar_result
+        self._shell_half_1 = shell_half_1
+        self._shell_half_2 = shell_half_2
+        self._csg_success = csg_success
         
-        # Show prism (main hard shell geometry per paper)
-        self.mesh_viewer.show_hard_shell_prism(prism_result.prism_mesh)
+        # Show the outer collar extension (extended parting surface)
+        if collar_result is not None and collar_result.mesh is not None:
+            self.mesh_viewer.show_outer_collar(collar_result.mesh)
+            self.mesh_viewer.set_outer_collar_visible(False)  # Hidden by default
         
-        # Show extended parting surface (collar) - extends 2x offset to fully cut prism
-        self.mesh_viewer.show_outer_collar_surface(collar_result.mesh)
+        if csg_success and shell_with_cavity is not None:
+            # Show the shell with cavity (prism - hull) but hide it by default
+            self.mesh_viewer.show_shell_with_cavity(shell_with_cavity)
+            self.mesh_viewer.set_shell_with_cavity_visible(False)  # Hide - show halves instead
+            
+            # Also show prism but hide it initially
+            self.mesh_viewer.show_hard_shell_prism(prism_result.prism_mesh)
+            self.mesh_viewer.set_hard_shell_prism_visible(False)
+            
+            # Show shell halves (primary visualization)
+            if shell_half_1 is not None:
+                self.mesh_viewer.show_shell_half_1(shell_half_1)
+            if shell_half_2 is not None:
+                self.mesh_viewer.show_shell_half_2(shell_half_2)
+        else:
+            # CSG failed - show just the prism
+            self.mesh_viewer.show_hard_shell_prism(prism_result.prism_mesh)
         
         self._update_hard_shell_step_ui()
         self.step_buttons[Step.HARD_SHELL].set_status('completed')
         
-        total_time = prism_result.computation_time_ms + collar_result.computation_time_ms
-        logger.info(f"Hard shell generated in {total_time:.0f}ms "
+        logger.info(f"Hard shell generated in {prism_result.computation_time_ms:.0f}ms "
                    f"(prism has {len(prism_result.silhouette_2d)} silhouette vertices)")
 
     def _on_hard_shell_error(self, message: str):
@@ -6048,11 +6232,20 @@ class MainWindow(QMainWindow):
             self.shell_progress.hide()
         self._hard_shell_worker = None
 
-    def _on_toggle_outer_collar(self, checked: bool):
-        self.mesh_viewer.set_outer_collar_surface_visible(checked)
+    def _on_toggle_shell_cavity(self, show: bool):
+        self.mesh_viewer.set_shell_with_cavity_visible(show)
 
-    def _on_toggle_prism(self, checked: bool):
-        self.mesh_viewer.set_hard_shell_prism_visible(checked)
+    def _on_toggle_prism(self, show: bool):
+        self.mesh_viewer.set_hard_shell_prism_visible(show)
+
+    def _on_toggle_outer_collar(self, show: bool):
+        self.mesh_viewer.set_outer_collar_visible(show)
+
+    def _on_toggle_shell_half_1(self, show: bool):
+        self.mesh_viewer.set_shell_half_1_visible(show)
+
+    def _on_toggle_shell_half_2(self, show: bool):
+        self.mesh_viewer.set_shell_half_2_visible(show)
 
     # =========================================================================
     # HULL STEP

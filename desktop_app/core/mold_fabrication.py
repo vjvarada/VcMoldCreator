@@ -26,6 +26,15 @@ import numpy as np
 import trimesh
 from scipy.spatial import ConvexHull
 
+# CSG operations via manifold3d
+try:
+    import manifold3d
+    MANIFOLD_AVAILABLE = True
+except ImportError:
+    MANIFOLD_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning("manifold3d not available - CSG operations will be disabled")
+
 logger = logging.getLogger(__name__)
 
 
@@ -162,6 +171,41 @@ class HardShellPrismResult:
     
     # Computation time
     computation_time_ms: float = 0.0
+
+
+@dataclass
+class HardShellSplitResult:
+    """Result of CSG operations to create two hard shell halves.
+    
+    The workflow is:
+    1. Subtract hull from prism to create cavity
+    2. Split along parting surface (with extended collar) into two halves
+    """
+    
+    # The two shell halves (H1 and H2)
+    shell_half_1: Optional[trimesh.Trimesh] = None  # Upper half (aligned with d1)
+    shell_half_2: Optional[trimesh.Trimesh] = None  # Lower half (aligned with d2)
+    
+    # Intermediate result: prism with cavity (before splitting)
+    shell_with_cavity: Optional[trimesh.Trimesh] = None
+    
+    # The pouring direction used
+    pouring_direction: Optional[np.ndarray] = None
+    
+    # Statistics for each half
+    half_1_vertex_count: int = 0
+    half_1_face_count: int = 0
+    half_2_vertex_count: int = 0
+    half_2_face_count: int = 0
+    
+    # Computation times for each step
+    cavity_time_ms: float = 0.0
+    split_time_ms: float = 0.0
+    total_time_ms: float = 0.0
+    
+    # Success flags
+    cavity_success: bool = False
+    split_success: bool = False
 
 
 # ============================================================================
@@ -311,6 +355,687 @@ def create_hard_shell_prism(
     
     logger.info(f"Hard shell prism created: {result.vertex_count} vertices, "
                 f"{result.face_count} faces in {elapsed_ms:.1f}ms")
+    
+    return result
+
+
+# ============================================================================
+# CSG OPERATIONS FOR HARD SHELL (Cavity + Split)
+# ============================================================================
+
+def _trimesh_to_manifold(mesh: trimesh.Trimesh) -> 'manifold3d.Manifold':
+    """Convert a trimesh to manifold3d Manifold object."""
+    if not MANIFOLD_AVAILABLE:
+        raise RuntimeError("manifold3d is not available")
+    
+    vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    faces = np.asarray(mesh.faces, dtype=np.uint32)
+    
+    # Create Mesh then Manifold (correct API for manifold3d v3.x)
+    m3d_mesh = manifold3d.Mesh(vert_properties=vertices, tri_verts=faces)
+    return manifold3d.Manifold(m3d_mesh)
+
+
+def _manifold_to_trimesh(manifold: 'manifold3d.Manifold') -> trimesh.Trimesh:
+    """Convert a manifold3d Manifold object to trimesh."""
+    mesh_data = manifold.to_mesh()
+    vertices = np.asarray(mesh_data.vert_properties, dtype=np.float64)
+    faces = np.asarray(mesh_data.tri_verts, dtype=np.int64)
+    
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
+
+
+def create_shell_with_cavity(
+    prism_mesh: trimesh.Trimesh,
+    hull_mesh: trimesh.Trimesh
+) -> Tuple[Optional[trimesh.Trimesh], float, bool]:
+    """
+    Subtract the hull (mold cavity) from the prism to create the shell.
+    
+    This implements: shell = prism - hull
+    
+    Args:
+        prism_mesh: The hard shell prism mesh
+        hull_mesh: The inflated hull mesh (defines the cavity)
+        
+    Returns:
+        Tuple of (shell_with_cavity, computation_time_ms, success)
+    """
+    start_time = time.time()
+    
+    if not MANIFOLD_AVAILABLE:
+        logger.error("manifold3d not available - cannot perform CSG operations")
+        return None, 0.0, False
+    
+    try:
+        logger.info("Creating shell with cavity (prism - hull)...")
+        
+        # Convert to manifold
+        prism_manifold = _trimesh_to_manifold(prism_mesh)
+        hull_manifold = _trimesh_to_manifold(hull_mesh)
+        
+        # Perform subtraction: shell = prism - hull
+        shell_manifold = prism_manifold - hull_manifold
+        
+        # Convert back to trimesh
+        shell_mesh = _manifold_to_trimesh(shell_manifold)
+        
+        elapsed_ms = (time.time() - start_time) * 1000
+        
+        logger.info(f"Shell with cavity created: {len(shell_mesh.vertices)} vertices, "
+                   f"{len(shell_mesh.faces)} faces in {elapsed_ms:.1f}ms")
+        
+        return shell_mesh, elapsed_ms, True
+        
+    except Exception as e:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error(f"Failed to create shell with cavity: {e}")
+        return None, elapsed_ms, False
+
+
+def _create_cutting_volume_from_surface(
+    parting_surface: trimesh.Trimesh,
+    pouring_direction: np.ndarray,
+    thickness: float = 100.0
+) -> trimesh.Trimesh:
+    """
+    Create a thick volume from the parting surface for CSG splitting.
+    
+    The volume is created by extruding the parting surface along the pouring direction
+    in both directions, creating a "slab" that can be used for CSG operations.
+    
+    Args:
+        parting_surface: The parting surface mesh (with extended collar)
+        pouring_direction: The pouring direction (extrusion axis)
+        thickness: Total thickness of the slab (extends thickness/2 in each direction)
+        
+    Returns:
+        A watertight volume mesh for CSG operations
+    """
+    # Normalize direction
+    direction = np.array(pouring_direction, dtype=np.float64)
+    direction = direction / (np.linalg.norm(direction) + 1e-10)
+    
+    # Get surface vertices and faces
+    vertices = np.asarray(parting_surface.vertices, dtype=np.float64)
+    faces = np.asarray(parting_surface.faces, dtype=np.int64)
+    n_verts = len(vertices)
+    n_faces = len(faces)
+    
+    half_thickness = thickness / 2.0
+    
+    # Create top and bottom surfaces by offsetting along the direction
+    top_vertices = vertices + direction * half_thickness
+    bottom_vertices = vertices - direction * half_thickness
+    
+    # Combined vertices: [bottom, top]
+    all_vertices = np.vstack([bottom_vertices, top_vertices])
+    
+    # Faces for bottom surface (reverse winding for outward normals)
+    bottom_faces = faces[:, ::-1]  # Reverse winding
+    
+    # Faces for top surface (offset indices)
+    top_faces = faces + n_verts
+    
+    # Side faces: find boundary edges and create quads
+    edge_count = {}
+    edge_to_face = {}
+    
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
+            # Store oriented edge info for winding determination
+            if edge_key not in edge_to_face:
+                edge_to_face[edge_key] = (fi, v0, v1)
+    
+    # Boundary edges have count == 1
+    boundary_edges = [e for e, c in edge_count.items() if c == 1]
+    
+    side_faces = []
+    for v0, v1 in boundary_edges:
+        # Get the original edge orientation from the face
+        _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
+        
+        # Bottom vertices
+        b0, b1 = v0, v1
+        # Top vertices (offset by n_verts)
+        t0, t1 = v0 + n_verts, v1 + n_verts
+        
+        # Create quad (2 triangles) with correct winding
+        # The winding depends on the original edge direction in the face
+        if orig_v0 == v0:
+            # Edge goes v0->v1 in original face, so outward normal faces "right"
+            side_faces.append([b0, t0, t1])
+            side_faces.append([b0, t1, b1])
+        else:
+            # Edge goes v1->v0 in original face
+            side_faces.append([b0, b1, t1])
+            side_faces.append([b0, t1, t0])
+    
+    # Combine all faces
+    all_faces = np.vstack([
+        bottom_faces,
+        top_faces,
+        np.array(side_faces, dtype=np.int64) if side_faces else np.zeros((0, 3), dtype=np.int64)
+    ])
+    
+    volume_mesh = trimesh.Trimesh(
+        vertices=all_vertices,
+        faces=all_faces,
+        process=True
+    )
+    volume_mesh.fix_normals()
+    
+    logger.debug(f"Created cutting volume: {len(all_vertices)} verts, {len(all_faces)} faces, "
+                f"from {n_verts} surface verts, {len(boundary_edges)} boundary edges")
+    
+    return volume_mesh
+
+
+def _create_half_space_from_membrane(
+    membrane: trimesh.Trimesh,
+    direction: np.ndarray,
+    extrusion_distance: float = 500.0
+) -> trimesh.Trimesh:
+    """
+    Create a watertight half-space volume bounded by the membrane on one side.
+    
+    This extrudes the membrane along the given direction to create a closed volume
+    representing "everything on one side of the membrane".
+    
+    The resulting volume has:
+    - The membrane as its bottom face (with appropriate winding)
+    - The extruded membrane as its top face
+    - Side faces connecting the membrane boundary to the extruded boundary
+    
+    Args:
+        membrane: The membrane mesh (e.g., outer collar)
+        direction: Unit vector for extrusion direction (defines "which side")
+        extrusion_distance: How far to extrude (should be larger than the shell)
+        
+    Returns:
+        A watertight volume mesh representing the half-space
+    """
+    # Normalize direction
+    direction = np.array(direction, dtype=np.float64)
+    direction = direction / (np.linalg.norm(direction) + 1e-10)
+    
+    # Get membrane geometry
+    vertices = np.asarray(membrane.vertices, dtype=np.float64)
+    faces = np.asarray(membrane.faces, dtype=np.int64)
+    n_verts = len(vertices)
+    
+    # Create extruded vertices (far end of the half-space)
+    extruded_vertices = vertices + direction * extrusion_distance
+    
+    # Combined vertices: [membrane, extruded]
+    all_vertices = np.vstack([vertices, extruded_vertices])
+    
+    # Faces:
+    # 1. Membrane faces (bottom) - reverse winding so normals point into the half-space
+    #    (i.e., pointing in the negative direction)
+    bottom_faces = faces[:, ::-1]  # Reversed winding
+    
+    # 2. Extruded faces (top) - keep original winding, offset indices
+    #    These normals point outward (in positive direction)
+    top_faces = faces + n_verts
+    
+    # 3. Side faces connecting boundary edges
+    # Find boundary edges of membrane
+    edge_count = {}
+    edge_to_face = {}
+    
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
+            if edge_key not in edge_to_face:
+                edge_to_face[edge_key] = (fi, v0, v1)
+    
+    # Boundary edges have count == 1
+    boundary_edges = [e for e, c in edge_count.items() if c == 1]
+    
+    side_faces = []
+    for v0, v1 in boundary_edges:
+        _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
+        
+        # Bottom (membrane) vertices
+        b0, b1 = v0, v1
+        # Top (extruded) vertices
+        t0, t1 = v0 + n_verts, v1 + n_verts
+        
+        # Create quad with correct winding for outward-facing normals
+        # Since bottom faces are reversed, side faces should create outward normals
+        if orig_v0 == v0:
+            side_faces.append([b0, b1, t1])
+            side_faces.append([b0, t1, t0])
+        else:
+            side_faces.append([b0, t0, t1])
+            side_faces.append([b0, t1, b1])
+    
+    # Combine all faces
+    all_faces_list = [bottom_faces, top_faces]
+    if side_faces:
+        all_faces_list.append(np.array(side_faces, dtype=np.int64))
+    all_faces = np.vstack(all_faces_list)
+    
+    half_space_mesh = trimesh.Trimesh(
+        vertices=all_vertices,
+        faces=all_faces,
+        process=True
+    )
+    half_space_mesh.fix_normals()
+    
+    logger.debug(f"Created half-space volume: {len(all_vertices)} verts, {len(all_faces)} faces, "
+                f"extruded {extrusion_distance:.1f}mm in direction {direction}")
+    
+    return half_space_mesh
+
+
+def _create_cutting_blade_from_membrane(
+    membrane: trimesh.Trimesh,
+    direction: np.ndarray,
+    thickness: float = 0.0005
+) -> trimesh.Trimesh:
+    """
+    Create a thin watertight "blade" volume from the membrane for cutting.
+    
+    The blade is created by extruding the membrane slightly in both directions
+    (+thickness/2 and -thickness/2) to create a thin solid volume that can be
+    subtracted from the shell to create a gap.
+    
+    Args:
+        membrane: The membrane mesh (e.g., outer collar)
+        direction: Unit vector perpendicular to the membrane (pouring direction)
+        thickness: Total thickness of the blade (default: 0.0005mm = 0.5 micron)
+        
+    Returns:
+        A watertight blade volume mesh
+    """
+    # Normalize direction
+    direction = np.array(direction, dtype=np.float64)
+    direction = direction / (np.linalg.norm(direction) + 1e-10)
+    
+    # Get membrane geometry
+    vertices = np.asarray(membrane.vertices, dtype=np.float64)
+    faces = np.asarray(membrane.faces, dtype=np.int64)
+    n_verts = len(vertices)
+    
+    half_thickness = thickness / 2.0
+    
+    # Create vertices for both sides of the blade
+    # Bottom side: membrane shifted in -direction
+    bottom_vertices = vertices - direction * half_thickness
+    # Top side: membrane shifted in +direction
+    top_vertices = vertices + direction * half_thickness
+    
+    # Combined vertices: [bottom, top]
+    all_vertices = np.vstack([bottom_vertices, top_vertices])
+    
+    # Faces:
+    # 1. Bottom faces - reverse winding so normals point outward (downward)
+    bottom_faces = faces[:, ::-1]  # Reversed winding
+    
+    # 2. Top faces - keep original winding, offset indices
+    top_faces = faces + n_verts
+    
+    # 3. Side faces connecting boundary edges
+    edge_count = {}
+    edge_to_face = {}
+    
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
+            if edge_key not in edge_to_face:
+                edge_to_face[edge_key] = (fi, v0, v1)
+    
+    # Boundary edges have count == 1
+    boundary_edges = [e for e, c in edge_count.items() if c == 1]
+    
+    side_faces = []
+    for v0, v1 in boundary_edges:
+        _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
+        
+        # Bottom vertices
+        b0, b1 = v0, v1
+        # Top vertices (offset by n_verts)
+        t0, t1 = v0 + n_verts, v1 + n_verts
+        
+        # Create quad with correct winding for outward-facing normals
+        if orig_v0 == v0:
+            side_faces.append([b0, b1, t1])
+            side_faces.append([b0, t1, t0])
+        else:
+            side_faces.append([b0, t0, t1])
+            side_faces.append([b0, t1, b1])
+    
+    # Combine all faces
+    all_faces_list = [bottom_faces, top_faces]
+    if side_faces:
+        all_faces_list.append(np.array(side_faces, dtype=np.int64))
+    all_faces = np.vstack(all_faces_list)
+    
+    blade_mesh = trimesh.Trimesh(
+        vertices=all_vertices,
+        faces=all_faces,
+        process=True
+    )
+    blade_mesh.fix_normals()
+    
+    logger.debug(f"Created cutting blade: {len(all_vertices)} verts, {len(all_faces)} faces, "
+                f"thickness={thickness:.6f}mm")
+    
+    return blade_mesh
+
+
+def split_shell_with_membrane(
+    shell_with_cavity: trimesh.Trimesh,
+    membrane: trimesh.Trimesh,
+    pouring_direction: np.ndarray,
+    blade_thickness: float = 0.00001
+) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool]:
+    """
+    Split the shell into two manifold halves using the membrane as a cutting blade.
+    
+    This creates a very thin volume (blade) from the membrane and subtracts it
+    from the shell, leaving a tiny gap that separates the shell into two 
+    disconnected manifold components.
+    
+    Algorithm:
+    1. Create thin "blade" by extruding membrane ±thickness/2 in pouring direction
+    2. Subtract blade from shell: cut_shell = shell - blade
+    3. Split result into connected components
+    4. Return the two largest components as half_1 (upper) and half_2 (lower)
+    
+    Args:
+        shell_with_cavity: The shell mesh (prism - hull)
+        membrane: The cutting membrane (outer collar extended parting surface)
+        pouring_direction: Unit vector defining the "upper" direction
+        blade_thickness: Thickness of the cutting blade (default: 0.00001mm = 0.01 micron)
+                        The blade is centered on the membrane (±thickness/2 each side)
+        
+    Returns:
+        Tuple of (shell_half_1, shell_half_2, computation_time_ms, success)
+        shell_half_1 is the half in the positive pouring direction (upper)
+        shell_half_2 is the half in the negative pouring direction (lower)
+    """
+    start_time = time.time()
+    
+    if not MANIFOLD_AVAILABLE:
+        logger.error("manifold3d not available - cannot perform CSG operations")
+        return None, None, 0.0, False
+    
+    try:
+        logger.info(f"Splitting shell using thin blade subtraction (thickness={blade_thickness:.6f}mm)...")
+        
+        # Normalize direction
+        direction = np.array(pouring_direction, dtype=np.float64)
+        direction = direction / (np.linalg.norm(direction) + 1e-10)
+        
+        # Step 1: Create thin cutting blade from membrane
+        logger.info("Creating cutting blade from membrane...")
+        blade = _create_cutting_blade_from_membrane(membrane, direction, blade_thickness)
+        logger.info(f"Blade: {len(blade.vertices)} verts, {len(blade.faces)} faces")
+        
+        # Step 2: Convert to manifold3d
+        logger.info("Converting meshes to manifold...")
+        shell_manifold = _trimesh_to_manifold(shell_with_cavity)
+        blade_manifold = _trimesh_to_manifold(blade)
+        
+        # Step 3: CSG subtraction - cut the shell with the blade
+        logger.info("Performing CSG subtraction: shell - blade...")
+        cut_shell_manifold = shell_manifold - blade_manifold
+        
+        # Step 4: Convert back to trimesh
+        cut_shell = _manifold_to_trimesh(cut_shell_manifold)
+        logger.info(f"Cut shell: {len(cut_shell.vertices)} verts, {len(cut_shell.faces)} faces")
+        
+        # Step 5: Split into connected components
+        logger.info("Splitting into connected components...")
+        components = cut_shell.split(only_watertight=False)
+        logger.info(f"Found {len(components)} connected components")
+        
+        if len(components) < 2:
+            logger.warning("Failed to split shell into two components - blade may not have cut through")
+            elapsed_ms = (time.time() - start_time) * 1000
+            if len(components) == 1:
+                return components[0], None, elapsed_ms, False
+            return None, None, elapsed_ms, False
+        
+        # Step 6: Sort by size and take the two largest
+        components = sorted(components, key=lambda m: len(m.faces), reverse=True)
+        comp1, comp2 = components[0], components[1]
+        
+        # Step 7: Classify which is upper vs lower based on centroid position
+        centroid1 = comp1.centroid
+        centroid2 = comp2.centroid
+        
+        # Project centroids onto pouring direction
+        proj1 = np.dot(centroid1, direction)
+        proj2 = np.dot(centroid2, direction)
+        
+        # Upper half has higher projection value
+        if proj1 > proj2:
+            shell_half_1, shell_half_2 = comp1, comp2
+        else:
+            shell_half_1, shell_half_2 = comp2, comp1
+        
+        elapsed_ms = (time.time() - start_time) * 1000
+        
+        logger.info(f"Shell split complete in {elapsed_ms:.1f}ms:")
+        logger.info(f"  Half 1 (upper): {len(shell_half_1.vertices)} verts, {len(shell_half_1.faces)} faces")
+        logger.info(f"  Half 2 (lower): {len(shell_half_2.vertices)} verts, {len(shell_half_2.faces)} faces")
+        
+        if len(components) > 2:
+            logger.warning(f"  Note: {len(components) - 2} additional small fragments were discarded")
+        
+        return shell_half_1, shell_half_2, elapsed_ms, True
+        
+    except Exception as e:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error(f"Failed to split shell with membrane: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None, elapsed_ms, False
+
+
+def split_shell_along_parting_surface(
+    shell_with_cavity: trimesh.Trimesh,
+    parting_surface: trimesh.Trimesh,
+    pouring_direction: np.ndarray
+) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool]:
+    """
+    Split the shell into two halves along the parting surface.
+    
+    Uses the parting surface (with extended collar) as a cutting plane.
+    
+    Args:
+        shell_with_cavity: The shell mesh with cavity already subtracted
+        parting_surface: The parting surface mesh (with extended collar)
+        pouring_direction: The pouring direction (used to determine which half is which)
+        
+    Returns:
+        Tuple of (shell_half_1, shell_half_2, computation_time_ms, success)
+        shell_half_1 is the positive pouring direction half
+        shell_half_2 is the negative pouring direction half
+    """
+    start_time = time.time()
+    
+    if not MANIFOLD_AVAILABLE:
+        logger.error("manifold3d not available - cannot perform CSG operations")
+        return None, None, 0.0, False
+    
+    try:
+        logger.info("Splitting shell along parting surface...")
+        
+        # Create a thick volume from the parting surface for CSG
+        # The volume extends far in both directions to ensure complete intersection
+        cutting_volume = _create_cutting_volume_from_surface(
+            parting_surface,
+            pouring_direction,
+            thickness=1000.0  # Large enough to extend beyond the shell
+        )
+        
+        # Convert to manifold
+        shell_manifold = _trimesh_to_manifold(shell_with_cavity)
+        cutting_manifold = _trimesh_to_manifold(cutting_volume)
+        
+        # Split using intersection and subtraction:
+        # half_1 = shell - cutting_volume (part above the parting surface)
+        # half_2 = shell ∩ cutting_volume... no wait, that's not right
+        
+        # Actually, we need to split using the cutting volume as a divider
+        # The cutting volume represents the parting surface "thickened"
+        # We want: the shell on the positive side of parting surface, 
+        # and the shell on the negative side
+        
+        # Better approach: 
+        # 1. Create two half-spaces by offsetting the cutting slab
+        # 2. Intersect shell with each half-space
+        
+        # Simplest approach: 
+        # Create a large box on each side of the parting surface
+        # and intersect with shell
+        
+        # Get shell bounds to create large enough cutting boxes
+        shell_bounds = shell_with_cavity.bounds
+        shell_center = (shell_bounds[0] + shell_bounds[1]) / 2.0
+        shell_size = np.linalg.norm(shell_bounds[1] - shell_bounds[0])
+        box_size = shell_size * 3  # Make box much larger than shell
+        
+        direction = np.array(pouring_direction, dtype=np.float64)
+        direction = direction / (np.linalg.norm(direction) + 1e-10)
+        
+        # Create half-space boxes using the cutting volume
+        # Half 1: above the parting surface (positive direction)
+        # Half 2: below the parting surface (negative direction)
+        
+        # Use the cutting volume to split:
+        # half_1 = shell - (shell ∩ cutting_volume)  -- remove the "inside" part
+        # This gives us: shell parts NOT inside the cutting volume
+        
+        # Better: subtract cutting_volume from shell, then we have two disconnected pieces
+        # But that doesn't always work if cutting volume is thin
+        
+        # Most reliable: use intersection with half-space volumes
+        
+        # Create a large box for each half
+        # Box center offset by box_size/2 in the direction
+        half_box_size = box_size
+        
+        # Create half-space box for positive direction (half 1)
+        # Center is offset by box_size/2 + small epsilon in positive direction from shell center
+        # But we need to use the parting surface centroid, not shell center
+        parting_center = parting_surface.centroid
+        
+        box_center_1 = parting_center + direction * (half_box_size / 2.0 + 0.1)
+        box_1 = trimesh.creation.box(
+            extents=[box_size, box_size, box_size],
+            transform=trimesh.transformations.translation_matrix(box_center_1)
+        )
+        
+        box_center_2 = parting_center - direction * (half_box_size / 2.0 + 0.1)
+        box_2 = trimesh.creation.box(
+            extents=[box_size, box_size, box_size],
+            transform=trimesh.transformations.translation_matrix(box_center_2)
+        )
+        
+        # Convert boxes to manifold
+        box_manifold_1 = _trimesh_to_manifold(box_1)
+        box_manifold_2 = _trimesh_to_manifold(box_2)
+        
+        # Intersect shell with each half-space box
+        half_1_manifold = shell_manifold ^ box_manifold_1  # Intersection
+        half_2_manifold = shell_manifold ^ box_manifold_2  # Intersection
+        
+        # Convert back to trimesh
+        shell_half_1 = _manifold_to_trimesh(half_1_manifold)
+        shell_half_2 = _manifold_to_trimesh(half_2_manifold)
+        
+        elapsed_ms = (time.time() - start_time) * 1000
+        
+        logger.info(f"Shell split complete in {elapsed_ms:.1f}ms:")
+        logger.info(f"  Half 1: {len(shell_half_1.vertices)} verts, {len(shell_half_1.faces)} faces")
+        logger.info(f"  Half 2: {len(shell_half_2.vertices)} verts, {len(shell_half_2.faces)} faces")
+        
+        return shell_half_1, shell_half_2, elapsed_ms, True
+        
+    except Exception as e:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error(f"Failed to split shell: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None, elapsed_ms, False
+
+
+def create_split_hard_shell(
+    prism_result: HardShellPrismResult,
+    hull_mesh: trimesh.Trimesh,
+    parting_surface_with_collar: trimesh.Trimesh,
+    pouring_direction: np.ndarray
+) -> HardShellSplitResult:
+    """
+    Complete CSG pipeline: create shell with cavity and split into two halves.
+    
+    Pipeline:
+    1. Subtract hull from prism to create cavity
+    2. Split along parting surface into two halves
+    
+    Args:
+        prism_result: The hard shell prism result
+        hull_mesh: The inflated hull mesh (defines mold cavity)
+        parting_surface_with_collar: The parting surface with extended collar
+        pouring_direction: The resin pouring direction
+        
+    Returns:
+        HardShellSplitResult with both shell halves
+    """
+    result = HardShellSplitResult(
+        pouring_direction=np.array(pouring_direction)
+    )
+    
+    total_start = time.time()
+    
+    # Step 1: Create shell with cavity
+    shell_with_cavity, cavity_time, cavity_success = create_shell_with_cavity(
+        prism_result.prism_mesh,
+        hull_mesh
+    )
+    
+    result.shell_with_cavity = shell_with_cavity
+    result.cavity_time_ms = cavity_time
+    result.cavity_success = cavity_success
+    
+    if not cavity_success or shell_with_cavity is None:
+        result.total_time_ms = (time.time() - total_start) * 1000
+        return result
+    
+    # Step 2: Split along parting surface
+    shell_half_1, shell_half_2, split_time, split_success = split_shell_along_parting_surface(
+        shell_with_cavity,
+        parting_surface_with_collar,
+        pouring_direction
+    )
+    
+    result.shell_half_1 = shell_half_1
+    result.shell_half_2 = shell_half_2
+    result.split_time_ms = split_time
+    result.split_success = split_success
+    
+    if shell_half_1 is not None:
+        result.half_1_vertex_count = len(shell_half_1.vertices)
+        result.half_1_face_count = len(shell_half_1.faces)
+    
+    if shell_half_2 is not None:
+        result.half_2_vertex_count = len(shell_half_2.vertices)
+        result.half_2_face_count = len(shell_half_2.faces)
+    
+    result.total_time_ms = (time.time() - total_start) * 1000
     
     return result
 

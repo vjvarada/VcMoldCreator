@@ -26,13 +26,20 @@ applyTo: '**'
 - Gap filling for floating edges
 - Small hole removal
 - Persistence-based pouring direction optimization
+- Hard shell prism generation (aligned with pouring direction)
+- CSG subtraction (prism - hull) using manifold3d
+- Outer collar extension (parting surface extended outward)
+- Shell splitting into two manifold halves using membrane
 
 #### In Progress 🔄
 - Secondary membrane extraction
 - Session save/load
+- Shell halves export for 3D printing
 
 #### Not Started ❌
-- Fabrication pipeline (shell, metamold)
+- Air vent placement
+- Registration marks on shell halves
+- Metamold geometry
 - Multi-piece molds
 - GPU acceleration for Dijkstra
 
@@ -137,6 +144,13 @@ biased_dist = δ + max(λ_w, 0)
 - Added face vertex and inner vertex computation
 - Completed persistence-based pouring direction optimization
 - Added floating edge gap filling
+- **Hard Shell Pipeline:**
+  - Created `create_hard_shell_prism()` in mold_fabrication.py
+  - Implemented CSG subtraction using manifold3d
+  - Added outer collar extension (parting surface extended beyond hull)
+  - Implemented `split_shell_with_membrane()` using half-space volumes
+  - Added display options for shell with cavity, prism, outer collar, shell halves
+  - Shell halves shown in teal (half 1) and coral (half 2) colors
 
 ---
 

@@ -5519,3 +5519,309 @@ class MeshViewer(QWidget):
             self._hard_shell_prism_actor.SetVisibility(visible)
             self.plotter.update()
             logger.debug(f"Hard shell prism visibility set to {visible}")
+
+    # =========================================================================
+    # SHELL WITH CAVITY VISUALIZATION (CSG Result: prism - hull)
+    # =========================================================================
+    
+    def show_shell_with_cavity(self, shell_mesh: 'trimesh.Trimesh'):
+        """
+        Display the hard shell with cavity (result of prism - hull CSG).
+        
+        Displayed in cyan to distinguish from the prism.
+        
+        Args:
+            shell_mesh: The shell mesh with cavity subtracted
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        # Remove existing actor
+        self.remove_shell_with_cavity()
+        
+        if shell_mesh is None or len(shell_mesh.vertices) == 0:
+            logger.warning("No valid shell mesh to display")
+            return
+        
+        self._shell_with_cavity_mesh = shell_mesh
+        
+        try:
+            vertices = np.asarray(shell_mesh.vertices)
+            faces = np.asarray(shell_mesh.faces)
+            faces_pv = np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64)
+            pv_mesh = pv.PolyData(vertices, faces_pv.flatten())
+        except Exception as e:
+            logger.error(f"Failed to convert shell mesh to PyVista: {e}")
+            return
+        
+        self._shell_with_cavity_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='#00CED1',  # Dark Turquoise
+            opacity=0.5,  # More translucent to see inner details
+            show_edges=True,
+            edge_color='#008B8B',  # Dark Cyan
+            line_width=0.5,
+        )
+        self._shell_with_cavity_visible = True
+        logger.info(f"Shell with cavity displayed: {len(vertices)} vertices, {len(faces)} faces")
+        
+        self.plotter.update()
+
+    def remove_shell_with_cavity(self):
+        """Remove the shell with cavity from the display."""
+        if hasattr(self, '_shell_with_cavity_actor') and self._shell_with_cavity_actor is not None:
+            try:
+                self.plotter.remove_actor(self._shell_with_cavity_actor)
+            except Exception:
+                pass
+            self._shell_with_cavity_actor = None
+        
+        if hasattr(self, '_shell_with_cavity_mesh'):
+            self._shell_with_cavity_mesh = None
+        
+        self.plotter.update()
+
+    def set_shell_with_cavity_visible(self, visible: bool):
+        """
+        Set visibility of the shell with cavity.
+        
+        Args:
+            visible: True to show, False to hide
+        """
+        self._shell_with_cavity_visible = visible
+        if hasattr(self, '_shell_with_cavity_actor') and self._shell_with_cavity_actor is not None:
+            self._shell_with_cavity_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Shell with cavity visibility set to {visible}")
+
+    # =========================================================================
+    # OUTER COLLAR EXTENSION VISUALIZATION
+    # =========================================================================
+    
+    def show_outer_collar(self, mesh: 'trimesh.Trimesh'):
+        """
+        Display the outer collar extension (parting surface extended outward).
+        
+        This is the parting surface with an extended "collar" that reaches
+        beyond the hull boundary to fully cut through the hard shell prism.
+        
+        Args:
+            mesh: The extended parting surface mesh with outer collar
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        # Remove existing actor
+        self.remove_outer_collar()
+        
+        if mesh is None or len(mesh.vertices) == 0:
+            logger.warning("No valid outer collar mesh to display")
+            return
+        
+        self._outer_collar_mesh = mesh
+        
+        try:
+            vertices = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.faces)
+            faces_pv = np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64)
+            pv_mesh = pv.PolyData(vertices, faces_pv.flatten())
+        except Exception as e:
+            logger.error(f"Failed to convert outer collar mesh to PyVista: {e}")
+            return
+        
+        # Display in magenta to distinguish from parting surface (blue) and shell (cyan)
+        self._outer_collar_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='#FF00FF',  # Magenta
+            opacity=0.6,
+            show_edges=True,
+            edge_color='#CC00CC',  # Darker magenta
+            line_width=1.0,
+        )
+        self._outer_collar_visible = True
+        logger.info(f"Outer collar displayed: {len(vertices)} vertices, {len(faces)} faces")
+        
+        self.plotter.update()
+    
+    def remove_outer_collar(self):
+        """Remove the outer collar extension mesh from the display."""
+        if hasattr(self, '_outer_collar_actor') and self._outer_collar_actor is not None:
+            try:
+                self.plotter.remove_actor(self._outer_collar_actor)
+            except Exception:
+                pass
+            self._outer_collar_actor = None
+        
+        if hasattr(self, '_outer_collar_mesh'):
+            self._outer_collar_mesh = None
+        
+        self.plotter.update()
+    
+    def set_outer_collar_visible(self, visible: bool):
+        """
+        Set visibility of the outer collar extension.
+        
+        Args:
+            visible: True to show, False to hide
+        """
+        self._outer_collar_visible = visible
+        if hasattr(self, '_outer_collar_actor') and self._outer_collar_actor is not None:
+            self._outer_collar_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Outer collar visibility set to {visible}")
+
+    # =========================================================================
+    # SHELL HALVES VISUALIZATION (SPLIT BY MEMBRANE)
+    # =========================================================================
+    
+    def show_shell_half_1(self, mesh: 'trimesh.Trimesh'):
+        """
+        Display shell half 1 (upper half split by membrane).
+        
+        This is the upper portion of the hard shell cut by the parting membrane.
+        Displayed in teal color.
+        
+        Args:
+            mesh: The shell half 1 mesh
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        # Remove existing actor
+        self.remove_shell_half_1()
+        
+        if mesh is None or len(mesh.vertices) == 0:
+            logger.warning("No valid shell half 1 mesh to display")
+            return
+        
+        self._shell_half_1_mesh = mesh
+        
+        try:
+            vertices = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.faces)
+            faces_pv = np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64)
+            pv_mesh = pv.PolyData(vertices, faces_pv.flatten())
+        except Exception as e:
+            logger.error(f"Failed to convert shell half 1 mesh to PyVista: {e}")
+            return
+        
+        # Display in teal to represent "top" mold half
+        self._shell_half_1_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='#20B2AA',  # Light Sea Green / Teal
+            opacity=0.6,
+            show_edges=True,
+            edge_color='#008080',  # Teal
+            line_width=0.5,
+        )
+        self._shell_half_1_visible = True
+        logger.info(f"Shell half 1 displayed: {len(vertices)} vertices, {len(faces)} faces")
+        
+        self.plotter.update()
+    
+    def remove_shell_half_1(self):
+        """Remove shell half 1 from the display."""
+        if hasattr(self, '_shell_half_1_actor') and self._shell_half_1_actor is not None:
+            try:
+                self.plotter.remove_actor(self._shell_half_1_actor)
+            except Exception:
+                pass
+            self._shell_half_1_actor = None
+        
+        if hasattr(self, '_shell_half_1_mesh'):
+            self._shell_half_1_mesh = None
+        
+        self.plotter.update()
+    
+    def set_shell_half_1_visible(self, visible: bool):
+        """
+        Set visibility of shell half 1.
+        
+        Args:
+            visible: True to show, False to hide
+        """
+        self._shell_half_1_visible = visible
+        if hasattr(self, '_shell_half_1_actor') and self._shell_half_1_actor is not None:
+            self._shell_half_1_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Shell half 1 visibility set to {visible}")
+    
+    def show_shell_half_2(self, mesh: 'trimesh.Trimesh'):
+        """
+        Display shell half 2 (lower half split by membrane).
+        
+        This is the lower portion of the hard shell cut by the parting membrane.
+        Displayed in coral color to distinguish from half 1.
+        
+        Args:
+            mesh: The shell half 2 mesh
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        # Remove existing actor
+        self.remove_shell_half_2()
+        
+        if mesh is None or len(mesh.vertices) == 0:
+            logger.warning("No valid shell half 2 mesh to display")
+            return
+        
+        self._shell_half_2_mesh = mesh
+        
+        try:
+            vertices = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.faces)
+            faces_pv = np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64)
+            pv_mesh = pv.PolyData(vertices, faces_pv.flatten())
+        except Exception as e:
+            logger.error(f"Failed to convert shell half 2 mesh to PyVista: {e}")
+            return
+        
+        # Display in coral to represent "bottom" mold half (contrasts with teal)
+        self._shell_half_2_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='#F08080',  # Light Coral
+            opacity=0.6,
+            show_edges=True,
+            edge_color='#CD5C5C',  # Indian Red
+            line_width=0.5,
+        )
+        self._shell_half_2_visible = True
+        logger.info(f"Shell half 2 displayed: {len(vertices)} vertices, {len(faces)} faces")
+        
+        self.plotter.update()
+    
+    def remove_shell_half_2(self):
+        """Remove shell half 2 from the display."""
+        if hasattr(self, '_shell_half_2_actor') and self._shell_half_2_actor is not None:
+            try:
+                self.plotter.remove_actor(self._shell_half_2_actor)
+            except Exception:
+                pass
+            self._shell_half_2_actor = None
+        
+        if hasattr(self, '_shell_half_2_mesh'):
+            self._shell_half_2_mesh = None
+        
+        self.plotter.update()
+    
+    def set_shell_half_2_visible(self, visible: bool):
+        """
+        Set visibility of shell half 2.
+        
+        Args:
+            visible: True to show, False to hide
+        """
+        self._shell_half_2_visible = visible
+        if hasattr(self, '_shell_half_2_actor') and self._shell_half_2_actor is not None:
+            self._shell_half_2_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Shell half 2 visibility set to {visible}")
