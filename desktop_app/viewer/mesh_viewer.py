@@ -5301,3 +5301,221 @@ class MeshViewer(QWidget):
     def triangle_debug_mode(self) -> bool:
         """Check if triangle debug mode is enabled."""
         return self._triangle_debug_mode
+
+    # =========================================================================
+    # OUTER SHELL HULL AND OUTER COLLAR VISUALIZATION
+    # =========================================================================
+    
+    def show_outer_shell_hull(self, mesh: 'trimesh.Trimesh'):
+        """
+        Display the outer shell hull (offset hull for hard plastic shell).
+        
+        Args:
+            mesh: The outer shell hull mesh
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        # Remove existing actor
+        self.remove_outer_shell_hull()
+        
+        # Store reference
+        self._outer_shell_hull_mesh = mesh
+        
+        # Convert to PyVista
+        try:
+            vertices = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.faces)
+            faces_pv = np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64)
+            pv_mesh = pv.PolyData(vertices, faces_pv.flatten())
+        except Exception as e:
+            logger.error(f"Failed to convert outer shell hull to PyVista: {e}")
+            return
+        
+        # Add to scene with distinct color (purple, semi-transparent)
+        self._outer_shell_hull_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='#9370DB',  # Medium purple
+            opacity=0.25,
+            show_edges=True,
+            edge_color='#6A5ACD',  # Slate blue
+            line_width=0.5,
+        )
+        
+        self._outer_shell_hull_visible = True
+        self.plotter.update()
+        logger.info(f"Outer shell hull displayed: {len(vertices)} vertices, {len(faces)} faces")
+    
+    def remove_outer_shell_hull(self):
+        """Remove the outer shell hull mesh from the display."""
+        if hasattr(self, '_outer_shell_hull_actor') and self._outer_shell_hull_actor is not None:
+            try:
+                self.plotter.remove_actor(self._outer_shell_hull_actor)
+            except Exception:
+                pass
+            self._outer_shell_hull_actor = None
+        
+        if hasattr(self, '_outer_shell_hull_mesh'):
+            self._outer_shell_hull_mesh = None
+        
+        self.plotter.update()
+    
+    def set_outer_shell_hull_visible(self, visible: bool):
+        """
+        Set visibility of the outer shell hull.
+        
+        Args:
+            visible: True to show, False to hide
+        """
+        self._outer_shell_hull_visible = visible
+        if hasattr(self, '_outer_shell_hull_actor') and self._outer_shell_hull_actor is not None:
+            self._outer_shell_hull_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Outer shell hull visibility set to {visible}")
+    
+    def show_outer_collar_surface(self, mesh: 'trimesh.Trimesh'):
+        """
+        Display the extended parting surface (with outer collar).
+        
+        Args:
+            mesh: The parting surface mesh extended with outer collar
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        # Remove existing actor
+        self.remove_outer_collar_surface()
+        
+        # Store reference
+        self._outer_collar_mesh = mesh
+        
+        # Convert to PyVista
+        try:
+            vertices = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.faces)
+            faces_pv = np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64)
+            pv_mesh = pv.PolyData(vertices, faces_pv.flatten())
+        except Exception as e:
+            logger.error(f"Failed to convert outer collar surface to PyVista: {e}")
+            return
+        
+        # Add to scene with distinct color (teal/cyan for outer collar)
+        self._outer_collar_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='#20B2AA',  # Light sea green
+            opacity=0.6,
+            show_edges=True,
+            edge_color='#008B8B',  # Dark cyan
+            line_width=0.8,
+        )
+        
+        self._outer_collar_visible = True
+        self.plotter.update()
+        logger.info(f"Outer collar surface displayed: {len(vertices)} vertices, {len(faces)} faces")
+    
+    def remove_outer_collar_surface(self):
+        """Remove the outer collar surface from the display."""
+        if hasattr(self, '_outer_collar_actor') and self._outer_collar_actor is not None:
+            try:
+                self.plotter.remove_actor(self._outer_collar_actor)
+            except Exception:
+                pass
+            self._outer_collar_actor = None
+        
+        if hasattr(self, '_outer_collar_mesh'):
+            self._outer_collar_mesh = None
+        
+        self.plotter.update()
+    
+    def set_outer_collar_surface_visible(self, visible: bool):
+        """
+        Set visibility of the outer collar surface.
+        
+        Args:
+            visible: True to show, False to hide
+        """
+        self._outer_collar_visible = visible
+        if hasattr(self, '_outer_collar_actor') and self._outer_collar_actor is not None:
+            self._outer_collar_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Outer collar surface visibility set to {visible}")
+
+    # =========================================================================
+    # HARD SHELL PRISM VISUALIZATION
+    # =========================================================================
+    
+    def show_hard_shell_prism(self, mesh: 'trimesh.Trimesh'):
+        """
+        Display the hard shell prism (aligned with pouring direction per paper Section 5).
+        
+        The prism has a flat base orthogonal to the pouring direction, shaped like
+        the silhouette of the convex hull.
+        
+        Args:
+            mesh: The hard shell prism mesh
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        # Remove existing actor
+        self.remove_hard_shell_prism()
+        
+        # Store reference
+        self._hard_shell_prism_mesh = mesh
+        
+        # Convert to PyVista
+        try:
+            vertices = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.faces)
+            faces_pv = np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64)
+            pv_mesh = pv.PolyData(vertices, faces_pv.flatten())
+        except Exception as e:
+            logger.error(f"Failed to convert hard shell prism to PyVista: {e}")
+            return
+        
+        # Add to scene with distinct color (orange, semi-transparent for prism)
+        self._hard_shell_prism_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='#FF8C00',  # Dark orange
+            opacity=0.2,
+            show_edges=True,
+            edge_color='#FF4500',  # Orange red
+            line_width=1.0,
+        )
+        
+        self._hard_shell_prism_visible = True
+        self.plotter.update()
+        logger.info(f"Hard shell prism displayed: {len(vertices)} vertices, {len(faces)} faces")
+    
+    def remove_hard_shell_prism(self):
+        """Remove the hard shell prism mesh from the display."""
+        if hasattr(self, '_hard_shell_prism_actor') and self._hard_shell_prism_actor is not None:
+            try:
+                self.plotter.remove_actor(self._hard_shell_prism_actor)
+            except Exception:
+                pass
+            self._hard_shell_prism_actor = None
+        
+        if hasattr(self, '_hard_shell_prism_mesh'):
+            self._hard_shell_prism_mesh = None
+        
+        self.plotter.update()
+    
+    def set_hard_shell_prism_visible(self, visible: bool):
+        """
+        Set visibility of the hard shell prism.
+        
+        Args:
+            visible: True to show, False to hide
+        """
+        self._hard_shell_prism_visible = visible
+        if hasattr(self, '_hard_shell_prism_actor') and self._hard_shell_prism_actor is not None:
+            self._hard_shell_prism_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Hard shell prism visibility set to {visible}")

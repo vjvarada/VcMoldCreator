@@ -80,6 +80,12 @@ from core.secondary_membrane import (
     create_enhanced_secondary_cut_edges,
     SecondaryMembraneInfo,
 )
+from core.mold_fabrication import (
+    create_outer_shell_hull,
+    create_outer_collar_extension,
+    OuterShellHullResult,
+    OuterCollarResult,
+)
 
 __all__ = [
     'STLLoader',
@@ -155,4 +161,10 @@ __all__ = [
     'find_orphan_edge_clusters',
     'create_enhanced_secondary_cut_edges',
     'SecondaryMembraneInfo',
+    # Mold fabrication (hard shell)
+    'create_outer_shell_hull',
+    'create_outer_collar_extension',
+    'OuterShellHullResult',
+    'OuterCollarResult',
 ]
+

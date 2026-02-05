@@ -77,6 +77,7 @@ class Step(Enum):
     PARTING_SURFACE_SMOOTH = 'parting-surface-smooth'  # Smooth BOTH primary and secondary surfaces together
     REGISTRATION_NOISE = 'registration-noise'  # Add registration patterns for mold alignment
     POURING = 'pouring'                # Pouring direction optimization (final step)
+    HARD_SHELL = 'hard-shell'          # Hard shell generation (outer collar + prism)
 
 
 STEPS = [
@@ -93,6 +94,7 @@ STEPS = [
     {'id': Step.PARTING_SURFACE_SMOOTH, 'icon': '✨', 'title': 'Smooth Surfaces', 'description': 'Smooth both primary and secondary surfaces with boundary re-projection'},
     {'id': Step.REGISTRATION_NOISE, 'icon': '🔑', 'title': 'Registration Pattern', 'description': 'Add registration pattern to parting surface for mold alignment'},
     {'id': Step.POURING, 'icon': '🧪', 'title': 'Pouring Directions', 'description': 'Optimize silicone/resin pouring directions for each mold half'},
+    {'id': Step.HARD_SHELL, 'icon': '🏠', 'title': 'Hard Shell', 'description': 'Generate hard shell geometry with outer collar extension'},
 ]
 
 
@@ -866,6 +868,73 @@ class MoldAwarePouringDirectionWorker(QThread):
             
         except Exception as e:
             logger.exception(f"Error computing mold-aware pouring directions: {e}")
+            self.error.emit(str(e))
+
+
+
+
+class HardShellWorker(QThread):
+    """Background worker for generating hard shell geometry (prism + extended collar)."""
+    
+    progress = pyqtSignal(str)
+    complete = pyqtSignal(object, object)  # (HardShellPrismResult, OuterCollarResult)
+    error = pyqtSignal(str)
+    
+    def __init__(
+        self,
+        parting_surface,
+        inner_hull,
+        vertex_boundary_type,
+        pouring_direction,
+        wall_thickness=5.0
+    ):
+        super().__init__()
+        self.parting_surface = parting_surface
+        self.inner_hull = inner_hull
+        self.vertex_boundary_type = vertex_boundary_type
+        self.pouring_direction = pouring_direction
+        self.wall_thickness = wall_thickness
+    
+    def run(self):
+        try:
+            from core.mold_fabrication import (
+                create_hard_shell_prism,
+                create_outer_collar_extension
+            )
+            
+            logger.info(f"Generating hard shell with wall_thickness={self.wall_thickness}mm")
+            
+            # Step 1: Create the prism (paper Section 5 - aligned with pouring direction)
+            # The prism is offset from the inner hull by wall_thickness
+            self.progress.emit("Creating hard shell prism (aligned with pouring direction)...")
+            prism_result = create_hard_shell_prism(
+                self.inner_hull,
+                self.pouring_direction,
+                wall_thickness=self.wall_thickness,
+                margin=0.0  # wall_thickness is the full offset
+            )
+            logger.info(f"Hard shell prism: {prism_result.vertex_count} vertices, "
+                       f"silhouette has {len(prism_result.silhouette_2d)} points")
+            
+            # Step 2: Create outer collar extension (extend parting surface 2x wall_thickness
+            # so it fully passes through the prism boundary)
+            self.progress.emit("Creating outer collar extension (2x offset for full cut)...")
+            collar_extension_distance = self.wall_thickness * 2.0
+            collar_result = create_outer_collar_extension(
+                self.parting_surface,
+                self.inner_hull,
+                self.vertex_boundary_type,
+                self.pouring_direction,
+                extension_distance=collar_extension_distance
+            )
+            logger.info(f"Outer collar: {collar_result.collar_vertex_count} new vertices, "
+                       f"extended {collar_extension_distance}mm")
+            
+            self.progress.emit(f"Hard shell generation complete")
+            self.complete.emit(prism_result, collar_result)
+            
+        except Exception as e:
+            logger.exception(f"Error generating hard shell: {e}")
             self.error.emit(str(e))
 
 
@@ -4566,6 +4635,11 @@ class MainWindow(QMainWindow):
         # Pouring direction state
         self._pouring_worker: Optional[MoldAwarePouringDirectionWorker] = None
         self._mold_aware_pouring_result = None  # MoldAwarePouringDirections
+
+        # Hard shell state
+        self._hard_shell_worker = None
+        self._hard_shell_prism_result = None  # HardShellPrismResult
+        self._outer_collar_result = None  # OuterCollarResult
         
         # Registration noise state
         self._registration_noise_result = None  # SinusoidalRegistrationResult
@@ -5159,6 +5233,8 @@ class MainWindow(QMainWindow):
             self._setup_registration_noise_step()
         elif self._active_step == Step.POURING:
             self._setup_pouring_step()
+        elif self._active_step == Step.HARD_SHELL:
+            self._setup_hard_shell_step()
         
         self.context_layout.addStretch()
     
@@ -5716,6 +5792,268 @@ class MainWindow(QMainWindow):
             self.pouring_progress.hide()
         self._pouring_worker = None
     
+
+    # =========================================================================
+    # HARD SHELL STEP
+    # =========================================================================
+
+    def _setup_hard_shell_step(self):
+        """Setup the hard shell generation step UI."""
+        has_smoothed_surface = (
+            self._combined_smooth_result is not None and
+            self._combined_smooth_result.primary_mesh is not None
+        )
+        
+        has_pouring_direction = (
+            self._mold_aware_pouring_result is not None and
+            self._mold_aware_pouring_result.resin_direction is not None
+        )
+        
+        has_hull = self._hull_result is not None
+        
+        if not has_smoothed_surface:
+            no_data_label = QLabel("Please smooth the parting surface first.")
+            no_data_label.setStyleSheet(f"color: {Colors.WARNING}; font-size: 13px; padding: 12px;")
+            no_data_label.setWordWrap(True)
+            self.context_layout.addWidget(no_data_label)
+            return
+        
+        if not has_pouring_direction:
+            no_data_label = QLabel("Please compute pouring directions first.")
+            no_data_label.setStyleSheet(f"color: {Colors.WARNING}; font-size: 13px; padding: 12px;")
+            no_data_label.setWordWrap(True)
+            self.context_layout.addWidget(no_data_label)
+            return
+        
+        if not has_hull:
+            no_data_label = QLabel("Please generate the bounding hull first.")
+            no_data_label.setStyleSheet(f"color: {Colors.WARNING}; font-size: 13px; padding: 12px;")
+            no_data_label.setWordWrap(True)
+            self.context_layout.addWidget(no_data_label)
+            return
+        
+        header = QLabel("Hard Shell Generation")
+        header.setStyleSheet(f"font-size: 14px; font-weight: 500; color: {Colors.DARK};")
+        self.context_layout.addWidget(header)
+        
+        desc = QLabel("Generate the hard plastic shell prism aligned with the pouring direction. "
+                      "The prism base is shaped like the silhouette of the convex hull, as described in the paper (Section 5).")
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"font-size: 12px; color: {Colors.GRAY}; margin-bottom: 8px;")
+        self.context_layout.addWidget(desc)
+        
+        # Wall thickness parameter
+        shell_params_group = QGroupBox("Parameters")
+        shell_params_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+            QLabel {{
+                color: {Colors.DARK};
+                font-size: 12px;
+            }}
+        """)
+        shell_params_layout = QFormLayout(shell_params_group)
+        shell_params_layout.setContentsMargins(12, 16, 12, 12)
+        
+        self.shell_wall_thickness_spin = QDoubleSpinBox()
+        self.shell_wall_thickness_spin.setRange(1.0, 20.0)
+        self.shell_wall_thickness_spin.setValue(2.0)
+        self.shell_wall_thickness_spin.setSuffix(" mm")
+        self.shell_wall_thickness_spin.setSingleStep(0.5)
+        self.shell_wall_thickness_spin.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                background-color: {Colors.WHITE};
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 12px;
+                min-width: 80px;
+            }}
+        """)
+        shell_params_layout.addRow("Prism offset:", self.shell_wall_thickness_spin)
+        
+        self.context_layout.addWidget(shell_params_group)
+        
+        # Generate button
+        self.shell_generate_btn = QPushButton("Generate Hard Shell")
+        self.shell_generate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.shell_generate_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #6b5b95;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+            }}
+            QPushButton:hover {{ background-color: #5a4a80; }}
+            QPushButton:disabled {{ background-color: {Colors.GRAY_LIGHT}; color: {Colors.GRAY}; }}
+        """)
+        self.shell_generate_btn.clicked.connect(self._on_generate_hard_shell)
+        self.context_layout.addWidget(self.shell_generate_btn)
+        
+        # Progress
+        self.shell_progress = QProgressBar()
+        self.shell_progress.setRange(0, 0)
+        self.shell_progress.setTextVisible(False)
+        self.shell_progress.hide()
+        self.context_layout.addWidget(self.shell_progress)
+        
+        self.shell_progress_label = QLabel("")
+        self.shell_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.shell_progress_label.hide()
+        self.context_layout.addWidget(self.shell_progress_label)
+        
+        # Results
+        self.shell_stats = StatsBox()
+        self.shell_stats.hide()
+        self.context_layout.addWidget(self.shell_stats)
+        
+        # Visibility checkboxes
+        self.show_prism_checkbox = QCheckBox("Show Hard Shell Prism")
+        self.show_prism_checkbox.setChecked(True)
+        self.show_prism_checkbox.toggled.connect(self._on_toggle_prism)
+        self.show_prism_checkbox.hide()
+        self.context_layout.addWidget(self.show_prism_checkbox)
+        
+        self.show_outer_collar_checkbox = QCheckBox("Show Extended Parting Surface")
+        self.show_outer_collar_checkbox.setChecked(True)
+        self.show_outer_collar_checkbox.toggled.connect(self._on_toggle_outer_collar)
+        self.show_outer_collar_checkbox.hide()
+        self.context_layout.addWidget(self.show_outer_collar_checkbox)
+        
+        self._update_hard_shell_step_ui()
+
+    def _update_hard_shell_step_ui(self):
+        """Update hard shell step UI based on current state."""
+        if not hasattr(self, 'shell_stats'):
+            return
+        
+        has_prism = self._hard_shell_prism_result is not None
+        has_collar = self._outer_collar_result is not None
+        
+        if has_prism and has_collar:
+            prism_result = self._hard_shell_prism_result
+            collar_result = self._outer_collar_result
+            
+            self.shell_stats.clear()
+            self.shell_stats.show()
+            
+            self.shell_stats.add_header('Hard Shell Generated', Colors.SUCCESS)
+            
+            # Prism stats (main hard shell per paper)
+            self.shell_stats.add_row(f'Prism: {prism_result.vertex_count:,} vertices, {prism_result.face_count:,} faces')
+            self.shell_stats.add_row(f'Silhouette: {len(prism_result.silhouette_2d)} vertices')
+            self.shell_stats.add_row(f'Prism height: {prism_result.prism_height:.1f} mm')
+            self.shell_stats.add_row(f'Wall offset: {prism_result.wall_thickness:.1f} mm')
+            
+            # Collar stats
+            self.shell_stats.add_row(f'Collar extension: {collar_result.extension_distance:.1f} mm (2x offset)')
+            self.shell_stats.add_row(f'Collar vertices: +{collar_result.collar_vertex_count}')
+            
+            total_time = prism_result.computation_time_ms + collar_result.computation_time_ms
+            self.shell_stats.add_row(f'Time: {total_time:.0f}ms')
+            
+            self.shell_generate_btn.setText("Regenerate")
+            self.show_prism_checkbox.show()
+            self.show_outer_collar_checkbox.show()
+
+    def _on_generate_hard_shell(self):
+        """Start hard shell generation."""
+        if self._hull_result is None or self._combined_smooth_result is None:
+            return
+        
+        if self._mold_aware_pouring_result is None:
+            QMessageBox.warning(self, "Missing Data", "Please compute pouring directions first.")
+            return
+        
+        wall_thickness = self.shell_wall_thickness_spin.value()
+        
+        parting_surface = self._combined_smooth_result.primary_mesh
+        vertex_boundary_type = None
+        if hasattr(self._combined_smooth_result, 'primary_vertex_boundary_type'):
+            vertex_boundary_type = self._combined_smooth_result.primary_vertex_boundary_type
+        
+        if vertex_boundary_type is None:
+            logger.warning("No vertex_boundary_type available")
+            vertex_boundary_type = np.zeros(len(parting_surface.vertices), dtype=np.int32)
+        
+        self.shell_generate_btn.setEnabled(False)
+        self.shell_progress.show()
+        self.shell_progress_label.setText("Generating hard shell...")
+        self.shell_progress_label.show()
+        
+        self._hard_shell_prism_result = None
+        self._outer_collar_result = None
+        self.mesh_viewer.remove_hard_shell_prism()
+        self.mesh_viewer.remove_outer_collar_surface()
+        
+        self._hard_shell_worker = HardShellWorker(
+            parting_surface,
+            self._hull_result.mesh,
+            vertex_boundary_type,
+            self._mold_aware_pouring_result.resin_direction,
+            wall_thickness=wall_thickness
+        )
+        self._hard_shell_worker.progress.connect(self._on_hard_shell_progress)
+        self._hard_shell_worker.complete.connect(self._on_hard_shell_complete)
+        self._hard_shell_worker.error.connect(self._on_hard_shell_error)
+        self._hard_shell_worker.finished.connect(self._on_hard_shell_worker_finished)
+        self._hard_shell_worker.start()
+
+    def _on_hard_shell_progress(self, message: str):
+        if hasattr(self, 'shell_progress_label'):
+            self.shell_progress_label.setText(message)
+
+    def _on_hard_shell_complete(self, prism_result, collar_result):
+        self._hard_shell_prism_result = prism_result
+        self._outer_collar_result = collar_result
+        
+        # Show prism (main hard shell geometry per paper)
+        self.mesh_viewer.show_hard_shell_prism(prism_result.prism_mesh)
+        
+        # Show extended parting surface (collar) - extends 2x offset to fully cut prism
+        self.mesh_viewer.show_outer_collar_surface(collar_result.mesh)
+        
+        self._update_hard_shell_step_ui()
+        self.step_buttons[Step.HARD_SHELL].set_status('completed')
+        
+        total_time = prism_result.computation_time_ms + collar_result.computation_time_ms
+        logger.info(f"Hard shell generated in {total_time:.0f}ms "
+                   f"(prism has {len(prism_result.silhouette_2d)} silhouette vertices)")
+
+    def _on_hard_shell_error(self, message: str):
+        if hasattr(self, 'shell_progress_label'):
+            self.shell_progress_label.setText(f"Error: {message}")
+            self.shell_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+        QMessageBox.critical(self, "Error", f"Hard shell generation failed:\n{message}")
+
+    def _on_hard_shell_worker_finished(self):
+        if hasattr(self, 'shell_generate_btn'):
+            self.shell_generate_btn.setEnabled(True)
+        if hasattr(self, 'shell_progress'):
+            self.shell_progress.hide()
+        self._hard_shell_worker = None
+
+    def _on_toggle_outer_collar(self, checked: bool):
+        self.mesh_viewer.set_outer_collar_surface_visible(checked)
+
+    def _on_toggle_prism(self, checked: bool):
+        self.mesh_viewer.set_hard_shell_prism_visible(checked)
+
     # =========================================================================
     # HULL STEP
     # =========================================================================
