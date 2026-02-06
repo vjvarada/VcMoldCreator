@@ -78,6 +78,7 @@ class Step(Enum):
     REGISTRATION_NOISE = 'registration-noise'  # Add registration patterns for mold alignment
     POURING = 'pouring'                # Pouring direction optimization (final step)
     HARD_SHELL = 'hard-shell'          # Hard shell generation (outer collar + prism)
+    METAMOLD = 'metamold'              # Metamold prism for casting silicone mold
 
 
 STEPS = [
@@ -95,6 +96,7 @@ STEPS = [
     {'id': Step.REGISTRATION_NOISE, 'icon': '🔑', 'title': 'Registration Pattern', 'description': 'Add registration pattern to parting surface for mold alignment'},
     {'id': Step.POURING, 'icon': '🧪', 'title': 'Pouring Directions', 'description': 'Optimize silicone/resin pouring directions for each mold half'},
     {'id': Step.HARD_SHELL, 'icon': '🏠', 'title': 'Hard Shell', 'description': 'Generate hard shell geometry with outer collar extension'},
+    {'id': Step.METAMOLD, 'icon': '🧊', 'title': 'Metamold', 'description': 'Generate metamold prism for casting silicone mold halves'},
 ]
 
 
@@ -968,6 +970,61 @@ class HardShellWorker(QThread):
             
         except Exception as e:
             logger.exception(f"Error generating hard shell: {e}")
+            self.error.emit(str(e))
+
+
+class MetamoldWorker(QThread):
+    """Background worker for generating metamold prism for casting silicone mold."""
+    
+    progress = pyqtSignal(str)
+    complete = pyqtSignal(object)  # MetamoldPrismResult
+    error = pyqtSignal(str)
+    
+    def __init__(
+        self,
+        hull_mesh,
+        parting_surface,
+        resin_pouring_direction,
+        wall_thickness=5.0,
+        margin=0.0,  # Same as hard shell (0.0)
+        height_above=2.0,
+        height_below=2.0
+    ):
+        super().__init__()
+        self.hull_mesh = hull_mesh
+        self.parting_surface = parting_surface
+        self.resin_pouring_direction = resin_pouring_direction
+        self.wall_thickness = wall_thickness
+        self.margin = margin
+        self.height_above = height_above
+        self.height_below = height_below
+    
+    def run(self):
+        try:
+            from core.mold_fabrication import create_metamold_prism
+            
+            logger.info(f"Generating metamold prism with wall_thickness={self.wall_thickness}mm, "
+                       f"margin={self.margin}mm, height_above={self.height_above}mm, height_below={self.height_below}mm")
+            
+            self.progress.emit("Creating metamold prism (same silhouette as hard shell)...")
+            
+            result = create_metamold_prism(
+                self.hull_mesh,
+                self.parting_surface,
+                self.resin_pouring_direction,
+                wall_thickness=self.wall_thickness,
+                margin=self.margin,
+                height_above=self.height_above,
+                height_below=self.height_below
+            )
+            
+            logger.info(f"Metamold prism generated: {result.vertex_count} vertices, {result.face_count} faces")
+            
+            self.progress.emit("Metamold generation complete")
+            self.complete.emit(result)
+            
+        except Exception as e:
+            logger.exception(f"Error generating metamold: {e}")
             self.error.emit(str(e))
 
 
@@ -4106,6 +4163,11 @@ class DisplayOptionsPanel(QFrame):
     # Feature classification debug signal
     show_feature_debug_changed = pyqtSignal(bool)  # Toggle sharp edge/corner visualization
     
+    # Pouring direction visibility signals
+    show_pouring_arrows_changed = pyqtSignal(bool)  # Toggle pouring direction arrows (S1, S2, Resin)
+    show_pouring_split_mesh_changed = pyqtSignal(bool)  # Toggle H1/H2 split mesh visualization
+    show_pouring_maxima_changed = pyqtSignal(bool)  # Toggle bubble-trapping maxima spheres
+    
     # Hard shell visibility signals
     show_shell_with_cavity_changed = pyqtSignal(bool)  # Toggle shell with cavity
     show_hard_shell_prism_changed = pyqtSignal(bool)  # Toggle hard shell prism (debug)
@@ -4524,6 +4586,41 @@ class DisplayOptionsPanel(QFrame):
         self.show_shell_half_2_cb.hide()
         layout.addWidget(self.show_shell_half_2_cb)
         
+        # -------------------------------------------------------------------
+        # POURING DIRECTION SECTION
+        # -------------------------------------------------------------------
+        self.pouring_separator = QFrame()
+        self.pouring_separator.setFixedHeight(1)
+        self.pouring_separator.setStyleSheet("background-color: #3a3f47;")
+        self.pouring_separator.hide()
+        layout.addWidget(self.pouring_separator)
+        
+        self.pouring_label = QLabel('Pouring Direction')
+        self.pouring_label.setStyleSheet("font-size: 10px; font-weight: bold; padding-top: 4px; color: rgba(255, 255, 255, 0.7);")
+        self.pouring_label.hide()
+        layout.addWidget(self.pouring_label)
+        
+        # Pouring arrows checkbox
+        self.show_pouring_arrows_cb = QCheckBox('Pouring Arrows')
+        self.show_pouring_arrows_cb.setChecked(True)  # Shown by default
+        self.show_pouring_arrows_cb.stateChanged.connect(lambda s: self.show_pouring_arrows_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_pouring_arrows_cb.hide()
+        layout.addWidget(self.show_pouring_arrows_cb)
+        
+        # Split mesh (H1/H2) checkbox
+        self.show_pouring_split_mesh_cb = QCheckBox('Split Mesh (H1/H2)')
+        self.show_pouring_split_mesh_cb.setChecked(True)  # Shown by default
+        self.show_pouring_split_mesh_cb.stateChanged.connect(lambda s: self.show_pouring_split_mesh_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_pouring_split_mesh_cb.hide()
+        layout.addWidget(self.show_pouring_split_mesh_cb)
+        
+        # Bubble maxima checkbox
+        self.show_pouring_maxima_cb = QCheckBox('Bubble Maxima')
+        self.show_pouring_maxima_cb.setChecked(True)  # Shown by default
+        self.show_pouring_maxima_cb.stateChanged.connect(lambda s: self.show_pouring_maxima_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_pouring_maxima_cb.hide()
+        layout.addWidget(self.show_pouring_maxima_cb)
+        
         # Store reference to feature debug data (set externally)
         self._feature_debug_data = None
         self._mesh_viewer = None
@@ -4726,6 +4823,43 @@ class DisplayOptionsPanel(QFrame):
         
         self.adjustSize()
     
+    def show_pouring_options(self, show_arrows: bool = False, show_split_mesh: bool = False, show_maxima: bool = False):
+        """Show or hide the pouring direction visibility checkboxes.
+        
+        Args:
+            show_arrows: Show the pouring arrows checkbox
+            show_split_mesh: Show the split mesh (H1/H2) checkbox
+            show_maxima: Show the bubble maxima checkbox
+        """
+        show_any = show_arrows or show_split_mesh or show_maxima
+        
+        if show_any:
+            self.pouring_separator.show()
+            self.pouring_label.show()
+        else:
+            self.pouring_separator.hide()
+            self.pouring_label.hide()
+        
+        if show_arrows:
+            self.show_pouring_arrows_cb.show()
+            self.show_pouring_arrows_cb.setChecked(True)  # Shown by default
+        else:
+            self.show_pouring_arrows_cb.hide()
+        
+        if show_split_mesh:
+            self.show_pouring_split_mesh_cb.show()
+            self.show_pouring_split_mesh_cb.setChecked(True)  # Shown by default
+        else:
+            self.show_pouring_split_mesh_cb.hide()
+        
+        if show_maxima:
+            self.show_pouring_maxima_cb.show()
+            self.show_pouring_maxima_cb.setChecked(True)  # Shown by default
+        else:
+            self.show_pouring_maxima_cb.hide()
+        
+        self.adjustSize()
+    
     def show_feature_debug_option(self, show: bool = True):
         """Show or hide the feature debug checkbox."""
         if show:
@@ -4772,6 +4906,10 @@ class MainWindow(QMainWindow):
         self._shell_half_1 = None  # Upper half of split shell (manifold)
         self._shell_half_2 = None  # Lower half of split shell (manifold)
         self._csg_success = False
+        
+        # Metamold state
+        self._metamold_worker = None
+        self._metamold_prism_result = None  # MetamoldPrismResult
         
         # Registration noise state
         self._registration_noise_result = None  # SinusoidalRegistrationResult
@@ -5211,6 +5349,17 @@ class MainWindow(QMainWindow):
             self._on_toggle_shell_half_2
         )
         
+        # Pouring direction visibility signals
+        self.display_options.show_pouring_arrows_changed.connect(
+            self._on_toggle_pouring_arrows
+        )
+        self.display_options.show_pouring_split_mesh_changed.connect(
+            self._on_toggle_pouring_split_mesh
+        )
+        self.display_options.show_pouring_maxima_changed.connect(
+            self._on_toggle_pouring_maxima
+        )
+        
         return wrapper
     
     def _on_triangle_debug_mode_changed(self, enabled: bool):
@@ -5384,6 +5533,8 @@ class MainWindow(QMainWindow):
             self._setup_pouring_step()
         elif self._active_step == Step.HARD_SHELL:
             self._setup_hard_shell_step()
+        elif self._active_step == Step.METAMOLD:
+            self._setup_metamold_step()
         
         self.context_layout.addStretch()
     
@@ -5776,8 +5927,7 @@ class MainWindow(QMainWindow):
         self.mesh_viewer.remove_split_meshes_for_pouring()
         
         # Hide display options pouring toggle
-        if hasattr(self.display_options, 'show_pouring_option'):
-            self.display_options.show_pouring_option(False)
+        self.display_options.show_pouring_options(show_arrows=False, show_split_mesh=False, show_maxima=False)
         
         # Use mold-aware pouring direction calculation (separate direction per mold half)
         logger.info("Using mold-aware pouring direction calculation (separate for H1/H2)")
@@ -5845,8 +5995,7 @@ class MainWindow(QMainWindow):
         self._update_mold_aware_pouring_stats()
         
         # Show the pouring toggle in display options
-        if hasattr(self.display_options, 'show_pouring_option'):
-            self.display_options.show_pouring_option(True)
+        self.display_options.show_pouring_options(show_arrows=True, show_split_mesh=True, show_maxima=True)
         
         # Update step status
         self.step_buttons[Step.POURING].set_status('completed')
@@ -6246,6 +6395,217 @@ class MainWindow(QMainWindow):
 
     def _on_toggle_shell_half_2(self, show: bool):
         self.mesh_viewer.set_shell_half_2_visible(show)
+
+    def _on_toggle_pouring_arrows(self, show: bool):
+        """Toggle visibility of pouring direction arrows."""
+        self.mesh_viewer.set_pouring_arrows_visible(show)
+
+    def _on_toggle_pouring_split_mesh(self, show: bool):
+        """Toggle visibility of H1/H2 split mesh for pouring analysis."""
+        self.mesh_viewer.set_split_meshes_visible(show)
+
+    def _on_toggle_pouring_maxima(self, show: bool):
+        """Toggle visibility of bubble-trapping maxima spheres."""
+        self.mesh_viewer.set_resin_maxima_visible(show)
+        self.mesh_viewer.set_resin_global_maximum_visible(show)
+
+    # =========================================================================
+    # METAMOLD STEP
+    # =========================================================================
+    
+    def _setup_metamold_step(self):
+        """Setup the metamold generation step UI."""
+        has_smoothed_surface = (
+            self._combined_smooth_result is not None and
+            self._combined_smooth_result.primary_mesh is not None
+        )
+        
+        has_pouring_direction = (
+            self._mold_aware_pouring_result is not None and
+            self._mold_aware_pouring_result.resin_direction is not None
+        )
+        
+        has_hull = self._hull_result is not None
+        
+        has_hard_shell = self._hard_shell_prism_result is not None
+        
+        if not has_hull:
+            no_data_label = QLabel("Please generate the bounding hull first.")
+            no_data_label.setStyleSheet(f"color: {Colors.WARNING}; font-size: 13px; padding: 12px;")
+            no_data_label.setWordWrap(True)
+            self.context_layout.addWidget(no_data_label)
+            return
+        
+        if not has_smoothed_surface:
+            no_data_label = QLabel("Please smooth the parting surface first.")
+            no_data_label.setStyleSheet(f"color: {Colors.WARNING}; font-size: 13px; padding: 12px;")
+            no_data_label.setWordWrap(True)
+            self.context_layout.addWidget(no_data_label)
+            return
+        
+        if not has_pouring_direction:
+            no_data_label = QLabel("Please compute pouring directions first.")
+            no_data_label.setStyleSheet(f"color: {Colors.WARNING}; font-size: 13px; padding: 12px;")
+            no_data_label.setWordWrap(True)
+            self.context_layout.addWidget(no_data_label)
+            return
+        
+        if not has_hard_shell:
+            no_data_label = QLabel("Please generate the hard shell first.")
+            no_data_label.setStyleSheet(f"color: {Colors.WARNING}; font-size: 13px; padding: 12px;")
+            no_data_label.setWordWrap(True)
+            self.context_layout.addWidget(no_data_label)
+            return
+        
+        header = QLabel("Metamold Generation")
+        header.setStyleSheet(f"font-size: 14px; font-weight: 500; color: {Colors.DARK};")
+        self.context_layout.addWidget(header)
+        
+        desc = QLabel("Generate a metamold prism for casting the silicone mold halves. "
+                      "Uses the EXACT same footprint as the hard shell (same silhouette, direction, and wall offset), "
+                      "but with height just 2mm above/below the parting surface.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"font-size: 12px; color: {Colors.GRAY}; margin-bottom: 8px;")
+        self.context_layout.addWidget(desc)
+        
+        # Generate button (no parameters needed - uses hard shell dimensions)
+        self.metamold_generate_btn = QPushButton("Generate Metamold")
+        self.metamold_generate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.metamold_generate_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #2e7d32;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+            }}
+            QPushButton:hover {{ background-color: #1b5e20; }}
+            QPushButton:disabled {{ background-color: {Colors.GRAY_LIGHT}; color: {Colors.GRAY}; }}
+        """)
+        self.metamold_generate_btn.clicked.connect(self._on_generate_metamold)
+        self.context_layout.addWidget(self.metamold_generate_btn)
+        
+        # Progress
+        self.metamold_progress = QProgressBar()
+        self.metamold_progress.setRange(0, 0)
+        self.metamold_progress.setTextVisible(False)
+        self.metamold_progress.hide()
+        self.context_layout.addWidget(self.metamold_progress)
+        
+        self.metamold_progress_label = QLabel("")
+        self.metamold_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.metamold_progress_label.hide()
+        self.context_layout.addWidget(self.metamold_progress_label)
+        
+        # Results
+        self.metamold_stats = StatsBox()
+        self.metamold_stats.hide()
+        self.context_layout.addWidget(self.metamold_stats)
+        
+        self._update_metamold_step_ui()
+
+    def _update_metamold_step_ui(self):
+        """Update metamold step UI based on current state."""
+        if not hasattr(self, 'metamold_stats'):
+            return
+        
+        has_metamold = self._metamold_prism_result is not None
+        
+        if has_metamold:
+            result = self._metamold_prism_result
+            
+            self.metamold_stats.clear()
+            self.metamold_stats.show()
+            
+            self.metamold_stats.add_header('Metamold Prism Generated', Colors.SUCCESS)
+            self.metamold_stats.add_row(f'Vertices: {result.vertex_count:,}')
+            self.metamold_stats.add_row(f'Faces: {result.face_count:,}')
+            self.metamold_stats.add_row(f'Silhouette: {len(result.silhouette_2d)} points')
+            self.metamold_stats.add_row(f'Prism height: {result.prism_height:.2f} mm')
+            self.metamold_stats.add_row(f'Parting surface range: {result.parting_surface_min_height:.2f} to {result.parting_surface_max_height:.2f}')
+            self.metamold_stats.add_row(f'Computation time: {result.computation_time_ms:.0f} ms')
+
+    def _on_generate_metamold(self):
+        """Start metamold generation."""
+        if self._combined_smooth_result is None:
+            return
+        
+        if self._mold_aware_pouring_result is None:
+            QMessageBox.warning(self, "Missing Data", "Please compute pouring directions first.")
+            return
+        
+        if self._hull_result is None:
+            QMessageBox.warning(self, "Missing Data", "Please generate the bounding hull first.")
+            return
+        
+        if self._hard_shell_prism_result is None:
+            QMessageBox.warning(self, "Missing Data", "Please generate the hard shell first.")
+            return
+        
+        # Use the same wall_thickness as the hard shell
+        wall_thickness = self._hard_shell_prism_result.wall_thickness
+        height_above = 2.0  # Fixed 2mm above parting surface
+        height_below = 2.0  # Fixed 2mm below parting surface
+        
+        parting_surface = self._combined_smooth_result.primary_mesh
+        
+        # Use collar mesh if available (extended parting surface), otherwise use primary
+        if self._outer_collar_result is not None and self._outer_collar_result.mesh is not None:
+            parting_surface = self._outer_collar_result.mesh
+            logger.info("Using outer collar mesh for metamold height reference")
+        
+        self.metamold_generate_btn.setEnabled(False)
+        self.metamold_progress.show()
+        self.metamold_progress_label.setText("Generating metamold...")
+        self.metamold_progress_label.show()
+        
+        self._metamold_prism_result = None
+        self.mesh_viewer.remove_metamold_prism()
+        
+        self._metamold_worker = MetamoldWorker(
+            self._hull_result.mesh,  # Hull for silhouette (same as hard shell)
+            parting_surface,  # Parting surface for height
+            self._mold_aware_pouring_result.resin_direction,  # Resin direction (same as hard shell)
+            wall_thickness=wall_thickness,  # Same wall_thickness as hard shell
+            margin=0.0,  # Same margin as hard shell (0.0)
+            height_above=height_above,
+            height_below=height_below
+        )
+        self._metamold_worker.progress.connect(self._on_metamold_progress)
+        self._metamold_worker.complete.connect(self._on_metamold_complete)
+        self._metamold_worker.error.connect(self._on_metamold_error)
+        self._metamold_worker.finished.connect(self._on_metamold_worker_finished)
+        self._metamold_worker.start()
+
+    def _on_metamold_progress(self, message: str):
+        if hasattr(self, 'metamold_progress_label'):
+            self.metamold_progress_label.setText(message)
+
+    def _on_metamold_complete(self, result):
+        self._metamold_prism_result = result
+        
+        if result.prism_mesh is not None:
+            self.mesh_viewer.show_metamold_prism(result.prism_mesh)
+        
+        self._update_metamold_step_ui()
+        self.step_buttons[Step.METAMOLD].set_status('completed')
+        
+        logger.info(f"Metamold generated in {result.computation_time_ms:.0f}ms "
+                   f"(prism has {result.vertex_count} vertices, {result.face_count} faces)")
+
+    def _on_metamold_error(self, message: str):
+        if hasattr(self, 'metamold_progress_label'):
+            self.metamold_progress_label.setText(f"Error: {message}")
+            self.metamold_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+        QMessageBox.critical(self, "Error", f"Metamold generation failed:\n{message}")
+
+    def _on_metamold_worker_finished(self):
+        if hasattr(self, 'metamold_generate_btn'):
+            self.metamold_generate_btn.setEnabled(True)
+        if hasattr(self, 'metamold_progress'):
+            self.metamold_progress.hide()
+        self._metamold_worker = None
 
     # =========================================================================
     # HULL STEP
@@ -7124,8 +7484,7 @@ class MainWindow(QMainWindow):
                             h2_centroid=np.array(h2_centroid) if h2_centroid is not None else part_centroid,
                             part_centroid=np.array(part_centroid)
                         )
-                        if hasattr(self.display_options, 'show_pouring_option'):
-                            self.display_options.show_pouring_option(True)
+                        self.display_options.show_pouring_options(show_arrows=True, show_split_mesh=True, show_maxima=True)
             except Exception as e:
                 logger.warning(f"Could not restore pouring direction visualization: {e}")
         

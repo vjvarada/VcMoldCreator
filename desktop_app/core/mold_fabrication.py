@@ -208,6 +208,234 @@ class HardShellSplitResult:
     split_success: bool = False
 
 
+@dataclass
+class MetamoldPrismResult:
+    """Result of creating the metamold prism.
+    
+    The metamold is a mold used to cast the silicone soft mold itself.
+    Unlike the hard shell prism (which uses hull for silhouette), the metamold
+    prism uses the parting surface as the reference for both silhouette and height.
+    
+    The prism is aligned with the silicone pouring direction, with:
+    - Silhouette derived from the parting surface projection
+    - Height based on parting surface extent + configurable offsets above/below
+    """
+    
+    # The prism mesh (before subtracting any cavities)
+    prism_mesh: trimesh.Trimesh
+    
+    # The 2D silhouette polygon (convex hull of parting surface projection)
+    silhouette_2d: np.ndarray  # (N, 2) ordered vertices of 2D convex hull
+    
+    # The 3D silhouette polygon (on the base plane)
+    silhouette_3d: np.ndarray  # (N, 3) 3D positions on base plane
+    
+    # The base plane center and normal
+    base_plane_center: np.ndarray  # (3,)
+    base_plane_normal: np.ndarray  # (3,) = silicone pouring direction
+    
+    # Prism dimensions
+    prism_height: float  # Total extrusion distance
+    height_above_surface: float  # Distance from parting surface max to top
+    height_below_surface: float  # Distance from parting surface min to bottom
+    
+    # The transformation matrix from world to 2D projection plane
+    world_to_2d: np.ndarray  # (3, 3) rotation matrix
+    
+    # The silicone pouring direction used
+    pouring_direction: np.ndarray  # (3,)
+    
+    # Wall thickness (horizontal offset from silhouette)
+    wall_thickness: float
+    
+    # Reference heights from parting surface
+    parting_surface_min_height: float  # Min projection along pouring direction
+    parting_surface_max_height: float  # Max projection along pouring direction
+    
+    # Statistics
+    vertex_count: int = 0
+    face_count: int = 0
+    
+    # Computation time
+    computation_time_ms: float = 0.0
+
+
+# ============================================================================
+# METAMOLD PRISM CREATION
+# ============================================================================
+
+def create_metamold_prism(
+    hull_mesh: trimesh.Trimesh,
+    parting_surface: trimesh.Trimesh,
+    resin_pouring_direction: np.ndarray,
+    wall_thickness: float = 5.0,
+    margin: float = 0.0,
+    height_above: float = 2.0,
+    height_below: float = 2.0
+) -> MetamoldPrismResult:
+    """
+    Create a metamold prism aligned with the resin pouring direction.
+    
+    The metamold is used to cast the silicone soft mold. It uses the EXACT SAME
+    silhouette and extrusion direction as the hard shell prism:
+    
+    - Silhouette: 2D convex hull of HULL vertices projected onto a plane
+                  perpendicular to the RESIN pouring direction (same as hard shell)
+    - Extrusion: Along RESIN pouring direction (same as hard shell)
+    - Wall offset: wall_thickness + margin (same as hard shell)
+    - Height: From (parting_min - height_below) to (parting_max + height_above)
+              where min/max are the parting surface extent along pouring direction
+    
+    This ensures the metamold has the EXACT same footprint as the hard shell but is
+    only as tall as needed to enclose the parting surface with 2mm margin.
+    
+    Args:
+        hull_mesh: The inflated hull mesh (used for silhouette, same as hard shell)
+        parting_surface: The parting surface mesh (used for height reference)
+        resin_pouring_direction: Unit vector for RESIN pouring direction (same as hard shell)
+        wall_thickness: How thick the hard shell wall should be (mm)
+        margin: Additional margin beyond the hull bounds (mm) - same as hard shell
+        height_above: Distance above parting surface max to top of prism (mm)
+        height_below: Distance below parting surface min to bottom of prism (mm)
+        
+    Returns:
+        MetamoldPrismResult with the prism mesh and metadata
+    """
+    start_time = time.time()
+    
+    logger.info(f"Creating metamold prism aligned with resin direction: {resin_pouring_direction}")
+    logger.info(f"  Wall thickness: {wall_thickness}mm, margin: {margin}mm, height_above: {height_above}mm, height_below: {height_below}mm")
+    
+    # Normalize pouring direction (same as hard shell)
+    pouring_dir = np.array(resin_pouring_direction, dtype=np.float64)
+    pouring_dir = pouring_dir / (np.linalg.norm(pouring_dir) + 1e-10)
+    
+    # Use hull vertices for silhouette (same as hard shell)
+    hull_vertices = np.array(hull_mesh.vertices, dtype=np.float64)
+    # Use parting surface vertices for height extent
+    parting_vertices = np.array(parting_surface.vertices, dtype=np.float64)
+    
+    # =========================================================================
+    # Step 1: Build orthonormal basis for the projection plane (same as hard shell)
+    # =========================================================================
+    
+    # The plane normal is the pouring direction
+    # Find two orthogonal vectors in the plane
+    
+    # Start with an arbitrary non-parallel vector
+    if abs(pouring_dir[0]) < 0.9:
+        arbitrary = np.array([1.0, 0.0, 0.0])
+    else:
+        arbitrary = np.array([0.0, 1.0, 0.0])
+    
+    # Gram-Schmidt to get orthogonal basis
+    u_axis = arbitrary - np.dot(arbitrary, pouring_dir) * pouring_dir
+    u_axis = u_axis / np.linalg.norm(u_axis)
+    
+    v_axis = np.cross(pouring_dir, u_axis)
+    v_axis = v_axis / np.linalg.norm(v_axis)
+    
+    # Rotation matrix: world_to_2d projects world coordinates to (u, v) plane
+    world_to_2d = np.column_stack([u_axis, v_axis, pouring_dir]).T  # (3, 3)
+    
+    # =========================================================================
+    # Step 2: Project parting surface vertices to get height extent
+    # =========================================================================
+    
+    parting_transformed = parting_vertices @ world_to_2d.T
+    parting_heights = parting_transformed[:, 2]  # projection along pouring direction
+    
+    # Get height extent of the parting surface
+    parting_min_height = np.min(parting_heights)
+    parting_max_height = np.max(parting_heights)
+    
+    logger.info(f"Parting surface height extent: {parting_min_height:.2f} to {parting_max_height:.2f}")
+    
+    # =========================================================================
+    # Step 3: Project HULL vertices to get 2D silhouette (SAME as hard shell)
+    # =========================================================================
+    
+    hull_transformed = hull_vertices @ world_to_2d.T
+    projected_2d = hull_transformed[:, :2]  # (N, 2)
+    
+    try:
+        hull_2d = ConvexHull(projected_2d)
+        silhouette_indices = hull_2d.vertices
+        silhouette_2d = projected_2d[silhouette_indices]
+    except Exception as e:
+        logger.error(f"Failed to compute 2D convex hull: {e}")
+        # Fallback: use bounding box
+        min_2d = np.min(projected_2d, axis=0)
+        max_2d = np.max(projected_2d, axis=0)
+        silhouette_2d = np.array([
+            [min_2d[0], min_2d[1]],
+            [max_2d[0], min_2d[1]],
+            [max_2d[0], max_2d[1]],
+            [min_2d[0], max_2d[1]],
+        ], dtype=np.float64)
+    
+    logger.info(f"2D silhouette from hull has {len(silhouette_2d)} vertices")
+    
+    # =========================================================================
+    # Step 4: Offset the silhouette outward by wall_thickness + margin (SAME as hard shell)
+    # =========================================================================
+    
+    total_offset = wall_thickness + margin
+    silhouette_2d_offset = _offset_polygon_2d(silhouette_2d, total_offset)
+    
+    logger.info(f"Offset silhouette has {len(silhouette_2d_offset)} vertices (offset={total_offset}mm)")
+    
+    # =========================================================================
+    # Step 5: Determine prism height (based on parting surface + offsets)
+    # =========================================================================
+    
+    min_height = parting_min_height - height_below
+    max_height = parting_max_height + height_above
+    prism_height = max_height - min_height
+    
+    logger.info(f"Prism height: {prism_height:.2f} (from {min_height:.2f} to {max_height:.2f})")
+    
+    # =========================================================================
+    # Step 6: Create prism mesh by extruding the silhouette
+    # =========================================================================
+    
+    prism_mesh, silhouette_3d_bottom, silhouette_3d_top = _extrude_polygon_to_prism(
+        silhouette_2d_offset,
+        world_to_2d,
+        min_height,
+        max_height
+    )
+    
+    # Compute base plane center (centroid of bottom silhouette)
+    base_plane_center = np.mean(silhouette_3d_bottom, axis=0)
+    
+    elapsed_ms = (time.time() - start_time) * 1000
+    
+    result = MetamoldPrismResult(
+        prism_mesh=prism_mesh,
+        silhouette_2d=silhouette_2d_offset,
+        silhouette_3d=silhouette_3d_bottom,
+        base_plane_center=base_plane_center,
+        base_plane_normal=pouring_dir,
+        prism_height=prism_height,
+        height_above_surface=height_above,
+        height_below_surface=height_below,
+        world_to_2d=world_to_2d,
+        pouring_direction=pouring_dir,
+        wall_thickness=wall_thickness,
+        parting_surface_min_height=parting_min_height,
+        parting_surface_max_height=parting_max_height,
+        vertex_count=len(prism_mesh.vertices),
+        face_count=len(prism_mesh.faces),
+        computation_time_ms=elapsed_ms
+    )
+    
+    logger.info(f"Metamold prism created: {result.vertex_count} vertices, "
+                f"{result.face_count} faces in {elapsed_ms:.1f}ms")
+    
+    return result
+
+
 # ============================================================================
 # HARD SHELL PRISM CREATION (Paper Section 5)
 # ============================================================================

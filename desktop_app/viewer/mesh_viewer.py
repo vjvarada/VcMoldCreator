@@ -5825,3 +5825,79 @@ class MeshViewer(QWidget):
             self._shell_half_2_actor.SetVisibility(visible)
             self.plotter.update()
             logger.debug(f"Shell half 2 visibility set to {visible}")
+
+    # =========================================================================
+    # METAMOLD PRISM VISUALIZATION
+    # =========================================================================
+    
+    def show_metamold_prism(self, mesh: 'trimesh.Trimesh'):
+        """
+        Display the metamold prism for casting silicone mold halves.
+        
+        The prism is aligned with the silicone pouring direction and uses
+        the parting surface silhouette as its base shape.
+        
+        Args:
+            mesh: The metamold prism mesh
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        # Remove existing actor
+        self.remove_metamold_prism()
+        
+        # Store reference
+        self._metamold_prism_mesh = mesh
+        
+        # Convert to PyVista
+        try:
+            vertices = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.faces)
+            faces_pv = np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64)
+            pv_mesh = pv.PolyData(vertices, faces_pv.flatten())
+        except Exception as e:
+            logger.error(f"Failed to convert metamold prism to PyVista: {e}")
+            return
+        
+        # Add to scene with distinct color (green, semi-transparent)
+        self._metamold_prism_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='#4CAF50',  # Material Green
+            opacity=0.25,
+            show_edges=True,
+            edge_color='#2E7D32',  # Dark Green
+            line_width=1.0,
+        )
+        
+        self._metamold_prism_visible = True
+        self.plotter.update()
+        logger.info(f"Metamold prism displayed: {len(vertices)} vertices, {len(faces)} faces")
+    
+    def remove_metamold_prism(self):
+        """Remove the metamold prism mesh from the display."""
+        if hasattr(self, '_metamold_prism_actor') and self._metamold_prism_actor is not None:
+            try:
+                self.plotter.remove_actor(self._metamold_prism_actor)
+            except Exception:
+                pass
+            self._metamold_prism_actor = None
+        
+        if hasattr(self, '_metamold_prism_mesh'):
+            self._metamold_prism_mesh = None
+        
+        self.plotter.update()
+    
+    def set_metamold_prism_visible(self, visible: bool):
+        """
+        Set visibility of the metamold prism.
+        
+        Args:
+            visible: True to show, False to hide
+        """
+        self._metamold_prism_visible = visible
+        if hasattr(self, '_metamold_prism_actor') and self._metamold_prism_actor is not None:
+            self._metamold_prism_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Metamold prism visibility set to {visible}")
