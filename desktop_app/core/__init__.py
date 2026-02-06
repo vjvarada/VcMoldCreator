@@ -83,6 +83,7 @@ from core.secondary_membrane import (
 from core.mold_fabrication import (
     create_outer_shell_hull,
     create_outer_collar_extension,
+    extend_membrane_height,
     OuterShellHullResult,
     OuterCollarResult,
 )
@@ -164,6 +165,7 @@ __all__ = [
     # Mold fabrication (hard shell)
     'create_outer_shell_hull',
     'create_outer_collar_extension',
+    'extend_membrane_height',
     'OuterShellHullResult',
     'OuterCollarResult',
 ]

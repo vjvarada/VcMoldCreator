@@ -974,16 +974,18 @@ class HardShellWorker(QThread):
 
 
 class MetamoldWorker(QThread):
-    """Background worker for generating metamold prism for casting silicone mold."""
+    """Background worker for generating metamold geometry (prism + CSG cavity + split into halves)."""
     
     progress = pyqtSignal(str)
-    complete = pyqtSignal(object)  # MetamoldPrismResult
+    # (MetamoldPrismResult, metamold_with_cavity, metamold_half_1, metamold_half_2, success)
+    complete = pyqtSignal(object, object, object, object, bool)
     error = pyqtSignal(str)
     
     def __init__(
         self,
         hull_mesh,
-        parting_surface,
+        part_mesh,
+        outer_collar_mesh,
         resin_pouring_direction,
         wall_thickness=5.0,
         margin=0.0,  # Same as hard shell (0.0)
@@ -992,7 +994,8 @@ class MetamoldWorker(QThread):
     ):
         super().__init__()
         self.hull_mesh = hull_mesh
-        self.parting_surface = parting_surface
+        self.part_mesh = part_mesh
+        self.outer_collar_mesh = outer_collar_mesh  # Reused from hard shell step
         self.resin_pouring_direction = resin_pouring_direction
         self.wall_thickness = wall_thickness
         self.margin = margin
@@ -1001,27 +1004,68 @@ class MetamoldWorker(QThread):
     
     def run(self):
         try:
-            from core.mold_fabrication import create_metamold_prism
+            from core.mold_fabrication import (
+                create_metamold_prism,
+                create_shell_with_cavity,
+                split_shell_with_membrane
+            )
             
-            logger.info(f"Generating metamold prism with wall_thickness={self.wall_thickness}mm, "
+            logger.info(f"Generating metamold with wall_thickness={self.wall_thickness}mm, "
                        f"margin={self.margin}mm, height_above={self.height_above}mm, height_below={self.height_below}mm")
             
+            # Step 1: Create the prism (same silhouette as hard shell, height from part mesh)
+            # Pass the outer collar (parting surface) so the prism extends to include it
             self.progress.emit("Creating metamold prism (same silhouette as hard shell)...")
-            
-            result = create_metamold_prism(
+            prism_result = create_metamold_prism(
                 self.hull_mesh,
-                self.parting_surface,
+                self.part_mesh,
                 self.resin_pouring_direction,
                 wall_thickness=self.wall_thickness,
                 margin=self.margin,
                 height_above=self.height_above,
-                height_below=self.height_below
+                height_below=self.height_below,
+                parting_surface=self.outer_collar_mesh  # Ensures prism includes parting surface level
+            )
+            logger.info(f"Metamold prism: {prism_result.vertex_count} vertices, {prism_result.face_count} faces")
+            
+            # Step 2: CSG subtraction - metamold = prism - hull_mesh
+            # NOTE: Use hull_mesh (not part_mesh) because:
+            # 1. The metamold combines with hard shell half to form a container for casting silicone
+            # 2. Both need the same cavity (hull-shaped) so they fit together properly
+            # 3. The parting surface/blade was designed based on hull geometry
+            self.progress.emit("Performing CSG: subtracting hull from prism...")
+            metamold_with_cavity, csg_time_ms, csg_success = create_shell_with_cavity(
+                prism_result.prism_mesh,
+                self.hull_mesh  # Use hull (same as hard shell) for proper fit and splitting
             )
             
-            logger.info(f"Metamold prism generated: {result.vertex_count} vertices, {result.face_count} faces")
+            metamold_half_1 = None
+            metamold_half_2 = None
+            
+            if csg_success and metamold_with_cavity is not None:
+                logger.info(f"CSG cavity complete: metamold has {len(metamold_with_cavity.vertices)} vertices, "
+                           f"{len(metamold_with_cavity.faces)} faces in {csg_time_ms:.1f}ms")
+                
+                # Step 3: Split metamold using the same blade from hard shell
+                # Simple CSG: metamold_halves = metamold - blade
+                self.progress.emit("Splitting metamold into two halves...")
+                metamold_half_1, metamold_half_2, split_time_ms, split_success = split_shell_with_membrane(
+                    metamold_with_cavity,
+                    self.outer_collar_mesh,  # Same parting surface + collar used in hard shell
+                    self.resin_pouring_direction
+                )
+                
+                if split_success:
+                    logger.info(f"Metamold split complete in {split_time_ms:.1f}ms")
+                    logger.info(f"  Half 1: {len(metamold_half_1.vertices)} verts, {len(metamold_half_1.faces)} faces")
+                    logger.info(f"  Half 2: {len(metamold_half_2.vertices)} verts, {len(metamold_half_2.faces)} faces")
+                else:
+                    logger.warning("Metamold splitting failed - halves may be incomplete")
+            else:
+                logger.warning("CSG cavity subtraction failed - cannot split metamold")
             
             self.progress.emit("Metamold generation complete")
-            self.complete.emit(result)
+            self.complete.emit(prism_result, metamold_with_cavity, metamold_half_1, metamold_half_2, csg_success)
             
         except Exception as e:
             logger.exception(f"Error generating metamold: {e}")
@@ -4175,6 +4219,12 @@ class DisplayOptionsPanel(QFrame):
     show_shell_half_1_changed = pyqtSignal(bool)  # Toggle shell half 1 (upper half)
     show_shell_half_2_changed = pyqtSignal(bool)  # Toggle shell half 2 (lower half)
     
+    # Metamold visibility signals
+    show_metamold_prism_changed = pyqtSignal(bool)  # Toggle metamold prism (debug)
+    show_metamold_cavity_changed = pyqtSignal(bool)  # Toggle metamold with cavity
+    show_metamold_half_1_changed = pyqtSignal(bool)  # Toggle metamold half 1 (upper half)
+    show_metamold_half_2_changed = pyqtSignal(bool)  # Toggle metamold half 2 (lower half)
+
     # Individual feature type visibility signals
     # Target mesh features:
     show_feature_sharp_edges_changed = pyqtSignal(bool)  # Yellow lines - sharp edges on target
@@ -4198,6 +4248,10 @@ class DisplayOptionsPanel(QFrame):
         super().__init__(parent)
         self.setObjectName("displayOptionsPanel")
         self.setFixedWidth(180)
+        
+        # Install event filter on parent to resize with it
+        if parent is not None:
+            parent.installEventFilter(self)
         
         # Set the palette background to match the 3D viewer background
         # This way, rounded corner "transparent" areas show the viewer color, not black
@@ -4238,22 +4292,63 @@ class DisplayOptionsPanel(QFrame):
             #displayOptionsPanel QCheckBox::indicator:hover {
                 border-color: rgba(255, 255, 255, 0.5);
             }
+            #displayOptionsPanel QScrollArea {
+                background: transparent;
+                border: none;
+            }
+            #displayOptionsPanel QScrollBar:vertical {
+                background: #2a2f37;
+                width: 8px;
+                border-radius: 4px;
+            }
+            #displayOptionsPanel QScrollBar::handle:vertical {
+                background: #4a5060;
+                border-radius: 4px;
+                min-height: 20px;
+            }
+            #displayOptionsPanel QScrollBar::handle:vertical:hover {
+                background: #5a6070;
+            }
+            #displayOptionsPanel QScrollBar::add-line:vertical,
+            #displayOptionsPanel QScrollBar::sub-line:vertical {
+                height: 0;
+            }
         """)
         
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 12)
-        layout.setSpacing(6)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 10, 12, 12)
+        main_layout.setSpacing(6)
         
-        # Header
+        # Header (outside scroll area)
         header = QLabel('Display Options')
         header.setStyleSheet("font-size: 11px; font-weight: bold; padding-bottom: 4px;")
-        layout.addWidget(header)
+        main_layout.addWidget(header)
         
-        # Separator line
+        # Separator line (outside scroll area)
         separator = QFrame()
         separator.setFixedHeight(1)
         separator.setStyleSheet("background-color: #3a3f47;")
-        layout.addWidget(separator)
+        main_layout.addWidget(separator)
+        
+        # Scroll area for all checkboxes
+        from PyQt6.QtWidgets import QScrollArea
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # No max height - panel will be full height of parent
+        
+        # Container widget for scroll area content
+        scroll_content = QWidget()
+        scroll_content.setStyleSheet("background: transparent;")
+        layout = QVBoxLayout(scroll_content)
+        layout.setContentsMargins(0, 0, 4, 0)  # Small right margin for scrollbar
+        layout.setSpacing(6)
+        
+        self.scroll_area.setWidget(scroll_content)
+        main_layout.addWidget(self.scroll_area)
+        
+        # NOTE: All widgets below are added to 'layout' which is inside the scroll area
         
         # Hide mesh checkbox
         self.hide_mesh_cb = QCheckBox('Hide Original Mesh')
@@ -4621,6 +4716,48 @@ class DisplayOptionsPanel(QFrame):
         self.show_pouring_maxima_cb.hide()
         layout.addWidget(self.show_pouring_maxima_cb)
         
+        # -------------------------------------------------------------------
+        # METAMOLD SECTION
+        # -------------------------------------------------------------------
+        self.metamold_separator = QFrame()
+        self.metamold_separator.setFixedHeight(1)
+        self.metamold_separator.setStyleSheet("background-color: #3a3f47;")
+        self.metamold_separator.hide()
+        layout.addWidget(self.metamold_separator)
+        
+        self.metamold_label = QLabel('Metamold')
+        self.metamold_label.setStyleSheet("font-size: 10px; font-weight: bold; padding-top: 4px; color: rgba(255, 255, 255, 0.7);")
+        self.metamold_label.hide()
+        layout.addWidget(self.metamold_label)
+        
+        # Metamold prism (debug) checkbox
+        self.show_metamold_prism_cb = QCheckBox('Prism (Debug)')
+        self.show_metamold_prism_cb.setChecked(False)
+        self.show_metamold_prism_cb.stateChanged.connect(lambda s: self.show_metamold_prism_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_metamold_prism_cb.hide()
+        layout.addWidget(self.show_metamold_prism_cb)
+        
+        # Metamold with cavity checkbox
+        self.show_metamold_cavity_cb = QCheckBox('With Cavity')
+        self.show_metamold_cavity_cb.setChecked(False)
+        self.show_metamold_cavity_cb.stateChanged.connect(lambda s: self.show_metamold_cavity_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_metamold_cavity_cb.hide()
+        layout.addWidget(self.show_metamold_cavity_cb)
+        
+        # Metamold half 1 (upper, green) checkbox
+        self.show_metamold_half_1_cb = QCheckBox('Metamold Half 1 (Green)')
+        self.show_metamold_half_1_cb.setChecked(True)  # Shown by default
+        self.show_metamold_half_1_cb.stateChanged.connect(lambda s: self.show_metamold_half_1_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_metamold_half_1_cb.hide()
+        layout.addWidget(self.show_metamold_half_1_cb)
+        
+        # Metamold half 2 (lower, purple) checkbox
+        self.show_metamold_half_2_cb = QCheckBox('Metamold Half 2 (Purple)')
+        self.show_metamold_half_2_cb.setChecked(True)  # Shown by default
+        self.show_metamold_half_2_cb.stateChanged.connect(lambda s: self.show_metamold_half_2_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_metamold_half_2_cb.hide()
+        layout.addWidget(self.show_metamold_half_2_cb)
+        
         # Store reference to feature debug data (set externally)
         self._feature_debug_data = None
         self._mesh_viewer = None
@@ -4868,6 +5005,68 @@ class DisplayOptionsPanel(QFrame):
             self.show_feature_debug_cb.hide()
             self.show_feature_debug_cb.setChecked(False)
         self.adjustSize()
+    
+    def show_metamold_options(self, show_prism: bool = False, show_cavity: bool = False, show_halves: bool = False):
+        """Show or hide the metamold visibility checkboxes.
+        
+        Args:
+            show_prism: Show the metamold prism checkbox (debug)
+            show_cavity: Show the metamold with cavity checkbox
+            show_halves: Show the metamold halves checkboxes
+        """
+        show_any = show_prism or show_cavity or show_halves
+        
+        if show_any:
+            self.metamold_separator.show()
+            self.metamold_label.show()
+        else:
+            self.metamold_separator.hide()
+            self.metamold_label.hide()
+        
+        if show_prism:
+            self.show_metamold_prism_cb.show()
+            self.show_metamold_prism_cb.setChecked(False)  # Hidden by default
+        else:
+            self.show_metamold_prism_cb.hide()
+        
+        if show_cavity:
+            self.show_metamold_cavity_cb.show()
+            self.show_metamold_cavity_cb.setChecked(False)  # Hidden by default
+        else:
+            self.show_metamold_cavity_cb.hide()
+        
+        if show_halves:
+            self.show_metamold_half_1_cb.show()
+            self.show_metamold_half_1_cb.setChecked(True)  # Shown by default
+            self.show_metamold_half_2_cb.show()
+            self.show_metamold_half_2_cb.setChecked(True)  # Shown by default
+        else:
+            self.show_metamold_half_1_cb.hide()
+            self.show_metamold_half_2_cb.hide()
+        
+        self.adjustSize()
+
+    def eventFilter(self, watched, event):
+        """Resize panel to match parent height when parent resizes."""
+        from PyQt6.QtCore import QEvent
+        if event.type() == QEvent.Type.Resize and watched == self.parent():
+            # Update panel height to fill parent, leaving margin at top and bottom
+            parent_height = watched.height()
+            margin = 32  # 16px margin top + 16px margin bottom
+            new_height = parent_height - margin
+            if new_height > 100:  # Minimum sensible height
+                self.setFixedHeight(new_height)
+        return super().eventFilter(watched, event)
+    
+    def showEvent(self, event):
+        """Set initial height when panel is first shown."""
+        super().showEvent(event)
+        if self.parent() is not None:
+            parent_height = self.parent().height()
+            margin = 32
+            new_height = parent_height - margin
+            if new_height > 100:
+                self.setFixedHeight(new_height)
 
 
 # ============================================================================
@@ -4910,6 +5109,10 @@ class MainWindow(QMainWindow):
         # Metamold state
         self._metamold_worker = None
         self._metamold_prism_result = None  # MetamoldPrismResult
+        self._metamold_with_cavity = None  # trimesh after CSG subtraction (prism - part)
+        self._metamold_half_1 = None  # Upper half of split metamold (manifold)
+        self._metamold_half_2 = None  # Lower half of split metamold (manifold)
+        self._metamold_csg_success = False
         
         # Registration noise state
         self._registration_noise_result = None  # SinusoidalRegistrationResult
@@ -5358,6 +5561,20 @@ class MainWindow(QMainWindow):
         )
         self.display_options.show_pouring_maxima_changed.connect(
             self._on_toggle_pouring_maxima
+        )
+        
+        # Metamold visibility signals
+        self.display_options.show_metamold_prism_changed.connect(
+            self._on_toggle_metamold_prism
+        )
+        self.display_options.show_metamold_cavity_changed.connect(
+            self._on_toggle_metamold_cavity
+        )
+        self.display_options.show_metamold_half_1_changed.connect(
+            self._on_toggle_metamold_half_1
+        )
+        self.display_options.show_metamold_half_2_changed.connect(
+            self._on_toggle_metamold_half_2
         )
         
         return wrapper
@@ -6288,7 +6505,15 @@ class MainWindow(QMainWindow):
         
         wall_thickness = self.shell_wall_thickness_spin.value()
         
-        parting_surface = self._combined_smooth_result.primary_mesh
+        # Use registration-marked surface if available, otherwise use smooth surface
+        if hasattr(self, '_registration_noise_result') and self._registration_noise_result is not None and hasattr(self._registration_noise_result, 'mesh') and self._registration_noise_result.mesh is not None:
+            parting_surface = self._registration_noise_result.mesh
+            logger.info("Using registration-marked parting surface for hard shell outer collar")
+        else:
+            parting_surface = self._combined_smooth_result.primary_mesh
+            logger.info("Using smooth parting surface for hard shell outer collar (no registration marks)")
+        
+        # vertex_boundary_type is preserved from smooth result (registration only modifies positions, not topology)
         vertex_boundary_type = None
         if hasattr(self._combined_smooth_result, 'primary_vertex_boundary_type'):
             vertex_boundary_type = self._combined_smooth_result.primary_vertex_boundary_type
@@ -6409,6 +6634,22 @@ class MainWindow(QMainWindow):
         self.mesh_viewer.set_resin_maxima_visible(show)
         self.mesh_viewer.set_resin_global_maximum_visible(show)
 
+    def _on_toggle_metamold_prism(self, show: bool):
+        """Toggle visibility of metamold prism (debug)."""
+        self.mesh_viewer.set_metamold_prism_visible(show)
+
+    def _on_toggle_metamold_cavity(self, show: bool):
+        """Toggle visibility of metamold with cavity."""
+        self.mesh_viewer.set_metamold_with_cavity_visible(show)
+
+    def _on_toggle_metamold_half_1(self, show: bool):
+        """Toggle visibility of metamold half 1."""
+        self.mesh_viewer.set_metamold_half_1_visible(show)
+
+    def _on_toggle_metamold_half_2(self, show: bool):
+        """Toggle visibility of metamold half 2."""
+        self.mesh_viewer.set_metamold_half_2_visible(show)
+
     # =========================================================================
     # METAMOLD STEP
     # =========================================================================
@@ -6518,13 +6759,28 @@ class MainWindow(QMainWindow):
             self.metamold_stats.clear()
             self.metamold_stats.show()
             
-            self.metamold_stats.add_header('Metamold Prism Generated', Colors.SUCCESS)
-            self.metamold_stats.add_row(f'Vertices: {result.vertex_count:,}')
-            self.metamold_stats.add_row(f'Faces: {result.face_count:,}')
+            self.metamold_stats.add_header('Metamold Generated', Colors.SUCCESS)
+            
+            # Prism info
+            self.metamold_stats.add_row(f'Prism: {result.vertex_count:,} verts, {result.face_count:,} faces')
             self.metamold_stats.add_row(f'Silhouette: {len(result.silhouette_2d)} points')
             self.metamold_stats.add_row(f'Prism height: {result.prism_height:.2f} mm')
-            self.metamold_stats.add_row(f'Parting surface range: {result.parting_surface_min_height:.2f} to {result.parting_surface_max_height:.2f}')
-            self.metamold_stats.add_row(f'Computation time: {result.computation_time_ms:.0f} ms')
+            self.metamold_stats.add_row(f'Part mesh range: {result.part_mesh_min_height:.2f} to {result.part_mesh_max_height:.2f}')
+            
+            # CSG cavity info
+            if self._metamold_with_cavity is not None:
+                self.metamold_stats.add_row(f'With cavity: {len(self._metamold_with_cavity.vertices):,} verts, {len(self._metamold_with_cavity.faces):,} faces')
+            
+            # Split halves info
+            if self._metamold_half_1 is not None:
+                self.metamold_stats.add_row(f'Half 1: {len(self._metamold_half_1.vertices):,} verts, {len(self._metamold_half_1.faces):,} faces')
+            if self._metamold_half_2 is not None:
+                self.metamold_stats.add_row(f'Half 2: {len(self._metamold_half_2.vertices):,} verts, {len(self._metamold_half_2.faces):,} faces')
+            
+            if not self._metamold_csg_success:
+                self.metamold_stats.add_row('⚠️ CSG operations incomplete', Colors.WARNING)
+            
+            self.metamold_stats.add_row(f'Time: {result.computation_time_ms:.0f}ms')
 
     def _on_generate_metamold(self):
         """Start metamold generation."""
@@ -6543,17 +6799,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Missing Data", "Please generate the hard shell first.")
             return
         
+        if self._outer_collar_result is None or self._outer_collar_result.mesh is None:
+            QMessageBox.warning(self, "Missing Data", "Outer collar mesh not available from hard shell step.")
+            return
+        
         # Use the same wall_thickness as the hard shell
         wall_thickness = self._hard_shell_prism_result.wall_thickness
-        height_above = 2.0  # Fixed 2mm above parting surface
-        height_below = 2.0  # Fixed 2mm below parting surface
+        height_above = 2.0  # Fixed 2mm above part mesh
+        height_below = 2.0  # Fixed 2mm below part mesh
         
-        parting_surface = self._combined_smooth_result.primary_mesh
-        
-        # Use collar mesh if available (extended parting surface), otherwise use primary
-        if self._outer_collar_result is not None and self._outer_collar_result.mesh is not None:
-            parting_surface = self._outer_collar_result.mesh
-            logger.info("Using outer collar mesh for metamold height reference")
+        # Use part mesh for height reference (not parting surface)
+        if self._current_mesh is None:
+            QMessageBox.warning(self, "Missing Data", "Part mesh not available.")
+            return
         
         self.metamold_generate_btn.setEnabled(False)
         self.metamold_progress.show()
@@ -6561,11 +6819,19 @@ class MainWindow(QMainWindow):
         self.metamold_progress_label.show()
         
         self._metamold_prism_result = None
+        self._metamold_with_cavity = None
+        self._metamold_half_1 = None
+        self._metamold_half_2 = None
+        self._metamold_csg_success = False
         self.mesh_viewer.remove_metamold_prism()
+        self.mesh_viewer.remove_metamold_with_cavity()
+        self.mesh_viewer.remove_metamold_half_1()
+        self.mesh_viewer.remove_metamold_half_2()
         
         self._metamold_worker = MetamoldWorker(
             self._hull_result.mesh,  # Hull for silhouette (same as hard shell)
-            parting_surface,  # Parting surface for height
+            self._current_mesh,  # Part mesh for height and cavity subtraction
+            self._outer_collar_result.mesh,  # Outer collar for splitting (reused from hard shell)
             self._mold_aware_pouring_result.resin_direction,  # Resin direction (same as hard shell)
             wall_thickness=wall_thickness,  # Same wall_thickness as hard shell
             margin=0.0,  # Same margin as hard shell (0.0)
@@ -6582,17 +6848,59 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'metamold_progress_label'):
             self.metamold_progress_label.setText(message)
 
-    def _on_metamold_complete(self, result):
-        self._metamold_prism_result = result
+    def _on_metamold_complete(self, prism_result, metamold_with_cavity, metamold_half_1, metamold_half_2, csg_success):
+        self._metamold_prism_result = prism_result
+        self._metamold_with_cavity = metamold_with_cavity
+        self._metamold_half_1 = metamold_half_1
+        self._metamold_half_2 = metamold_half_2
+        self._metamold_csg_success = csg_success
         
-        if result.prism_mesh is not None:
-            self.mesh_viewer.show_metamold_prism(result.prism_mesh)
+        # Clear any previous metamold displays
+        self.mesh_viewer.remove_metamold_prism()
+        self.mesh_viewer.remove_metamold_with_cavity()
+        self.mesh_viewer.remove_metamold_half_1()
+        self.mesh_viewer.remove_metamold_half_2()
+        
+        # Determine what to show based on results
+        has_prism = prism_result is not None and prism_result.prism_mesh is not None
+        has_cavity = metamold_with_cavity is not None and len(metamold_with_cavity.vertices) > 0
+        has_half_1 = metamold_half_1 is not None and len(metamold_half_1.vertices) > 4  # More than a single tet
+        has_half_2 = metamold_half_2 is not None and len(metamold_half_2.vertices) > 4  # More than a single tet
+        has_valid_halves = has_half_1 and has_half_2
+        
+        # Show display options
+        self.display_options.show_metamold_options(
+            show_prism=has_prism,
+            show_cavity=has_cavity,
+            show_halves=has_valid_halves
+        )
+        
+        # Show the metamold halves by default if available, otherwise show prism
+        if has_valid_halves:
+            self.mesh_viewer.show_metamold_half_1(metamold_half_1)
+            self.mesh_viewer.show_metamold_half_2(metamold_half_2)
+            logger.info("Showing metamold halves in viewer")
+        elif has_cavity:
+            # Show cavity if halves not available
+            self.mesh_viewer.show_metamold_with_cavity(metamold_with_cavity)
+            logger.info("Showing metamold with cavity in viewer (halves not valid)")
+        elif has_prism:
+            # Fall back to prism
+            self.mesh_viewer.show_metamold_prism(prism_result.prism_mesh)
+            logger.info("Showing metamold prism in viewer (no cavity or halves)")
         
         self._update_metamold_step_ui()
         self.step_buttons[Step.METAMOLD].set_status('completed')
         
-        logger.info(f"Metamold generated in {result.computation_time_ms:.0f}ms "
-                   f"(prism has {result.vertex_count} vertices, {result.face_count} faces)")
+        logger.info(f"Metamold generated in {prism_result.computation_time_ms:.0f}ms ")
+        if csg_success:
+            logger.info(f"  CSG cavity subtraction successful")
+            if metamold_half_1 is not None:
+                logger.info(f"  Half 1: {len(metamold_half_1.vertices)} verts, {len(metamold_half_1.faces)} faces")
+            if metamold_half_2 is not None:
+                logger.info(f"  Half 2: {len(metamold_half_2.vertices)} verts, {len(metamold_half_2.faces)} faces")
+        else:
+            logger.warning("  CSG operations did not complete successfully")
 
     def _on_metamold_error(self, message: str):
         if hasattr(self, 'metamold_progress_label'):

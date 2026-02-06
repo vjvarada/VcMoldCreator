@@ -213,12 +213,12 @@ class MetamoldPrismResult:
     """Result of creating the metamold prism.
     
     The metamold is a mold used to cast the silicone soft mold itself.
-    Unlike the hard shell prism (which uses hull for silhouette), the metamold
-    prism uses the parting surface as the reference for both silhouette and height.
+    It uses the same silhouette/direction as the hard shell (hull + resin direction)
+    but the height is based on the PART MESH extent, not the parting surface.
     
-    The prism is aligned with the silicone pouring direction, with:
-    - Silhouette derived from the parting surface projection
-    - Height based on parting surface extent + configurable offsets above/below
+    The prism is aligned with the resin pouring direction (same as hard shell), with:
+    - Silhouette derived from the HULL projection (same as hard shell)
+    - Height based on PART MESH extent + configurable offsets above/below
     """
     
     # The prism mesh (before subtracting any cavities)
@@ -248,9 +248,9 @@ class MetamoldPrismResult:
     # Wall thickness (horizontal offset from silhouette)
     wall_thickness: float
     
-    # Reference heights from parting surface
-    parting_surface_min_height: float  # Min projection along pouring direction
-    parting_surface_max_height: float  # Max projection along pouring direction
+    # Reference heights from part mesh
+    part_mesh_min_height: float  # Min projection along pouring direction
+    part_mesh_max_height: float  # Max projection along pouring direction
     
     # Statistics
     vertex_count: int = 0
@@ -266,12 +266,13 @@ class MetamoldPrismResult:
 
 def create_metamold_prism(
     hull_mesh: trimesh.Trimesh,
-    parting_surface: trimesh.Trimesh,
+    part_mesh: trimesh.Trimesh,
     resin_pouring_direction: np.ndarray,
     wall_thickness: float = 5.0,
     margin: float = 0.0,
     height_above: float = 2.0,
-    height_below: float = 2.0
+    height_below: float = 2.0,
+    parting_surface: trimesh.Trimesh = None
 ) -> MetamoldPrismResult:
     """
     Create a metamold prism aligned with the resin pouring direction.
@@ -283,20 +284,24 @@ def create_metamold_prism(
                   perpendicular to the RESIN pouring direction (same as hard shell)
     - Extrusion: Along RESIN pouring direction (same as hard shell)
     - Wall offset: wall_thickness + margin (same as hard shell)
-    - Height: From (parting_min - height_below) to (parting_max + height_above)
-              where min/max are the parting surface extent along pouring direction
+    - Height: From (part_min - height_below) to (part_max + height_above)
+              where min/max are the PART MESH extent along pouring direction
+              IMPORTANT: Also extends to include parting_surface if provided,
+              ensuring the cutting blade can pass through the prism walls.
     
-    This ensures the metamold has the EXACT same footprint as the hard shell but is
-    only as tall as needed to enclose the parting surface with 2mm margin.
+    This ensures the metamold has the EXACT same footprint as the hard shell and is
+    tall enough to enclose the entire part with 2mm margin on each side.
     
     Args:
         hull_mesh: The inflated hull mesh (used for silhouette, same as hard shell)
-        parting_surface: The parting surface mesh (used for height reference)
+        part_mesh: The original part mesh (used for height reference)
         resin_pouring_direction: Unit vector for RESIN pouring direction (same as hard shell)
         wall_thickness: How thick the hard shell wall should be (mm)
         margin: Additional margin beyond the hull bounds (mm) - same as hard shell
-        height_above: Distance above parting surface max to top of prism (mm)
-        height_below: Distance below parting surface min to bottom of prism (mm)
+        height_above: Distance above part mesh max to top of prism (mm)
+        height_below: Distance below part mesh min to bottom of prism (mm)
+        parting_surface: Optional parting surface mesh - if provided, prism height
+                        will be extended to include it (ensuring blade cuts through)
         
     Returns:
         MetamoldPrismResult with the prism mesh and metadata
@@ -312,8 +317,8 @@ def create_metamold_prism(
     
     # Use hull vertices for silhouette (same as hard shell)
     hull_vertices = np.array(hull_mesh.vertices, dtype=np.float64)
-    # Use parting surface vertices for height extent
-    parting_vertices = np.array(parting_surface.vertices, dtype=np.float64)
+    # Use part mesh vertices for height extent
+    part_vertices = np.array(part_mesh.vertices, dtype=np.float64)
     
     # =========================================================================
     # Step 1: Build orthonormal basis for the projection plane (same as hard shell)
@@ -339,17 +344,17 @@ def create_metamold_prism(
     world_to_2d = np.column_stack([u_axis, v_axis, pouring_dir]).T  # (3, 3)
     
     # =========================================================================
-    # Step 2: Project parting surface vertices to get height extent
+    # Step 2: Project part mesh vertices to get height extent
     # =========================================================================
     
-    parting_transformed = parting_vertices @ world_to_2d.T
-    parting_heights = parting_transformed[:, 2]  # projection along pouring direction
+    part_transformed = part_vertices @ world_to_2d.T
+    part_heights = part_transformed[:, 2]  # projection along pouring direction
     
-    # Get height extent of the parting surface
-    parting_min_height = np.min(parting_heights)
-    parting_max_height = np.max(parting_heights)
+    # Get height extent of the part mesh
+    part_min_height = np.min(part_heights)
+    part_max_height = np.max(part_heights)
     
-    logger.info(f"Parting surface height extent: {parting_min_height:.2f} to {parting_max_height:.2f}")
+    logger.info(f"Part mesh height extent: {part_min_height:.2f} to {part_max_height:.2f}")
     
     # =========================================================================
     # Step 3: Project HULL vertices to get 2D silhouette (SAME as hard shell)
@@ -386,11 +391,37 @@ def create_metamold_prism(
     logger.info(f"Offset silhouette has {len(silhouette_2d_offset)} vertices (offset={total_offset}mm)")
     
     # =========================================================================
-    # Step 5: Determine prism height (based on parting surface + offsets)
+    # Step 5: Determine prism height (based on part mesh + offsets)
+    #         Also extend to include parting surface if provided
     # =========================================================================
     
-    min_height = parting_min_height - height_below
-    max_height = parting_max_height + height_above
+    min_height = part_min_height - height_below
+    max_height = part_max_height + height_above
+    
+    # If parting surface is provided, extend bounds to include it
+    # This ensures the cutting blade (at parting surface level) passes through walls
+    if parting_surface is not None:
+        ps_vertices = np.array(parting_surface.vertices, dtype=np.float64)
+        ps_transformed = ps_vertices @ world_to_2d.T
+        ps_heights = ps_transformed[:, 2]  # projection along pouring direction
+        ps_min_height = np.min(ps_heights)
+        ps_max_height = np.max(ps_heights)
+        
+        logger.info(f"Parting surface height extent: {ps_min_height:.2f} to {ps_max_height:.2f}")
+        logger.info(f"Part mesh height extent: {part_min_height:.2f} to {part_max_height:.2f}")
+        
+        # Extend prism bounds to include parting surface with margin
+        parting_margin = 2.0  # 2mm margin around parting surface
+        if ps_min_height - parting_margin < min_height:
+            old_min = min_height
+            min_height = ps_min_height - parting_margin
+            logger.info(f"Extended prism bottom from {old_min:.2f} to {min_height:.2f} to include parting surface")
+        
+        if ps_max_height + parting_margin > max_height:
+            old_max = max_height
+            max_height = ps_max_height + parting_margin
+            logger.info(f"Extended prism top from {old_max:.2f} to {max_height:.2f} to include parting surface")
+    
     prism_height = max_height - min_height
     
     logger.info(f"Prism height: {prism_height:.2f} (from {min_height:.2f} to {max_height:.2f})")
@@ -423,8 +454,8 @@ def create_metamold_prism(
         world_to_2d=world_to_2d,
         pouring_direction=pouring_dir,
         wall_thickness=wall_thickness,
-        parting_surface_min_height=parting_min_height,
-        parting_surface_max_height=parting_max_height,
+        part_mesh_min_height=part_min_height,
+        part_mesh_max_height=part_max_height,
         vertex_count=len(prism_mesh.vertices),
         face_count=len(prism_mesh.faces),
         computation_time_ms=elapsed_ms
@@ -961,6 +992,294 @@ def _create_cutting_blade_from_membrane(
     return blade_mesh
 
 
+def _create_tall_cutting_blade(
+    membrane: trimesh.Trimesh,
+    direction: np.ndarray,
+    extrusion_distance: float = 100.0,
+    blade_thickness: float = 0.00001
+) -> trimesh.Trimesh:
+    """
+    Create a tall cutting blade by extruding the membrane far in both directions.
+    
+    Unlike `_create_cutting_blade_from_membrane` which creates a thin blade at the
+    membrane's position, this creates a blade that extends significantly above and
+    below the membrane to ensure it cuts through any shell regardless of height bounds.
+    
+    The blade is essentially the membrane extruded into a prism shape along the
+    pouring direction, then made slightly thick to create a gap when subtracted.
+    
+    Args:
+        membrane: The membrane mesh (parting surface + outer collar)
+        direction: Pouring direction (extrusion axis)
+        extrusion_distance: How far to extrude above and below (default: 100mm each way)
+        blade_thickness: Gap thickness for CSG subtraction (default: 0.01 micron)
+        
+    Returns:
+        A tall prism-shaped blade mesh
+    """
+    # Normalize direction
+    direction = np.array(direction, dtype=np.float64)
+    direction = direction / (np.linalg.norm(direction) + 1e-10)
+    
+    # Get membrane geometry
+    vertices = np.asarray(membrane.vertices, dtype=np.float64)
+    faces = np.asarray(membrane.faces, dtype=np.int64)
+    n_verts = len(vertices)
+    
+    # The blade extends far in both directions along the pouring axis
+    # We add a tiny offset (blade_thickness/2) to create a gap
+    half_gap = blade_thickness / 2.0
+    
+    # Bottom vertices: membrane projected far down along pouring direction
+    # We find the membrane's center to project from
+    membrane_heights = np.dot(vertices, direction)
+    membrane_center_height = (membrane_heights.min() + membrane_heights.max()) / 2.0
+    
+    # Create vertices at the bottom plane (membrane height - extrusion_distance - half_gap)
+    bottom_vertices = vertices - direction * (extrusion_distance + half_gap)
+    # Create vertices at the top plane (membrane height + extrusion_distance + half_gap)
+    top_vertices = vertices + direction * (extrusion_distance + half_gap)
+    
+    # Combined vertices: [bottom, top]
+    all_vertices = np.vstack([bottom_vertices, top_vertices])
+    
+    # Faces:
+    # 1. Bottom faces - reverse winding so normals point outward (downward)
+    bottom_faces = faces[:, ::-1]  # Reversed winding
+    
+    # 2. Top faces - keep original winding, offset indices
+    top_faces = faces + n_verts
+    
+    # 3. Side faces connecting boundary edges
+    edge_count = {}
+    edge_to_face = {}
+    
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
+            if edge_key not in edge_to_face:
+                edge_to_face[edge_key] = (fi, v0, v1)
+    
+    # Boundary edges have count == 1
+    boundary_edges = [e for e, c in edge_count.items() if c == 1]
+    
+    side_faces = []
+    for v0, v1 in boundary_edges:
+        _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
+        
+        # Bottom vertices
+        b0, b1 = v0, v1
+        # Top vertices (offset by n_verts)
+        t0, t1 = v0 + n_verts, v1 + n_verts
+        
+        # Create quad with correct winding for outward-facing normals
+        if orig_v0 == v0:
+            side_faces.append([b0, b1, t1])
+            side_faces.append([b0, t1, t0])
+        else:
+            side_faces.append([b0, t0, t1])
+            side_faces.append([b0, t1, b1])
+    
+    # Combine all faces
+    all_faces_list = [bottom_faces, top_faces]
+    if side_faces:
+        all_faces_list.append(np.array(side_faces, dtype=np.int64))
+    all_faces = np.vstack(all_faces_list)
+    
+    blade_mesh = trimesh.Trimesh(
+        vertices=all_vertices,
+        faces=all_faces,
+        process=True
+    )
+    blade_mesh.fix_normals()
+    
+    logger.info(f"Created tall cutting blade: {len(all_vertices)} verts, {len(all_faces)} faces, "
+               f"extrusion={extrusion_distance:.1f}mm each direction")
+    
+    return blade_mesh
+
+
+def extend_membrane_height(
+    membrane: trimesh.Trimesh,
+    pouring_direction: np.ndarray,
+    target_min_height: float,
+    target_max_height: float
+) -> trimesh.Trimesh:
+    """
+    Extend a membrane mesh vertically to match target height bounds.
+    
+    This is needed when using a cutting membrane (designed for one prism) to split
+    another prism with different height bounds (e.g., using hard shell's outer collar
+    to split the metamold).
+    
+    Algorithm:
+    1. Convert membrane to aligned coordinate system (z = pouring direction)
+    2. Find current height bounds of the membrane
+    3. For each boundary edge at min_height, extend down to target_min_height
+    4. For each boundary edge at max_height, extend up to target_max_height
+    5. Create collar faces connecting original boundary to extended boundary
+    
+    Args:
+        membrane: The cutting membrane mesh
+        pouring_direction: Unit vector defining the "up" direction
+        target_min_height: Target minimum height (along pouring direction)
+        target_max_height: Target maximum height (along pouring direction)
+        
+    Returns:
+        Extended membrane trimesh
+    """
+    if membrane is None or len(membrane.vertices) == 0:
+        return membrane
+    
+    vertices = np.array(membrane.vertices, dtype=np.float64)
+    faces = np.array(membrane.faces, dtype=np.int64)
+    
+    # Normalize pouring direction
+    direction = np.array(pouring_direction, dtype=np.float64)
+    direction = direction / (np.linalg.norm(direction) + 1e-10)
+    
+    # Project all vertices onto pouring direction
+    heights = np.dot(vertices, direction)
+    current_min_height = heights.min()
+    current_max_height = heights.max()
+    
+    logger.info(f"Extending membrane height from [{current_min_height:.2f}, {current_max_height:.2f}] "
+               f"to [{target_min_height:.2f}, {target_max_height:.2f}]")
+    
+    # Check if extension is needed
+    extension_below = target_min_height - current_min_height  # Should be negative if we need to go lower
+    extension_above = target_max_height - current_max_height  # Should be positive if we need to go higher
+    
+    # Tolerance for identifying boundary vertices
+    height_tol = (current_max_height - current_min_height) * 0.05  # 5% of height range
+    
+    if extension_below >= -0.1 and extension_above <= 0.1:
+        logger.info("No significant height extension needed")
+        return membrane
+    
+    # Find boundary edges
+    edge_to_face = {}
+    edge_count = {}
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            third_v = int(face[(i + 2) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
+            if edge_key not in edge_to_face:
+                edge_to_face[edge_key] = (fi, v0, v1, third_v)
+    
+    boundary_edges = [(v0, v1) for (v0, v1), c in edge_count.items() if c == 1]
+    
+    if not boundary_edges:
+        logger.warning("No boundary edges found - cannot extend membrane height")
+        return membrane
+    
+    # Categorize boundary edges by height
+    bottom_edges = []  # Edges near current min_height
+    top_edges = []     # Edges near current max_height
+    
+    for v0, v1 in boundary_edges:
+        h0 = heights[v0]
+        h1 = heights[v1]
+        avg_height = (h0 + h1) / 2
+        
+        # Check if edge is near bottom
+        if avg_height < current_min_height + height_tol:
+            bottom_edges.append((v0, v1))
+        # Check if edge is near top
+        elif avg_height > current_max_height - height_tol:
+            top_edges.append((v0, v1))
+    
+    logger.info(f"Found {len(bottom_edges)} bottom edges, {len(top_edges)} top edges")
+    
+    # Extend vertices and create collar faces
+    new_vertices = list(vertices)
+    new_faces = list(faces)
+    
+    # Maps: original_vertex_index -> extended_vertex_index
+    bottom_extension_map = {}
+    top_extension_map = {}
+    
+    # Extend bottom boundary if needed
+    if extension_below < -0.1 and len(bottom_edges) > 0:
+        for v0, v1 in bottom_edges:
+            for vi in [v0, v1]:
+                if vi not in bottom_extension_map:
+                    # Create extended vertex
+                    old_pos = vertices[vi]
+                    new_pos = old_pos + direction * extension_below  # extension_below is negative
+                    new_idx = len(new_vertices)
+                    new_vertices.append(new_pos)
+                    bottom_extension_map[vi] = new_idx
+        
+        # Create collar faces for bottom
+        for v0, v1 in bottom_edges:
+            ext_v0 = bottom_extension_map.get(v0)
+            ext_v1 = bottom_extension_map.get(v1)
+            if ext_v0 is not None and ext_v1 is not None:
+                # Get winding from original face
+                edge_key = (min(v0, v1), max(v0, v1))
+                face_info = edge_to_face.get(edge_key)
+                if face_info is not None:
+                    fi, orig_v0, orig_v1, _ = face_info
+                    # Create quad connecting original to extended (downward)
+                    # Winding should be consistent with face orientation
+                    if orig_v0 == v0:
+                        # Edge goes v0->v1 in the face
+                        new_faces.append([v0, ext_v0, ext_v1])
+                        new_faces.append([v0, ext_v1, v1])
+                    else:
+                        # Edge goes v1->v0 in the face
+                        new_faces.append([v0, v1, ext_v1])
+                        new_faces.append([v0, ext_v1, ext_v0])
+    
+    # Extend top boundary if needed
+    if extension_above > 0.1 and len(top_edges) > 0:
+        for v0, v1 in top_edges:
+            for vi in [v0, v1]:
+                if vi not in top_extension_map:
+                    # Create extended vertex
+                    old_pos = vertices[vi]
+                    new_pos = old_pos + direction * extension_above  # extension_above is positive
+                    new_idx = len(new_vertices)
+                    new_vertices.append(new_pos)
+                    top_extension_map[vi] = new_idx
+        
+        # Create collar faces for top
+        for v0, v1 in top_edges:
+            ext_v0 = top_extension_map.get(v0)
+            ext_v1 = top_extension_map.get(v1)
+            if ext_v0 is not None and ext_v1 is not None:
+                # Get winding from original face
+                edge_key = (min(v0, v1), max(v0, v1))
+                face_info = edge_to_face.get(edge_key)
+                if face_info is not None:
+                    fi, orig_v0, orig_v1, _ = face_info
+                    # Create quad connecting original to extended (upward)
+                    if orig_v0 == v0:
+                        new_faces.append([v0, v1, ext_v1])
+                        new_faces.append([v0, ext_v1, ext_v0])
+                    else:
+                        new_faces.append([v0, ext_v0, ext_v1])
+                        new_faces.append([v0, ext_v1, v1])
+    
+    # Create extended mesh
+    extended_mesh = trimesh.Trimesh(
+        vertices=np.array(new_vertices, dtype=np.float64),
+        faces=np.array(new_faces, dtype=np.int64),
+        process=True
+    )
+    extended_mesh.fix_normals()
+    
+    logger.info(f"Extended membrane: {len(vertices)} -> {len(new_vertices)} vertices, "
+               f"{len(faces)} -> {len(new_faces)} faces")
+    
+    return extended_mesh
+
+
 def split_shell_with_membrane(
     shell_with_cavity: trimesh.Trimesh,
     membrane: trimesh.Trimesh,
@@ -1010,8 +1329,73 @@ def split_shell_with_membrane(
         blade = _create_cutting_blade_from_membrane(membrane, direction, blade_thickness)
         logger.info(f"Blade: {len(blade.vertices)} verts, {len(blade.faces)} faces")
         
+        # DIAGNOSTIC: Check blade and membrane properties
+        logger.info(f"DIAGNOSTIC - Membrane properties:")
+        logger.info(f"  Membrane: {len(membrane.vertices)} verts, {len(membrane.faces)} faces")
+        logger.info(f"  Membrane is_watertight: {membrane.is_watertight}")
+        # Count membrane boundary edges
+        membrane_edge_count = {}
+        for face in membrane.faces:
+            for i in range(3):
+                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                edge_key = (min(v0, v1), max(v0, v1))
+                membrane_edge_count[edge_key] = membrane_edge_count.get(edge_key, 0) + 1
+        membrane_boundary_edges = sum(1 for c in membrane_edge_count.values() if c == 1)
+        logger.info(f"  Membrane boundary edges: {membrane_boundary_edges}")
+        
+        logger.info(f"DIAGNOSTIC - Blade properties:")
+        logger.info(f"  Blade is_watertight: {blade.is_watertight}")
+        # Count blade boundary edges
+        blade_edge_count = {}
+        for face in blade.faces:
+            for i in range(3):
+                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                edge_key = (min(v0, v1), max(v0, v1))
+                blade_edge_count[edge_key] = blade_edge_count.get(edge_key, 0) + 1
+        blade_boundary_edges = sum(1 for c in blade_edge_count.values() if c == 1)
+        logger.info(f"  Blade boundary edges: {blade_boundary_edges}")
+        if blade_boundary_edges > 0:
+            logger.warning(f"  WARNING: Blade has {blade_boundary_edges} open edges - not watertight!")
+        
+        # DIAGNOSTIC: Log bounding box info
+        shell_bounds = shell_with_cavity.bounds  # [[xmin,ymin,zmin], [xmax,ymax,zmax]]
+        blade_bounds = blade.bounds
+        membrane_bounds = membrane.bounds
+        logger.info(f"DIAGNOSTIC - Bounding boxes:")
+        logger.info(f"  Shell:    min={shell_bounds[0]}, max={shell_bounds[1]}")
+        logger.info(f"  Membrane: min={membrane_bounds[0]}, max={membrane_bounds[1]}")
+        logger.info(f"  Blade:    min={blade_bounds[0]}, max={blade_bounds[1]}")
+        
+        # Check overlap along pouring direction
+        # Project bounds onto pouring direction
+        shell_proj_min = np.dot(shell_bounds[0], direction)
+        shell_proj_max = np.dot(shell_bounds[1], direction)
+        blade_proj_min = np.dot(blade_bounds[0], direction)
+
+        blade_proj_max = np.dot(blade_bounds[1], direction)
+        
+        logger.info(f"  Shell extent along pouring dir: [{shell_proj_min:.2f}, {shell_proj_max:.2f}]")
+        logger.info(f"  Blade extent along pouring dir: [{blade_proj_min:.2f}, {blade_proj_max:.2f}]")
+        
+        # Check if blade overlaps with shell
+        overlap = not (blade_proj_max < shell_proj_min or blade_proj_min > shell_proj_max)
+        if not overlap:
+            logger.warning("DIAGNOSTIC: Blade does NOT overlap with shell along pouring direction!")
+            logger.warning("  This means the blade is outside the shell's Z range and won't cut it.")
+        else:
+            logger.info("  Blade overlaps with shell along pouring direction - OK")
+        
         # Step 2: Convert to manifold3d
         logger.info("Converting meshes to manifold...")
+        
+        # DIAGNOSTIC: Check shell connectivity BEFORE cutting
+        logger.info("DIAGNOSTIC: Checking shell connectivity BEFORE cutting...")
+        shell_components_before = shell_with_cavity.split(only_watertight=False)
+        logger.info(f"  Shell has {len(shell_components_before)} connected components BEFORE cutting")
+        if len(shell_components_before) > 1:
+            for i, comp in enumerate(sorted(shell_components_before, key=lambda m: len(m.faces), reverse=True)[:5]):
+                logger.info(f"    Component {i+1}: {len(comp.vertices)} verts, {len(comp.faces)} faces")
+        
         shell_manifold = _trimesh_to_manifold(shell_with_cavity)
         blade_manifold = _trimesh_to_manifold(blade)
         
@@ -1067,6 +1451,118 @@ def split_shell_with_membrane(
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000
         logger.error(f"Failed to split shell with membrane: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None, elapsed_ms, False
+
+
+def split_shell_with_tall_blade(
+    shell: trimesh.Trimesh,
+    membrane: trimesh.Trimesh,
+    pouring_direction: np.ndarray,
+    extrusion_distance: float = 200.0,
+    blade_gap: float = 0.00001
+) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool]:
+    """
+    Split a shell using a tall cutting blade that extends far above and below the membrane.
+    
+    This is designed for splitting the metamold, where the shell may have different
+    height bounds than the membrane (parting surface + outer collar from hard shell step).
+    The tall blade ensures the cut extends through the entire shell regardless of height.
+    
+    Algorithm:
+    1. Create tall blade by extruding membrane ±extrusion_distance in pouring direction
+    2. Subtract blade from shell: cut_shell = shell - blade
+    3. Split result into connected components
+    4. Return the two largest components as half_1 (upper) and half_2 (lower)
+    
+    Args:
+        shell: The shell mesh to split (e.g., metamold with cavity)
+        membrane: The cutting membrane (parting surface + outer collar from hard shell)
+        pouring_direction: Unit vector defining the "upper" direction
+        extrusion_distance: How far to extrude blade above/below membrane (default: 200mm)
+        blade_gap: The thin gap created by the cut (default: 0.01 micron)
+        
+    Returns:
+        Tuple of (shell_half_1, shell_half_2, computation_time_ms, success)
+        shell_half_1 is the half in the positive pouring direction (upper)
+        shell_half_2 is the half in the negative pouring direction (lower)
+    """
+    start_time = time.time()
+    
+    if not MANIFOLD_AVAILABLE:
+        logger.error("manifold3d not available - cannot perform CSG operations")
+        return None, None, 0.0, False
+    
+    try:
+        logger.info(f"Splitting shell using tall blade (extrusion={extrusion_distance}mm, gap={blade_gap:.6f}mm)...")
+        
+        # Normalize direction
+        direction = np.array(pouring_direction, dtype=np.float64)
+        direction = direction / (np.linalg.norm(direction) + 1e-10)
+        
+        # Step 1: Create tall cutting blade from membrane
+        logger.info("Creating tall cutting blade from membrane...")
+        blade = _create_tall_cutting_blade(membrane, direction, extrusion_distance, blade_gap)
+        logger.info(f"Tall blade: {len(blade.vertices)} verts, {len(blade.faces)} faces")
+        
+        # Step 2: Convert to manifold3d
+        logger.info("Converting meshes to manifold...")
+        shell_manifold = _trimesh_to_manifold(shell)
+        blade_manifold = _trimesh_to_manifold(blade)
+        
+        # Step 3: CSG subtraction - cut the shell with the blade
+        logger.info("Performing CSG subtraction: shell - tall_blade...")
+        cut_shell_manifold = shell_manifold - blade_manifold
+        
+        # Step 4: Convert back to trimesh
+        cut_shell = _manifold_to_trimesh(cut_shell_manifold)
+        logger.info(f"Cut shell: {len(cut_shell.vertices)} verts, {len(cut_shell.faces)} faces")
+        
+        # Step 5: Split into connected components
+        logger.info("Splitting into connected components...")
+        components = cut_shell.split(only_watertight=False)
+        logger.info(f"Found {len(components)} connected components")
+        
+        if len(components) < 2:
+            logger.warning("Failed to split shell into two components - blade may not have cut through")
+            elapsed_ms = (time.time() - start_time) * 1000
+            if len(components) == 1:
+                return components[0], None, elapsed_ms, False
+            return None, None, elapsed_ms, False
+        
+        # Step 6: Sort by size and take the two largest
+        components = sorted(components, key=lambda m: len(m.faces), reverse=True)
+        comp1, comp2 = components[0], components[1]
+        
+        # Step 7: Classify which is upper vs lower based on centroid position
+        centroid1 = comp1.centroid
+        centroid2 = comp2.centroid
+        
+        # Project centroids onto pouring direction
+        proj1 = np.dot(centroid1, direction)
+        proj2 = np.dot(centroid2, direction)
+        
+        # Upper half has higher projection value
+        if proj1 > proj2:
+            shell_half_1, shell_half_2 = comp1, comp2
+        else:
+            shell_half_1, shell_half_2 = comp2, comp1
+        
+        elapsed_ms = (time.time() - start_time) * 1000
+        
+        logger.info(f"Shell split complete in {elapsed_ms:.1f}ms:")
+        logger.info(f"  Half 1 (upper): {len(shell_half_1.vertices)} verts, {len(shell_half_1.faces)} faces")
+        logger.info(f"  Half 2 (lower): {len(shell_half_2.vertices)} verts, {len(shell_half_2.faces)} faces")
+        
+        if len(components) > 2:
+            logger.warning(f"  Note: {len(components) - 2} additional small fragments were discarded")
+        
+        return shell_half_1, shell_half_2, elapsed_ms, True
+        
+    except Exception as e:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error(f"Failed to split shell with tall blade: {e}")
         import traceback
         traceback.print_exc()
         return None, None, elapsed_ms, False

@@ -5901,3 +5901,230 @@ class MeshViewer(QWidget):
             self._metamold_prism_actor.SetVisibility(visible)
             self.plotter.update()
             logger.debug(f"Metamold prism visibility set to {visible}")
+
+    # =========================================================================
+    # METAMOLD WITH CAVITY VISUALIZATION
+    # =========================================================================
+    
+    def show_metamold_with_cavity(self, mesh: 'trimesh.Trimesh'):
+        """
+        Display the metamold with cavity (prism - part mesh).
+        
+        Args:
+            mesh: The metamold with cavity mesh
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        # Remove existing actor
+        self.remove_metamold_with_cavity()
+        
+        if mesh is None or len(mesh.vertices) == 0:
+            logger.warning("No valid metamold with cavity mesh to display")
+            return
+        
+        self._metamold_cavity_mesh = mesh
+        
+        try:
+            vertices = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.faces)
+            faces_pv = np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64)
+            pv_mesh = pv.PolyData(vertices, faces_pv.flatten())
+        except Exception as e:
+            logger.error(f"Failed to convert metamold with cavity to PyVista: {e}")
+            return
+        
+        # Display in light green (different from prism)
+        self._metamold_cavity_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='#81C784',  # Light Green
+            opacity=0.4,
+            show_edges=True,
+            edge_color='#388E3C',  # Green
+            line_width=0.5,
+        )
+        self._metamold_cavity_visible = True
+        logger.info(f"Metamold with cavity displayed: {len(vertices)} vertices, {len(faces)} faces")
+        
+        self.plotter.update()
+    
+    def remove_metamold_with_cavity(self):
+        """Remove metamold with cavity from the display."""
+        if hasattr(self, '_metamold_cavity_actor') and self._metamold_cavity_actor is not None:
+            try:
+                self.plotter.remove_actor(self._metamold_cavity_actor)
+            except Exception:
+                pass
+            self._metamold_cavity_actor = None
+        
+        if hasattr(self, '_metamold_cavity_mesh'):
+            self._metamold_cavity_mesh = None
+        
+        self.plotter.update()
+    
+    def set_metamold_with_cavity_visible(self, visible: bool):
+        """
+        Set visibility of metamold with cavity.
+        
+        Args:
+            visible: True to show, False to hide
+        """
+        self._metamold_cavity_visible = visible
+        if hasattr(self, '_metamold_cavity_actor') and self._metamold_cavity_actor is not None:
+            self._metamold_cavity_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Metamold with cavity visibility set to {visible}")
+
+    # =========================================================================
+    # METAMOLD HALVES VISUALIZATION
+    # =========================================================================
+    
+    def show_metamold_half_1(self, mesh: 'trimesh.Trimesh'):
+        """
+        Display metamold half 1 (upper half split by membrane).
+        
+        This is the upper portion of the metamold cut by the parting membrane.
+        Displayed in green color.
+        
+        Args:
+            mesh: The metamold half 1 mesh
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        # Remove existing actor
+        self.remove_metamold_half_1()
+        
+        if mesh is None or len(mesh.vertices) == 0:
+            logger.warning("No valid metamold half 1 mesh to display")
+            return
+        
+        self._metamold_half_1_mesh = mesh
+        
+        try:
+            vertices = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.faces)
+            faces_pv = np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64)
+            pv_mesh = pv.PolyData(vertices, faces_pv.flatten())
+        except Exception as e:
+            logger.error(f"Failed to convert metamold half 1 mesh to PyVista: {e}")
+            return
+        
+        # Display in distinct green
+        self._metamold_half_1_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='#66BB6A',  # Green 400
+            opacity=0.6,
+            show_edges=True,
+            edge_color='#43A047',  # Green 600
+            line_width=0.5,
+        )
+        self._metamold_half_1_visible = True
+        logger.info(f"Metamold half 1 displayed: {len(vertices)} vertices, {len(faces)} faces")
+        
+        self.plotter.update()
+    
+    def remove_metamold_half_1(self):
+        """Remove metamold half 1 from the display."""
+        if hasattr(self, '_metamold_half_1_actor') and self._metamold_half_1_actor is not None:
+            try:
+                self.plotter.remove_actor(self._metamold_half_1_actor)
+            except Exception:
+                pass
+            self._metamold_half_1_actor = None
+        
+        if hasattr(self, '_metamold_half_1_mesh'):
+            self._metamold_half_1_mesh = None
+        
+        self.plotter.update()
+    
+    def set_metamold_half_1_visible(self, visible: bool):
+        """
+        Set visibility of metamold half 1.
+        
+        Args:
+            visible: True to show, False to hide
+        """
+        self._metamold_half_1_visible = visible
+        if hasattr(self, '_metamold_half_1_actor') and self._metamold_half_1_actor is not None:
+            self._metamold_half_1_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Metamold half 1 visibility set to {visible}")
+    
+    def show_metamold_half_2(self, mesh: 'trimesh.Trimesh'):
+        """
+        Display metamold half 2 (lower half split by membrane).
+        
+        This is the lower portion of the metamold cut by the parting membrane.
+        Displayed in purple color to distinguish from half 1.
+        
+        Args:
+            mesh: The metamold half 2 mesh
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        # Remove existing actor
+        self.remove_metamold_half_2()
+        
+        if mesh is None or len(mesh.vertices) == 0:
+            logger.warning("No valid metamold half 2 mesh to display")
+            return
+        
+        self._metamold_half_2_mesh = mesh
+        
+        try:
+            vertices = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.faces)
+            faces_pv = np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64)
+            pv_mesh = pv.PolyData(vertices, faces_pv.flatten())
+        except Exception as e:
+            logger.error(f"Failed to convert metamold half 2 mesh to PyVista: {e}")
+            return
+        
+        # Display in purple (contrasts with green)
+        self._metamold_half_2_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='#AB47BC',  # Purple 400
+            opacity=0.6,
+            show_edges=True,
+            edge_color='#8E24AA',  # Purple 600
+            line_width=0.5,
+        )
+        self._metamold_half_2_visible = True
+        logger.info(f"Metamold half 2 displayed: {len(vertices)} vertices, {len(faces)} faces")
+        
+        self.plotter.update()
+    
+    def remove_metamold_half_2(self):
+        """Remove metamold half 2 from the display."""
+        if hasattr(self, '_metamold_half_2_actor') and self._metamold_half_2_actor is not None:
+            try:
+                self.plotter.remove_actor(self._metamold_half_2_actor)
+            except Exception:
+                pass
+            self._metamold_half_2_actor = None
+        
+        if hasattr(self, '_metamold_half_2_mesh'):
+            self._metamold_half_2_mesh = None
+        
+        self.plotter.update()
+    
+    def set_metamold_half_2_visible(self, visible: bool):
+        """
+        Set visibility of metamold half 2.
+        
+        Args:
+            visible: True to show, False to hide
+        """
+        self._metamold_half_2_visible = visible
+        if hasattr(self, '_metamold_half_2_actor') and self._metamold_half_2_actor is not None:
+            self._metamold_half_2_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Metamold half 2 visibility set to {visible}")
