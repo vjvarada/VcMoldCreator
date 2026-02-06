@@ -1028,15 +1028,12 @@ class MetamoldWorker(QThread):
             )
             logger.info(f"Metamold prism: {prism_result.vertex_count} vertices, {prism_result.face_count} faces")
             
-            # Step 2: CSG subtraction - metamold = prism - hull_mesh
-            # NOTE: Use hull_mesh (not part_mesh) because:
-            # 1. The metamold combines with hard shell half to form a container for casting silicone
-            # 2. Both need the same cavity (hull-shaped) so they fit together properly
-            # 3. The parting surface/blade was designed based on hull geometry
-            self.progress.emit("Performing CSG: subtracting hull from prism...")
+            # Step 2: CSG subtraction - metamold = prism - part_mesh
+            # The metamold cavity is shaped like the part (different from hard shell which uses hull)
+            self.progress.emit("Performing CSG: subtracting part from prism...")
             metamold_with_cavity, csg_time_ms, csg_success = create_shell_with_cavity(
                 prism_result.prism_mesh,
-                self.hull_mesh  # Use hull (same as hard shell) for proper fit and splitting
+                self.part_mesh  # Use part mesh for metamold cavity
             )
             
             metamold_half_1 = None
