@@ -2052,7 +2052,10 @@ class MeshViewer(QWidget):
                 logger.info(f"Added {np.sum(concave_edge_mask)} membrane CONCAVE edge spheres (orange)")
             
             # Corner concave (magenta) - FIXED, no smoothing allowed
-            concave_corner_mask = types == 4
+            # Also includes isolated triangle tip vertices (type 5) which are treated the same
+            concave_corner_mask = (types == 4) | (types == 5)
+            n_concave_corners = np.sum(types == 4)
+            n_isolated_tips = np.sum(types == 5)
             if np.sum(concave_corner_mask) > 0:
                 corner_positions = positions[concave_corner_mask]
                 corner_cloud = pv.PolyData(corner_positions)
@@ -2067,7 +2070,8 @@ class MeshViewer(QWidget):
                     color='magenta',
                     opacity=1.0,
                 )
-                logger.info(f"Added {np.sum(concave_corner_mask)} membrane CONCAVE corner spheres (magenta) - FIXED")
+                logger.info(f"Added {np.sum(concave_corner_mask)} membrane FIXED spheres (magenta) - "
+                           f"{n_concave_corners} concave corners + {n_isolated_tips} isolated triangle tips")
         
         # === 4. Draw restored corner vertices (blue spheres) ===
         # These are concave corner vertices that were snapped back to original positions after smoothing

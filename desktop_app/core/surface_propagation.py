@@ -99,13 +99,22 @@ class SmoothingResult:
     # Timing
     total_time_ms: float = 0.0
     
-    # Restored corner vertices (concave corners snapped back after smoothing)
+    # Restored fixed vertices (concave corners AND isolated triangle tips snapped back after smoothing)
     restored_corner_positions: Optional[np.ndarray] = None  # (K, 3) positions of restored vertices
 
 
 @dataclass
 class FeatureDebugVisualization:
-    """Debug visualization data for sharp edge/corner feature classification."""
+    """Debug visualization data for sharp edge/corner feature classification.
+    
+    Membrane boundary vertex projected types:
+        0 = smooth (normal projection)
+        1 = convex sharp edge (can be smoothed)
+        2 = convex corner (can be smoothed)
+        3 = concave sharp edge (can be smoothed)
+        4 = concave corner (FIXED - no smoothing)
+        5 = isolated triangle tip (FIXED - same detection as inner collar creation)
+    """
     
     # Target mesh (part or hull) feature data
     target_mesh_vertices: Optional[np.ndarray] = None       # (N, 3) vertex positions
@@ -114,10 +123,10 @@ class FeatureDebugVisualization:
     
     # Membrane boundary vertex data  
     membrane_boundary_positions: Optional[np.ndarray] = None  # (M, 3) boundary vertex positions
-    membrane_boundary_projected_types: Optional[np.ndarray] = None  # (M,) feature type each projects to
+    membrane_boundary_projected_types: Optional[np.ndarray] = None  # (M,) feature type each projects to (0-5)
     membrane_boundary_nearest_target: Optional[np.ndarray] = None  # (M,) nearest target vertex index
     
-    # Restored corner vertices (concave corners snapped back after smoothing)
+    # Restored corner vertices (concave corners AND single-triangle tips snapped back after smoothing)
     restored_corner_positions: Optional[np.ndarray] = None  # (K, 3) positions of restored vertices (blue spheres)
 
 
@@ -375,10 +384,57 @@ def get_feature_debug_visualization(
         debug.membrane_boundary_projected_types = projected_types
         debug.membrane_boundary_nearest_target = nearest_target_indices
         
+        # === Also detect isolated triangle tip vertices ===
+        # Uses the SAME edge-based logic as inner collar creation and smoothing step:
+        # A tip vertex has exactly 2 boundary edges that share the SAME face.
+        
+        # Build edge_to_face mapping for the membrane mesh
+        edge_to_face_membrane = {}
+        edge_face_count_membrane = {}
+        for fi, face in enumerate(membrane_mesh.faces):
+            for ei in range(3):
+                v0, v1 = int(face[ei]), int(face[(ei + 1) % 3])
+                edge_key = (min(v0, v1), max(v0, v1))
+                edge_face_count_membrane[edge_key] = edge_face_count_membrane.get(edge_key, 0) + 1
+                edge_to_face_membrane[edge_key] = (fi, int(face[(ei + 2) % 3]))
+        
+        # Find boundary edges (edges with only 1 adjacent face)
+        vis_boundary_edges = [(v0, v1) for (v0, v1), count in edge_face_count_membrane.items() if count == 1]
+        
+        # Build vertex -> boundary edges mapping
+        vertex_to_vis_boundary_edges = {}
+        for v0, v1 in vis_boundary_edges:
+            if v0 not in vertex_to_vis_boundary_edges:
+                vertex_to_vis_boundary_edges[v0] = []
+            if v1 not in vertex_to_vis_boundary_edges:
+                vertex_to_vis_boundary_edges[v1] = []
+            vertex_to_vis_boundary_edges[v0].append(((v0, v1), v0, v1))
+            vertex_to_vis_boundary_edges[v1].append(((v0, v1), v1, v0))
+        
+        # Mark isolated tip vertices as type 5 (same as inner collar detection)
+        # Tip = vertex with exactly 2 boundary edges from the SAME face
+        # NOTE: This marks ALL boundary tips for visualization; smoothing only fixes PART boundary tips
+        for i, vi in enumerate(membrane_boundary_indices):
+            if projected_types[i] == 4:
+                continue  # Already a concave corner, don't override
+            
+            edges = vertex_to_vis_boundary_edges.get(vi, [])
+            if len(edges) == 2:
+                edge_key_a = (min(edges[0][0][0], edges[0][0][1]), max(edges[0][0][0], edges[0][0][1]))
+                edge_key_b = (min(edges[1][0][0], edges[1][0][1]), max(edges[1][0][0], edges[1][0][1]))
+                
+                face_a = edge_to_face_membrane.get(edge_key_a)
+                face_b = edge_to_face_membrane.get(edge_key_b)
+                
+                if face_a is not None and face_b is not None and face_a[0] == face_b[0]:
+                    # Same face - this is an isolated triangle tip!
+                    projected_types[i] = 5
+        
         logger.info(
             f"Feature debug (direct analysis): {np.sum(projected_types == 0)} smooth, "
             f"{np.sum(projected_types == 1)} convex edge, {np.sum(projected_types == 2)} convex corner, "
-            f"{np.sum(projected_types == 3)} concave edge, {np.sum(projected_types == 4)} concave corner"
+            f"{np.sum(projected_types == 3)} concave edge, {np.sum(projected_types == 4)} concave corner, "
+            f"{np.sum(projected_types == 5)} isolated triangle tip"
         )
     
     # Add restored corner positions if provided
@@ -1879,6 +1935,70 @@ def smooth_membrane_with_boundary_reprojection(
         
         return concave_verts
     
+    def identify_isolated_tip_boundary_vertices(
+        membrane_faces: np.ndarray,
+        inner_boundary_edges: List[Tuple[int, int]],
+        edge_to_face: dict,
+        part_boundary_indices: np.ndarray
+    ) -> set:
+        """
+        Find isolated triangle tip vertices on the part boundary.
+        
+        Uses the SAME detection logic as inner collar creation in parting_surface.py:
+        An isolated tip is a boundary vertex where exactly 2 boundary edges 
+        share the SAME face. This indicates the vertex is at the tip of an 
+        isolated triangle.
+        
+        These tip vertices should be kept fixed during smoothing to prevent 
+        them from drifting. They represent critical contact points with the 
+        part mesh (often at thin protrusions or sharp features).
+        
+        Args:
+            membrane_faces: (F, 3) array of membrane face indices
+            inner_boundary_edges: List of (v0, v1) inner boundary edges
+            edge_to_face: Dict mapping edge_key -> (face_idx, third_vertex)
+            part_boundary_indices: Indices of membrane vertices on the part boundary
+            
+        Returns:
+            Set of membrane vertex indices that are isolated triangle tips
+        """
+        if len(part_boundary_indices) == 0 or len(inner_boundary_edges) == 0:
+            return set()
+        
+        # Build mapping from vertex to its adjacent inner boundary edges
+        # (same logic as in parting_surface.py create_robust_collar_extension)
+        vertex_to_boundary_edges = {}
+        for v0, v1 in inner_boundary_edges:
+            if v0 not in vertex_to_boundary_edges:
+                vertex_to_boundary_edges[v0] = []
+            if v1 not in vertex_to_boundary_edges:
+                vertex_to_boundary_edges[v1] = []
+            vertex_to_boundary_edges[v0].append(((v0, v1), v0, v1))
+            vertex_to_boundary_edges[v1].append(((v0, v1), v1, v0))
+        
+        # Find isolated tip vertices: vertices with exactly 2 boundary edges
+        # from the SAME face (same as inner collar detection)
+        part_boundary_set = set(part_boundary_indices)
+        isolated_tip_verts = set()
+        
+        for vi, edges in vertex_to_boundary_edges.items():
+            if vi not in part_boundary_set:
+                continue
+                
+            if len(edges) == 2:
+                # Check if these 2 boundary edges share the same face
+                edge_key_a = (min(edges[0][0][0], edges[0][0][1]), max(edges[0][0][0], edges[0][0][1]))
+                edge_key_b = (min(edges[1][0][0], edges[1][0][1]), max(edges[1][0][0], edges[1][0][1]))
+                
+                face_a = edge_to_face.get(edge_key_a)
+                face_b = edge_to_face.get(edge_key_b)
+                
+                if face_a is not None and face_b is not None and face_a[0] == face_b[0]:
+                    # Same face - this is an isolated triangle tip!
+                    isolated_tip_verts.add(vi)
+        
+        return isolated_tip_verts
+    
     # Only apply feature detection to part boundary, NOT hull boundary
     if feature_aware_smoothing and part_mesh is not None and len(part_boundary_indices) > 0:
         part_concave_verts = identify_concave_membrane_vertices_at_part_boundary(
@@ -1890,6 +2010,37 @@ def smooth_membrane_with_boundary_reprojection(
         corner_vertex_set.update(part_concave_verts)
         if part_concave_verts:
             logger.info(f"Found {len(part_concave_verts)} membrane vertices at part concave features (will restore after smoothing)")
+        
+        # Also detect isolated triangle tip vertices (same logic as inner collar creation)
+        # First, build edge_to_face mapping for the membrane mesh
+        edge_to_face_membrane = {}
+        for fi, face in enumerate(faces):
+            for i in range(3):
+                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                edge_key = (min(v0, v1), max(v0, v1))
+                edge_to_face_membrane[edge_key] = (fi, int(face[(i + 2) % 3]))
+        
+        # Build list of inner boundary edges (edges where at least one vertex is on part)
+        part_boundary_set = set(part_boundary_indices)
+        inner_boundary_edges_for_tips = []
+        for v0, v1 in boundary_edges:
+            # Edge is "inner" if at least one vertex is on part boundary
+            if v0 in part_boundary_set or v1 in part_boundary_set:
+                inner_boundary_edges_for_tips.append((v0, v1))
+        
+        # Detect isolated tip vertices using same logic as inner collar
+        isolated_tip_verts = identify_isolated_tip_boundary_vertices(
+            membrane_faces=faces,
+            inner_boundary_edges=inner_boundary_edges_for_tips,
+            edge_to_face=edge_to_face_membrane,
+            part_boundary_indices=part_boundary_indices
+        )
+        # Only add if not already classified as concave corner
+        new_tip_verts = isolated_tip_verts - corner_vertex_set
+        corner_vertex_set.update(new_tip_verts)
+        if new_tip_verts:
+            logger.info(f"Found {len(new_tip_verts)} isolated triangle tip vertices (same as inner collar detection, will restore after smoothing)")
+        
     elif not feature_aware_smoothing:
         logger.info("Feature-aware smoothing disabled - all part boundary vertices smoothed normally")
     
@@ -1903,7 +2054,7 @@ def smooth_membrane_with_boundary_reprojection(
         corner_original_positions[vi] = vertices[vi].copy()
     
     if corner_vertex_set:
-        logger.info(f"Total {len(corner_vertex_set)} part concave vertices - will smooth then restore positions")
+        logger.info(f"Total {len(corner_vertex_set)} fixed vertices (concave corners + tip vertices) - will smooth then restore positions")
     
     # NOTE: We no longer add corner vertices to excluded_set
     # They will be smoothed normally, then snapped back to original positions after
