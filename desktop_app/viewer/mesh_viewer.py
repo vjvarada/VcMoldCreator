@@ -6132,3 +6132,157 @@ class MeshViewer(QWidget):
             self._metamold_half_2_actor.SetVisibility(visible)
             self.plotter.update()
             logger.debug(f"Metamold half 2 visibility set to {visible}")
+
+    # =========================================================================
+    # METAMOLD HALVES WITH PART ADDED
+    # =========================================================================
+
+    def show_metamold_half_1_with_part(self, mesh: 'trimesh.Trimesh'):
+        """
+        Display metamold half 1 with part mesh added (boolean union).
+        
+        This is the upper portion of the metamold with the part mesh 
+        added back as solid geometry.
+        Displayed in cyan color to distinguish from other halves.
+        
+        Args:
+            mesh: The metamold half 1 with part added mesh
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        # Remove existing actor
+        self.remove_metamold_half_1_with_part()
+        
+        if mesh is None or len(mesh.vertices) == 0:
+            logger.warning("No valid metamold half 1 with part mesh to display")
+            return
+        
+        self._metamold_half_1_with_part_mesh = mesh
+        
+        try:
+            vertices = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.faces)
+            faces_pv = np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64)
+            pv_mesh = pv.PolyData(vertices, faces_pv.flatten())
+        except Exception as e:
+            logger.error(f"Failed to convert metamold half 1 with part mesh to PyVista: {e}")
+            return
+        
+        # Display in cyan (bright, easy to see)
+        self._metamold_half_1_with_part_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='#00BCD4',  # Cyan 500
+            opacity=0.7,
+            show_edges=True,
+            edge_color='#0097A7',  # Cyan 700
+            line_width=0.5,
+        )
+        self._metamold_half_1_with_part_visible = True
+        logger.info(f"Metamold half 1 with part displayed: {len(vertices)} vertices, {len(faces)} faces")
+        
+        self.plotter.update()
+    
+    def remove_metamold_half_1_with_part(self):
+        """Remove metamold half 1 with part from the display."""
+        if hasattr(self, '_metamold_half_1_with_part_actor') and self._metamold_half_1_with_part_actor is not None:
+            try:
+                self.plotter.remove_actor(self._metamold_half_1_with_part_actor)
+            except Exception:
+                pass
+            self._metamold_half_1_with_part_actor = None
+        
+        if hasattr(self, '_metamold_half_1_with_part_mesh'):
+            self._metamold_half_1_with_part_mesh = None
+        
+        self.plotter.update()
+    
+    def set_metamold_half_1_with_part_visible(self, visible: bool):
+        """
+        Set visibility of metamold half 1 with part.
+        
+        Args:
+            visible: True to show, False to hide
+        """
+        self._metamold_half_1_with_part_visible = visible
+        if hasattr(self, '_metamold_half_1_with_part_actor') and self._metamold_half_1_with_part_actor is not None:
+            self._metamold_half_1_with_part_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Metamold half 1 with part visibility set to {visible}")
+
+    def show_metamold_half_2_with_part(self, mesh: 'trimesh.Trimesh'):
+        """
+        Display metamold half 2 with part mesh added (boolean union).
+        
+        This is the lower portion of the metamold with the part mesh 
+        added back as solid geometry.
+        Displayed in orange color to distinguish from other halves.
+        
+        Args:
+            mesh: The metamold half 2 with part added mesh
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        # Remove existing actor
+        self.remove_metamold_half_2_with_part()
+        
+        if mesh is None or len(mesh.vertices) == 0:
+            logger.warning("No valid metamold half 2 with part mesh to display")
+            return
+        
+        self._metamold_half_2_with_part_mesh = mesh
+        
+        try:
+            vertices = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.faces)
+            faces_pv = np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64)
+            pv_mesh = pv.PolyData(vertices, faces_pv.flatten())
+        except Exception as e:
+            logger.error(f"Failed to convert metamold half 2 with part mesh to PyVista: {e}")
+            return
+        
+        # Display in orange (warm color, contrasts with cyan)
+        self._metamold_half_2_with_part_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='#FF9800',  # Orange 500
+            opacity=0.7,
+            show_edges=True,
+            edge_color='#F57C00',  # Orange 700
+            line_width=0.5,
+        )
+        self._metamold_half_2_with_part_visible = True
+        logger.info(f"Metamold half 2 with part displayed: {len(vertices)} vertices, {len(faces)} faces")
+        
+        self.plotter.update()
+    
+    def remove_metamold_half_2_with_part(self):
+        """Remove metamold half 2 with part from the display."""
+        if hasattr(self, '_metamold_half_2_with_part_actor') and self._metamold_half_2_with_part_actor is not None:
+            try:
+                self.plotter.remove_actor(self._metamold_half_2_with_part_actor)
+            except Exception:
+                pass
+            self._metamold_half_2_with_part_actor = None
+        
+        if hasattr(self, '_metamold_half_2_with_part_mesh'):
+            self._metamold_half_2_with_part_mesh = None
+        
+        self.plotter.update()
+    
+    def set_metamold_half_2_with_part_visible(self, visible: bool):
+        """
+        Set visibility of metamold half 2 with part.
+        
+        Args:
+            visible: True to show, False to hide
+        """
+        self._metamold_half_2_with_part_visible = visible
+        if hasattr(self, '_metamold_half_2_with_part_actor') and self._metamold_half_2_with_part_actor is not None:
+            self._metamold_half_2_with_part_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Metamold half 2 with part visibility set to {visible}")

@@ -1697,6 +1697,344 @@ def split_shell_along_parting_surface(
         return None, None, elapsed_ms, False
 
 
+# ============================================================================
+# SURFACE THICKENING (for secondary membranes)
+# ============================================================================
+
+def thicken_surface_symmetric(
+    surface_mesh: trimesh.Trimesh,
+    thickness: float = 0.2
+) -> Tuple[Optional[trimesh.Trimesh], float, bool]:
+    """
+    Thicken a surface mesh symmetrically by offsetting it in both normal directions.
+    
+    Creates a watertight solid by:
+    1. Computing per-vertex normals from the surface
+    2. Offsetting vertices by +thickness/2 and -thickness/2 along normals
+    3. Creating side faces to close the boundary
+    
+    The result is a manifold solid "slab" centered on the original surface.
+    
+    Args:
+        surface_mesh: The input surface mesh to thicken
+        thickness: Total thickness (will extend thickness/2 on each side)
+        
+    Returns:
+        Tuple of (thickened_mesh, computation_time_ms, success)
+    """
+    start_time = time.time()
+    
+    if surface_mesh is None or len(surface_mesh.vertices) == 0:
+        logger.error("Surface mesh is empty or None")
+        return None, 0.0, False
+    
+    if thickness <= 0:
+        logger.error("Thickness must be positive")
+        return None, 0.0, False
+    
+    try:
+        logger.info(f"Thickening surface symmetrically by {thickness}mm...")
+        logger.info(f"  Input: {len(surface_mesh.vertices)} verts, {len(surface_mesh.faces)} faces")
+        
+        vertices = np.asarray(surface_mesh.vertices, dtype=np.float64)
+        faces = np.asarray(surface_mesh.faces, dtype=np.int64)
+        n_verts = len(vertices)
+        n_faces = len(faces)
+        
+        # Compute per-vertex normals
+        # Use trimesh's vertex normals (weighted by face area)
+        vertex_normals = np.asarray(surface_mesh.vertex_normals, dtype=np.float64)
+        
+        # Normalize the vertex normals
+        norms = np.linalg.norm(vertex_normals, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1.0  # Avoid division by zero
+        vertex_normals = vertex_normals / norms
+        
+        half_thickness = thickness / 2.0
+        
+        # Create offset vertices
+        # Top surface: offset in positive normal direction
+        top_vertices = vertices + vertex_normals * half_thickness
+        # Bottom surface: offset in negative normal direction
+        bottom_vertices = vertices - vertex_normals * half_thickness
+        
+        # Combined vertices: [bottom, top]
+        all_vertices = np.vstack([bottom_vertices, top_vertices])
+        
+        # Create faces:
+        # 1. Bottom faces - original winding (normals point outward = down)
+        bottom_faces = faces.copy()
+        
+        # 2. Top faces - reversed winding (normals point outward = up), indices offset by n_verts
+        top_faces = faces[:, ::-1] + n_verts
+        
+        # 3. Side faces connecting boundary edges
+        # Find boundary edges
+        edge_count = {}
+        edge_to_winding = {}  # Track original winding for consistent side face orientation
+        
+        for fi, face in enumerate(faces):
+            for i in range(3):
+                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                edge_key = (min(v0, v1), max(v0, v1))
+                edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
+                if edge_key not in edge_to_winding:
+                    # Store the original edge direction based on face winding
+                    edge_to_winding[edge_key] = (v0, v1)
+        
+        # Boundary edges appear only once
+        boundary_edges = [e for e, c in edge_count.items() if c == 1]
+        
+        side_faces = []
+        for edge_key in boundary_edges:
+            v0_orig, v1_orig = edge_to_winding[edge_key]
+            
+            # Bottom vertices
+            b0, b1 = v0_orig, v1_orig
+            # Top vertices (offset by n_verts)
+            t0, t1 = v0_orig + n_verts, v1_orig + n_verts
+            
+            # Create quad (2 triangles) with outward-facing normals
+            # The winding should create normals pointing away from the surface
+            side_faces.append([b0, t0, t1])
+            side_faces.append([b0, t1, b1])
+        
+        # Combine all faces
+        all_faces = np.vstack([
+            bottom_faces,
+            top_faces,
+            np.array(side_faces, dtype=np.int64) if side_faces else np.empty((0, 3), dtype=np.int64)
+        ])
+        
+        # Create the thickened mesh
+        thickened_mesh = trimesh.Trimesh(
+            vertices=all_vertices,
+            faces=all_faces,
+            process=True
+        )
+        
+        # Try to fix any winding issues
+        thickened_mesh.fix_normals()
+        
+        elapsed_ms = (time.time() - start_time) * 1000
+        
+        if thickened_mesh.is_watertight:
+            logger.info(f"Surface thickened: {len(thickened_mesh.vertices)} verts, "
+                       f"{len(thickened_mesh.faces)} faces (watertight) in {elapsed_ms:.1f}ms")
+        else:
+            logger.warning(f"Surface thickened: {len(thickened_mesh.vertices)} verts, "
+                          f"{len(thickened_mesh.faces)} faces (NOT watertight) in {elapsed_ms:.1f}ms")
+        
+        return thickened_mesh, elapsed_ms, True
+        
+    except Exception as e:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error(f"Failed to thicken surface: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, elapsed_ms, False
+
+
+def create_part_with_thickened_secondary(
+    part_mesh: trimesh.Trimesh,
+    secondary_surface: trimesh.Trimesh,
+    secondary_thickness: float = 0.2
+) -> Tuple[Optional[trimesh.Trimesh], float, bool]:
+    """
+    Create a combined mesh of part + thickened secondary surface.
+    
+    This is used for metamold creation where we want the secondary membrane
+    features to be part of the mold cavity.
+    
+    Args:
+        part_mesh: The original part mesh
+        secondary_surface: The smoothed secondary parting surface
+        secondary_thickness: Thickness for the secondary surface (symmetric)
+        
+    Returns:
+        Tuple of (combined_mesh, computation_time_ms, success)
+    """
+    start_time = time.time()
+    
+    if not MANIFOLD_AVAILABLE:
+        logger.error("manifold3d not available - cannot perform CSG operations")
+        return None, 0.0, False
+    
+    if part_mesh is None or len(part_mesh.vertices) == 0:
+        logger.warning("Part mesh is empty - returning None")
+        return None, 0.0, False
+    
+    # If no secondary surface, just return the part mesh
+    if secondary_surface is None or len(secondary_surface.vertices) == 0:
+        logger.info("No secondary surface provided - using part mesh only")
+        elapsed_ms = (time.time() - start_time) * 1000
+        return part_mesh.copy(), elapsed_ms, True
+    
+    try:
+        logger.info(f"Creating part mesh with thickened secondary surface...")
+        logger.info(f"  Part: {len(part_mesh.vertices)} verts, {len(part_mesh.faces)} faces")
+        logger.info(f"  Secondary: {len(secondary_surface.vertices)} verts, {len(secondary_surface.faces)} faces")
+        logger.info(f"  Secondary thickness: {secondary_thickness}mm")
+        
+        # Step 1: Thicken the secondary surface
+        thickened_secondary, thicken_time, thicken_success = thicken_surface_symmetric(
+            secondary_surface, secondary_thickness
+        )
+        
+        if not thicken_success or thickened_secondary is None:
+            logger.warning("Failed to thicken secondary surface - using part mesh only")
+            elapsed_ms = (time.time() - start_time) * 1000
+            return part_mesh.copy(), elapsed_ms, True
+        
+        # Step 2: Boolean union part + thickened secondary
+        logger.info("Performing boolean union: part + thickened_secondary...")
+        
+        part_manifold = _trimesh_to_manifold(part_mesh)
+        secondary_manifold = _trimesh_to_manifold(thickened_secondary)
+        
+        combined_manifold = part_manifold + secondary_manifold
+        combined_mesh = _manifold_to_trimesh(combined_manifold)
+        
+        elapsed_ms = (time.time() - start_time) * 1000
+        
+        if combined_mesh.is_watertight:
+            logger.info(f"Combined mesh created: {len(combined_mesh.vertices)} verts, "
+                       f"{len(combined_mesh.faces)} faces (watertight) in {elapsed_ms:.1f}ms")
+        else:
+            logger.warning(f"Combined mesh created: {len(combined_mesh.vertices)} verts, "
+                          f"{len(combined_mesh.faces)} faces (NOT watertight) in {elapsed_ms:.1f}ms")
+        
+        return combined_mesh, elapsed_ms, True
+        
+    except Exception as e:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error(f"Failed to create part with thickened secondary: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, elapsed_ms, False
+
+
+# ============================================================================
+# METAMOLD: ADD PART MESH BACK TO HALVES
+# ============================================================================
+
+def add_part_to_metamold_half(
+    metamold_half: trimesh.Trimesh,
+    part_mesh: trimesh.Trimesh
+) -> Tuple[Optional[trimesh.Trimesh], float, bool]:
+    """
+    Boolean ADD (union) the part mesh to a metamold half.
+    
+    This operation adds the part mesh back into the metamold half, creating
+    a solid where the part would be placed. This is useful for creating
+    metamold halves that can be used to cast silicone around an actual part.
+    
+    The result is a manifold mesh thanks to manifold3d's robust CSG operations.
+    
+    Args:
+        metamold_half: One half of the split metamold (with cavity)
+        part_mesh: The original part mesh to add back
+        
+    Returns:
+        Tuple of (result_mesh, computation_time_ms, success)
+        result_mesh is the metamold half with the part added as solid geometry
+    """
+    start_time = time.time()
+    
+    if not MANIFOLD_AVAILABLE:
+        logger.error("manifold3d not available - cannot perform CSG operations")
+        return None, 0.0, False
+    
+    if metamold_half is None or len(metamold_half.vertices) == 0:
+        logger.error("Metamold half is empty or None")
+        return None, 0.0, False
+    
+    if part_mesh is None or len(part_mesh.vertices) == 0:
+        logger.error("Part mesh is empty or None")
+        return None, 0.0, False
+    
+    try:
+        logger.info(f"Adding part mesh to metamold half (boolean union)...")
+        logger.info(f"  Metamold half: {len(metamold_half.vertices)} verts, {len(metamold_half.faces)} faces")
+        logger.info(f"  Part mesh: {len(part_mesh.vertices)} verts, {len(part_mesh.faces)} faces")
+        
+        # Convert to manifold
+        half_manifold = _trimesh_to_manifold(metamold_half)
+        part_manifold = _trimesh_to_manifold(part_mesh)
+        
+        # Perform union: result = half + part
+        result_manifold = half_manifold + part_manifold
+        
+        # Convert back to trimesh
+        result_mesh = _manifold_to_trimesh(result_manifold)
+        
+        elapsed_ms = (time.time() - start_time) * 1000
+        
+        # Verify manifold output
+        if result_mesh.is_watertight:
+            logger.info(f"Part added to metamold half: {len(result_mesh.vertices)} verts, "
+                       f"{len(result_mesh.faces)} faces (watertight) in {elapsed_ms:.1f}ms")
+        else:
+            logger.warning(f"Part added to metamold half: {len(result_mesh.vertices)} verts, "
+                          f"{len(result_mesh.faces)} faces (NOT watertight) in {elapsed_ms:.1f}ms")
+        
+        return result_mesh, elapsed_ms, True
+        
+    except Exception as e:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error(f"Failed to add part to metamold half: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, elapsed_ms, False
+
+
+def add_part_to_metamold_halves(
+    metamold_half_1: trimesh.Trimesh,
+    metamold_half_2: trimesh.Trimesh,
+    part_mesh: trimesh.Trimesh
+) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool]:
+    """
+    Boolean ADD (union) the part mesh to both metamold halves.
+    
+    This is a convenience function that calls add_part_to_metamold_half for both halves.
+    
+    Args:
+        metamold_half_1: First metamold half (upper, positive pouring direction)
+        metamold_half_2: Second metamold half (lower, negative pouring direction)
+        part_mesh: The original part mesh to add back
+        
+    Returns:
+        Tuple of (half_1_with_part, half_2_with_part, total_computation_time_ms, success)
+    """
+    start_time = time.time()
+    
+    logger.info("Adding part mesh to both metamold halves...")
+    
+    # Process half 1
+    half_1_with_part, time_1, success_1 = add_part_to_metamold_half(metamold_half_1, part_mesh)
+    
+    if not success_1:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error("Failed to add part to metamold half 1")
+        return None, None, elapsed_ms, False
+    
+    # Process half 2
+    half_2_with_part, time_2, success_2 = add_part_to_metamold_half(metamold_half_2, part_mesh)
+    
+    if not success_2:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error("Failed to add part to metamold half 2")
+        return half_1_with_part, None, elapsed_ms, False
+    
+    elapsed_ms = (time.time() - start_time) * 1000
+    
+    logger.info(f"Part added to both metamold halves in {elapsed_ms:.1f}ms")
+    logger.info(f"  Half 1 with part: {len(half_1_with_part.vertices)} verts, {len(half_1_with_part.faces)} faces")
+    logger.info(f"  Half 2 with part: {len(half_2_with_part.vertices)} verts, {len(half_2_with_part.faces)} faces")
+    
+    return half_1_with_part, half_2_with_part, elapsed_ms, True
+
+
 def create_split_hard_shell(
     prism_result: HardShellPrismResult,
     hull_mesh: trimesh.Trimesh,
