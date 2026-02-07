@@ -2830,10 +2830,7 @@ class CombinedSurfaceSmoothingWorker(QThread):
         try:
             from core.surface_propagation import smooth_membrane_with_boundary_reprojection
             from core.tetrahedral_mesh import extract_labeled_boundary_meshes
-            from core.parting_surface import (
-                detect_floating_boundary_edges,
-                create_robust_collar_extension
-            )
+            from core.parting_surface import create_robust_collar_extension
             import time
             
             result = CombinedSurfaceSmoothingResult()
@@ -3017,13 +3014,16 @@ class CombinedSurfaceSmoothingWorker(QThread):
             
             # Use new robust collar extension
             # Pass hull_mesh for accurate inner/outer boundary classification
+            # Pass restored_corner_positions so concave corners from smoothing 
+            # are treated as corner vertices for fan triangle creation
             fill_result = create_robust_collar_extension(
                 membrane_mesh=current_mesh,
                 part_mesh=part_mesh,
                 hull_mesh=hull_mesh,
                 vertex_boundary_type=current_boundary_type,
                 collar_depth=0.5,
-                fan_subdivisions=4
+                fan_subdivisions=4,
+                restored_corner_positions=restored_corner_positions
             )
             
             gap_fill_time_ms = (time.time() - gap_fill_start) * 1000
@@ -3376,13 +3376,16 @@ class MembraneSmoothingWorker(QThread):
                 
                 self.progress.emit("Creating robust collar extension...")
                 # Pass hull_mesh for accurate inner/outer boundary classification
+                # Pass restored_corner_positions so concave corners from smoothing
+                # are treated as corner vertices for fan triangle creation
                 fill_result = create_robust_collar_extension(
                     membrane_mesh=result.mesh,
                     part_mesh=self.part_mesh,
                     hull_mesh=self.hull_mesh,
                     vertex_boundary_type=None,  # Use distance-based detection
                     collar_depth=0.5,
-                    fan_subdivisions=4
+                    fan_subdivisions=4,
+                    restored_corner_positions=result.restored_corner_positions
                 )
                 
                 if fill_result.fill_triangles_added > 0:
@@ -7420,8 +7423,39 @@ class MainWindow(QMainWindow):
         # Clear mold halves results
         self._mold_halves_result = None
         
-        # Clear tetrahedral mesh results
-        self._tet_mesh_result = None
+        # Clear tetrahedral mesh results (fix: was incorrectly _tet_mesh_result)
+        self._tet_result = None
+        
+        # Clear parting surface results
+        self._parting_surface_result = None
+        self._primary_smoothing_result = None
+        self._combined_smooth_result = None
+        
+        # Clear secondary surface results
+        self._secondary_parting_surface_result = None
+        self._propagation_result = None
+        self._secondary_smoothing_result = None
+        self._secondary_surface_result = None
+        
+        # Clear registration noise results
+        self._registration_noise_result = None
+        
+        # Clear hard shell results
+        self._hard_shell_prism_result = None
+        self._shell_with_cavity = None
+        self._outer_collar_result = None
+        self._shell_half_1 = None
+        self._shell_half_2 = None
+        self._csg_success = False
+        
+        # Clear metamold results
+        self._metamold_prism_result = None
+        self._metamold_with_cavity = None
+        self._metamold_half_1 = None
+        self._metamold_half_2 = None
+        self._metamold_half_1_with_part = None
+        self._metamold_half_2_with_part = None
+        self._metamold_csg_success = False
         
         # Reset current mesh
         self._current_mesh = None
@@ -7617,13 +7651,18 @@ class MainWindow(QMainWindow):
                             data[key][str_key] = list(v)
                         else:
                             data[key][str_key] = str(v)  # Fallback
+                elif hasattr(value, '__dict__'):
+                    # Handle nested dataclasses or objects with __dict__
+                    nested_data = result_to_dict(value)
+                    if nested_data:
+                        data[key] = nested_data
                 else:
                     # Skip non-serializable objects
                     pass
             return data
         
         session = {
-            'version': 2,  # Incremented version for new fields
+            'version': 3,  # Version 3: Added hard shell and metamold data
             'filename': self._loaded_filename,
             'active_step': self._active_step.value if self._active_step else None,
             
@@ -7675,6 +7714,45 @@ class MainWindow(QMainWindow):
             'mold_aware_pouring_result': result_to_dict(
                 self._mold_aware_pouring_result if hasattr(self, '_mold_aware_pouring_result') else None
             ),
+            
+            # Hard shell results (v3)
+            'hard_shell_prism_result': result_to_dict(
+                self._hard_shell_prism_result if hasattr(self, '_hard_shell_prism_result') else None
+            ),
+            'shell_with_cavity': mesh_to_dict(
+                self._shell_with_cavity if hasattr(self, '_shell_with_cavity') else None
+            ),
+            'outer_collar_result': result_to_dict(
+                self._outer_collar_result if hasattr(self, '_outer_collar_result') else None
+            ),
+            'shell_half_1': mesh_to_dict(
+                self._shell_half_1 if hasattr(self, '_shell_half_1') else None
+            ),
+            'shell_half_2': mesh_to_dict(
+                self._shell_half_2 if hasattr(self, '_shell_half_2') else None
+            ),
+            'csg_success': getattr(self, '_csg_success', False),
+            
+            # Metamold results (v3)
+            'metamold_prism_result': result_to_dict(
+                self._metamold_prism_result if hasattr(self, '_metamold_prism_result') else None
+            ),
+            'metamold_with_cavity': mesh_to_dict(
+                self._metamold_with_cavity if hasattr(self, '_metamold_with_cavity') else None
+            ),
+            'metamold_half_1': mesh_to_dict(
+                self._metamold_half_1 if hasattr(self, '_metamold_half_1') else None
+            ),
+            'metamold_half_2': mesh_to_dict(
+                self._metamold_half_2 if hasattr(self, '_metamold_half_2') else None
+            ),
+            'metamold_half_1_with_part': mesh_to_dict(
+                self._metamold_half_1_with_part if hasattr(self, '_metamold_half_1_with_part') else None
+            ),
+            'metamold_half_2_with_part': mesh_to_dict(
+                self._metamold_half_2_with_part if hasattr(self, '_metamold_half_2_with_part') else None
+            ),
+            'metamold_csg_success': getattr(self, '_metamold_csg_success', False),
         }
         
         return session
@@ -7742,6 +7820,13 @@ class MainWindow(QMainWindow):
         # First reset everything
         self._on_reset_all()
         
+        # Debug: Log what keys are in the session
+        logger.info(f"Session version: {session.get('version', 'unknown')}")
+        logger.info(f"Session keys present: {list(session.keys())}")
+        logger.info(f"  - combined_smooth_result in session: {'Yes' if session.get('combined_smooth_result') else 'No'}")
+        logger.info(f"  - mold_aware_pouring_result in session: {'Yes' if session.get('mold_aware_pouring_result') else 'No'}")
+        logger.info(f"  - hull_result in session: {'Yes' if session.get('hull_result') else 'No'}")
+        
         # Restore filename
         self._loaded_filename = session.get('filename')
         
@@ -7775,11 +7860,51 @@ class MainWindow(QMainWindow):
         
         # Restore hull result
         if session.get('hull_result'):
-            from core.inflated_hull import InflatedHullResult
-            self._hull_result = dict_to_result(session['hull_result'], InflatedHullResult)
-            if self._hull_result and hasattr(self._hull_result, 'mesh') and self._hull_result.mesh:
-                self.mesh_viewer.set_hull_mesh(self._hull_result.mesh)
-                self.display_options.show_hull_option(True)
+            from core.inflated_hull import InflatedHullResult, ManifoldValidation
+            hull_data = session['hull_result']
+            try:
+                # Convert mesh dicts back to trimesh
+                mesh = dict_to_mesh(hull_data.get('mesh')) if hull_data.get('mesh') else None
+                original_hull = dict_to_mesh(hull_data.get('original_hull')) if hull_data.get('original_hull') else None
+                
+                # Restore ManifoldValidation nested dataclass
+                mv_data = hull_data.get('manifold_validation', {})
+                if isinstance(mv_data, dict) and mv_data:
+                    manifold_validation = ManifoldValidation(
+                        is_closed=mv_data.get('is_closed', True),
+                        is_manifold=mv_data.get('is_manifold', True),
+                        boundary_edge_count=mv_data.get('boundary_edge_count', 0),
+                        non_manifold_edge_count=mv_data.get('non_manifold_edge_count', 0),
+                        total_edge_count=mv_data.get('total_edge_count', 0),
+                        euler_characteristic=mv_data.get('euler_characteristic', 2)
+                    )
+                else:
+                    # Default manifold validation
+                    manifold_validation = ManifoldValidation(
+                        is_closed=True, is_manifold=True,
+                        boundary_edge_count=0, non_manifold_edge_count=0,
+                        total_edge_count=0, euler_characteristic=2
+                    )
+                
+                # Create the result if we have the required mesh
+                if mesh is not None:
+                    self._hull_result = InflatedHullResult(
+                        mesh=mesh,
+                        original_hull=original_hull if original_hull else mesh,
+                        smooth_normals=np.array(hull_data.get('smooth_normals', [])) if hull_data.get('smooth_normals') is not None else np.array([]),
+                        vertex_count=hull_data.get('vertex_count', len(mesh.vertices) if mesh else 0),
+                        face_count=hull_data.get('face_count', len(mesh.faces) if mesh else 0),
+                        manifold_validation=manifold_validation,
+                        offset=hull_data.get('offset', 0.0)
+                    )
+                    self.mesh_viewer.set_hull_mesh(self._hull_result.mesh)
+                    self.display_options.show_hull_option(True)
+                    logger.info(f"Hull result restored: {self._hull_result.vertex_count} vertices")
+                else:
+                    logger.warning("Could not restore hull result: mesh data missing")
+            except Exception as e:
+                logger.warning(f"Could not restore hull result: {e}")
+                self._hull_result = None
         
         # Restore mold halves result (visualization applied later after tet_result is restored)
         if session.get('mold_halves_result'):
@@ -7896,7 +8021,9 @@ class MainWindow(QMainWindow):
             for k, v in session['propagation_result'].items():
                 if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
                     setattr(self._propagation_result, k, dict_to_mesh(v))
-                elif isinstance(v, list):
+                elif isinstance(v, np.ndarray):
+                    setattr(self._propagation_result, k, v)
+                elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], (int, float, np.integer, np.floating)):
                     setattr(self._propagation_result, k, np.array(v))
                 else:
                     setattr(self._propagation_result, k, v)
@@ -7906,7 +8033,9 @@ class MainWindow(QMainWindow):
             for k, v in session['secondary_smoothing_result'].items():
                 if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
                     setattr(self._secondary_smoothing_result, k, dict_to_mesh(v))
-                elif isinstance(v, list):
+                elif isinstance(v, np.ndarray):
+                    setattr(self._secondary_smoothing_result, k, v)
+                elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], (int, float, np.integer, np.floating)):
                     setattr(self._secondary_smoothing_result, k, np.array(v))
                 else:
                     setattr(self._secondary_smoothing_result, k, v)
@@ -7916,7 +8045,9 @@ class MainWindow(QMainWindow):
             for k, v in session['secondary_surface_result'].items():
                 if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
                     setattr(self._secondary_surface_result, k, dict_to_mesh(v))
-                elif isinstance(v, list):
+                elif isinstance(v, np.ndarray):
+                    setattr(self._secondary_surface_result, k, v)
+                elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], (int, float, np.integer, np.floating)):
                     setattr(self._secondary_surface_result, k, np.array(v))
                 else:
                     setattr(self._secondary_surface_result, k, v)
@@ -7943,8 +8074,8 @@ class MainWindow(QMainWindow):
                     setattr(self._registration_noise_result, k, dict_to_mesh(v))
                 elif isinstance(v, np.ndarray):
                     setattr(self._registration_noise_result, k, v)
-                elif isinstance(v, list):
-                    # Convert lists back to numpy arrays
+                elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], (int, float, np.integer, np.floating)):
+                    # Convert lists of numbers back to numpy arrays
                     setattr(self._registration_noise_result, k, np.array(v))
                 else:
                     setattr(self._registration_noise_result, k, v)
@@ -7963,8 +8094,12 @@ class MainWindow(QMainWindow):
                 elif isinstance(v, np.ndarray):
                     setattr(self._mold_aware_pouring_result, k, v)
                 elif isinstance(v, list):
-                    # Convert lists back to numpy arrays (for direction vectors etc.)
-                    setattr(self._mold_aware_pouring_result, k, np.array(v))
+                    # Only convert lists of numbers to numpy arrays
+                    # Lists of complex objects (like dataclasses) should be kept as-is
+                    if len(v) > 0 and isinstance(v[0], (int, float, np.integer, np.floating)):
+                        setattr(self._mold_aware_pouring_result, k, np.array(v))
+                    else:
+                        setattr(self._mold_aware_pouring_result, k, v)
                 else:
                     setattr(self._mold_aware_pouring_result, k, v)
             
@@ -7999,7 +8134,54 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logger.warning(f"Could not restore pouring direction visualization: {e}")
         
-        # Restore step statuses
+        # Restore hard shell results (v3)
+        if session.get('hard_shell_prism_result'):
+            self._hard_shell_prism_result = type('Result', (), {})()
+            for k, v in session['hard_shell_prism_result'].items():
+                if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
+                    setattr(self._hard_shell_prism_result, k, dict_to_mesh(v))
+                else:
+                    setattr(self._hard_shell_prism_result, k, v)
+        
+        if session.get('shell_with_cavity'):
+            self._shell_with_cavity = dict_to_mesh(session['shell_with_cavity'])
+        
+        if session.get('outer_collar_result'):
+            self._outer_collar_result = type('Result', (), {})()
+            for k, v in session['outer_collar_result'].items():
+                if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
+                    setattr(self._outer_collar_result, k, dict_to_mesh(v))
+                else:
+                    setattr(self._outer_collar_result, k, v)
+        
+        if session.get('shell_half_1'):
+            self._shell_half_1 = dict_to_mesh(session['shell_half_1'])
+        if session.get('shell_half_2'):
+            self._shell_half_2 = dict_to_mesh(session['shell_half_2'])
+        self._csg_success = session.get('csg_success', False)
+        
+        # Restore metamold results (v3)
+        if session.get('metamold_prism_result'):
+            self._metamold_prism_result = type('Result', (), {})()
+            for k, v in session['metamold_prism_result'].items():
+                if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
+                    setattr(self._metamold_prism_result, k, dict_to_mesh(v))
+                else:
+                    setattr(self._metamold_prism_result, k, v)
+        
+        if session.get('metamold_with_cavity'):
+            self._metamold_with_cavity = dict_to_mesh(session['metamold_with_cavity'])
+        if session.get('metamold_half_1'):
+            self._metamold_half_1 = dict_to_mesh(session['metamold_half_1'])
+        if session.get('metamold_half_2'):
+            self._metamold_half_2 = dict_to_mesh(session['metamold_half_2'])
+        if session.get('metamold_half_1_with_part'):
+            self._metamold_half_1_with_part = dict_to_mesh(session['metamold_half_1_with_part'])
+        if session.get('metamold_half_2_with_part'):
+            self._metamold_half_2_with_part = dict_to_mesh(session['metamold_half_2_with_part'])
+        self._metamold_csg_success = session.get('metamold_csg_success', False)
+        
+        # Restore step statuses from saved session
         step_status = session.get('step_status', {})
         for step_val, status in step_status.items():
             try:
@@ -8009,15 +8191,32 @@ class MainWindow(QMainWindow):
             except ValueError:
                 pass
         
-        # Restore active step
-        active_step_val = session.get('active_step')
-        if active_step_val:
-            try:
-                self._active_step = Step(active_step_val)
-                for step, btn in self.step_buttons.items():
-                    btn.set_active(step == self._active_step)
-            except ValueError:
-                pass
+        # Re-validate step statuses based on actual data present
+        # This ensures steps show as incomplete if their data failed to restore
+        self._validate_and_update_step_statuses()
+        
+        # Determine the first incomplete step based on available data
+        # This ensures we navigate to the step that needs to be run next
+        first_incomplete_step = self._determine_first_incomplete_step()
+        
+        # Use the determined step, or fall back to saved active step
+        if first_incomplete_step:
+            self._active_step = first_incomplete_step
+            logger.info(f"Navigating to first incomplete step: {first_incomplete_step}")
+        else:
+            # All steps complete or fall back to saved step
+            active_step_val = session.get('active_step')
+            if active_step_val:
+                try:
+                    self._active_step = Step(active_step_val)
+                except ValueError:
+                    self._active_step = Step.IMPORT
+            else:
+                self._active_step = Step.IMPORT
+        
+        # Update button active states
+        for step, btn in self.step_buttons.items():
+            btn.set_active(step == self._active_step)
         
         # Update context panel for current step
         self._update_context_panel()
@@ -8027,7 +8226,290 @@ class MainWindow(QMainWindow):
             self.display_options.show()
             self.display_options.raise_()  # Bring to front
         
-        logger.info(f"Session restored, active step: {self._active_step}")
+        # Debug: Log what critical results we have for hard shell step
+        logger.info(f"Session restore summary:")
+        logger.info(f"  - Current mesh: {'Yes' if self._current_mesh is not None else 'No'}")
+        logger.info(f"  - Hull result: {'Yes' if self._hull_result is not None else 'No'}")
+        logger.info(f"  - Tet result: {'Yes' if self._tet_result is not None else 'No'}")
+        logger.info(f"  - Combined smooth result: {'Yes' if self._combined_smooth_result is not None else 'No'}")
+        if self._combined_smooth_result is not None:
+            has_primary = hasattr(self._combined_smooth_result, 'primary_mesh') and self._combined_smooth_result.primary_mesh is not None
+            has_secondary = hasattr(self._combined_smooth_result, 'secondary_mesh') and self._combined_smooth_result.secondary_mesh is not None
+            logger.info(f"    - primary_mesh: {'Yes' if has_primary else 'No'}")
+            logger.info(f"    - secondary_mesh: {'Yes' if has_secondary else 'No'}")
+        logger.info(f"  - Pouring result: {'Yes' if self._mold_aware_pouring_result is not None else 'No'}")
+        if self._mold_aware_pouring_result is not None:
+            has_resin = hasattr(self._mold_aware_pouring_result, 'resin_direction') and self._mold_aware_pouring_result.resin_direction is not None
+            logger.info(f"    - resin_direction: {'Yes' if has_resin else 'No'}")
+        logger.info(f"  - Hard shell: {'Yes' if self._shell_half_1 is not None else 'No'}")
+        logger.info(f"  - Metamold: {'Yes' if self._metamold_half_1 is not None else 'No'}")
+        logger.info(f"  - Active step: {self._active_step}")
+    
+    def _determine_first_incomplete_step(self) -> Optional[Step]:
+        """
+        Determine the first incomplete step based on available data.
+        
+        Walks through the pipeline in order and returns the first step
+        that hasn't been completed (missing its output data).
+        
+        Returns:
+            The first incomplete Step, or None if all steps are complete.
+        """
+        # Step 1: IMPORT - needs current_mesh
+        if self._current_mesh is None:
+            return Step.IMPORT
+        
+        # Step 2: PARTING - needs parting_result
+        if self._parting_result is None:
+            return Step.PARTING
+        
+        # Step 3: HULL - needs hull_result
+        if self._hull_result is None:
+            return Step.HULL
+        
+        # Step 4: TETRAHEDRALIZE - needs tet_result
+        if self._tet_result is None:
+            return Step.TETRAHEDRALIZE
+        
+        # Step 5: MOLD_HALVES - needs mold_halves_result and tet_result.boundary_labels
+        if self._mold_halves_result is None:
+            return Step.MOLD_HALVES
+        if not hasattr(self._tet_result, 'boundary_labels') or self._tet_result.boundary_labels is None:
+            return Step.MOLD_HALVES
+        
+        # Step 6: EDGE_WEIGHTS - needs tet_result.edge_weights
+        if not hasattr(self._tet_result, 'edge_weights') or self._tet_result.edge_weights is None:
+            return Step.EDGE_WEIGHTS
+        
+        # Step 7: DIJKSTRA - needs tet_result.seed_escape_labels and primary_cut_edges
+        if not hasattr(self._tet_result, 'seed_escape_labels') or self._tet_result.seed_escape_labels is None:
+            return Step.DIJKSTRA
+        if not hasattr(self._tet_result, 'primary_cut_edges') or self._tet_result.primary_cut_edges is None:
+            return Step.DIJKSTRA
+        
+        # Step 8: PARTING_SURFACE - needs parting_surface_result
+        if self._parting_surface_result is None:
+            return Step.PARTING_SURFACE
+        if not hasattr(self._parting_surface_result, 'mesh') or self._parting_surface_result.mesh is None:
+            return Step.PARTING_SURFACE
+        
+        # Step 9: SECONDARY_CUTS - needs tet_result.secondary_cut_edges (can be empty list, but should exist)
+        if not hasattr(self._tet_result, 'secondary_cut_edges'):
+            return Step.SECONDARY_CUTS
+        # Note: secondary_cut_edges can be None or empty list if no secondary cuts needed
+        
+        # Step 10: SECONDARY_SURFACE - only needed if secondary_cut_edges exist
+        has_secondary_cuts = (
+            hasattr(self._tet_result, 'secondary_cut_edges') and 
+            self._tet_result.secondary_cut_edges is not None and
+            len(self._tet_result.secondary_cut_edges) > 0
+        )
+        if has_secondary_cuts:
+            if self._secondary_surface_result is None:
+                return Step.SECONDARY_SURFACE
+            if not hasattr(self._secondary_surface_result, 'mesh') or self._secondary_surface_result.mesh is None:
+                return Step.SECONDARY_SURFACE
+        
+        # Step 11: PARTING_SURFACE_SMOOTH - needs combined_smooth_result
+        if self._combined_smooth_result is None:
+            return Step.PARTING_SURFACE_SMOOTH
+        if not hasattr(self._combined_smooth_result, 'primary_mesh') or self._combined_smooth_result.primary_mesh is None:
+            return Step.PARTING_SURFACE_SMOOTH
+        
+        # Step 12: REGISTRATION_NOISE - optional, skip if not done
+        # (User may choose not to add registration noise)
+        
+        # Step 13: POURING - needs mold_aware_pouring_result
+        if self._mold_aware_pouring_result is None:
+            return Step.POURING
+        if not hasattr(self._mold_aware_pouring_result, 'resin_direction') or self._mold_aware_pouring_result.resin_direction is None:
+            return Step.POURING
+        
+        # Step 14: HARD_SHELL - needs shell halves generated
+        if self._shell_half_1 is None or self._shell_half_2 is None:
+            return Step.HARD_SHELL
+        
+        # Step 15: METAMOLD - needs metamold halves generated  
+        if self._metamold_half_1 is None or self._metamold_half_2 is None:
+            return Step.METAMOLD
+        
+        # All steps complete - return None (stay on current/saved step)
+        return None
+    
+    def _validate_and_update_step_statuses(self):
+        """
+        Validate step statuses based on actual data present.
+        
+        This ensures that if data failed to restore, the step will show
+        as incomplete ('available') rather than 'complete'.
+        """
+        # Check each step and update status based on data presence
+        
+        # IMPORT: complete if we have current_mesh
+        if self._current_mesh is not None:
+            self.step_buttons[Step.IMPORT].set_status('complete')
+        else:
+            self.step_buttons[Step.IMPORT].set_status('available')
+        
+        # PARTING: complete if we have parting_result, available if prereqs met
+        if self._parting_result is not None:
+            self.step_buttons[Step.PARTING].set_status('complete')
+        elif self._current_mesh is not None:
+            self.step_buttons[Step.PARTING].set_status('available')
+        else:
+            self.step_buttons[Step.PARTING].set_status('locked')
+        
+        # HULL: complete if we have hull_result
+        if self._hull_result is not None:
+            self.step_buttons[Step.HULL].set_status('complete')
+        elif self._current_mesh is not None:
+            self.step_buttons[Step.HULL].set_status('available')
+        else:
+            self.step_buttons[Step.HULL].set_status('locked')
+        
+        # TETRAHEDRALIZE: complete if we have tet_result
+        if self._tet_result is not None:
+            self.step_buttons[Step.TETRAHEDRALIZE].set_status('complete')
+        elif self._current_mesh is not None and self._hull_result is not None:
+            self.step_buttons[Step.TETRAHEDRALIZE].set_status('available')
+        else:
+            self.step_buttons[Step.TETRAHEDRALIZE].set_status('locked')
+        
+        # MOLD_HALVES: complete if we have mold_halves_result
+        if self._mold_halves_result is not None:
+            self.step_buttons[Step.MOLD_HALVES].set_status('complete')
+        elif self._tet_result is not None and self._parting_result is not None:
+            self.step_buttons[Step.MOLD_HALVES].set_status('available')
+        else:
+            self.step_buttons[Step.MOLD_HALVES].set_status('locked')
+        
+        # EDGE_WEIGHTS: complete if tet_result has edge_weights
+        has_edge_weights = (
+            self._tet_result is not None and
+            hasattr(self._tet_result, 'edge_weights') and
+            self._tet_result.edge_weights is not None
+        )
+        if has_edge_weights:
+            self.step_buttons[Step.EDGE_WEIGHTS].set_status('complete')
+        elif self._tet_result is not None:
+            self.step_buttons[Step.EDGE_WEIGHTS].set_status('available')
+        else:
+            self.step_buttons[Step.EDGE_WEIGHTS].set_status('locked')
+        
+        # DIJKSTRA: complete if tet_result has seed_escape_labels
+        has_dijkstra = (
+            self._tet_result is not None and
+            hasattr(self._tet_result, 'seed_escape_labels') and
+            self._tet_result.seed_escape_labels is not None
+        )
+        if has_dijkstra:
+            self.step_buttons[Step.DIJKSTRA].set_status('complete')
+        elif has_edge_weights:
+            self.step_buttons[Step.DIJKSTRA].set_status('available')
+        else:
+            self.step_buttons[Step.DIJKSTRA].set_status('locked')
+        
+        # PARTING_SURFACE: complete if we have parting_surface_result with mesh
+        has_parting_surface = (
+            self._parting_surface_result is not None and
+            hasattr(self._parting_surface_result, 'mesh') and
+            self._parting_surface_result.mesh is not None
+        )
+        if has_parting_surface:
+            self.step_buttons[Step.PARTING_SURFACE].set_status('complete')
+        elif has_dijkstra:
+            self.step_buttons[Step.PARTING_SURFACE].set_status('available')
+        else:
+            self.step_buttons[Step.PARTING_SURFACE].set_status('locked')
+        
+        # SECONDARY_CUTS: complete if tet_result has secondary_cut_edges attribute
+        has_secondary_cuts_computed = (
+            self._tet_result is not None and
+            hasattr(self._tet_result, 'secondary_cut_edges')
+        )
+        if has_secondary_cuts_computed:
+            self.step_buttons[Step.SECONDARY_CUTS].set_status('complete')
+        elif has_dijkstra:
+            self.step_buttons[Step.SECONDARY_CUTS].set_status('available')
+        else:
+            self.step_buttons[Step.SECONDARY_CUTS].set_status('locked')
+        
+        # SECONDARY_SURFACE: complete if we have secondary_surface_result with mesh
+        has_secondary_surface = (
+            self._secondary_surface_result is not None and
+            hasattr(self._secondary_surface_result, 'mesh') and
+            self._secondary_surface_result.mesh is not None
+        )
+        has_secondary_cuts = (
+            self._tet_result is not None and
+            hasattr(self._tet_result, 'secondary_cut_edges') and
+            self._tet_result.secondary_cut_edges is not None and
+            len(self._tet_result.secondary_cut_edges) > 0
+        )
+        if has_secondary_surface or (has_secondary_cuts_computed and not has_secondary_cuts):
+            # Complete if we have surface, or if no secondary cuts needed
+            self.step_buttons[Step.SECONDARY_SURFACE].set_status('complete')
+        elif has_secondary_cuts:
+            self.step_buttons[Step.SECONDARY_SURFACE].set_status('available')
+        else:
+            self.step_buttons[Step.SECONDARY_SURFACE].set_status('locked')
+        
+        # PARTING_SURFACE_SMOOTH: complete if we have combined_smooth_result
+        has_smooth = (
+            self._combined_smooth_result is not None and
+            hasattr(self._combined_smooth_result, 'primary_mesh') and
+            self._combined_smooth_result.primary_mesh is not None
+        )
+        if has_smooth:
+            self.step_buttons[Step.PARTING_SURFACE_SMOOTH].set_status('complete')
+        elif has_parting_surface:
+            self.step_buttons[Step.PARTING_SURFACE_SMOOTH].set_status('available')
+        else:
+            self.step_buttons[Step.PARTING_SURFACE_SMOOTH].set_status('locked')
+        
+        # REGISTRATION_NOISE: complete if we have registration_noise_result
+        has_registration = (
+            self._registration_noise_result is not None and
+            hasattr(self._registration_noise_result, 'mesh') and
+            self._registration_noise_result.mesh is not None
+        )
+        if has_registration:
+            self.step_buttons[Step.REGISTRATION_NOISE].set_status('complete')
+        elif has_smooth:
+            self.step_buttons[Step.REGISTRATION_NOISE].set_status('available')
+        else:
+            self.step_buttons[Step.REGISTRATION_NOISE].set_status('locked')
+        
+        # POURING: complete if we have mold_aware_pouring_result
+        has_pouring = (
+            self._mold_aware_pouring_result is not None and
+            hasattr(self._mold_aware_pouring_result, 'resin_direction') and
+            self._mold_aware_pouring_result.resin_direction is not None
+        )
+        if has_pouring:
+            self.step_buttons[Step.POURING].set_status('complete')
+        elif self._mold_halves_result is not None and self._current_mesh is not None:
+            self.step_buttons[Step.POURING].set_status('available')
+        else:
+            self.step_buttons[Step.POURING].set_status('locked')
+        
+        # HARD_SHELL: complete if we have shell halves
+        has_hard_shell = self._shell_half_1 is not None and self._shell_half_2 is not None
+        if has_hard_shell:
+            self.step_buttons[Step.HARD_SHELL].set_status('complete')
+        elif has_smooth and has_pouring and self._hull_result is not None:
+            self.step_buttons[Step.HARD_SHELL].set_status('available')
+        else:
+            self.step_buttons[Step.HARD_SHELL].set_status('locked')
+        
+        # METAMOLD: complete if we have metamold halves
+        has_metamold = self._metamold_half_1 is not None and self._metamold_half_2 is not None
+        if has_metamold:
+            self.step_buttons[Step.METAMOLD].set_status('complete')
+        elif has_hard_shell:
+            self.step_buttons[Step.METAMOLD].set_status('available')
+        else:
+            self.step_buttons[Step.METAMOLD].set_status('locked')
 
     def _on_view_changed(self, view: str):
         """Handle view change from title bar."""
@@ -9985,17 +10467,25 @@ class MainWindow(QMainWindow):
 
             pattern_name = getattr(result, 'pattern_type', 'sinusoidal')
             self.noise_stats.add_header(f'✅ Registration Pattern ({pattern_name})', Colors.SUCCESS)
-            self.noise_stats.add_row(f'Modified vertices: {result.n_modified_vertices:,}')
+            
+            n_modified = getattr(result, 'n_modified_vertices', 0)
+            self.noise_stats.add_row(f'Modified vertices: {n_modified:,}')
 
             # Displacement stats
-            non_zero = result.displacement[result.modified_mask]
-            if len(non_zero) > 0:
-                self.noise_stats.add_row(f'Displacement range: [{non_zero.min():.2f}, {non_zero.max():.2f}] mm')
-                self.noise_stats.add_row(f'Mean |displacement|: {np.mean(np.abs(non_zero)):.2f} mm')
+            displacement = getattr(result, 'displacement', None)
+            modified_mask = getattr(result, 'modified_mask', None)
+            if displacement is not None and modified_mask is not None:
+                non_zero = displacement[modified_mask]
+                if len(non_zero) > 0:
+                    self.noise_stats.add_row(f'Displacement range: [{non_zero.min():.2f}, {non_zero.max():.2f}] mm')
+                    self.noise_stats.add_row(f'Mean |displacement|: {np.mean(np.abs(non_zero)):.2f} mm')
 
-            self.noise_stats.add_row(f'Band center: {result.band_center_distance:.2f} mm from part')
-            self.noise_stats.add_row(f'Band width: {result.band_width:.2f} mm')
-            self.noise_stats.add_row(f'Time: {result.computation_time_ms:.0f} ms')
+            band_center = getattr(result, 'band_center_distance', 0.0)
+            band_width = getattr(result, 'band_width', 0.0)
+            comp_time = getattr(result, 'computation_time_ms', 0.0)
+            self.noise_stats.add_row(f'Band center: {band_center:.2f} mm from part')
+            self.noise_stats.add_row(f'Band width: {band_width:.2f} mm')
+            self.noise_stats.add_row(f'Time: {comp_time:.0f} ms')
 
             self.noise_apply_btn.setText("🔄 Reapply Pattern")
     
@@ -10622,13 +11112,22 @@ class MainWindow(QMainWindow):
             result = self._parting_surface_result
             self.parting_surface_stats.clear()
             self.parting_surface_stats.add_header('Extracted Surface', Colors.SUCCESS)
-            self.parting_surface_stats.add_row(f'Vertices: {result.num_vertices:,}')
-            self.parting_surface_stats.add_row(f'Faces: {result.num_faces:,}')
-            self.parting_surface_stats.add_row(f'Tets contributing: {result.num_tets_contributing:,}/{result.num_tets_processed:,}')
+            self.parting_surface_stats.add_row(f'Vertices: {getattr(result, "num_vertices", 0):,}')
+            self.parting_surface_stats.add_row(f'Faces: {getattr(result, "num_faces", 0):,}')
+            num_tets_contributing = getattr(result, 'num_tets_contributing', 0)
+            num_tets_processed = getattr(result, 'num_tets_processed', 0)
+            if num_tets_processed > 0:
+                self.parting_surface_stats.add_row(f'Tets contributing: {num_tets_contributing:,}/{num_tets_processed:,}')
             self.parting_surface_stats.add_row('')
-            self.parting_surface_stats.add_row(f'⏱ Extraction: {result.extraction_time_ms:.0f}ms')
-            self.parting_surface_stats.add_row(f'⏱ Cleanup: {result.repair_time_ms:.0f}ms')
-            self.parting_surface_stats.add_row(f'Total time: {result.total_time_ms:.0f}ms')
+            extraction_time = getattr(result, 'extraction_time_ms', 0)
+            repair_time = getattr(result, 'repair_time_ms', 0)
+            total_time = getattr(result, 'total_time_ms', 0)
+            if extraction_time > 0:
+                self.parting_surface_stats.add_row(f'⏱ Extraction: {extraction_time:.0f}ms')
+            if repair_time > 0:
+                self.parting_surface_stats.add_row(f'⏱ Cleanup: {repair_time:.0f}ms')
+            if total_time > 0:
+                self.parting_surface_stats.add_row(f'Total time: {total_time:.0f}ms')
             self.parting_surface_stats.show()
     
     def _on_run_parting_surface(self):
@@ -10984,15 +11483,24 @@ class MainWindow(QMainWindow):
             result = self._parting_surface_smooth_result
             self.smooth_surface_stats.clear()
             self.smooth_surface_stats.add_header('Smoothed Surface', Colors.SUCCESS)
-            self.smooth_surface_stats.add_row(f'Vertices: {result.num_vertices:,}')
-            self.smooth_surface_stats.add_row(f'Faces: {result.num_faces:,}')
-            self.smooth_surface_stats.add_row(f'Boundary verts: {result.boundary_vertices:,}')
-            self.smooth_surface_stats.add_row(f'Interior verts: {result.interior_vertices:,}')
+            self.smooth_surface_stats.add_row(f'Vertices: {getattr(result, "num_vertices", 0):,}')
+            self.smooth_surface_stats.add_row(f'Faces: {getattr(result, "num_faces", 0):,}')
+            boundary_verts = getattr(result, 'boundary_vertices', 0)
+            interior_verts = getattr(result, 'interior_vertices', 0)
+            if boundary_verts > 0 or interior_verts > 0:
+                self.smooth_surface_stats.add_row(f'Boundary verts: {boundary_verts:,}')
+                self.smooth_surface_stats.add_row(f'Interior verts: {interior_verts:,}')
             self.smooth_surface_stats.add_row('')
-            self.smooth_surface_stats.add_row(f'⏱ Smoothing ({result.smooth_iterations} iter): {result.smoothing_time_ms:.0f}ms')
-            if result.gap_fill_time_ms > 0:
-                self.smooth_surface_stats.add_row(f'⏱ Gap fill: {result.gap_fill_time_ms:.0f}ms')
-            self.smooth_surface_stats.add_row(f'Total time: {result.total_time_ms:.0f}ms')
+            smooth_iter = getattr(result, 'smooth_iterations', 0)
+            smoothing_time = getattr(result, 'smoothing_time_ms', 0)
+            gap_fill_time = getattr(result, 'gap_fill_time_ms', 0)
+            total_time = getattr(result, 'total_time_ms', 0)
+            if smoothing_time > 0:
+                self.smooth_surface_stats.add_row(f'⏱ Smoothing ({smooth_iter} iter): {smoothing_time:.0f}ms')
+            if gap_fill_time > 0:
+                self.smooth_surface_stats.add_row(f'⏱ Gap fill: {gap_fill_time:.0f}ms')
+            if total_time > 0:
+                self.smooth_surface_stats.add_row(f'Total time: {total_time:.0f}ms')
             self.smooth_surface_stats.show()
     
     def _on_run_smooth_surface(self):
@@ -11014,7 +11522,7 @@ class MainWindow(QMainWindow):
         # Check if we have a secondary surface to smooth
         has_secondary = (self._secondary_surface_result is not None and 
                         self._secondary_surface_result.mesh is not None and
-                        self._secondary_surface_result.num_faces > 0)
+                        getattr(self._secondary_surface_result, 'num_faces', 0) > 0)
         
         surfaces_to_smooth = "primary + secondary" if has_secondary else "primary only"
         

@@ -1367,12 +1367,15 @@ def split_shell_with_membrane(
         logger.info(f"  Blade:    min={blade_bounds[0]}, max={blade_bounds[1]}")
         
         # Check overlap along pouring direction
-        # Project bounds onto pouring direction
-        shell_proj_min = np.dot(shell_bounds[0], direction)
-        shell_proj_max = np.dot(shell_bounds[1], direction)
-        blade_proj_min = np.dot(blade_bounds[0], direction)
-
-        blade_proj_max = np.dot(blade_bounds[1], direction)
+        # Project ALL vertices onto the direction to get true extent
+        # (projecting bbox corners doesn't work for non-axis-aligned directions)
+        shell_projections = np.dot(shell_with_cavity.vertices, direction)
+        blade_projections = np.dot(blade.vertices, direction)
+        
+        shell_proj_min = shell_projections.min()
+        shell_proj_max = shell_projections.max()
+        blade_proj_min = blade_projections.min()
+        blade_proj_max = blade_projections.max()
         
         logger.info(f"  Shell extent along pouring dir: [{shell_proj_min:.2f}, {shell_proj_max:.2f}]")
         logger.info(f"  Blade extent along pouring dir: [{blade_proj_min:.2f}, {blade_proj_max:.2f}]")
@@ -1381,7 +1384,7 @@ def split_shell_with_membrane(
         overlap = not (blade_proj_max < shell_proj_min or blade_proj_min > shell_proj_max)
         if not overlap:
             logger.warning("DIAGNOSTIC: Blade does NOT overlap with shell along pouring direction!")
-            logger.warning("  This means the blade is outside the shell's Z range and won't cut it.")
+            logger.warning("  This means the blade is outside the shell's extent and won't cut it.")
         else:
             logger.info("  Blade overlaps with shell along pouring direction - OK")
         

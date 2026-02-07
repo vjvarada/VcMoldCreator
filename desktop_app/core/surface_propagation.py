@@ -167,6 +167,24 @@ def get_feature_debug_visualization(
     if target_mesh is None or len(target_mesh.faces) == 0:
         return debug
     
+    # === SAFETY: Ensure mesh faces are integer type (required for restored sessions) ===
+    # When sessions are restored via pickle/JSON, face arrays may become float64
+    # which causes IndexError in trimesh proximity queries
+    if target_mesh.faces.dtype != np.int64 and target_mesh.faces.dtype != np.int32:
+        logger.debug(f"Converting target_mesh faces from {target_mesh.faces.dtype} to int64")
+        target_mesh = trimesh.Trimesh(
+            vertices=target_mesh.vertices,
+            faces=target_mesh.faces.astype(np.int64)
+        )
+    
+    if membrane_mesh is not None and len(membrane_mesh.faces) > 0:
+        if membrane_mesh.faces.dtype != np.int64 and membrane_mesh.faces.dtype != np.int32:
+            logger.debug(f"Converting membrane_mesh faces from {membrane_mesh.faces.dtype} to int64")
+            membrane_mesh = trimesh.Trimesh(
+                vertices=membrane_mesh.vertices,
+                faces=membrane_mesh.faces.astype(np.int64)
+            )
+    
     # Classify target mesh vertices (for visualization of target mesh features)
     feature_types, sharp_edge_info = classify_mesh_vertex_features(
         target_mesh, angle_threshold
@@ -226,6 +244,12 @@ def get_feature_debug_visualization(
         
         membrane_boundary_indices = np.array(list(boundary_verts), dtype=np.int64)
         logger.info(f"Feature debug: Computed {len(membrane_boundary_indices)} membrane boundary vertices")
+    
+    # === SAFETY: Ensure membrane_boundary_indices is integer type ===
+    if membrane_boundary_indices is not None and len(membrane_boundary_indices) > 0:
+        if membrane_boundary_indices.dtype != np.int64 and membrane_boundary_indices.dtype != np.int32:
+            logger.debug(f"Converting membrane_boundary_indices from {membrane_boundary_indices.dtype} to int64")
+            membrane_boundary_indices = membrane_boundary_indices.astype(np.int64)
     
     # === Classify membrane boundary vertices using DIRECT CONNECTION ANALYSIS ===
     # This matches the actual detection logic in identify_concave_membrane_vertices_at_part_boundary
@@ -513,118 +537,6 @@ def remove_isolated_islands(
 
 # =============================================================================
 # DEGENERATE TRIANGLE REMOVAL
-# =============================================================================
-
-def remove_on_surface_triangles(
-    membrane_mesh: trimesh.Trimesh,
-    part_mesh: trimesh.Trimesh,
-    tolerance_fraction: float = 0.0005,
-    vertex_boundary_type: Optional[np.ndarray] = None
-) -> Tuple[trimesh.Trimesh, int, Optional[np.ndarray]]:
-    """
-    Remove degenerate triangles that lie entirely on the part mesh surface.
-    
-    These are triangles where ALL three vertices AND the centroid are within
-    tolerance of the part mesh surface. Such triangles are typically artifacts
-    from the marching tetrahedra extraction and don't contribute to the membrane's
-    cutting function - they lie flat on M rather than spanning from it.
-    
-    This cleanup step should be run BEFORE smoothing to prevent these degenerate
-    triangles from causing issues during Laplacian smoothing.
-    
-    Args:
-        membrane_mesh: The primary surface membrane mesh
-        part_mesh: The part mesh (M) to check against
-        tolerance_fraction: Distance tolerance as fraction of mesh scale (default 0.5%)
-        vertex_boundary_type: Optional per-vertex boundary type array from extraction
-                              (will be filtered to match remaining vertices)
-    
-    Returns:
-        Tuple of (cleaned_mesh, num_triangles_removed, updated_vertex_boundary_type)
-    """
-    if membrane_mesh is None or len(membrane_mesh.faces) == 0:
-        return membrane_mesh, 0, vertex_boundary_type
-    
-    if part_mesh is None or len(part_mesh.faces) == 0:
-        logger.warning("No part mesh provided for on-surface triangle removal")
-        return membrane_mesh, 0, vertex_boundary_type
-    
-    from trimesh.proximity import ProximityQuery
-    
-    vertices = membrane_mesh.vertices
-    faces = membrane_mesh.faces
-    n_faces = len(faces)
-    
-    # Compute tolerance based on mesh scale
-    mesh_scale = np.linalg.norm(membrane_mesh.bounds[1] - membrane_mesh.bounds[0])
-    tolerance = mesh_scale * tolerance_fraction
-    
-    logger.info(f"Checking {n_faces} triangles for on-surface degeneracy "
-               f"(tolerance: {tolerance:.4f}, {tolerance_fraction*100:.1f}% of mesh scale)")
-    
-    # Build proximity query for part mesh
-    part_proximity = ProximityQuery(part_mesh)
-    
-    # Check distances for all vertices first
-    _, vertex_distances, _ = part_proximity.on_surface(vertices)
-    
-    # For each face, check if all 3 vertices AND centroid are on the part mesh
-    faces_to_keep = []
-    
-    for fi, face in enumerate(faces):
-        v0, v1, v2 = face
-        
-        # Check vertex distances
-        d0 = vertex_distances[v0]
-        d1 = vertex_distances[v1]
-        d2 = vertex_distances[v2]
-        
-        all_vertices_on_surface = (d0 < tolerance and d1 < tolerance and d2 < tolerance)
-        
-        if all_vertices_on_surface:
-            # Also check centroid
-            centroid = (vertices[v0] + vertices[v1] + vertices[v2]) / 3.0
-            _, centroid_dist, _ = part_proximity.on_surface(centroid.reshape(1, 3))
-            
-            if centroid_dist[0] < tolerance:
-                # This triangle is entirely on the part mesh - remove it
-                continue
-        
-        faces_to_keep.append(fi)
-    
-    num_removed = n_faces - len(faces_to_keep)
-    
-    if num_removed == 0:
-        logger.info("No on-surface degenerate triangles found")
-        return membrane_mesh, 0, vertex_boundary_type
-    
-    # Build new mesh with only kept faces
-    kept_faces = faces[faces_to_keep]
-    
-    # Find which vertices are still used
-    used_vertices = np.unique(kept_faces.flatten())
-    
-    # Create vertex mapping from old to new indices
-    old_to_new = np.full(len(vertices), -1, dtype=np.int64)
-    old_to_new[used_vertices] = np.arange(len(used_vertices))
-    
-    # Remap face indices
-    new_faces = old_to_new[kept_faces]
-    new_vertices = vertices[used_vertices]
-    
-    # Update vertex_boundary_type if provided
-    new_boundary_type = None
-    if vertex_boundary_type is not None and len(vertex_boundary_type) == len(vertices):
-        new_boundary_type = vertex_boundary_type[used_vertices]
-    
-    cleaned_mesh = trimesh.Trimesh(vertices=new_vertices, faces=new_faces)
-    
-    logger.info(f"Removed {num_removed} on-surface degenerate triangles "
-               f"({n_faces} → {len(cleaned_mesh.faces)} faces)")
-    
-    return cleaned_mesh, num_removed, new_boundary_type
-
-
 # =============================================================================
 # BOUNDARY DETECTION
 # =============================================================================
