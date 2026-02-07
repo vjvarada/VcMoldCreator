@@ -997,7 +997,9 @@ def select_aligned_silicone_directions_across_halves(
     h1_results: List[PouringDirectionResult],
     h2_results: List[PouringDirectionResult],
     max_alignment_angle_deg: float = 30.0,
-    n_candidates: int = 20
+    n_candidates: int = 20,
+    parting_direction: Optional[np.ndarray] = None,
+    max_parting_angle_deg: float = 45.0
 ) -> Tuple[PouringDirectionResult, PouringDirectionResult, float, bool]:
     """
     Select nearly-aligned silicone pouring directions for two mold halves.
@@ -1005,6 +1007,10 @@ def select_aligned_silicone_directions_across_halves(
     Per the paper: "For each piece P1, P2 of the soft silicone part, we evaluate
     the score of a set of candidate directions for silicone pouring and choose
     from those scoring lowest a couple of nearly aligned directions f1, f2."
+    
+    IMPORTANT: The pouring directions should also be roughly aligned with or
+    opposite to the parting direction. This ensures the parting surface is
+    roughly horizontal during casting, allowing silicone to level out properly.
     
     IMPORTANT: H1 and H2 mold halves have opposite orientations when being poured:
     - When pouring H1, the part sits with parting surface facing DOWN
@@ -1026,6 +1032,9 @@ def select_aligned_silicone_directions_across_halves(
         h2_results: Scored results for H2 mold piece (sorted by score ascending)
         max_alignment_angle_deg: Maximum angle between f1 and f2 (or f1 and -f2)
         n_candidates: Number of top candidates from each half to consider
+        parting_direction: Optional parting direction. If provided, candidates
+            are filtered to those within max_parting_angle_deg of parting dir.
+        max_parting_angle_deg: Maximum allowed angle from parting direction (default 45°)
         
     Returns:
         Tuple of (h1_best_result, h2_best_result, alignment_angle_deg, is_anti_aligned)
@@ -1037,9 +1046,43 @@ def select_aligned_silicone_directions_across_halves(
     if not h2_results:
         raise ValueError("No H2 results provided")
     
-    # Take top candidates from each half - use more candidates for better coverage
-    h1_candidates = h1_results[:min(n_candidates, len(h1_results))]
-    h2_candidates = h2_results[:min(n_candidates, len(h2_results))]
+    # Filter candidates by parting direction alignment if provided
+    h1_candidates = h1_results[:min(n_candidates * 2, len(h1_results))]  # Start with more, then filter
+    h2_candidates = h2_results[:min(n_candidates * 2, len(h2_results))]
+    
+    if parting_direction is not None:
+        parting_dir = np.asarray(parting_direction, dtype=np.float64)
+        parting_dir = parting_dir / np.linalg.norm(parting_dir)
+        min_parting_cos = np.cos(np.radians(max_parting_angle_deg))
+        
+        # Filter H1 candidates: keep directions aligned OR anti-aligned with parting
+        h1_filtered = []
+        for r in h1_candidates:
+            parting_cos = np.abs(np.dot(r.direction, parting_dir))
+            if parting_cos >= min_parting_cos:
+                h1_filtered.append(r)
+        
+        # Filter H2 candidates: same filter
+        h2_filtered = []
+        for r in h2_candidates:
+            parting_cos = np.abs(np.dot(r.direction, parting_dir))
+            if parting_cos >= min_parting_cos:
+                h2_filtered.append(r)
+        
+        # Use filtered lists if they have enough candidates
+        if len(h1_filtered) >= 3 and len(h2_filtered) >= 3:
+            h1_candidates = h1_filtered[:n_candidates]
+            h2_candidates = h2_filtered[:n_candidates]
+            logger.info(f"Filtered to {len(h1_candidates)} H1 and {len(h2_candidates)} H2 candidates "
+                       f"within {max_parting_angle_deg}° of parting direction")
+        else:
+            logger.warning(f"Not enough candidates within {max_parting_angle_deg}° of parting direction "
+                          f"(H1: {len(h1_filtered)}, H2: {len(h2_filtered)}). Using unfiltered candidates.")
+            h1_candidates = h1_results[:min(n_candidates, len(h1_results))]
+            h2_candidates = h2_results[:min(n_candidates, len(h2_results))]
+    else:
+        h1_candidates = h1_candidates[:n_candidates]
+        h2_candidates = h2_candidates[:n_candidates]
     
     # Log score ranges for diagnostics
     h1_score_range = f"{h1_candidates[0].total_score:.2f} - {h1_candidates[-1].total_score:.2f}"
@@ -1185,7 +1228,8 @@ def select_resin_direction(
     cone_half_angle_deg: float = 5.0,
     n_samples_in_cone: int = 16,
     tilt_angle_deg: float = 10.0,
-    area_threshold_mm2: float = 0.5
+    area_threshold_mm2: float = 0.5,
+    parting_direction: Optional[np.ndarray] = None
 ) -> PouringDirectionResult:
     """
     Select optimal resin pouring direction in cone around f1/f2 bisector.
@@ -1196,6 +1240,11 @@ def select_resin_direction(
     nearly aligned silicone and resin pouring directions is required for
     the silicone to have a good surface to level out while casting."
     
+    IMPORTANT: If parting_direction is provided, the resin direction should be
+    aligned with it (perpendicular to the parting surface). The prism base must
+    be parallel to the parting surface for proper shell splitting. In this case,
+    we use parting_direction as the cone axis instead of the f1/f2 bisector.
+    
     Args:
         mesh: Input mesh (the complete part, not mold halves)
         f1, f2: Silicone pouring directions for each mold piece
@@ -1203,26 +1252,47 @@ def select_resin_direction(
         n_samples_in_cone: Number of directions to sample in cone
         tilt_angle_deg: Assumed tilt capability
         area_threshold_mm2: Filter threshold for trapped area
+        parting_direction: If provided, use this as the cone axis (should be aligned
+                          with f1/f2 bisector if silicone directions were properly constrained)
         
     Returns:
         Best PouringDirectionResult for resin (lowest score in cone)
     """
-    # Compute bisector of f1 and f2
-    bisector = (f1 + f2) / 2
-    norm = np.linalg.norm(bisector)
-    if norm < 1e-10:
-        # f1 and f2 are opposite - use f1 as bisector
-        bisector = f1.copy()
+    # Determine the cone axis
+    if parting_direction is not None:
+        # Use parting direction as the primary axis
+        # This ensures the resin direction is perpendicular to the parting surface
+        parting_dir = np.asarray(parting_direction, dtype=np.float64)
+        parting_dir = parting_dir / np.linalg.norm(parting_dir)
+        
+        # Choose the sign that's closer to the f1/f2 bisector
+        bisector = (f1 + f2) / 2
+        norm = np.linalg.norm(bisector)
+        if norm > 1e-10:
+            bisector = bisector / norm
+            if np.dot(parting_dir, bisector) < 0:
+                parting_dir = -parting_dir
+        
+        cone_axis = parting_dir
+        logger.info(f"Using parting direction {parting_dir} as cone axis for resin direction")
     else:
-        bisector = bisector / norm
+        # Fall back to bisector of f1 and f2
+        bisector = (f1 + f2) / 2
+        norm = np.linalg.norm(bisector)
+        if norm < 1e-10:
+            # f1 and f2 are opposite - use f1 as bisector
+            bisector = f1.copy()
+        else:
+            bisector = bisector / norm
+        cone_axis = bisector
     
-    # Sample directions in cone around bisector
+    # Sample directions in cone around the axis
     cone_directions = sample_cone_directions(
-        bisector, cone_half_angle_deg, n_samples_in_cone
+        cone_axis, cone_half_angle_deg, n_samples_in_cone
     )
     
-    # Include bisector itself
-    all_directions = np.vstack([bisector.reshape(1, 3), cone_directions])
+    # Include cone axis itself
+    all_directions = np.vstack([cone_axis.reshape(1, 3), cone_directions])
     
     # Score all directions
     results = evaluate_candidate_directions(
@@ -1601,11 +1671,14 @@ def find_mold_aware_pouring_directions(
     if h1_all_directions and h2_all_directions:
         # Use joint selection to find aligned or anti-aligned pair
         # Use more candidates for better chance of finding good directions
+        # Also filter by parting direction alignment to ensure proper mold orientation
         h1_best, h2_best, alignment_angle_deg, is_anti_aligned = select_aligned_silicone_directions_across_halves(
             h1_all_directions,
             h2_all_directions,
             max_alignment_angle_deg=30.0,
-            n_candidates=min(30, len(h1_all_directions), len(h2_all_directions))
+            n_candidates=min(30, len(h1_all_directions), len(h2_all_directions)),
+            parting_direction=parting_direction,
+            max_parting_angle_deg=45.0  # Allow up to 45° from parting direction
         )
         h1_direction = h1_best.direction.copy()
         h1_score = h1_best.total_score
@@ -1651,6 +1724,8 @@ def find_mold_aware_pouring_directions(
     
     # Sample directions in a cone around the bisector of f1, f2
     # Paper: "opening angle of 10° in our experiments" -> half-angle = 5°
+    # NOTE: We pass parting_direction to ensure resin direction is aligned with it
+    #       (perpendicular to the parting surface for proper shell splitting)
     resin_result = select_resin_direction(
         inverted_part_mesh,  # Use INVERTED mesh - resin fills the mold cavity
         h1_direction,
@@ -1658,7 +1733,8 @@ def find_mold_aware_pouring_directions(
         cone_half_angle_deg=5.0,  # 10° opening angle per paper
         n_samples_in_cone=16,
         tilt_angle_deg=tilt_angle_deg,
-        area_threshold_mm2=area_threshold_mm2
+        area_threshold_mm2=area_threshold_mm2,
+        parting_direction=parting_direction  # Pass parting direction for alignment
     )
     
     # Extract maxima positions for visualization

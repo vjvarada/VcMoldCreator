@@ -17,6 +17,9 @@ from typing import List, Tuple, Optional, Set
 import numpy as np
 import trimesh
 
+# Import self-intersection detection
+from core.parting_surface import detect_mesh_self_intersections
+
 logger = logging.getLogger(__name__)
 
 
@@ -98,6 +101,10 @@ class SmoothingResult:
     
     # Timing
     total_time_ms: float = 0.0
+    
+    # Self-intersection detection results
+    # Count of self-intersecting triangle pairs (0 = clean mesh)
+    self_intersection_count: int = 0
     
     # Restored fixed vertices (concave corners AND isolated triangle tips snapped back after smoothing)
     restored_corner_positions: Optional[np.ndarray] = None  # (K, 3) positions of restored vertices
@@ -2298,10 +2305,22 @@ def smooth_membrane_with_boundary_reprojection(
     
     result.mesh = smoothed_mesh
     result.final_vertices = len(smoothed_mesh.vertices)
+    
+    # Check for self-intersecting triangles introduced by smoothing
+    si_count, si_pairs = detect_mesh_self_intersections(smoothed_mesh)
+    result.self_intersection_count = si_count
+    
+    if si_count > 0:
+        logger.warning(f"SMOOTHED MEMBRANE HAS {si_count} SELF-INTERSECTING TRIANGLE PAIRS!")
+        logger.warning("Smoothing may have caused triangles to fold over.")
+        # Log a few examples
+        for fi, fj in si_pairs[:5]:
+            logger.debug(f"  Faces {fi} and {fj} intersect")
+    
     result.total_time_ms = (time.time() - start_time) * 1000
     
     logger.info(f"Membrane smoothing complete: {iterations} iterations, "
-               f"{result.total_time_ms:.1f}ms")
+               f"self-intersections: {si_count}, {result.total_time_ms:.1f}ms")
     
     return result
 

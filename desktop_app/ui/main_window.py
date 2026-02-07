@@ -5223,7 +5223,7 @@ class MainWindow(QMainWindow):
         # Mold halves classification state
         self._mold_halves_worker = None
         self._mold_halves_result: Optional[MoldHalfClassificationResult] = None
-        self._boundary_zone_threshold: float = 0.15  # Default 15%
+        self._boundary_zone_threshold: float = 0.05  # Default 5%
         
         # Tetrahedral mesh state
         self._tet_worker = None

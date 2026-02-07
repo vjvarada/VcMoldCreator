@@ -26,6 +26,9 @@ import numpy as np
 import trimesh
 from scipy.spatial import ConvexHull
 
+# Import self-intersection detection from parting_surface
+from core.parting_surface import detect_mesh_self_intersections
+
 # CSG operations via manifold3d
 try:
     import manifold3d
@@ -102,6 +105,10 @@ class OuterCollarResult:
     # Statistics
     n_outer_boundary_edges_processed: int = 0
     n_corner_fans_created: int = 0
+    
+    # Self-intersection detection results
+    # Count of self-intersecting triangle pairs (0 = clean mesh)
+    self_intersection_count: int = 0
     
     # Computation time
     computation_time_ms: float = 0.0
@@ -922,6 +929,7 @@ def _create_cutting_blade_from_membrane(
     vertices = np.asarray(membrane.vertices, dtype=np.float64)
     faces = np.asarray(membrane.faces, dtype=np.int64)
     n_verts = len(vertices)
+    n_faces = len(faces)
     
     half_thickness = thickness / 2.0
     
@@ -942,36 +950,50 @@ def _create_cutting_blade_from_membrane(
     top_faces = faces + n_verts
     
     # 3. Side faces connecting boundary edges
+    # Build edge info tracking DIRECTED edges (preserves winding information)
     edge_count = {}
-    edge_to_face = {}
+    directed_edge_info = {}  # edge_key -> [(face_idx, v0, v1), ...] - list of directed edges
     
     for fi, face in enumerate(faces):
         for i in range(3):
             v0, v1 = int(face[i]), int(face[(i + 1) % 3])
             edge_key = (min(v0, v1), max(v0, v1))
             edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
-            if edge_key not in edge_to_face:
-                edge_to_face[edge_key] = (fi, v0, v1)
+            
+            if edge_key not in directed_edge_info:
+                directed_edge_info[edge_key] = []
+            directed_edge_info[edge_key].append((fi, v0, v1))
     
-    # Boundary edges have count == 1
-    boundary_edges = [e for e, c in edge_count.items() if c == 1]
+    # Boundary edges have count == 1 (only one adjacent face)
+    boundary_edges = [(e, directed_edge_info[e][0]) for e, c in edge_count.items() if c == 1]
+    
+    logger.debug(f"Blade: Found {len(boundary_edges)} boundary edges to close")
     
     side_faces = []
-    for v0, v1 in boundary_edges:
-        _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
+    for edge_key, (fi, directed_v0, directed_v1) in boundary_edges:
+        # directed_v0 -> directed_v1 is the edge direction in the original face
+        # The outward-facing side of this edge (when viewed from outside the blade)
+        # should have normals pointing away from the face interior
         
-        # Bottom vertices
-        b0, b1 = v0, v1
+        # Bottom vertices (same index as membrane)
+        b0, b1 = directed_v0, directed_v1
         # Top vertices (offset by n_verts)
-        t0, t1 = v0 + n_verts, v1 + n_verts
+        t0, t1 = directed_v0 + n_verts, directed_v1 + n_verts
         
-        # Create quad with correct winding for outward-facing normals
-        if orig_v0 == v0:
-            side_faces.append([b0, b1, t1])
-            side_faces.append([b0, t1, t0])
-        else:
-            side_faces.append([b0, t0, t1])
-            side_faces.append([b0, t1, b1])
+        # Create quad (2 triangles) connecting bottom edge to top edge
+        # The edge b0->b1 is on the OUTSIDE of the bottom face (reversed winding)
+        # So the side face should have normals pointing outward from the blade center
+        # 
+        # Visualize from outside looking at the side:
+        #   t0 ---- t1      (top)
+        #    |      |
+        #   b0 ---- b1      (bottom)
+        #
+        # For outward normals (right-hand rule), we need:
+        #   Triangle 1: b0 -> t0 -> t1 (CCW when viewed from outside)
+        #   Triangle 2: b0 -> t1 -> b1 (CCW when viewed from outside)
+        side_faces.append([b0, t0, t1])
+        side_faces.append([b0, t1, b1])
     
     # Combine all faces
     all_faces_list = [bottom_faces, top_faces]
@@ -979,15 +1001,70 @@ def _create_cutting_blade_from_membrane(
         all_faces_list.append(np.array(side_faces, dtype=np.int64))
     all_faces = np.vstack(all_faces_list)
     
+    # Create mesh WITHOUT processing to preserve vertex indices
+    # This prevents vertex merging that could break edge connectivity
     blade_mesh = trimesh.Trimesh(
         vertices=all_vertices,
         faces=all_faces,
-        process=True
+        process=False  # CRITICAL: Don't merge vertices or modify topology
     )
+    
+    # Fix normals for consistent orientation
     blade_mesh.fix_normals()
     
+    # Verify the blade is watertight
+    if not blade_mesh.is_watertight:
+        # Count open edges for diagnostics
+        blade_edge_count = {}
+        for face in blade_mesh.faces:
+            for i in range(3):
+                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                edge_key = (min(v0, v1), max(v0, v1))
+                blade_edge_count[edge_key] = blade_edge_count.get(edge_key, 0) + 1
+        open_edges = [(e, c) for e, c in blade_edge_count.items() if c == 1]
+        
+        logger.warning(f"Blade is NOT watertight! {len(open_edges)} open edges detected")
+        
+        # Try to close remaining open edges by finding matching edges on opposite side
+        if open_edges:
+            logger.debug("Attempting to close open edges...")
+            additional_faces = []
+            
+            for (v0, v1), count in open_edges:
+                # Check if this edge is on bottom (v0, v1 < n_verts) or top
+                is_bottom_edge = v0 < n_verts and v1 < n_verts
+                is_top_edge = v0 >= n_verts and v1 >= n_verts
+                
+                if is_bottom_edge:
+                    # Find corresponding top edge and create side faces
+                    t0, t1 = v0 + n_verts, v1 + n_verts
+                    additional_faces.append([v0, t0, t1])
+                    additional_faces.append([v0, t1, v1])
+                    logger.debug(f"  Closing bottom edge ({v0}, {v1}) -> top ({t0}, {t1})")
+                elif is_top_edge:
+                    # Find corresponding bottom edge
+                    b0, b1 = v0 - n_verts, v1 - n_verts
+                    additional_faces.append([b0, v0, v1])
+                    additional_faces.append([b0, v1, b1])
+                    logger.debug(f"  Closing top edge ({v0}, {v1}) -> bottom ({b0}, {b1})")
+            
+            if additional_faces:
+                # Add the closing faces
+                new_faces = np.vstack([blade_mesh.faces, np.array(additional_faces, dtype=np.int64)])
+                blade_mesh = trimesh.Trimesh(
+                    vertices=blade_mesh.vertices,
+                    faces=new_faces,
+                    process=False
+                )
+                blade_mesh.fix_normals()
+                
+                if blade_mesh.is_watertight:
+                    logger.info(f"Successfully closed blade with {len(additional_faces)} additional faces")
+                else:
+                    logger.warning(f"Blade still not watertight after adding {len(additional_faces)} faces")
+    
     logger.debug(f"Created cutting blade: {len(all_vertices)} verts, {len(all_faces)} faces, "
-                f"thickness={thickness:.6f}mm")
+                f"thickness={thickness:.6f}mm, watertight={blade_mesh.is_watertight}")
     
     return blade_mesh
 
@@ -1284,7 +1361,7 @@ def split_shell_with_membrane(
     shell_with_cavity: trimesh.Trimesh,
     membrane: trimesh.Trimesh,
     pouring_direction: np.ndarray,
-    blade_thickness: float = 0.001
+    blade_thickness: float = 0.0001
 ) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool]:
     """
     Split the shell into two manifold halves using the membrane as a cutting blade.
@@ -1303,7 +1380,7 @@ def split_shell_with_membrane(
         shell_with_cavity: The shell mesh (prism - hull)
         membrane: The cutting membrane (outer collar extended parting surface)
         pouring_direction: Unit vector defining the "upper" direction
-        blade_thickness: Thickness of the cutting blade (default: 0.00001mm = 0.01 micron)
+        blade_thickness: Thickness of the cutting blade (default: 0.0001mm = 0.1 micron)
                         The blade is centered on the membrane (±thickness/2 each side)
         
     Returns:
@@ -2827,6 +2904,17 @@ def create_outer_collar_extension(
     # Try to order the outer boundary as a loop
     outer_boundary_loop = _extract_boundary_loop(faces_arr_final, outer_boundary_verts, vertices_arr_final)
     
+    # Check for self-intersecting triangles
+    # Self-intersections cause CSG operations (blade thickening) to fail
+    si_count, si_pairs = detect_mesh_self_intersections(extended_mesh)
+    
+    if si_count > 0:
+        logger.warning(f"OUTER COLLAR HAS {si_count} SELF-INTERSECTING TRIANGLE PAIRS!")
+        logger.warning("This will likely cause blade thickening CSG to fail!")
+        # Log a few examples
+        for fi, fj in si_pairs[:5]:
+            logger.debug(f"  Faces {fi} and {fj} intersect")
+    
     elapsed_ms = (time.time() - start_time) * 1000
     
     result = OuterCollarResult(
@@ -2842,12 +2930,13 @@ def create_outer_collar_extension(
         outer_boundary_loop=outer_boundary_loop,
         n_outer_boundary_edges_processed=len(outer_boundary_edges),
         n_corner_fans_created=corner_fans_created,
+        self_intersection_count=si_count,
         computation_time_ms=elapsed_ms
     )
     
     logger.info(f"Outer collar extension complete: {len(vertices)} vertices, {len(faces)} faces "
                 f"(+{collar_vertices_created} verts, +{collar_faces_created + corner_fans_created} faces, "
-                f"extended {extension_distance}mm) in {elapsed_ms:.1f}ms")
+                f"extended {extension_distance}mm, self-intersections: {si_count}) in {elapsed_ms:.1f}ms")
     
     return result
 

@@ -204,6 +204,214 @@ def _build_marching_tet_table() -> Dict[int, List[Tuple]]:
 MARCHING_TET_TABLE = _build_marching_tet_table()
 
 
+# =============================================================================
+# SELF-INTERSECTION DETECTION
+# =============================================================================
+
+def detect_mesh_self_intersections(
+    mesh: trimesh.Trimesh,
+    sample_fraction: float = 1.0,
+    max_pairs_to_check: int = 1000000
+) -> Tuple[int, List[Tuple[int, int]]]:
+    """
+    Detect self-intersecting triangles in a mesh.
+    
+    Two triangles "self-intersect" if they are non-adjacent (don't share an edge
+    or vertex) but their geometry overlaps in 3D space. This causes CSG operations
+    to fail or produce incorrect results.
+    
+    Algorithm:
+    1. Build adjacency map (which triangles share vertices)
+    2. Use spatial hashing/BVH to find candidate triangle pairs
+    3. For non-adjacent pairs with overlapping bboxes, test intersection
+    
+    Args:
+        mesh: The mesh to check for self-intersections
+        sample_fraction: Fraction of triangles to check (1.0 = all). Use < 1.0 for
+            large meshes to get a fast estimate.
+        max_pairs_to_check: Maximum number of triangle pairs to test (for performance)
+        
+    Returns:
+        Tuple of (count, pairs) where:
+        - count: Number of self-intersecting triangle pairs found
+        - pairs: List of (face_idx_1, face_idx_2) pairs that intersect
+    """
+    import time
+    start = time.time()
+    
+    if mesh is None or len(mesh.faces) == 0:
+        return 0, []
+    
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    n_faces = len(faces)
+    
+    if n_faces < 2:
+        return 0, []
+    
+    # Step 1: Build vertex-to-face adjacency
+    # face_idx is adjacent to another if they share at least one vertex
+    vertex_to_faces: Dict[int, Set[int]] = {}
+    for fi, face in enumerate(faces):
+        for vi in face:
+            if vi not in vertex_to_faces:
+                vertex_to_faces[vi] = set()
+            vertex_to_faces[vi].add(fi)
+    
+    # Build face adjacency set (faces that share a vertex are adjacent)
+    face_adjacent: Dict[int, Set[int]] = {fi: set() for fi in range(n_faces)}
+    for vi, face_set in vertex_to_faces.items():
+        for fi in face_set:
+            face_adjacent[fi].update(face_set)
+    # Remove self-adjacency
+    for fi in range(n_faces):
+        face_adjacent[fi].discard(fi)
+    
+    # Step 2: Compute per-face bounding boxes for spatial filtering
+    tri_verts = vertices[faces]  # (F, 3, 3)
+    bbox_min = tri_verts.min(axis=1)  # (F, 3)
+    bbox_max = tri_verts.max(axis=1)  # (F, 3)
+    
+    # Step 3: Find candidate pairs using bbox overlap
+    # For efficiency, use sampling if mesh is large
+    if sample_fraction < 1.0 and n_faces > 100:
+        n_sample = max(int(n_faces * sample_fraction), 50)
+        sample_indices = np.random.choice(n_faces, size=n_sample, replace=False)
+    else:
+        sample_indices = np.arange(n_faces)
+    
+    intersecting_pairs = []
+    pairs_checked = 0
+    
+    for i_idx, fi in enumerate(sample_indices):
+        if pairs_checked >= max_pairs_to_check:
+            break
+            
+        # Get triangle fi's bbox
+        fi_min = bbox_min[fi]
+        fi_max = bbox_max[fi]
+        
+        # Find candidate triangles with overlapping bbox (only check fj > fi to avoid duplicates)
+        for fj in range(fi + 1, n_faces):
+            if pairs_checked >= max_pairs_to_check:
+                break
+                
+            # Skip adjacent triangles (they share vertices, so they "touch" but don't "intersect")
+            if fj in face_adjacent[fi]:
+                continue
+            
+            # Quick bbox overlap check
+            fj_min = bbox_min[fj]
+            fj_max = bbox_max[fj]
+            
+            # Check if bboxes overlap in all 3 dimensions
+            if (fi_max[0] < fj_min[0] or fj_max[0] < fi_min[0] or
+                fi_max[1] < fj_min[1] or fj_max[1] < fi_min[1] or
+                fi_max[2] < fj_min[2] or fj_max[2] < fi_min[2]):
+                continue  # No overlap
+            
+            pairs_checked += 1
+            
+            # Bboxes overlap - do full triangle-triangle intersection test
+            tri_i = (vertices[faces[fi, 0]], vertices[faces[fi, 1]], vertices[faces[fi, 2]])
+            tri_j = (vertices[faces[fj, 0]], vertices[faces[fj, 1]], vertices[faces[fj, 2]])
+            
+            if _triangles_intersect_fast(tri_i, tri_j):
+                intersecting_pairs.append((fi, fj))
+    
+    elapsed = time.time() - start
+    
+    if intersecting_pairs:
+        logger.warning(f"SELF-INTERSECTION: Found {len(intersecting_pairs)} intersecting triangle pairs "
+                      f"(checked {pairs_checked} pairs in {elapsed*1000:.1f}ms)")
+    else:
+        logger.debug(f"Self-intersection check: OK (checked {pairs_checked} pairs in {elapsed*1000:.1f}ms)")
+    
+    return len(intersecting_pairs), intersecting_pairs
+
+
+def _triangles_intersect_fast(
+    tri1: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    tri2: Tuple[np.ndarray, np.ndarray, np.ndarray]
+) -> bool:
+    """
+    Fast check if two triangles intersect using Möller's algorithm.
+    
+    Two triangles intersect if:
+    1. Any edge of tri1 passes through tri2, OR
+    2. Any edge of tri2 passes through tri1
+    
+    This is the same logic as _triangles_intersect in tetrahedral_mesh.py,
+    duplicated here to avoid circular imports.
+    """
+    v0, v1, v2 = tri1
+    u0, u1, u2 = tri2
+    
+    # Check edges of tri1 against tri2
+    if _segment_intersects_triangle_fast(v0, v1, u0, u1, u2):
+        return True
+    if _segment_intersects_triangle_fast(v1, v2, u0, u1, u2):
+        return True
+    if _segment_intersects_triangle_fast(v2, v0, u0, u1, u2):
+        return True
+    
+    # Check edges of tri2 against tri1
+    if _segment_intersects_triangle_fast(u0, u1, v0, v1, v2):
+        return True
+    if _segment_intersects_triangle_fast(u1, u2, v0, v1, v2):
+        return True
+    if _segment_intersects_triangle_fast(u2, u0, v0, v1, v2):
+        return True
+    
+    return False
+
+
+def _segment_intersects_triangle_fast(
+    p0: np.ndarray, p1: np.ndarray,
+    v0: np.ndarray, v1: np.ndarray, v2: np.ndarray
+) -> bool:
+    """
+    Möller–Trumbore ray-triangle intersection test for a line segment.
+    Returns True if segment (p0, p1) intersects triangle (v0, v1, v2).
+    """
+    EPSILON = 1e-9
+    
+    direction = p1 - p0
+    seg_length = np.linalg.norm(direction)
+    if seg_length < EPSILON:
+        return False
+    direction = direction / seg_length
+    
+    edge1 = v1 - v0
+    edge2 = v2 - v0
+    
+    h = np.cross(direction, edge2)
+    a = np.dot(edge1, h)
+    
+    if abs(a) < EPSILON:
+        return False  # Ray parallel to triangle
+    
+    f = 1.0 / a
+    s = p0 - v0
+    u = f * np.dot(s, h)
+    
+    if u < -EPSILON or u > 1.0 + EPSILON:
+        return False
+    
+    q = np.cross(s, edge1)
+    v = f * np.dot(direction, q)
+    
+    if v < -EPSILON or (u + v) > 1.0 + EPSILON:
+        return False
+    
+    t = f * np.dot(edge2, q)
+    
+    # Check if intersection is within segment bounds
+    if t < -EPSILON or t > seg_length + EPSILON:
+        return False
+    
+    return True
+
 
 # =============================================================================
 # PARTING SURFACE EXTRACTION
@@ -239,6 +447,12 @@ class PartingSurfaceResult:
     num_faces: int = 0
     num_tets_processed: int = 0
     num_tets_contributing: int = 0
+    
+    # Self-intersection detection results
+    # Count of self-intersecting triangle pairs (0 = clean mesh)
+    self_intersection_count: int = 0
+    # List of (face_idx_1, face_idx_2) pairs that intersect
+    self_intersecting_pairs: Optional[List[Tuple[int, int]]] = None
     
     # Timing
     extraction_time_ms: float = 0.0
@@ -782,10 +996,25 @@ def extract_parting_surface(
     except Exception as e:
         logger.error(f"Failed to create trimesh: {e}")
     
+    # Step 4: Check for self-intersecting triangles
+    # Self-intersections cause CSG operations (blade thickening) to fail
+    if result.mesh is not None:
+        si_count, si_pairs = detect_mesh_self_intersections(result.mesh)
+        result.self_intersection_count = si_count
+        result.self_intersecting_pairs = si_pairs
+        
+        if si_count > 0:
+            logger.warning(f"PARTING SURFACE HAS {si_count} SELF-INTERSECTING TRIANGLE PAIRS")
+            logger.warning("This may cause CSG operations (blade thickening) to fail!")
+            # Log a few examples
+            for fi, fj in si_pairs[:5]:
+                logger.debug(f"  Faces {fi} and {fj} intersect")
+    
     result.extraction_time_ms = (time.time() - start) * 1000
     
     logger.info(f"Parting surface: {result.num_vertices} vertices, {result.num_faces} faces "
                 f"from {result.num_tets_contributing}/{result.num_tets_processed} tets "
+                f"(self-intersections: {result.self_intersection_count}) "
                 f"in {result.extraction_time_ms:.1f}ms")
     
     return result

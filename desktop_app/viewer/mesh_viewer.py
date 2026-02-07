@@ -6286,3 +6286,82 @@ class MeshViewer(QWidget):
             self._metamold_half_2_with_part_actor.SetVisibility(visible)
             self.plotter.update()
             logger.debug(f"Metamold half 2 with part visibility set to {visible}")
+    
+    # =========================================================================
+    # DEBUG: Defect Visualization
+    # =========================================================================
+    
+    def show_defect_points(self, points: np.ndarray, color: str = 'red', point_size: float = 10.0):
+        """
+        Display defect points (e.g., vertices on open edges) as colored spheres.
+        
+        Args:
+            points: (N, 3) array of point coordinates
+            color: Color for the defect markers (default: red)
+            point_size: Size of point markers (default: 10.0)
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        # Remove existing defect points
+        self.remove_defect_points()
+        
+        if points is None or len(points) == 0:
+            logger.warning("No defect points to display")
+            return
+        
+        points = np.asarray(points)
+        if points.ndim != 2 or points.shape[1] != 3:
+            logger.error(f"Invalid defect points shape: {points.shape}")
+            return
+        
+        self._defect_points = points
+        
+        try:
+            # Create point cloud
+            pv_points = pv.PolyData(points)
+            
+            # Display as spheres
+            self._defect_points_actor = self.plotter.add_mesh(
+                pv_points,
+                color=color,
+                point_size=point_size,
+                render_points_as_spheres=True,
+            )
+            self._defect_points_visible = True
+            logger.info(f"Displayed {len(points)} defect points in {color}")
+            
+        except Exception as e:
+            logger.error(f"Failed to display defect points: {e}")
+            return
+        
+        self.plotter.update()
+    
+    def remove_defect_points(self):
+        """Remove defect points from the display."""
+        if hasattr(self, '_defect_points_actor') and self._defect_points_actor is not None:
+            try:
+                self.plotter.remove_actor(self._defect_points_actor)
+            except Exception:
+                pass
+            self._defect_points_actor = None
+        
+        if hasattr(self, '_defect_points'):
+            self._defect_points = None
+        
+        self.plotter.update()
+    
+    def set_defect_points_visible(self, visible: bool):
+        """
+        Set visibility of defect points.
+        
+        Args:
+            visible: True to show, False to hide
+        """
+        self._defect_points_visible = visible
+        if hasattr(self, '_defect_points_actor') and self._defect_points_actor is not None:
+            self._defect_points_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Defect points visibility set to {visible}")
