@@ -19,10 +19,13 @@ from core.pouring_direction import (
     PouringDirectionResult as PouringDirResult,
     PersistencePair,
     evaluate_candidate_directions,
+    evaluate_candidate_directions_gpu,
     score_pouring_direction,
     compute_persistence_pairs,
     find_mold_aware_pouring_directions,
     MoldAwarePouringDirections,
+    CUDA_AVAILABLE as POURING_CUDA_AVAILABLE,
+    TORCH_AVAILABLE as POURING_TORCH_AVAILABLE,
 )
 from core.inflated_hull import (
     generate_inflated_hull,

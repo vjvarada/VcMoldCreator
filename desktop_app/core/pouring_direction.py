@@ -41,6 +41,28 @@ logger = logging.getLogger(__name__)
 # GPU/ACCELERATION DETECTION
 # ============================================================================
 
+# Check for PyTorch/CUDA GPU acceleration
+try:
+    import torch
+    TORCH_AVAILABLE = True
+    CUDA_AVAILABLE = torch.cuda.is_available()
+    if CUDA_AVAILABLE:
+        _device = torch.device('cuda')
+        logger.info(f"PyTorch CUDA available: {torch.cuda.get_device_name(0)}")
+    else:
+        _device = torch.device('cpu')
+        logger.info("PyTorch available (CPU only)")
+except ImportError:
+    TORCH_AVAILABLE = False
+    CUDA_AVAILABLE = False
+    _device = None
+    logger.info("PyTorch not available - GPU acceleration disabled")
+
+# Check for concurrent.futures for parallel CPU evaluation
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
+N_CPU_CORES = multiprocessing.cpu_count()
+
 # Check if C++ fast_algorithms is available (already compiled for this project)
 try:
     from . import fast_algorithms as _cpp
@@ -254,6 +276,71 @@ class PrecomputedMeshData:
         face_heights = vertex_heights[:, self.faces].mean(axis=2)
         
         return vertex_heights, face_heights
+    
+    def compute_heights_batch_gpu(self, directions: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute vertex and face heights for multiple directions using GPU.
+        
+        Args:
+            directions: (N, 3) array of direction vectors
+            
+        Returns:
+            vertex_heights: (N, n_vertices) array
+            face_heights: (N, n_faces) array
+        """
+        if not TORCH_AVAILABLE:
+            return self.compute_heights_batch(directions)
+        
+        device = _device if CUDA_AVAILABLE else torch.device('cpu')
+        
+        # Convert to torch tensors
+        dirs_t = torch.tensor(directions, dtype=torch.float32, device=device)
+        verts_t = torch.tensor(self.vertices, dtype=torch.float32, device=device)
+        faces_t = torch.tensor(self.faces, dtype=torch.int64, device=device)
+        
+        # Normalize directions
+        dirs_t = dirs_t / dirs_t.norm(dim=1, keepdim=True)
+        
+        # Batch matrix multiply: (N, 3) @ (V, 3).T -> (N, V)
+        vertex_heights_t = torch.matmul(dirs_t, verts_t.T)
+        
+        # Compute face heights: (N, F) from (N, V) indexed by (F, 3)
+        # Use advanced indexing: vertex_heights[:, faces] -> (N, F, 3), then mean over last dim
+        face_heights_t = vertex_heights_t[:, faces_t].mean(dim=2)
+        
+        # Convert back to numpy
+        return vertex_heights_t.cpu().numpy(), face_heights_t.cpu().numpy()
+    
+    def compute_ceiling_masks_batch_gpu(self, directions: np.ndarray) -> np.ndarray:
+        """
+        Compute ceiling face masks (normal · direction < 0) for multiple directions using GPU.
+        
+        Args:
+            directions: (N, 3) array of direction vectors
+            
+        Returns:
+            ceiling_masks: (N, n_faces) boolean array - True for ceiling faces
+        """
+        if not TORCH_AVAILABLE:
+            # CPU fallback
+            norms = np.linalg.norm(directions, axis=1, keepdims=True)
+            directions = directions / norms
+            # (N, 3) @ (F, 3).T -> (N, F)
+            normal_dots = directions @ self.face_normals.T
+            return normal_dots < 0
+        
+        device = _device if CUDA_AVAILABLE else torch.device('cpu')
+        
+        dirs_t = torch.tensor(directions, dtype=torch.float32, device=device)
+        normals_t = torch.tensor(self.face_normals, dtype=torch.float32, device=device)
+        
+        # Normalize directions
+        dirs_t = dirs_t / dirs_t.norm(dim=1, keepdim=True)
+        
+        # Batch dot products: (N, 3) @ (F, 3).T -> (N, F)
+        normal_dots = torch.matmul(dirs_t, normals_t.T)
+        
+        return (normal_dots < 0).cpu().numpy()
     
     def get_vertex_faces(self, vertex_idx: int) -> np.ndarray:
         """Get faces containing a vertex (fast lookup)."""
@@ -989,6 +1076,260 @@ def evaluate_candidate_directions_fast(
     return all_results
 
 
+def evaluate_candidate_directions_gpu(
+    mesh: trimesh.Trimesh,
+    n_directions: int = 64,
+    tilt_angle_deg: float = 10.0,
+    area_threshold_mm2: float = 0.5,
+    directions: Optional[np.ndarray] = None,
+    progress_callback: Optional[callable] = None,
+    n_workers: Optional[int] = None
+) -> List[PouringDirectionResult]:
+    """
+    GPU-accelerated direction evaluation with parallel CPU scoring.
+    
+    Optimizations:
+    1. GPU batch computation of heights and ceiling masks (if CUDA available)
+    2. Parallel CPU evaluation using ThreadPoolExecutor
+    3. Precomputed mesh data structures
+    
+    Args:
+        mesh: Input mesh
+        n_directions: Number of directions to sample (if directions not provided)
+        tilt_angle_deg: Assumed tilt capability
+        area_threshold_mm2: Filter threshold for trapped area
+        directions: Optional pre-specified directions array
+        progress_callback: Optional callback(current, total) for progress updates
+        n_workers: Number of parallel workers (default: CPU count)
+        
+    Returns:
+        List of PouringDirectionResult, sorted by total_score (ascending)
+    """
+    start_time = time.time()
+    
+    if directions is None:
+        directions = fibonacci_sphere(n_directions)
+    directions = np.asarray(directions, dtype=np.float64)
+    
+    n_dirs = len(directions)
+    if n_workers is None:
+        n_workers = min(N_CPU_CORES, n_dirs)
+    
+    # Precompute mesh data
+    precomputed = PrecomputedMeshData(mesh)
+    
+    # GPU batch computation of heights and ceiling masks
+    gpu_str = "GPU" if CUDA_AVAILABLE else "CPU"
+    logger.info(f"Computing batch heights/ceilings on {gpu_str} for {n_dirs} directions...")
+    
+    batch_start = time.time()
+    if CUDA_AVAILABLE:
+        all_vertex_heights, all_face_heights = precomputed.compute_heights_batch_gpu(directions)
+        all_ceiling_masks = precomputed.compute_ceiling_masks_batch_gpu(directions)
+    else:
+        all_vertex_heights, all_face_heights = precomputed.compute_heights_batch(directions)
+        # CPU fallback for ceiling masks
+        norms = np.linalg.norm(directions, axis=1, keepdims=True)
+        dirs_normalized = directions / norms
+        normal_dots = dirs_normalized @ precomputed.face_normals.T
+        all_ceiling_masks = normal_dots < 0
+    
+    batch_time = (time.time() - batch_start) * 1000
+    logger.info(f"Batch computation complete in {batch_time:.1f}ms")
+    
+    # Progress tracking with thread safety
+    import threading
+    progress_lock = threading.Lock()
+    completed = [0]
+    
+    def score_single_direction(args):
+        """Score a single direction using precomputed data."""
+        idx, direction = args
+        vertex_heights = all_vertex_heights[idx]
+        face_heights = all_face_heights[idx]
+        ceiling_mask = all_ceiling_masks[idx]
+        
+        # Compute persistence pairs
+        pairs, _ = compute_persistence_pairs(
+            precomputed.mesh, direction, precomputed.vertex_neighbors
+        )
+        
+        # Score pairs
+        relevant_pairs = []
+        total_score = 0.0
+        tilt_threshold = np.sin(np.radians(tilt_angle_deg))
+        
+        for pair in pairs:
+            if pair.persistence < 1e-6:
+                continue
+            
+            # Fast trapped region with precomputed ceiling mask
+            trapped = _grow_trapped_region_with_ceiling(
+                precomputed, pair.maximum_idx, pair.saddle_height,
+                face_heights, ceiling_mask
+            )
+            
+            if not trapped:
+                continue
+            
+            # Compute tiltable region
+            tiltable = _compute_tiltable_region_fast(
+                precomputed, direction, trapped, pair.saddle_idx,
+                tilt_threshold
+            )
+            
+            final_trapped = trapped - tiltable
+            if final_trapped:
+                score = np.sum(precomputed.face_areas[list(final_trapped)])
+                if score >= area_threshold_mm2:
+                    pair.trapped_faces = final_trapped
+                    pair.relevance_score = score
+                    relevant_pairs.append(pair)
+                    total_score += score
+        
+        # Update progress
+        with progress_lock:
+            completed[0] += 1
+            if progress_callback:
+                progress_callback(completed[0], n_dirs)
+        
+        return PouringDirectionResult(
+            direction=direction.copy(),
+            pairs=relevant_pairs,
+            total_score=total_score,
+            relevant_pair_count=len(relevant_pairs)
+        )
+    
+    # Parallel evaluation using ThreadPoolExecutor
+    # ThreadPool is better than ProcessPool here because:
+    # 1. Data doesn't need to be pickled/unpickled
+    # 2. The heavy computation is in numpy which releases the GIL
+    logger.info(f"Evaluating {n_dirs} directions using {n_workers} workers...")
+    
+    eval_start = time.time()
+    results = []
+    
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        args_list = [(i, directions[i]) for i in range(n_dirs)]
+        results = list(executor.map(score_single_direction, args_list))
+    
+    eval_time = (time.time() - eval_start) * 1000
+    total_time = (time.time() - start_time) * 1000
+    
+    logger.info(f"Parallel evaluation complete in {eval_time:.1f}ms (total: {total_time:.1f}ms)")
+    
+    # Sort by score (lower is better)
+    results.sort(key=lambda r: r.total_score)
+    
+    return results
+
+
+def _grow_trapped_region_with_ceiling(
+    precomputed: PrecomputedMeshData,
+    maximum_idx: int,
+    saddle_height: float,
+    face_heights: np.ndarray,
+    ceiling_mask: np.ndarray
+) -> Set[int]:
+    """
+    Grow trapped region using precomputed ceiling mask.
+    
+    Args:
+        precomputed: Precomputed mesh data
+        maximum_idx: Vertex index of maximum
+        saddle_height: Height of saddle point
+        face_heights: Precomputed face heights for this direction
+        ceiling_mask: Boolean mask of ceiling faces (normal · direction < 0)
+        
+    Returns:
+        Set of face indices in trapped region
+    """
+    # Find seed face: ceiling face containing max vertex with highest centroid
+    max_faces = precomputed.get_vertex_faces(maximum_idx)
+    if len(max_faces) == 0:
+        return set()
+    
+    # Filter to ceiling faces
+    ceiling_seed_faces = max_faces[ceiling_mask[max_faces]]
+    if len(ceiling_seed_faces) == 0:
+        return set()
+    
+    seed_face = ceiling_seed_faces[np.argmax(face_heights[ceiling_seed_faces])]
+    
+    # BFS to grow region
+    trapped = set()
+    queue = deque([seed_face])
+    visited = {seed_face}
+    
+    while queue:
+        face_idx = queue.popleft()
+        
+        if ceiling_mask[face_idx] and face_heights[face_idx] >= saddle_height:
+            trapped.add(face_idx)
+            
+            for neighbor in precomputed.face_neighbors.get(face_idx, []):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+    
+    return trapped
+
+
+def _compute_tiltable_region_fast(
+    precomputed: PrecomputedMeshData,
+    direction: np.ndarray,
+    trapped_faces: Set[int],
+    saddle_idx: int,
+    tilt_threshold: float
+) -> Set[int]:
+    """
+    Fast tiltable region computation with precomputed data.
+    
+    Args:
+        precomputed: Precomputed mesh data
+        direction: Pouring direction
+        trapped_faces: Set of trapped face indices
+        saddle_idx: Saddle vertex index
+        tilt_threshold: sin(tilt_angle) threshold
+        
+    Returns:
+        Set of face indices that can drain when tilted
+    """
+    if not trapped_faces:
+        return set()
+    
+    direction = direction / np.linalg.norm(direction)
+    
+    # Find seed faces (faces containing saddle vertex in trapped region)
+    saddle_faces = set(precomputed.get_vertex_faces(saddle_idx))
+    seed_faces = saddle_faces & trapped_faces
+    
+    if not seed_faces:
+        return set()
+    
+    # Normal dots for drainability check
+    normal_dots = precomputed.face_normals @ direction
+    
+    # BFS from saddle
+    tiltable = set()
+    queue = deque(seed_faces)
+    visited = set(seed_faces)
+    
+    while queue:
+        face_idx = queue.popleft()
+        
+        # Face can drain if: normal · direction > -sin(tilt_angle)
+        if normal_dots[face_idx] > -tilt_threshold:
+            tiltable.add(face_idx)
+            
+            for neighbor in precomputed.face_neighbors.get(face_idx, []):
+                if neighbor in trapped_faces and neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+    
+    return tiltable
+
+
 # ============================================================================
 # SILICONE AND RESIN DIRECTION SELECTION
 # ============================================================================
@@ -1481,7 +1822,8 @@ def find_mold_aware_pouring_directions(
     area_threshold_mm2: float = 0.5,
     progress_callback: Optional[callable] = None,
     use_fast: bool = True,
-    parting_direction: Optional[np.ndarray] = None
+    parting_direction: Optional[np.ndarray] = None,
+    parting_alignment_cone_deg: float = 45.0
 ) -> MoldAwarePouringDirections:
     """
     Find optimal pouring directions for each mold half separately.
@@ -1492,6 +1834,10 @@ def find_mold_aware_pouring_directions(
       of the part surface that belongs to that mold half
     - The resin pouring direction is optimized for the complete part
     
+    IMPORTANT: Pouring directions are constrained to be within a cone around
+    the parting direction. This ensures the mold can be positioned with the
+    parting surface roughly horizontal during pouring (per paper Section 5).
+    
     Args:
         part_mesh: The original part mesh
         tet_result: TetrahedralMeshResult with seed_escape_labels computed
@@ -1500,7 +1846,11 @@ def find_mold_aware_pouring_directions(
         area_threshold_mm2: Ignore trapped regions smaller than this
         progress_callback: Optional callback(current, total) for progress updates
         use_fast: If True, uses coarse-to-fine evaluation for speed (default True)
-        parting_direction: Optional parting direction for diagnostic logging
+        parting_direction: Parting direction (required for proper alignment).
+                          Candidate directions will be constrained to a cone around this.
+        parting_alignment_cone_deg: Half-angle of the constraint cone in degrees (default 45°).
+                                   Directions must be within this angle of the parting direction
+                                   (or its negation) to be considered.
     
     Returns:
         MoldAwarePouringDirections with separate results for H1 and H2
@@ -1517,7 +1867,43 @@ def find_mold_aware_pouring_directions(
     logger.info("Splitting part mesh into H1 and H2 submeshes...")
     h1_mesh, h2_mesh = split_part_mesh_by_mold_half(part_mesh, face_labels, h1_faces, h2_faces)
     
-    # Step 3: INVERT the meshes for cavity analysis
+    # Step 3: Generate constrained candidate directions
+    # If parting_direction is provided, constrain candidates to a cone around it.
+    # This ensures pouring directions are physically compatible with the mold design.
+    # Per paper Section 5: The hard shell prism is aligned with the resin pouring direction,
+    # and the parting surface should be roughly horizontal during pouring.
+    constrained_directions = None
+    if parting_direction is not None:
+        parting_dir = np.asarray(parting_direction, dtype=np.float64)
+        parting_dir = parting_dir / np.linalg.norm(parting_dir)
+        
+        logger.info(f"Constraining candidate directions to {parting_alignment_cone_deg}° cone around parting direction")
+        
+        # Sample directions in cones around both parting_dir and -parting_dir
+        # (H1 and H2 may prefer opposite orientations)
+        # Use fewer directions since they're already constrained to a valid region
+        n_per_cone = max(8, n_candidate_directions // 4)  # Reduced for speed
+        
+        # Sample around parting_dir
+        cone_dirs_1 = sample_cone_directions(parting_dir, parting_alignment_cone_deg, n_per_cone)
+        
+        # Sample around -parting_dir
+        cone_dirs_2 = sample_cone_directions(-parting_dir, parting_alignment_cone_deg, n_per_cone)
+        
+        # Combine and include the exact parting directions
+        constrained_directions = np.vstack([
+            parting_dir.reshape(1, 3),
+            -parting_dir.reshape(1, 3),
+            cone_dirs_1,
+            cone_dirs_2
+        ])
+        
+        logger.info(f"Generated {len(constrained_directions)} constrained directions (optimized)")
+    else:
+        logger.warning("No parting direction provided - using unconstrained Fibonacci sphere sampling. "
+                      "Pouring directions may not be aligned with parting surface!")
+    
+    # Step 4: INVERT the meshes for cavity analysis
     # SILICONE POURING ANALYSIS:
     # When pouring silicone around the part, bubbles rise and get trapped
     # against undersides/overhangs of the part surface (faces pointing DOWN).
@@ -1527,11 +1913,16 @@ def find_mold_aware_pouring_directions(
     # The h1_mesh and h2_mesh are submeshes of the part surface.
     logger.info(f"Analyzing silicone pour: using original part surface (not inverted)")
     
-    # Choose evaluation function
-    eval_func = evaluate_candidate_directions_fast if use_fast else evaluate_candidate_directions
+    # Log GPU/acceleration status
+    gpu_status = "GPU (CUDA)" if CUDA_AVAILABLE else "CPU"
+    logger.info(f"Using {gpu_status} acceleration for pouring direction computation")
+    
+    # Use GPU-accelerated version when available, which handles custom directions
+    use_gpu_version = TORCH_AVAILABLE  # Use GPU version whenever torch is available
     
     # Track progress across both meshes
-    total_directions = n_candidate_directions * 2  # For H1 and H2
+    total_dirs_count = len(constrained_directions) if constrained_directions is not None else n_candidate_directions
+    total_directions = total_dirs_count * 2  # For H1 and H2
     current_progress = [0]  # Use list to allow modification in nested function
     
     def h1_progress_callback(current, total):
@@ -1540,39 +1931,81 @@ def find_mold_aware_pouring_directions(
             progress_callback(current_progress[0], total_directions)
     
     def h2_progress_callback(current, total):
-        current_progress[0] = n_candidate_directions + current
+        current_progress[0] = total_dirs_count + current
         if progress_callback:
             progress_callback(current_progress[0], total_directions)
     
-    # Step 4: Evaluate candidate directions for H1 (if available)
+    # Step 5: Evaluate candidate directions for H1 (if available)
     h1_all_directions = []
     
     if h1_mesh is not None and len(h1_mesh.faces) > 0:
         logger.info(f"Computing H1 silicone directions ({len(h1_mesh.faces)} faces)...")
-        h1_all_directions = eval_func(
-            h1_mesh,  # Use ORIGINAL mesh for silicone analysis
-            n_candidate_directions,
-            tilt_angle_deg,
-            area_threshold_mm2,
-            progress_callback=h1_progress_callback
-        )
+        if use_gpu_version:
+            # Use GPU-accelerated parallel version
+            h1_all_directions = evaluate_candidate_directions_gpu(
+                h1_mesh,
+                n_directions=total_dirs_count,
+                tilt_angle_deg=tilt_angle_deg,
+                area_threshold_mm2=area_threshold_mm2,
+                directions=constrained_directions,
+                progress_callback=h1_progress_callback
+            )
+        elif constrained_directions is not None:
+            h1_all_directions = evaluate_candidate_directions(
+                h1_mesh,
+                n_directions=total_dirs_count,
+                tilt_angle_deg=tilt_angle_deg,
+                area_threshold_mm2=area_threshold_mm2,
+                directions=constrained_directions,
+                progress_callback=h1_progress_callback
+            )
+        else:
+            eval_func = evaluate_candidate_directions_fast if use_fast else evaluate_candidate_directions
+            h1_all_directions = eval_func(
+                h1_mesh,
+                n_candidate_directions,
+                tilt_angle_deg,
+                area_threshold_mm2,
+                progress_callback=h1_progress_callback
+            )
         h1_best_str = f"{h1_all_directions[0].total_score:.2f}" if h1_all_directions else "N/A"
         logger.info(f"H1: evaluated {len(h1_all_directions)} directions, best score={h1_best_str}")
     else:
         logger.warning("No H1 faces found")
     
-    # Step 5: Evaluate candidate directions for H2 (if available)
+    # Step 6: Evaluate candidate directions for H2 (if available)
     h2_all_directions = []
     
     if h2_mesh is not None and len(h2_mesh.faces) > 0:
         logger.info(f"Computing H2 silicone directions ({len(h2_mesh.faces)} faces)...")
-        h2_all_directions = eval_func(
-            h2_mesh,  # Use ORIGINAL mesh for silicone analysis
-            n_candidate_directions,
-            tilt_angle_deg,
-            area_threshold_mm2,
-            progress_callback=h2_progress_callback
-        )
+        if use_gpu_version:
+            # Use GPU-accelerated parallel version
+            h2_all_directions = evaluate_candidate_directions_gpu(
+                h2_mesh,
+                n_directions=total_dirs_count,
+                tilt_angle_deg=tilt_angle_deg,
+                area_threshold_mm2=area_threshold_mm2,
+                directions=constrained_directions,
+                progress_callback=h2_progress_callback
+            )
+        elif constrained_directions is not None:
+            h2_all_directions = evaluate_candidate_directions(
+                h2_mesh,
+                n_directions=total_dirs_count,
+                tilt_angle_deg=tilt_angle_deg,
+                area_threshold_mm2=area_threshold_mm2,
+                directions=constrained_directions,
+                progress_callback=h2_progress_callback
+            )
+        else:
+            eval_func = evaluate_candidate_directions_fast if use_fast else evaluate_candidate_directions
+            h2_all_directions = eval_func(
+                h2_mesh,
+                n_candidate_directions,
+                tilt_angle_deg,
+                area_threshold_mm2,
+                progress_callback=h2_progress_callback
+            )
         h2_best_str = f"{h2_all_directions[0].total_score:.2f}" if h2_all_directions else "N/A"
         logger.info(f"H2 cavity: evaluated {len(h2_all_directions)} directions, best score={h2_best_str}")
     else:
