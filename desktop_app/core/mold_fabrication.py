@@ -913,13 +913,20 @@ def _create_cutting_blade_from_membrane(
     (+thickness/2 and -thickness/2) to create a thin solid volume that can be
     subtracted from the shell to create a gap.
     
+    Algorithm:
+    1. Extrude membrane vertices by ±thickness/2 along pouring direction
+    2. Create bottom faces (reversed winding for outward normals)
+    3. Create top faces (original winding, offset indices)
+    4. Find boundary edges (edges with count == 1)
+    5. Create side faces connecting boundary edges (quad per edge)
+    
     Args:
-        membrane: The membrane mesh (e.g., outer collar)
+        membrane: The membrane mesh (e.g., outer collar with extended parting surface)
         direction: Unit vector perpendicular to the membrane (pouring direction)
         thickness: Total thickness of the blade (default: 0.0005mm = 0.5 micron)
         
     Returns:
-        A watertight blade volume mesh
+        A watertight blade volume mesh for CSG subtraction
     """
     # Normalize direction
     direction = np.array(direction, dtype=np.float64)
@@ -929,67 +936,87 @@ def _create_cutting_blade_from_membrane(
     vertices = np.asarray(membrane.vertices, dtype=np.float64)
     faces = np.asarray(membrane.faces, dtype=np.int64)
     n_verts = len(vertices)
-    n_faces = len(faces)
     
     half_thickness = thickness / 2.0
     
-    # Create vertices for both sides of the blade
+    # =========================================================================
+    # STEP 1: Extrude membrane by ±thickness/2 in pouring direction
+    # =========================================================================
+    
     # Bottom side: membrane shifted in -direction
     bottom_vertices = vertices - direction * half_thickness
     # Top side: membrane shifted in +direction
     top_vertices = vertices + direction * half_thickness
     
-    # Combined vertices: [bottom, top]
+    # Combined vertices: [bottom (0..n-1), top (n..2n-1)]
     all_vertices = np.vstack([bottom_vertices, top_vertices])
     
-    # Faces:
-    # 1. Bottom faces - reverse winding so normals point outward (downward)
+    # =========================================================================
+    # STEP 2 & 3: Create top and bottom faces
+    # =========================================================================
+    
+    # Bottom faces - reverse winding so normals point outward (downward)
     bottom_faces = faces[:, ::-1]  # Reversed winding
     
-    # 2. Top faces - keep original winding, offset indices
+    # Top faces - keep original winding, offset indices by n_verts
     top_faces = faces + n_verts
     
-    # 3. Side faces connecting boundary edges
-    # Build edge info tracking DIRECTED edges (preserves winding information)
-    edge_count = {}
-    directed_edge_info = {}  # edge_key -> [(face_idx, v0, v1), ...] - list of directed edges
+    # =========================================================================
+    # STEP 4: Find boundary edges (edges belonging to only ONE face)
+    # =========================================================================
     
-    for fi, face in enumerate(faces):
+    # Build edge-to-face count mapping
+    edge_face_count = {}   # (v0, v1) canonical -> count
+    edge_to_face = {}      # (v0, v1) canonical -> (face_idx, third_vertex, directed_v0, directed_v1)
+    
+    for face_idx, face in enumerate(faces):
         for i in range(3):
-            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-            edge_key = (min(v0, v1), max(v0, v1))
-            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
+            v0 = int(face[i])
+            v1 = int(face[(i + 1) % 3])
+            v2 = int(face[(i + 2) % 3])
             
-            if edge_key not in directed_edge_info:
-                directed_edge_info[edge_key] = []
-            directed_edge_info[edge_key].append((fi, v0, v1))
+            # Canonical edge key (smaller index first)
+            edge_key = (min(v0, v1), max(v0, v1))
+            
+            edge_face_count[edge_key] = edge_face_count.get(edge_key, 0) + 1
+            # Store face info with directed edge (v0->v1 is edge direction in face)
+            edge_to_face[edge_key] = (face_idx, v2, v0, v1)
     
-    # Boundary edges have count == 1 (only one adjacent face)
-    boundary_edges = [(e, directed_edge_info[e][0]) for e, c in edge_count.items() if c == 1]
+    # Boundary edges have count == 1
+    boundary_edges = [edge for edge, count in edge_face_count.items() if count == 1]
     
     logger.debug(f"Blade: Found {len(boundary_edges)} boundary edges to close")
     
+    # =========================================================================
+    # STEP 5: Create side faces connecting boundary edges
+    # =========================================================================
+    
     side_faces = []
-    for edge_key, (fi, directed_v0, directed_v1) in boundary_edges:
-        # directed_v0 -> directed_v1 is the edge direction in the original face
-        # The outward-facing side of this edge (when viewed from outside the blade)
-        # should have normals pointing away from the face interior
+    for edge_key in boundary_edges:
+        face_idx, third_v, directed_v0, directed_v1 = edge_to_face[edge_key]
         
-        # Bottom vertices (same index as membrane)
+        # directed_v0 -> directed_v1 is the edge direction as it appears in the ORIGINAL face
+        # In the original face (CCW winding), the face interior is to the LEFT of this edge
+        # After bottom face reversal, the edge goes directed_v1 -> directed_v0
+        # The blade interior is to the LEFT of directed_v1 -> directed_v0 = RIGHT of v0->v1
+        # So side face normal should point LEFT of v0->v1 (where there's no adjacent face)
+        
+        # Bottom vertices (indices 0..n-1)
         b0, b1 = directed_v0, directed_v1
-        # Top vertices (offset by n_verts)
+        # Top vertices (indices n..2n-1)
         t0, t1 = directed_v0 + n_verts, directed_v1 + n_verts
         
         # Create quad (2 triangles) connecting bottom edge to top edge
-        # The edge b0->b1 is on the OUTSIDE of the bottom face (reversed winding)
-        # So the side face should have normals pointing outward from the blade center
         # 
-        # Visualize from outside looking at the side:
-        #   t0 ---- t1      (top)
-        #    |      |
-        #   b0 ---- b1      (bottom)
+        # Visualize the quad from OUTSIDE the blade (looking at the side):
+        #   t0 -------- t1      (top, at +thickness/2)
+        #    |          |
+        #    |  OUTSIDE |  <-- normal points this way (out of page)
+        #    |          |
+        #   b0 -------- b1      (bottom, at -thickness/2)
         #
-        # For outward normals (right-hand rule), we need:
+        # The boundary edge goes b0->b1 in the original face (interior to left)
+        # For outward normals on the side face, using right-hand rule:
         #   Triangle 1: b0 -> t0 -> t1 (CCW when viewed from outside)
         #   Triangle 2: b0 -> t1 -> b1 (CCW when viewed from outside)
         side_faces.append([b0, t0, t1])
