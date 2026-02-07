@@ -1284,7 +1284,7 @@ def split_shell_with_membrane(
     shell_with_cavity: trimesh.Trimesh,
     membrane: trimesh.Trimesh,
     pouring_direction: np.ndarray,
-    blade_thickness: float = 0.00001
+    blade_thickness: float = 0.001
 ) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool]:
     """
     Split the shell into two manifold halves using the membrane as a cutting blade.
@@ -1416,11 +1416,32 @@ def split_shell_with_membrane(
         logger.info(f"Found {len(components)} connected components")
         
         if len(components) < 2:
-            logger.warning("Failed to split shell into two components - blade may not have cut through")
-            elapsed_ms = (time.time() - start_time) * 1000
-            if len(components) == 1:
-                return components[0], None, elapsed_ms, False
-            return None, None, elapsed_ms, False
+            # Try with progressively thicker blades (2x increments, 5 attempts)
+            current_thickness = blade_thickness
+            max_retries = 5
+            for retry_num in range(max_retries):
+                current_thickness *= 2.0  # Double the thickness each retry
+                logger.info(f"Retry {retry_num + 1}/{max_retries}: Trying blade thickness {current_thickness:.4f}mm...")
+                retry_blade = _create_cutting_blade_from_membrane(membrane, direction, current_thickness)
+                retry_blade_manifold = _trimesh_to_manifold(retry_blade)
+                retry_cut_manifold = shell_manifold - retry_blade_manifold
+                retry_cut_shell = _manifold_to_trimesh(retry_cut_manifold)
+                components = retry_cut_shell.split(only_watertight=False)
+                logger.info(f"  Found {len(components)} connected components with {current_thickness:.4f}mm blade")
+                if len(components) >= 2:
+                    cut_shell = retry_cut_shell
+                    logger.info(f"  Success with {current_thickness:.4f}mm blade!")
+                    break
+            
+            if len(components) < 2:
+                elapsed_ms = (time.time() - start_time) * 1000
+                error_msg = (f"CUTTING SURFACE ERROR: Failed to split shell into two components after {max_retries} attempts. "
+                            f"Final blade thickness tried: {current_thickness:.4f}mm. "
+                            f"The cutting membrane may have holes, be disconnected, or not fully intersect the shell.")
+                logger.error(error_msg)
+                if len(components) == 1:
+                    return components[0], None, elapsed_ms, False
+                return None, None, elapsed_ms, False
         
         # Step 6: Sort by size and take the two largest
         components = sorted(components, key=lambda m: len(m.faces), reverse=True)
@@ -1464,7 +1485,7 @@ def split_shell_with_tall_blade(
     membrane: trimesh.Trimesh,
     pouring_direction: np.ndarray,
     extrusion_distance: float = 200.0,
-    blade_gap: float = 0.00001
+    blade_gap: float = 0.001
 ) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool]:
     """
     Split a shell using a tall cutting blade that extends far above and below the membrane.
@@ -1484,7 +1505,7 @@ def split_shell_with_tall_blade(
         membrane: The cutting membrane (parting surface + outer collar from hard shell)
         pouring_direction: Unit vector defining the "upper" direction
         extrusion_distance: How far to extrude blade above/below membrane (default: 200mm)
-        blade_gap: The thin gap created by the cut (default: 0.01 micron)
+        blade_gap: The thin gap created by the cut (default: 0.1mm)
         
     Returns:
         Tuple of (shell_half_1, shell_half_2, computation_time_ms, success)
@@ -1498,7 +1519,7 @@ def split_shell_with_tall_blade(
         return None, None, 0.0, False
     
     try:
-        logger.info(f"Splitting shell using tall blade (extrusion={extrusion_distance}mm, gap={blade_gap:.6f}mm)...")
+        logger.info(f"Splitting shell using tall blade (extrusion={extrusion_distance}mm, gap={blade_gap:.3f}mm)...")
         
         # Normalize direction
         direction = np.array(pouring_direction, dtype=np.float64)
@@ -1528,11 +1549,33 @@ def split_shell_with_tall_blade(
         logger.info(f"Found {len(components)} connected components")
         
         if len(components) < 2:
-            logger.warning("Failed to split shell into two components - blade may not have cut through")
-            elapsed_ms = (time.time() - start_time) * 1000
-            if len(components) == 1:
-                return components[0], None, elapsed_ms, False
-            return None, None, elapsed_ms, False
+            # Try with progressively larger blade gaps if split fails
+            # Try with progressively larger blade gaps (2x increments, 5 attempts)
+            current_gap = blade_gap
+            max_retries = 5
+            for retry_num in range(max_retries):
+                current_gap *= 2.0  # Double the gap each retry
+                logger.info(f"Retry {retry_num + 1}/{max_retries}: Trying blade gap {current_gap:.4f}mm...")
+                retry_blade = _create_tall_cutting_blade(membrane, direction, extrusion_distance, current_gap)
+                retry_blade_manifold = _trimesh_to_manifold(retry_blade)
+                retry_cut_manifold = shell_manifold - retry_blade_manifold
+                retry_cut_shell = _manifold_to_trimesh(retry_cut_manifold)
+                components = retry_cut_shell.split(only_watertight=False)
+                logger.info(f"  Found {len(components)} connected components with {current_gap:.4f}mm blade gap")
+                if len(components) >= 2:
+                    cut_shell = retry_cut_shell
+                    logger.info(f"  Success with {current_gap:.4f}mm blade gap!")
+                    break
+            
+            if len(components) < 2:
+                elapsed_ms = (time.time() - start_time) * 1000
+                error_msg = (f"CUTTING SURFACE ERROR: Failed to split shell into two components after {max_retries} attempts. "
+                            f"Final blade gap tried: {current_gap:.4f}mm. "
+                            f"The cutting membrane may have holes, be disconnected, or not fully intersect the shell.")
+                logger.error(error_msg)
+                if len(components) == 1:
+                    return components[0], None, elapsed_ms, False
+                return None, None, elapsed_ms, False
         
         # Step 6: Sort by size and take the two largest
         components = sorted(components, key=lambda m: len(m.faces), reverse=True)

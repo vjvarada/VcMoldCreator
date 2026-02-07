@@ -2800,7 +2800,8 @@ class CombinedSurfaceSmoothingWorker(QThread):
     def __init__(self, primary_extraction_result, secondary_extraction_result,
                  tet_result, part_mesh=None, hull_mesh=None,
                  smooth_iterations: int = 5, damping_factor: float = 0.5,
-                 use_tet_boundaries: bool = True, feature_aware_smoothing: bool = True):
+                 use_tet_boundaries: bool = True, feature_aware_smoothing: bool = True,
+                 dual_reproject_transition: bool = True):
         """
         Initialize combined surface smoothing worker.
         
@@ -2814,6 +2815,8 @@ class CombinedSurfaceSmoothingWorker(QThread):
             damping_factor: Smoothing damping factor (0.5 per paper Section 4.4)
             use_tet_boundaries: If True (default), use tetrahedral boundary surfaces
             feature_aware_smoothing: If True (default), detect and preserve concave corners.
+            dual_reproject_transition: If True (default), transition vertices are dual-reprojected
+                                       (first to part, then to primary) for smooth transitions.
         """
         super().__init__()
         self.primary_extraction_result = primary_extraction_result
@@ -2825,6 +2828,7 @@ class CombinedSurfaceSmoothingWorker(QThread):
         self.damping_factor = damping_factor
         self.use_tet_boundaries = use_tet_boundaries
         self.feature_aware_smoothing = feature_aware_smoothing
+        self.dual_reproject_transition = dual_reproject_transition
     
     def run(self):
         try:
@@ -2924,7 +2928,8 @@ class CombinedSurfaceSmoothingWorker(QThread):
                         part_mesh_for_reprojection,
                         hull_mesh_for_reprojection,
                         primary_mesh_for_secondary,
-                        "SECONDARY"
+                        "SECONDARY",
+                        dual_reproject_transition=self.dual_reproject_transition
                     )
             else:
                 self.progress.emit("")
@@ -3056,7 +3061,8 @@ class CombinedSurfaceSmoothingWorker(QThread):
             current_boundary_type  # Return the vertex_boundary_type for downstream use
         )
 
-    def _smooth_single_surface_no_collar(self, mesh, vertex_boundary_type, part_mesh, hull_mesh, primary_mesh, label: str):
+    def _smooth_single_surface_no_collar(self, mesh, vertex_boundary_type, part_mesh, hull_mesh, primary_mesh, label: str,
+                                          dual_reproject_transition: bool = True):
         """
         Smooth a single surface mesh WITHOUT collar creation.
         
@@ -3071,6 +3077,8 @@ class CombinedSurfaceSmoothingWorker(QThread):
             hull_mesh: Hull mesh (not used for re-projection, but passed for consistency)
             primary_mesh: Primary membrane mesh for re-projection of non-part boundary vertices
             label: Label for progress messages
+            dual_reproject_transition: If True (default), transition vertices are dual-reprojected
+                                       (first to part, then to primary) for smooth transitions.
         
         Returns tuple of:
             (mesh, num_vertices, num_faces, boundary_vertices, interior_vertices,
@@ -3115,7 +3123,8 @@ class CombinedSurfaceSmoothingWorker(QThread):
                 vertex_boundary_type=current_boundary_type,
                 feature_aware_smoothing=self.feature_aware_smoothing,
                 reproject_to_hull=False,  # Secondary: don't re-project to hull
-                reproject_to_primary=True  # Secondary: re-project non-part boundaries to primary
+                reproject_to_primary=True,  # Secondary: re-project non-part boundaries to primary
+                dual_reproject_transition=dual_reproject_transition  # Pass through the option
             )
             
             smoothing_time_ms = (time.time() - smoothing_start) * 1000
@@ -5014,9 +5023,19 @@ class DisplayOptionsPanel(QFrame):
         
         if show_halves:
             self.show_shell_half_1_cb.show()
+            # Use blockSignals to prevent double-emission, then emit manually
+            self.show_shell_half_1_cb.blockSignals(True)
             self.show_shell_half_1_cb.setChecked(True)  # Shown by default
+            self.show_shell_half_1_cb.blockSignals(False)
+            # Manually emit signal to ensure visibility is triggered
+            self.show_shell_half_1_changed.emit(True)
+            
             self.show_shell_half_2_cb.show()
+            self.show_shell_half_2_cb.blockSignals(True)
             self.show_shell_half_2_cb.setChecked(True)  # Shown by default
+            self.show_shell_half_2_cb.blockSignals(False)
+            # Manually emit signal to ensure visibility is triggered
+            self.show_shell_half_2_changed.emit(True)
         else:
             self.show_shell_half_1_cb.hide()
             self.show_shell_half_2_cb.hide()
@@ -6661,16 +6680,40 @@ class MainWindow(QMainWindow):
             self.mesh_viewer.set_hard_shell_prism_visible(False)
             
             # Show shell halves (primary visualization)
-            if shell_half_1 is not None:
+            if shell_half_1 is not None and shell_half_2 is not None:
                 self.mesh_viewer.show_shell_half_1(shell_half_1)
-            if shell_half_2 is not None:
+                self.mesh_viewer.set_shell_half_1_visible(True)  # Explicitly ensure visible
                 self.mesh_viewer.show_shell_half_2(shell_half_2)
+                self.mesh_viewer.set_shell_half_2_visible(True)  # Explicitly ensure visible
+                logger.info(f"Hard shell halves displayed: half1={shell_half_1 is not None}, half2={shell_half_2 is not None}")
+            else:
+                # Splitting failed - show warning dialog
+                QMessageBox.warning(
+                    self, 
+                    "Cutting Surface Error",
+                    "Failed to split the hard shell into two halves.\n\n"
+                    "The cutting membrane (outer collar) may have:\n"
+                    "• Holes or gaps\n"
+                    "• Disconnected regions\n"
+                    "• Not fully intersecting the shell boundary\n\n"
+                    "The unsplit shell is shown instead. Check the parting surface "
+                    "and outer collar for defects."
+                )
+                # Show the unsplit shell with cavity instead
+                self.mesh_viewer.set_shell_with_cavity_visible(True)
+                logger.warning("Shell splitting failed - showing unsplit shell with cavity")
         else:
-            # CSG failed - show just the prism
+            # CSG failed - show just the prism (visible by default for debugging)
             self.mesh_viewer.show_hard_shell_prism(prism_result.prism_mesh)
+            self.mesh_viewer.set_hard_shell_prism_visible(True)  # Make sure prism is visible when CSG fails
+            logger.warning("CSG failed - showing prism only (visible)")
         
         self._update_hard_shell_step_ui()
         self.step_buttons[Step.HARD_SHELL].set_status('completed')
+        
+        # Update metamold step to 'available' now that hard shell is complete
+        if shell_half_1 is not None and shell_half_2 is not None:
+            self.step_buttons[Step.METAMOLD].set_status('available')
         
         logger.info(f"Hard shell generated in {prism_result.computation_time_ms:.0f}ms "
                    f"(prism has {len(prism_result.silhouette_2d)} silhouette vertices)")
@@ -7076,9 +7119,19 @@ class MainWindow(QMainWindow):
             self.mesh_viewer.show_metamold_half_2(metamold_half_2)
             logger.info("Showing metamold halves in viewer")
         elif has_cavity:
-            # Show cavity if halves not available
+            # Show cavity if halves not available - show warning dialog
+            QMessageBox.warning(
+                self, 
+                "Cutting Surface Error",
+                "Failed to split the metamold into two halves.\n\n"
+                "The cutting membrane (outer collar) may have:\n"
+                "• Holes or gaps\n"
+                "• Disconnected regions\n"
+                "• Not fully intersecting the metamold boundary\n\n"
+                "The unsplit metamold with cavity is shown instead."
+            )
             self.mesh_viewer.show_metamold_with_cavity(metamold_with_cavity)
-            logger.info("Showing metamold with cavity in viewer (halves not valid)")
+            logger.warning("Showing metamold with cavity in viewer (halves not valid)")
         elif has_prism:
             # Fall back to prism
             self.mesh_viewer.show_metamold_prism(prism_result.prism_mesh)
@@ -11414,6 +11467,36 @@ class MainWindow(QMainWindow):
         """)
         smooth_layout.addRow("", self.smooth_feature_aware_cb)
         
+        # Dual re-projection for transition vertices checkbox (secondary surface only)
+        self.smooth_dual_reproject_cb = QCheckBox("Dual Re-projection (Secondary)")
+        self.smooth_dual_reproject_cb.setChecked(True)  # Default: enabled
+        self.smooth_dual_reproject_cb.setToolTip(
+            "For SECONDARY surfaces only:\n"
+            "If enabled, 'transition vertices' (primary-bound vertices adjacent to\n"
+            "part-bound vertices along boundary edges) are first reprojected to the\n"
+            "part mesh, then to the primary membrane. This ensures smooth transitions.\n\n"
+            "If disabled, transition vertices are only reprojected to the primary membrane."
+        )
+        self.smooth_dual_reproject_cb.setStyleSheet(f"""
+            QCheckBox {{
+                color: {Colors.DARK};
+                font-size: 12px;
+                padding: 4px 0;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+                border-radius: 3px;
+                border: 1px solid {Colors.GRAY};
+                background-color: {Colors.WHITE};
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: #9966ff;
+                border: 1px solid #7744dd;
+            }}
+        """)
+        smooth_layout.addRow("", self.smooth_dual_reproject_cb)
+        
         self.context_layout.addWidget(smooth_group)
         
         # Smooth button
@@ -11519,6 +11602,9 @@ class MainWindow(QMainWindow):
         feature_aware = getattr(self, 'smooth_feature_aware_cb', None)
         feature_aware = feature_aware.isChecked() if feature_aware else True
         
+        dual_reproject = getattr(self, 'smooth_dual_reproject_cb', None)
+        dual_reproject = dual_reproject.isChecked() if dual_reproject else True
+        
         # Check if we have a secondary surface to smooth
         has_secondary = (self._secondary_surface_result is not None and 
                         self._secondary_surface_result.mesh is not None and
@@ -11546,7 +11632,8 @@ class MainWindow(QMainWindow):
             smooth_iterations=smooth_iterations,
             damping_factor=damping_factor,
             use_tet_boundaries=True,
-            feature_aware_smoothing=feature_aware
+            feature_aware_smoothing=feature_aware,
+            dual_reproject_transition=dual_reproject
         )
         self._combined_smooth_worker.progress.connect(self._on_smooth_surface_progress)
         self._combined_smooth_worker.complete.connect(self._on_combined_smooth_surface_complete)

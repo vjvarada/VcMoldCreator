@@ -574,6 +574,94 @@ def find_boundary_edges(mesh: trimesh.Trimesh) -> List[Tuple[int, int]]:
 
 
 # =============================================================================
+# SELF-INTERSECTION DETECTION FOR DUAL REPROJECTION
+# =============================================================================
+
+def detect_flipped_triangles_for_vertices(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    vertex_indices: np.ndarray,
+    original_normals: np.ndarray,
+    vertex_to_faces: dict
+) -> np.ndarray:
+    """
+    Detect which vertices cause triangle normal flips (self-intersection indicator).
+    
+    This is used during dual reprojection of secondary surface transition vertices.
+    After projecting a vertex to a new position, if any incident triangle's normal
+    flips direction (dot product with original normal < 0), the vertex is flagged.
+    
+    Args:
+        vertices: Current vertex positions (N, 3)
+        faces: Triangle faces (F, 3)
+        vertex_indices: Indices of vertices to check
+        original_normals: Original face normals before any reprojection (F, 3)
+        vertex_to_faces: Dict mapping vertex index -> list of incident face indices
+        
+    Returns:
+        Array of vertex indices that caused triangle flips (subset of vertex_indices)
+    """
+    if len(vertex_indices) == 0:
+        return np.array([], dtype=np.int64)
+    
+    flipped_vertices = []
+    
+    for vi in vertex_indices:
+        incident_faces = vertex_to_faces.get(vi, [])
+        if not incident_faces:
+            continue
+        
+        vertex_caused_flip = False
+        for fi in incident_faces:
+            # Compute current face normal
+            face = faces[fi]
+            v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
+            edge1 = v1 - v0
+            edge2 = v2 - v0
+            current_normal = np.cross(edge1, edge2)
+            
+            # Check for degenerate triangle (near-zero area)
+            area_sq = np.dot(current_normal, current_normal)
+            if area_sq < 1e-12:  # Degenerate
+                vertex_caused_flip = True
+                break
+            
+            # Normalize
+            current_normal = current_normal / np.sqrt(area_sq)
+            
+            # Compare with original normal
+            original_normal = original_normals[fi]
+            dot = np.dot(current_normal, original_normal)
+            
+            if dot < 0.0:  # Normal flipped
+                vertex_caused_flip = True
+                break
+        
+        if vertex_caused_flip:
+            flipped_vertices.append(vi)
+    
+    return np.array(flipped_vertices, dtype=np.int64)
+
+
+def build_vertex_to_faces_map(faces: np.ndarray, n_vertices: int) -> dict:
+    """
+    Build a mapping from vertex index to list of incident face indices.
+    
+    Args:
+        faces: Triangle faces (F, 3)
+        n_vertices: Total number of vertices
+        
+    Returns:
+        Dict mapping vertex index -> list of face indices
+    """
+    vertex_to_faces = {v: [] for v in range(n_vertices)}
+    for fi, face in enumerate(faces):
+        for vi in face:
+            vertex_to_faces[vi].append(fi)
+    return vertex_to_faces
+
+
+# =============================================================================
 # FEATURE DETECTION FOR SHARP EDGES/CORNERS
 # =============================================================================
 
@@ -1206,7 +1294,8 @@ def smooth_membrane_with_boundary_reprojection(
     vertex_boundary_type: Optional[np.ndarray] = None,
     feature_aware_smoothing: bool = True,
     reproject_to_hull: bool = True,
-    reproject_to_primary: bool = False
+    reproject_to_primary: bool = False,
+    dual_reproject_transition: bool = True
 ) -> SmoothingResult:
     """
     Smooth the membrane surface following the algorithm from Section 4.4 of the paper.
@@ -1249,6 +1338,10 @@ def smooth_membrane_with_boundary_reprojection(
         reproject_to_primary: If True, re-project non-part boundary vertices to primary mesh
                              (if primary_mesh is provided and they are close enough).
                              Use True for secondary surfaces to connect to primary membrane.
+        dual_reproject_transition: If True (default), transition vertices (primary-bound with
+                             part-bound neighbors) are first reprojected to part, then to primary.
+                             This ensures smooth transitions at the interface.
+                             If False, transition vertices are only reprojected to primary.
     
     Returns:
         SmoothingResult with smoothed mesh and statistics
@@ -1611,9 +1704,10 @@ def smooth_membrane_with_boundary_reprojection(
     
     # Detect "transition vertices" - primary-bound vertices that have part-bound neighbors along boundary edges.
     # These need dual re-projection: first to part, then to primary, to ensure smooth transition.
+    # Only detect if dual_reproject_transition is enabled.
     part_boundary_set = set(part_boundary_indices)
     transition_vertex_indices = []
-    if len(primary_boundary_indices) > 0 and len(part_boundary_indices) > 0:
+    if dual_reproject_transition and len(primary_boundary_indices) > 0 and len(part_boundary_indices) > 0:
         for vi in primary_boundary_indices:
             neighbors_along_boundary = boundary_neighbors.get(vi, set())
             # Check if any boundary neighbor is part-bound
@@ -1624,6 +1718,10 @@ def smooth_membrane_with_boundary_reprojection(
     if len(transition_vertex_indices) > 0:
         logger.info(f"Detected {len(transition_vertex_indices)} transition vertices "
                    f"(primary-bound with part-bound neighbors) for dual re-projection")
+    elif dual_reproject_transition:
+        logger.info("Dual re-projection enabled but no transition vertices found")
+    else:
+        logger.info("Dual re-projection disabled - transition vertices skipped")
     
     # Count how many boundary vertices are FREE (not re-projected anywhere)
     n_free_boundary = len(boundary_verts) - len(part_boundary_indices) - len(hull_boundary_indices) - len(primary_boundary_indices)
@@ -1971,6 +2069,14 @@ def smooth_membrane_with_boundary_reprojection(
     # NOTE: We no longer add corner vertices to excluded_set
     # They will be smoothed normally, then snapped back to original positions after
     
+    # Build vertex -> faces map for self-intersection detection during dual reprojection
+    # (only needed for secondary surfaces with transition vertices)
+    vertex_to_faces_map = None
+    dual_reproject_skip_set = set()  # Vertices to skip in dual reprojection (caused flips)
+    if len(transition_vertex_indices) > 0:
+        vertex_to_faces_map = build_vertex_to_faces_map(faces, len(vertices))
+        logger.debug(f"Built vertex_to_faces map for {len(transition_vertex_indices)} transition vertices")
+
     # Alternating smoothing iterations per paper Section 4.4:
     # "The smoothing is performed by alternating two main steps:
     #  1. First we smooth the polyline that includes the boundary vertices only.
@@ -2064,22 +2170,67 @@ def smooth_membrane_with_boundary_reprojection(
             # Vertices on edges connecting to part-bound vertices need to be projected
             # to part FIRST, then to primary. This ensures the secondary membrane
             # maintains a smooth transition at the part boundary interface.
+            #
+            # SELF-INTERSECTION PREVENTION:
+            # After reprojecting to part, we check if any triangles flipped their normal.
+            # If so, we revert those vertices and skip them in future iterations.
             if len(transition_vertex_indices) > 0 and part_mesh is not None:
-                if part_feature_types is not None:
-                    # Use feature-aware reprojection for transition vertices to part
-                    vertices = reproject_with_feature_awareness(
-                        vertices=vertices,
-                        boundary_indices=transition_vertex_indices,
-                        target_mesh=part_mesh,
-                        feature_types=part_feature_types,
-                        sharp_edge_info=part_sharp_edge_info,
-                        search_radius=search_radius
-                    )
-                elif part_proximity is not None:
-                    # Fallback to standard reprojection
-                    transition_positions = vertices[transition_vertex_indices]
-                    closest_pts, _, _ = part_proximity.on_surface(transition_positions)
-                    vertices[transition_vertex_indices] = closest_pts
+                # Filter out vertices that previously caused self-intersection
+                active_transition_verts = np.array(
+                    [vi for vi in transition_vertex_indices if vi not in dual_reproject_skip_set],
+                    dtype=np.int64
+                )
+                
+                if len(active_transition_verts) > 0:
+                    # Save positions and compute face normals BEFORE dual reprojection
+                    pre_dual_positions = vertices[active_transition_verts].copy()
+                    
+                    # Compute original face normals (only for faces incident to transition vertices)
+                    original_face_normals = np.zeros((len(faces), 3))
+                    for fi, face in enumerate(faces):
+                        v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
+                        edge1 = v1 - v0
+                        edge2 = v2 - v0
+                        n = np.cross(edge1, edge2)
+                        norm = np.linalg.norm(n)
+                        if norm > 1e-12:
+                            original_face_normals[fi] = n / norm
+                    
+                    # Perform dual reprojection to part mesh
+                    if part_feature_types is not None:
+                        vertices = reproject_with_feature_awareness(
+                            vertices=vertices,
+                            boundary_indices=active_transition_verts,
+                            target_mesh=part_mesh,
+                            feature_types=part_feature_types,
+                            sharp_edge_info=part_sharp_edge_info,
+                            search_radius=search_radius
+                        )
+                    elif part_proximity is not None:
+                        transition_positions = vertices[active_transition_verts]
+                        closest_pts, _, _ = part_proximity.on_surface(transition_positions)
+                        vertices[active_transition_verts] = closest_pts
+                    
+                    # Detect vertices that caused triangle flips (self-intersection)
+                    if vertex_to_faces_map is not None:
+                        flipped_verts = detect_flipped_triangles_for_vertices(
+                            vertices=vertices,
+                            faces=faces,
+                            vertex_indices=active_transition_verts,
+                            original_normals=original_face_normals,
+                            vertex_to_faces=vertex_to_faces_map
+                        )
+                        
+                        if len(flipped_verts) > 0:
+                            # Revert flipped vertices to pre-dual-reprojection positions
+                            for i, vi in enumerate(active_transition_verts):
+                                if vi in flipped_verts:
+                                    vertices[vi] = pre_dual_positions[i]
+                                    dual_reproject_skip_set.add(vi)
+                            
+                            if iteration == 0:  # Only log on first iteration to avoid spam
+                                logger.info(f"Self-intersection prevention: reverted {len(flipped_verts)} "
+                                           f"transition vertices (will skip dual reprojection for these)")
             
             # Now project ALL primary vertices to primary mesh (including transition vertices)
             if primary_feature_types is not None:
@@ -2126,6 +2277,12 @@ def smooth_membrane_with_boundary_reprojection(
         
         # Store the restored positions for visualization (blue spheres)
         result.restored_corner_positions = np.array(list(corner_original_positions.values()))
+    
+    # Report on self-intersection prevention for secondary surface dual reprojection
+    if len(dual_reproject_skip_set) > 0:
+        logger.info(f"Self-intersection prevention: {len(dual_reproject_skip_set)} of "
+                   f"{len(transition_vertex_indices)} transition vertices skipped dual reprojection "
+                   f"(would have caused triangle flips)")
     
     # Create smoothed mesh
     smoothed_mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
