@@ -79,6 +79,17 @@ PRIMARY_MIN_ISLAND_AREA_FRACTION = 0.01  # Islands with area < 1% of total are r
 FLOATING_EDGE_TOLERANCE_FRACTION = 0.001  # Edge is floating if midpoint is > 0.1% of edge length from part
 FLOATING_EDGE_MIN_TOLERANCE = 1e-6        # Minimum tolerance: 1 nanometer (essentially zero for CSG)
 
+# =============================================================================
+# FAN COLLAR TRIANGLE VERTEX CLASSIFICATION CONSTANTS
+# =============================================================================
+# These thresholds are used to classify boundary vertices for fan collar creation.
+# Based on boundary edge angles and loop topology.
+
+SHARP_CORNER_ANGLE_THRESHOLD = 60.0   # degrees - edges meeting at angle < this are "sharp corners"
+NEAR_TIP_ANGLE_THRESHOLD = 45.0       # degrees - edges nearly parallel (< this) are "near tips"
+COLLAR_DIVERGENCE_THRESHOLD = 90.0    # degrees - collars spread > 180 - this are "divergent"
+SMALL_LOOP_MAX_VERTICES = 5           # max vertices for a closed loop to be considered "small"
+
 
 # =============================================================================
 # MARCHING TETRAHEDRA LOOKUP TABLES
@@ -242,6 +253,100 @@ class PartingSurfaceResult:
     
     # Timing
     extraction_time_ms: float = 0.0
+
+
+@dataclass
+class BoundaryVertexInfo:
+    """
+    Classification info for boundary vertices for fan collar triangle creation.
+    
+    This dataclass stores the results of analyzing inner boundary edges and 
+    classifying each vertex based on topology and geometry.
+    
+    Vertex Classification Priority Order:
+        1. small_loop_vertices (vertices in closed loops ≤5 vertices) - gets fans
+        2. endpoints (1 boundary edge) - NO fans
+        3. high_valence (3+ boundary edges) - gets fans
+        4. isolated_tips (2 edges from SAME face) - gets fans
+        5. near_tips (2 edges, angle < 45°) - gets fans
+        6. sharp_corners (2 edges, angle < 60°) - gets fans
+        7. divergent_corners (2 edges, angle > 135°) - gets fans
+        8. corners (regular 2-edge vertices) - gets fans
+    
+    References:
+        Algorithm designed for fan collar creation in parting surface smoothing step.
+    """
+    
+    # PRIMARY categories
+    corners: List[int] = None              # Regular corners (2 edges from DIFFERENT faces, 60°-135° angle)
+    isolated_tips: List[int] = None        # 2 edges from SAME face (single triangle tip)
+    endpoints: List[int] = None            # 1 boundary edge (chain end) - NO FANS
+    
+    # ENHANCED categories  
+    near_tips: List[int] = None            # 2 edges from diff faces but similar direction (<45°)
+    sharp_corners: List[int] = None        # Edges meet at sharp angle (< 60°)
+    divergent_corners: List[int] = None    # Collar directions spread > 135°
+    high_valence: List[int] = None         # 3+ boundary edges (complex junctions)
+    small_loop_vertices: List[int] = None  # Vertices part of small closed boundary loops
+    
+    # Edge data for debugging/visualization
+    vertex_to_edges: Dict[int, List[Tuple]] = None  # vertex -> [(edge_key, this_v, other_v), ...]
+    vertex_edge_angles: Dict[int, float] = None     # vertex -> angle between edges (degrees)
+    
+    def __post_init__(self):
+        """Initialize empty lists if None."""
+        if self.corners is None:
+            self.corners = []
+        if self.isolated_tips is None:
+            self.isolated_tips = []
+        if self.endpoints is None:
+            self.endpoints = []
+        if self.near_tips is None:
+            self.near_tips = []
+        if self.sharp_corners is None:
+            self.sharp_corners = []
+        if self.divergent_corners is None:
+            self.divergent_corners = []
+        if self.high_valence is None:
+            self.high_valence = []
+        if self.small_loop_vertices is None:
+            self.small_loop_vertices = []
+        if self.vertex_to_edges is None:
+            self.vertex_to_edges = {}
+        if self.vertex_edge_angles is None:
+            self.vertex_edge_angles = {}
+    
+    def get_all_fan_vertices(self) -> List[int]:
+        """
+        Get all vertices that should have fanned triangle collars.
+        
+        Returns all classified vertices EXCEPT endpoints (which have only 1 edge
+        and don't need fan triangles).
+        
+        Returns:
+            List of vertex indices that should receive fan collar triangles.
+        """
+        fan_verts = set(self.isolated_tips)
+        fan_verts.update(self.near_tips)
+        fan_verts.update(self.sharp_corners)
+        fan_verts.update(self.divergent_corners)
+        fan_verts.update(self.high_valence)
+        fan_verts.update(self.corners)
+        fan_verts.update(self.small_loop_vertices)
+        # NOTE: endpoints are EXCLUDED (no fans needed for 1-edge vertices)
+        return list(fan_verts)
+    
+    def get_total_classified(self) -> int:
+        """Get total number of classified vertices (including endpoints)."""
+        all_verts = set(self.corners)
+        all_verts.update(self.isolated_tips)
+        all_verts.update(self.endpoints)
+        all_verts.update(self.near_tips)
+        all_verts.update(self.sharp_corners)
+        all_verts.update(self.divergent_corners)
+        all_verts.update(self.high_valence)
+        all_verts.update(self.small_loop_vertices)
+        return len(all_verts)
 
 
 def extract_parting_surface(
@@ -3165,6 +3270,357 @@ def fill_floating_edge_gaps(
     return result
 
 
+# =============================================================================
+# FAN COLLAR VERTEX CLASSIFICATION FUNCTIONS
+# =============================================================================
+
+def _compute_edge_angle(
+    vi_pos: np.ndarray,
+    other_a_pos: np.ndarray,
+    other_b_pos: np.ndarray
+) -> float:
+    """
+    Compute the angle (in degrees) between two edges meeting at a vertex.
+    
+    The angle is measured between the vectors (vi_pos -> other_a_pos) and
+    (vi_pos -> other_b_pos).
+    
+    Args:
+        vi_pos: Position of the common vertex
+        other_a_pos: Position of the endpoint of edge A (other than vi)
+        other_b_pos: Position of the endpoint of edge B (other than vi)
+    
+    Returns:
+        Angle in degrees [0, 180]
+    """
+    # Compute edge vectors from vi
+    edge_a = other_a_pos - vi_pos
+    edge_b = other_b_pos - vi_pos
+    
+    # Normalize
+    len_a = np.linalg.norm(edge_a)
+    len_b = np.linalg.norm(edge_b)
+    
+    if len_a < 1e-10 or len_b < 1e-10:
+        return 180.0  # Degenerate case - treat as straight
+    
+    edge_a_unit = edge_a / len_a
+    edge_b_unit = edge_b / len_b
+    
+    # Compute angle using dot product
+    cos_angle = np.clip(np.dot(edge_a_unit, edge_b_unit), -1.0, 1.0)
+    angle_rad = np.arccos(cos_angle)
+    angle_deg = np.degrees(angle_rad)
+    
+    return angle_deg
+
+
+def _detect_small_boundary_loops(
+    inner_boundary_edges: List[Tuple[int, int]],
+    max_vertices: int = SMALL_LOOP_MAX_VERTICES
+) -> List[set]:
+    """
+    Detect small closed boundary loops in the inner boundary edges.
+    
+    A "small loop" is a connected component of boundary edges that:
+    - Forms a closed loop (all vertices have exactly 2 neighbors in the component)
+    - Has <= max_vertices vertices
+    
+    These often occur at protrusion tips where a small ring of triangles caps
+    the end. All vertices in such loops should receive fan collar triangles.
+    
+    Args:
+        inner_boundary_edges: List of (v0, v1) inner boundary edges
+        max_vertices: Maximum number of vertices for a loop to be considered "small"
+    
+    Returns:
+        List of sets, each containing vertex indices forming a small closed loop
+    """
+    if len(inner_boundary_edges) == 0:
+        return []
+    
+    # Build adjacency graph
+    adj = {}
+    for v0, v1 in inner_boundary_edges:
+        if v0 not in adj:
+            adj[v0] = set()
+        if v1 not in adj:
+            adj[v1] = set()
+        adj[v0].add(v1)
+        adj[v1].add(v0)
+    
+    # Find connected components using DFS
+    visited = set()
+    small_loops = []
+    
+    for start_v in adj:
+        if start_v in visited:
+            continue
+        
+        # DFS to find component
+        component = set()
+        stack = [start_v]
+        
+        while stack:
+            v = stack.pop()
+            if v in visited:
+                continue
+            visited.add(v)
+            component.add(v)
+            
+            for neighbor in adj.get(v, set()):
+                if neighbor not in visited:
+                    stack.append(neighbor)
+        
+        # Check if this is a small closed loop
+        # Closed loop: ALL vertices have exactly 2 neighbors within the component
+        if len(component) <= max_vertices and len(component) >= 3:
+            is_closed_loop = True
+            for v in component:
+                neighbors_in_component = adj.get(v, set()) & component
+                if len(neighbors_in_component) != 2:
+                    is_closed_loop = False
+                    break
+            
+            if is_closed_loop:
+                small_loops.append(component)
+    
+    return small_loops
+
+
+def _classify_boundary_edge(
+    v0: int,
+    v1: int,
+    vertices_arr: np.ndarray,
+    part_mesh: trimesh.Trimesh,
+    hull_mesh: Optional[trimesh.Trimesh],
+    vertex_boundary_type: Optional[np.ndarray],
+    vert_to_part_dist: Dict[int, float],
+    vert_to_hull_dist: Dict[int, float],
+    part_proximity_threshold: float = 0.5
+) -> str:
+    """
+    Classify a boundary edge as 'inner' (part) or 'outer' (hull).
+    
+    Classification logic priority:
+    1. PRIMARY: If hull mesh available, compare distances to part vs hull
+    2. SECONDARY: Use vertex_boundary_type array (-1=part, 1/2=hull)
+    3. FALLBACK: Distance < part_proximity_threshold
+    
+    Args:
+        v0, v1: Vertex indices of the edge
+        vertices_arr: (N, 3) array of vertex positions
+        part_mesh: The part mesh
+        hull_mesh: The hull mesh (optional)
+        vertex_boundary_type: Array with -1=part, 0=interior, 1/2=hull
+        vert_to_part_dist: Dict mapping vertex -> distance to part
+        vert_to_hull_dist: Dict mapping vertex -> distance to hull
+        part_proximity_threshold: Fallback threshold in mm
+    
+    Returns:
+        'inner' if edge is on part boundary, 'outer' if on hull boundary
+    """
+    has_hull_mesh = hull_mesh is not None and len(vert_to_hull_dist) > 0
+    has_boundary_type = vertex_boundary_type is not None and len(vertex_boundary_type) > 0
+    
+    # Get distances
+    d0_part = vert_to_part_dist.get(v0, 999)
+    d1_part = vert_to_part_dist.get(v1, 999)
+    d0_hull = vert_to_hull_dist.get(v0, 999) if has_hull_mesh else 999
+    d1_hull = vert_to_hull_dist.get(v1, 999) if has_hull_mesh else 999
+    
+    # =========================================================================
+    # PRIMARY: Use hull vs part distance comparison (most reliable after smoothing)
+    # =========================================================================
+    if has_hull_mesh:
+        v0_closer_to_part = d0_part < d0_hull
+        v1_closer_to_part = d1_part < d1_hull
+        
+        if v0_closer_to_part and v1_closer_to_part:
+            return 'inner'
+        elif not v0_closer_to_part and not v1_closer_to_part:
+            return 'outer'
+        else:
+            # Mixed - check edge midpoint
+            midpoint = (vertices_arr[v0] + vertices_arr[v1]) / 2
+            try:
+                _, mid_dist_part, _ = trimesh.proximity.closest_point(part_mesh, [midpoint])
+                _, mid_dist_hull, _ = trimesh.proximity.closest_point(hull_mesh, [midpoint])
+                
+                if mid_dist_part[0] < mid_dist_hull[0]:
+                    return 'inner'
+                else:
+                    return 'outer'
+            except Exception:
+                # Fallback on error
+                pass
+    
+    # =========================================================================
+    # SECONDARY: Use vertex_boundary_type if available
+    # =========================================================================
+    if has_boundary_type:
+        bt0 = vertex_boundary_type[v0] if v0 < len(vertex_boundary_type) else 0
+        bt1 = vertex_boundary_type[v1] if v1 < len(vertex_boundary_type) else 0
+        
+        # Definite inner: at least one vertex is on part boundary (-1)
+        if bt0 == -1 or bt1 == -1:
+            return 'inner'
+        # Definite outer: both vertices are on hull boundary (1 or 2)
+        elif bt0 in (1, 2) and bt1 in (1, 2):
+            return 'outer'
+        # One is hull - treat as outer
+        elif bt0 in (1, 2) or bt1 in (1, 2):
+            return 'outer'
+    
+    # =========================================================================
+    # FALLBACK: Pure distance heuristic
+    # =========================================================================
+    if d0_part < part_proximity_threshold or d1_part < part_proximity_threshold:
+        return 'inner'
+    
+    return 'outer'
+
+
+def _detect_boundary_vertices(
+    inner_boundary_edges: List[Tuple[int, int]],
+    edge_to_face: Dict[Tuple[int, int], Tuple[int, int]],
+    vertices_arr: np.ndarray
+) -> BoundaryVertexInfo:
+    """
+    Classify all boundary vertices for fan collar creation.
+    
+    This function analyzes the topology and geometry of inner boundary edges
+    to classify each vertex into one of several categories that determine
+    whether and how fan collar triangles should be created.
+    
+    Classification Priority Order:
+        1. small_loop_vertices (vertices in closed loops ≤5 vertices) - gets fans
+        2. endpoints (1 boundary edge) - NO fans
+        3. high_valence (3+ boundary edges) - gets fans
+        4. isolated_tips (2 edges from SAME face) - gets fans
+        5. near_tips (2 edges, angle < 45°) - gets fans
+        6. sharp_corners (2 edges, angle < 60°) - gets fans
+        7. divergent_corners (2 edges, angle > 135°) - gets fans
+        8. corners (regular 2-edge vertices) - gets fans
+    
+    Args:
+        inner_boundary_edges: List of (v0, v1) inner boundary edges
+        edge_to_face: Dict mapping edge_key -> (face_idx, third_vertex)
+        vertices_arr: (N, 3) array of vertex positions
+    
+    Returns:
+        BoundaryVertexInfo with all classification data
+    """
+    info = BoundaryVertexInfo()
+    
+    if len(inner_boundary_edges) == 0:
+        return info
+    
+    # Build vertex -> edges mapping
+    vertex_to_edges = {}
+    for v0, v1 in inner_boundary_edges:
+        edge_key = (min(v0, v1), max(v0, v1))
+        
+        if v0 not in vertex_to_edges:
+            vertex_to_edges[v0] = []
+        if v1 not in vertex_to_edges:
+            vertex_to_edges[v1] = []
+        
+        # Store: (edge_key, this_vertex, other_vertex)
+        vertex_to_edges[v0].append((edge_key, v0, v1))
+        vertex_to_edges[v1].append((edge_key, v1, v0))
+    
+    info.vertex_to_edges = vertex_to_edges
+    
+    # FIRST: Detect small boundary loops (all vertices in these get fans)
+    small_loops = _detect_small_boundary_loops(inner_boundary_edges, SMALL_LOOP_MAX_VERTICES)
+    small_loop_vertex_set = set()
+    for loop in small_loops:
+        small_loop_vertex_set.update(loop)
+        info.small_loop_vertices.extend(loop)
+    
+    if small_loops:
+        logger.debug(f"Found {len(small_loops)} small boundary loops with {len(small_loop_vertex_set)} total vertices")
+    
+    # Classify each vertex
+    for vi, edges in vertex_to_edges.items():
+        n_edges = len(edges)
+        
+        # Skip if already in small loop (will get fans regardless)
+        if vi in small_loop_vertex_set:
+            continue
+        
+        # 1 edge: endpoint (NO FAN)
+        if n_edges == 1:
+            info.endpoints.append(vi)
+            continue
+        
+        # 3+ edges: high-valence junction (ALWAYS FANS)
+        if n_edges >= 3:
+            info.high_valence.append(vi)
+            continue
+        
+        # 2 edges: detailed classification
+        edge_a = edges[0]
+        edge_b = edges[1]
+        
+        edge_key_a = edge_a[0]
+        edge_key_b = edge_b[0]
+        other_v_a = edge_a[2]  # other vertex of edge A
+        other_v_b = edge_b[2]  # other vertex of edge B
+        
+        # Get face info for both edges
+        face_a = edge_to_face.get(edge_key_a)
+        face_b = edge_to_face.get(edge_key_b)
+        
+        # Check if both edges come from the same face (isolated tip)
+        same_face = (face_a is not None and face_b is not None and face_a[0] == face_b[0])
+        
+        # Compute angle between the two edges
+        vi_pos = vertices_arr[vi]
+        other_a_pos = vertices_arr[other_v_a]
+        other_b_pos = vertices_arr[other_v_b]
+        
+        edge_angle = _compute_edge_angle(vi_pos, other_a_pos, other_b_pos)
+        info.vertex_edge_angles[vi] = edge_angle
+        
+        if same_face:
+            # ISOLATED TIP: Both edges from same face (single triangle tip)
+            info.isolated_tips.append(vi)
+            
+        elif edge_angle < NEAR_TIP_ANGLE_THRESHOLD:
+            # NEAR TIP: Edges point in similar direction (nearly parallel)
+            info.near_tips.append(vi)
+            
+        elif edge_angle < SHARP_CORNER_ANGLE_THRESHOLD:
+            # SHARP CORNER: Edges meet at sharp angle
+            info.sharp_corners.append(vi)
+            
+        elif edge_angle > (180.0 - COLLAR_DIVERGENCE_THRESHOLD / 2):
+            # DIVERGENT CORNER: Collar directions will spread significantly (>135°)
+            info.divergent_corners.append(vi)
+            
+        else:
+            # REGULAR CORNER: Moderate angle (60° to 135°)
+            info.corners.append(vi)
+    
+    # Log classification summary
+    total = info.get_total_classified()
+    fan_count = len(info.get_all_fan_vertices())
+    logger.info(
+        f"Boundary vertex classification: {total} total vertices "
+        f"({fan_count} get fans, {len(info.endpoints)} endpoints no fans)"
+    )
+    logger.debug(
+        f"  small_loop={len(info.small_loop_vertices)}, isolated_tips={len(info.isolated_tips)}, "
+        f"near_tips={len(info.near_tips)}, sharp={len(info.sharp_corners)}, "
+        f"divergent={len(info.divergent_corners)}, corners={len(info.corners)}, "
+        f"high_valence={len(info.high_valence)}, endpoints={len(info.endpoints)}"
+    )
+    
+    return info
+
+
 def create_robust_collar_extension(
     membrane_mesh: trimesh.Trimesh,
     part_mesh: trimesh.Trimesh,
@@ -3377,58 +3833,59 @@ def create_robust_collar_extension(
         return result
     
     # =========================================================================
-    # STEP 2: Build vertex adjacency for boundary vertices
+    # STEP 2: Classify boundary vertices using enhanced detection
     # =========================================================================
+    # Use the multi-stage classification algorithm to determine which vertices
+    # receive fan collar triangles. This replaces the previous simple detection.
+    #
+    # Classification categories (from _detect_boundary_vertices):
+    #   - small_loop_vertices: vertices in closed loops ≤5 vertices (gets fans)
+    #   - endpoints: 1 boundary edge (NO fans)
+    #   - high_valence: 3+ boundary edges (gets fans)
+    #   - isolated_tips: 2 edges from SAME face (gets fans, special collar direction)
+    #   - near_tips: 2 edges, angle <45° (gets fans)
+    #   - sharp_corners: 2 edges, angle <60° (gets fans)
+    #   - divergent_corners: 2 edges, angle >135° (gets fans)
+    #   - corners: regular 2-edge vertices (gets fans)
     
-    # Map each boundary vertex to its adjacent boundary edges
-    vertex_to_boundary_edges = {}
-    for v0, v1 in inner_boundary_edges:
-        if v0 not in vertex_to_boundary_edges:
-            vertex_to_boundary_edges[v0] = []
-        if v1 not in vertex_to_boundary_edges:
-            vertex_to_boundary_edges[v1] = []
-        vertex_to_boundary_edges[v0].append(((v0, v1), v0, v1))  # (edge_tuple, this_vertex, other_vertex)
-        vertex_to_boundary_edges[v1].append(((v0, v1), v1, v0))
+    boundary_vertex_info = _detect_boundary_vertices(
+        inner_boundary_edges=inner_boundary_edges,
+        edge_to_face=edge_to_face,
+        vertices_arr=vertices_arr
+    )
     
-    # Identify different types of boundary vertices:
-    # - corner_vertices: vertices with 2+ boundary edges (regular corners along boundary chain)
-    # - isolated_tip_vertices: vertices where 2 boundary edges share the SAME face (isolated triangle tip)
-    # - endpoint_vertices: vertices with only 1 boundary edge
+    # Get the vertex-to-edges mapping built by the classification
+    vertex_to_boundary_edges = boundary_vertex_info.vertex_to_edges
     
-    corner_vertices = []
-    isolated_tip_vertices = []  # Special case: 2 boundary edges from same triangle
-    endpoint_vertices = []
+    # Get all vertices that should receive fan triangles
+    all_fan_vertices = set(boundary_vertex_info.get_all_fan_vertices())
     
-    for vi, edges in vertex_to_boundary_edges.items():
-        if len(edges) == 1:
-            endpoint_vertices.append(vi)
-        elif len(edges) == 2:
-            # Check if these 2 boundary edges share the same face (isolated tip)
-            edge_key_a = (min(edges[0][0][0], edges[0][0][1]), max(edges[0][0][0], edges[0][0][1]))
-            edge_key_b = (min(edges[1][0][0], edges[1][0][1]), max(edges[1][0][0], edges[1][0][1]))
-            
-            face_a = edge_to_face.get(edge_key_a)
-            face_b = edge_to_face.get(edge_key_b)
-            
-            if face_a is not None and face_b is not None and face_a[0] == face_b[0]:
-                # Same face - this is an isolated triangle tip!
-                isolated_tip_vertices.append(vi)
-                logger.debug(f"Vertex {vi} is isolated tip (both boundary edges on face {face_a[0]})")
-            else:
-                # Different faces - regular corner along boundary chain
-                corner_vertices.append(vi)
-        elif len(edges) > 2:
-            logger.warning(f"Vertex {vi} has {len(edges)} boundary edges (complex junction)")
-            corner_vertices.append(vi)
+    # For backward compatibility, also maintain the old variable names
+    isolated_tip_vertices = boundary_vertex_info.isolated_tips
+    corner_vertices = (
+        boundary_vertex_info.corners + 
+        boundary_vertex_info.near_tips + 
+        boundary_vertex_info.sharp_corners + 
+        boundary_vertex_info.divergent_corners + 
+        boundary_vertex_info.high_valence +
+        boundary_vertex_info.small_loop_vertices
+    )
+    endpoint_vertices = boundary_vertex_info.endpoints
     
-    logger.info(f"Corner vertices: {len(corner_vertices)}, isolated tips: {len(isolated_tip_vertices)}, endpoints: {len(endpoint_vertices)}")
+    logger.info(f"Fan vertices: {len(all_fan_vertices)} total "
+                f"(isolated_tips={len(isolated_tip_vertices)}, other_corners={len(corner_vertices)}, "
+                f"endpoints={len(endpoint_vertices)} no fans)")
     
     # =========================================================================
     # STEP 3: Create collar vertices for each edge endpoint
     # =========================================================================
     # Simple approach: create one collar vertex per edge endpoint.
     # For regular corners and edge midpoints, this works fine.
-    # Isolated tips get special handling - need different collar points for each edge.
+    # Isolated tips get special handling - need different collar points for each edge
+    # because the perpendicular direction is different for each edge.
+    #
+    # NOTE: isolated_tip_set is used for COLLAR PLACEMENT (perpendicular to edge)
+    #       all_fan_vertices is used for which vertices get FAN TRIANGLES
     
     membrane_face_normals = membrane_mesh.face_normals
     part_face_normals = part_mesh.face_normals
@@ -3437,8 +3894,14 @@ def create_robust_collar_extension(
     # edge_endpoint_collar[edge_key][vi] = collar_idx
     edge_endpoint_collar = {}
     
-    # Convert isolated_tip_vertices to a set for fast lookup
+    # Set of vertices with isolated tip geometry (2 edges from same face)
+    # These need special perpendicular collar direction for each edge
     isolated_tip_set = set(isolated_tip_vertices)
+    
+    # Set of ALL vertices that will receive fan triangles  
+    # This includes isolated tips + near tips + sharp corners + divergent corners + 
+    # regular corners + high valence + small loop vertices (but NOT endpoints)
+    fan_vertex_set = all_fan_vertices
     
     collar_vertices_created = 0
     
@@ -3735,308 +4198,333 @@ def create_robust_collar_extension(
     logger.info(f"Created {quads_created} quad collars ({quads_created * 2} triangles)")
     
     # =========================================================================
-    # STEP 5: Create arc fans at isolated tip vertices
+    # STEP 5: Create arc fans at ALL fan vertices
     # =========================================================================
-    # Isolated tips are vertices where 2 boundary edges share the SAME face
-    # (a triangle with 2 boundary edges sticking out). These need a fan of
-    # triangles to bridge between the two quad collars.
+    # Fan triangles are created at vertices where 2+ boundary edges meet.
+    # These include:
+    #   - isolated_tips: 2 edges from SAME face (special geometry)
+    #   - near_tips: 2 edges, angle <45° (nearly parallel)
+    #   - sharp_corners: 2 edges, angle <60°
+    #   - divergent_corners: 2 edges, angle >135° (wide spread)
+    #   - corners: regular 2-edge vertices (60°-135°)
+    #   - high_valence: 3+ boundary edges (complex junctions)
+    #   - small_loop_vertices: part of closed loops ≤5 vertices
     #
-    # NEW APPROACH: Use the adjacent quad information to determine the correct
-    # arc direction. The fan should go AWAY from the "other" collar vertices
-    # (which are on the interior side of the boundary).
+    # The arc fan bridges between the two (or more) quad collars meeting at
+    # each vertex. For 2-edge vertices, we create a fan from collar A to collar B.
+    # For 3+ edge vertices, we create fans between all adjacent collar pairs.
+    #
+    # NOTE: Endpoints (1 edge) do NOT get fans - they are chain ends.
     
     tip_arc_vertices_created = 0
     tip_fan_triangles_created = 0
     
-    for vi in isolated_tip_vertices:
+    for vi in fan_vertex_set:
         edges_at_tip = vertex_to_boundary_edges.get(vi, [])
         
-        if len(edges_at_tip) != 2:
+        if len(edges_at_tip) < 2:
+            # Shouldn't happen since endpoints are excluded from fan_vertex_set
             continue
         
         vi_pos = vertices_arr[vi]
         
-        # Get the two boundary edges and their collar vertices
-        edge_tuple_a, _, other_v_a = edges_at_tip[0]
-        edge_tuple_b, _, other_v_b = edges_at_tip[1]
-        
-        edge_key_a = (min(edge_tuple_a[0], edge_tuple_a[1]), max(edge_tuple_a[0], edge_tuple_a[1]))
-        edge_key_b = (min(edge_tuple_b[0], edge_tuple_b[1]), max(edge_tuple_b[0], edge_tuple_b[1]))
-        
-        collar_data_a = edge_endpoint_collar.get(edge_key_a, {})
-        collar_data_b = edge_endpoint_collar.get(edge_key_b, {})
-        
-        c_a = collar_data_a.get(vi)
-        c_b = collar_data_b.get(vi)
-        
-        if c_a is None or c_b is None:
-            logger.debug(f"Missing collar vertex for isolated tip {vi}")
-            continue
-        
-        c_a_pos = np.array(vertices[c_a])
-        c_b_pos = np.array(vertices[c_b])
-        
-        # Get quad info for each edge at this tip
-        quad_info_a = edge_tip_quad_info.get(edge_key_a, {}).get(vi)
-        quad_info_b = edge_tip_quad_info.get(edge_key_b, {}).get(vi)
-        
-        if quad_info_a is None or quad_info_b is None:
-            logger.debug(f"Missing quad info for isolated tip {vi}")
-            continue
-        
-        # Get the "other" collar vertices - these are on the interior side
-        c_other_a = quad_info_a['other_collar_idx']  # Collar at other end of edge A
-        c_other_b = quad_info_b['other_collar_idx']  # Collar at other end of edge B
-        ref_normal = quad_info_a['ref_normal']  # Use same reference normal as quads
-        
-        c_other_a_pos = np.array(vertices[c_other_a])
-        c_other_b_pos = np.array(vertices[c_other_b])
-        
-        # Collar directions from vi to each collar point
-        collar_dir_a = c_a_pos - vi_pos
-        collar_dir_b = c_b_pos - vi_pos
-        collar_len_a = np.linalg.norm(collar_dir_a)
-        collar_len_b = np.linalg.norm(collar_dir_b)
-        
-        if collar_len_a < 1e-8 or collar_len_b < 1e-8:
-            continue
-        
-        collar_dir_a_unit = collar_dir_a / collar_len_a
-        collar_dir_b_unit = collar_dir_b / collar_len_b
-        
-        # Compute the angle between the two collar directions
-        collar_cos = np.clip(np.dot(collar_dir_a_unit, collar_dir_b_unit), -1, 1)
-        collar_angle = np.arccos(collar_cos)
-        collar_angle_deg = np.degrees(collar_angle)
-        
-        logger.debug(f"Isolated tip {vi}: collar_angle={collar_angle_deg:.1f}°")
-        logger.debug(f"  c_a_pos={c_a_pos}, c_b_pos={c_b_pos}")
-        
-        # =======================================================================
-        # SIMPLE ROBUST APPROACH: Slerp in the plane of c_a, vi, c_b
-        # =======================================================================
-        # Instead of complex rotation around arbitrary axes, use proper slerp
-        # between the two collar directions. This naturally takes the SHORT path.
-        # 
-        # The key insight: We DON'T need to go the "long way" - we just need to
-        # make sure the fan triangles don't overlap with the quad triangles.
-        # 
-        # The quads connect:
-        #   - Edge A quad: vi -> c_a -> c_other_a (roughly)
-        #   - Edge B quad: vi -> c_b -> c_other_b (roughly)
-        # 
-        # The fan should connect c_a -> c_b via the SHORT path, which is
-        # naturally away from c_other_a and c_other_b.
-        
-        # Compute the "outward" direction (away from interior)
-        interior_point = (c_other_a_pos + c_other_b_pos) / 2
-        outward_dir = vi_pos - interior_point
-        outward_dir_len = np.linalg.norm(outward_dir)
-        if outward_dir_len > 1e-8:
-            outward_dir = outward_dir / outward_dir_len
-        
-        # Check: does the midpoint of direct slerp go outward or inward?
-        mid_collar_dir = collar_dir_a_unit + collar_dir_b_unit
-        mid_collar_len = np.linalg.norm(mid_collar_dir)
-        if mid_collar_len > 1e-8:
-            mid_collar_dir = mid_collar_dir / mid_collar_len
-        
-        dot_with_outward = np.dot(mid_collar_dir, outward_dir)
-        
-        logger.debug(f"  outward_dir={outward_dir}")
-        logger.debug(f"  mid_collar_dir={mid_collar_dir}, dot_with_outward={dot_with_outward:.3f}")
-        
-        # =======================================================================
-        # COMPUTE FAN PLANE - ALL ARC VERTICES WILL LIE IN THIS PLANE
-        # =======================================================================
-        # The fundamental insight: to avoid folding, all fan triangles must lie
-        # in or near a single plane. We define this plane by:
-        # - The apex (vi_pos)
-        # - The two collar endpoints (c_a_pos, c_b_pos)
-        #
-        # The fan plane normal is the cross product of the two collar directions.
-        # All intermediate arc points will be constrained to this plane.
-        
-        fan_plane_normal = np.cross(collar_dir_a_unit, collar_dir_b_unit)
-        fan_plane_len = np.linalg.norm(fan_plane_normal)
-        
-        if fan_plane_len < 1e-8:
-            # Collar directions are nearly parallel - no fan needed, just connect directly
-            logger.debug(f"  Collar directions parallel, creating single triangle")
-            e1 = c_a_pos - vi_pos
-            e2 = c_b_pos - vi_pos
-            tri_normal = np.cross(e1, e2)
-            if np.linalg.norm(tri_normal) > 1e-10:
-                if np.dot(tri_normal, ref_normal) >= 0:
-                    faces.append([vi, c_a, c_b])
-                else:
-                    faces.append([vi, c_b, c_a])
-                tip_fan_triangles_created += 1
-            continue
-        
-        fan_plane_normal = fan_plane_normal / fan_plane_len
-        
-        # Ensure fan plane normal points in same general direction as ref_normal
-        if np.dot(fan_plane_normal, ref_normal) < 0:
-            fan_plane_normal = -fan_plane_normal
-        
-        logger.debug(f"  fan_plane_normal={fan_plane_normal}")
-        logger.debug(f"  dot(fan_plane_normal, ref_normal)={np.dot(fan_plane_normal, ref_normal):.3f}")
-        
-        # =======================================================================
-        # CREATE PLANAR ARC VERTICES
-        # =======================================================================
-        # Instead of projecting to part surface (which causes non-planar arcs),
-        # we interpolate in the fan plane and then optionally adjust depth.
-        
-        # Determine number of subdivisions based on collar angle
-        if collar_angle_deg > 120:
-            n_subs = max(5, fan_subdivisions + 2)
-        elif collar_angle_deg > 90:
-            n_subs = max(4, fan_subdivisions + 1)
-        elif collar_angle_deg > 60:
-            n_subs = max(3, fan_subdivisions)
-        else:
-            n_subs = max(2, fan_subdivisions - 1)
-        
-        logger.debug(f"  n_subs={n_subs}")
-        
-        # Create arc points using SLERP but KEEP THEM IN THE FAN PLANE
-        arc_collars = [c_a]
-        arc_positions = [c_a_pos.copy()]
-        
-        for j in range(1, n_subs):
-            t = j / n_subs
+        # Handle 2-edge case (most common)
+        if len(edges_at_tip) == 2:
+            # Get the two boundary edges and their collar vertices
+            edge_tuple_a, _, other_v_a = edges_at_tip[0]
+            edge_tuple_b, _, other_v_b = edges_at_tip[1]
             
-            # Slerp between collar_dir_a and collar_dir_b (stays in fan plane by construction)
-            sin_angle = np.sin(collar_angle)
-            if abs(sin_angle) < 1e-8:
-                interp_dir = (1 - t) * collar_dir_a_unit + t * collar_dir_b_unit
-            else:
-                w_a = np.sin((1 - t) * collar_angle) / sin_angle
-                w_b = np.sin(t * collar_angle) / sin_angle
-                interp_dir = w_a * collar_dir_a_unit + w_b * collar_dir_b_unit
+            edge_key_a = (min(edge_tuple_a[0], edge_tuple_a[1]), max(edge_tuple_a[0], edge_tuple_a[1]))
+            edge_key_b = (min(edge_tuple_b[0], edge_tuple_b[1]), max(edge_tuple_b[0], edge_tuple_b[1]))
             
-            interp_dir_len = np.linalg.norm(interp_dir)
-            if interp_dir_len > 1e-8:
-                interp_dir = interp_dir / interp_dir_len
+            collar_data_a = edge_endpoint_collar.get(edge_key_a, {})
+            collar_data_b = edge_endpoint_collar.get(edge_key_b, {})
             
-            # Interpolate radius
-            interp_radius = (1 - t) * collar_len_a + t * collar_len_b
+            c_a = collar_data_a.get(vi)
+            c_b = collar_data_b.get(vi)
             
-            # Create arc point in fan plane (vi + radius * direction)
-            arc_pt = vi_pos + interp_radius * interp_dir
+            if c_a is None or c_b is None:
+                logger.debug(f"Missing collar vertex for fan vertex {vi}")
+                continue
             
-            # Now we have two options:
-            # 1. Keep the point exactly in the fan plane (most robust for no folding)
-            # 2. Project to part and risk non-planarity
-            #
-            # We'll use option 1 (planar) but verify the point is inside the part.
-            # If not inside, we'll try projecting, but constrain to near the fan plane.
+            c_a_pos = np.array(vertices[c_a])
+            c_b_pos = np.array(vertices[c_b])
             
-            try:
-                inside = part_mesh.contains([arc_pt])[0]
-            except:
-                inside = False
+            # Get quad info for each edge at this vertex
+            quad_info_a = edge_tip_quad_info.get(edge_key_a, {}).get(vi)
+            quad_info_b = edge_tip_quad_info.get(edge_key_b, {}).get(vi)
             
-            if inside:
-                # Point is inside part - use it directly
-                final_pt = arc_pt
-            else:
-                # Point is outside - project to part surface and offset into it
-                try:
-                    closest_pts, _, closest_faces = trimesh.proximity.closest_point(part_mesh, [arc_pt])
-                    closest_pt = closest_pts[0]
-                    closest_face = closest_faces[0]
-                    
-                    if closest_face < len(part_face_normals):
-                        part_normal = part_face_normals[closest_face]
-                        into_part = -part_normal
+            if quad_info_a is None or quad_info_b is None:
+                logger.debug(f"Missing quad info for fan vertex {vi}")
+                continue
+            
+            # Get the "other" collar vertices - these are on the interior side
+            c_other_a = quad_info_a['other_collar_idx']  # Collar at other end of edge A
+            c_other_b = quad_info_b['other_collar_idx']  # Collar at other end of edge B
+            ref_normal = quad_info_a['ref_normal']  # Use same reference normal as quads
+            
+            c_other_a_pos = np.array(vertices[c_other_a])
+            c_other_b_pos = np.array(vertices[c_other_b])
+            
+            # Collar directions from vi to each collar point
+            collar_dir_a = c_a_pos - vi_pos
+            collar_dir_b = c_b_pos - vi_pos
+            collar_len_a = np.linalg.norm(collar_dir_a)
+            collar_len_b = np.linalg.norm(collar_dir_b)
+            
+            if collar_len_a < 1e-8 or collar_len_b < 1e-8:
+                continue
+            
+            collar_dir_a_unit = collar_dir_a / collar_len_a
+            collar_dir_b_unit = collar_dir_b / collar_len_b
+            
+            # Compute the angle between the two collar directions
+            collar_cos = np.clip(np.dot(collar_dir_a_unit, collar_dir_b_unit), -1, 1)
+            collar_angle = np.arccos(collar_cos)
+            collar_angle_deg = np.degrees(collar_angle)
+            
+            logger.debug(f"Fan vertex {vi}: collar_angle={collar_angle_deg:.1f}°")
+            logger.debug(f"  c_a_pos={c_a_pos}, c_b_pos={c_b_pos}")
+            
+            # ===================================================================
+            # COMPUTE FAN GEOMETRY
+            # ===================================================================
+            # Compute the "outward" direction (away from interior)
+            interior_point = (c_other_a_pos + c_other_b_pos) / 2
+            outward_dir = vi_pos - interior_point
+            outward_dir_len = np.linalg.norm(outward_dir)
+            if outward_dir_len > 1e-8:
+                outward_dir = outward_dir / outward_dir_len
+            
+            # Check: does the midpoint of direct slerp go outward or inward?
+            mid_collar_dir = collar_dir_a_unit + collar_dir_b_unit
+            mid_collar_len = np.linalg.norm(mid_collar_dir)
+            if mid_collar_len > 1e-8:
+                mid_collar_dir = mid_collar_dir / mid_collar_len
+            
+            dot_with_outward = np.dot(mid_collar_dir, outward_dir)
+            
+            logger.debug(f"  outward_dir={outward_dir}")
+            logger.debug(f"  mid_collar_dir={mid_collar_dir}, dot_with_outward={dot_with_outward:.3f}")
+            
+            # ===================================================================
+            # COMPUTE FAN PLANE
+            # ===================================================================
+            fan_plane_normal = np.cross(collar_dir_a_unit, collar_dir_b_unit)
+            fan_plane_len = np.linalg.norm(fan_plane_normal)
+            
+            if fan_plane_len < 1e-8:
+                # Collar directions are nearly parallel - no fan needed, just connect directly
+                logger.debug(f"  Collar directions parallel, creating single triangle")
+                e1 = c_a_pos - vi_pos
+                e2 = c_b_pos - vi_pos
+                tri_normal = np.cross(e1, e2)
+                if np.linalg.norm(tri_normal) > 1e-10:
+                    if np.dot(tri_normal, ref_normal) >= 0:
+                        faces.append([vi, c_a, c_b])
                     else:
-                        into_part = interp_dir
-                    
-                    into_part_len = np.linalg.norm(into_part)
-                    if into_part_len > 1e-8:
-                        into_part = into_part / into_part_len
-                    
-                    projected_pt = closest_pt + collar_depth * into_part
-                    
-                    # Check if projected point is inside
+                        faces.append([vi, c_b, c_a])
+                    tip_fan_triangles_created += 1
+                continue
+            
+            fan_plane_normal = fan_plane_normal / fan_plane_len
+            
+            # Ensure fan plane normal points in same general direction as ref_normal
+            if np.dot(fan_plane_normal, ref_normal) < 0:
+                fan_plane_normal = -fan_plane_normal
+            
+            logger.debug(f"  fan_plane_normal={fan_plane_normal}")
+            
+            # ===================================================================
+            # CREATE PLANAR ARC VERTICES
+            # ===================================================================
+            # Determine number of subdivisions based on collar angle
+            if collar_angle_deg > 120:
+                n_subs = max(5, fan_subdivisions + 2)
+            elif collar_angle_deg > 90:
+                n_subs = max(4, fan_subdivisions + 1)
+            elif collar_angle_deg > 60:
+                n_subs = max(3, fan_subdivisions)
+            else:
+                n_subs = max(2, fan_subdivisions - 1)
+            
+            logger.debug(f"  n_subs={n_subs}")
+            
+            # Create arc points using SLERP
+            arc_collars = [c_a]
+            arc_positions = [c_a_pos.copy()]
+            
+            for j in range(1, n_subs):
+                t = j / n_subs
+                
+                # Slerp between collar_dir_a and collar_dir_b
+                sin_angle = np.sin(collar_angle)
+                if abs(sin_angle) < 1e-8:
+                    interp_dir = (1 - t) * collar_dir_a_unit + t * collar_dir_b_unit
+                else:
+                    w_a = np.sin((1 - t) * collar_angle) / sin_angle
+                    w_b = np.sin(t * collar_angle) / sin_angle
+                    interp_dir = w_a * collar_dir_a_unit + w_b * collar_dir_b_unit
+                
+                interp_dir_len = np.linalg.norm(interp_dir)
+                if interp_dir_len > 1e-8:
+                    interp_dir = interp_dir / interp_dir_len
+                
+                # Interpolate radius
+                interp_radius = (1 - t) * collar_len_a + t * collar_len_b
+                
+                # Create arc point in fan plane
+                arc_pt = vi_pos + interp_radius * interp_dir
+                
+                # Try to keep point inside part mesh
+                try:
+                    inside = part_mesh.contains([arc_pt])[0]
+                except:
+                    inside = False
+                
+                if inside:
+                    final_pt = arc_pt
+                else:
+                    # Project to part surface and offset
                     try:
-                        proj_inside = part_mesh.contains([projected_pt])[0]
-                        if proj_inside:
-                            final_pt = projected_pt
+                        closest_pts, _, closest_faces = trimesh.proximity.closest_point(part_mesh, [arc_pt])
+                        closest_pt = closest_pts[0]
+                        closest_face = closest_faces[0]
+                        
+                        if closest_face < len(part_face_normals):
+                            part_normal = part_face_normals[closest_face]
+                            into_part = -part_normal
                         else:
-                            # Try opposite direction
-                            alt_pt = closest_pt - collar_depth * into_part
-                            if part_mesh.contains([alt_pt])[0]:
-                                final_pt = alt_pt
+                            into_part = interp_dir
+                        
+                        into_part_len = np.linalg.norm(into_part)
+                        if into_part_len > 1e-8:
+                            into_part = into_part / into_part_len
+                        
+                        projected_pt = closest_pt + collar_depth * into_part
+                        
+                        try:
+                            proj_inside = part_mesh.contains([projected_pt])[0]
+                            if proj_inside:
+                                final_pt = projected_pt
                             else:
-                                # Fall back to planar point
-                                final_pt = arc_pt
+                                alt_pt = closest_pt - collar_depth * into_part
+                                if part_mesh.contains([alt_pt])[0]:
+                                    final_pt = alt_pt
+                                else:
+                                    final_pt = arc_pt
+                        except:
+                            final_pt = arc_pt
                     except:
                         final_pt = arc_pt
-                except:
-                    final_pt = arc_pt
+                
+                arc_idx = len(vertices)
+                vertices.append(final_pt.copy())
+                arc_collars.append(arc_idx)
+                arc_positions.append(final_pt.copy())
+                tip_arc_vertices_created += 1
             
-            arc_idx = len(vertices)
-            vertices.append(final_pt.copy())
-            arc_collars.append(arc_idx)
-            arc_positions.append(final_pt.copy())
-            tip_arc_vertices_created += 1
-        
-        arc_collars.append(c_b)
-        arc_positions.append(c_b_pos.copy())
-        
-        logger.debug(f"  arc_collars count: {len(arc_collars)}")
-        
-        # =======================================================================
-        # CREATE FAN TRIANGLES - ALL SHOULD HAVE CONSISTENT NORMALS
-        # =======================================================================
-        # Since all arc points are in or near the fan plane, all triangles
-        # should have normals close to fan_plane_normal.
-        # We use fan_plane_normal as THE reference for all triangles.
-        
-        triangles_added = 0
-        
-        for j in range(len(arc_collars) - 1):
-            c_curr_idx = arc_collars[j]
-            c_next_idx = arc_collars[j + 1]
+            arc_collars.append(c_b)
+            arc_positions.append(c_b_pos.copy())
             
-            if c_curr_idx == c_next_idx:
+            logger.debug(f"  arc_collars count: {len(arc_collars)}")
+            
+            # ===================================================================
+            # CREATE FAN TRIANGLES
+            # ===================================================================
+            triangles_added = 0
+            
+            for j in range(len(arc_collars) - 1):
+                c_curr_idx = arc_collars[j]
+                c_next_idx = arc_collars[j + 1]
+                
+                if c_curr_idx == c_next_idx:
+                    continue
+                
+                c_curr_pos = np.array(arc_positions[j])
+                c_next_pos = np.array(arc_positions[j + 1])
+                
+                # Compute triangle normal
+                e1 = c_curr_pos - vi_pos
+                e2 = c_next_pos - vi_pos
+                tri_normal = np.cross(e1, e2)
+                tri_normal_len = np.linalg.norm(tri_normal)
+                
+                if tri_normal_len < 1e-10:
+                    continue
+                
+                tri_normal = tri_normal / tri_normal_len
+                dot_with_fan = np.dot(tri_normal, fan_plane_normal)
+                
+                if dot_with_fan >= 0:
+                    faces.append([vi, c_curr_idx, c_next_idx])
+                else:
+                    faces.append([vi, c_next_idx, c_curr_idx])
+                
+                triangles_added += 1
+            
+            tip_fan_triangles_created += triangles_added
+            logger.debug(f"  Fan vertex {vi}: created {triangles_added} fan triangles")
+        
+        else:
+            # Handle 3+ edge case (high valence vertices)
+            # Create fans between each adjacent pair of collars
+            logger.debug(f"High-valence vertex {vi} with {len(edges_at_tip)} edges - creating multi-fan")
+            
+            # Get all collars for this vertex (one per edge)
+            collars_at_vertex = []
+            for edge_tuple, _, other_v in edges_at_tip:
+                edge_key = (min(edge_tuple[0], edge_tuple[1]), max(edge_tuple[0], edge_tuple[1]))
+                collar_data = edge_endpoint_collar.get(edge_key, {})
+                c_idx = collar_data.get(vi)
+                if c_idx is not None:
+                    collars_at_vertex.append((c_idx, edge_key))
+            
+            if len(collars_at_vertex) < 2:
+                logger.debug(f"  Not enough collars for high-valence vertex {vi}")
                 continue
             
-            c_curr_pos = np.array(arc_positions[j])
-            c_next_pos = np.array(arc_positions[j + 1])
-            
-            # Compute triangle normal for (vi, c_curr, c_next)
-            e1 = c_curr_pos - vi_pos
-            e2 = c_next_pos - vi_pos
-            tri_normal = np.cross(e1, e2)
-            tri_normal_len = np.linalg.norm(tri_normal)
-            
-            if tri_normal_len < 1e-10:
-                continue
-            
-            tri_normal = tri_normal / tri_normal_len
-            
-            # All fan triangles should have normals pointing same direction as fan_plane_normal
-            # (or opposite, depending on winding)
-            dot_with_fan = np.dot(tri_normal, fan_plane_normal)
-            
-            if dot_with_fan >= 0:
-                # Normal matches fan plane - use this winding
-                faces.append([vi, c_curr_idx, c_next_idx])
+            # Get reference normal from first quad
+            first_edge_key = collars_at_vertex[0][1]
+            quad_info = edge_tip_quad_info.get(first_edge_key, {}).get(vi)
+            if quad_info is not None:
+                ref_normal = quad_info['ref_normal']
             else:
-                # Normal is flipped - reverse winding
-                faces.append([vi, c_next_idx, c_curr_idx])
+                ref_normal = np.array([0, 0, 1])
             
-            triangles_added += 1
-        
-        tip_fan_triangles_created += triangles_added
-        logger.debug(f"  Tip {vi}: created {triangles_added} fan triangles")
+            # Create simple fan triangles between adjacent collars
+            # (For complex junctions, a simple direct connection works better than arc interpolation)
+            for i in range(len(collars_at_vertex)):
+                c_curr_idx = collars_at_vertex[i][0]
+                c_next_idx = collars_at_vertex[(i + 1) % len(collars_at_vertex)][0]
+                
+                if c_curr_idx == c_next_idx:
+                    continue
+                
+                c_curr_pos = np.array(vertices[c_curr_idx])
+                c_next_pos = np.array(vertices[c_next_idx])
+                
+                # Compute triangle normal
+                e1 = c_curr_pos - vi_pos
+                e2 = c_next_pos - vi_pos
+                tri_normal = np.cross(e1, e2)
+                tri_normal_len = np.linalg.norm(tri_normal)
+                
+                if tri_normal_len < 1e-10:
+                    continue
+                
+                tri_normal = tri_normal / tri_normal_len
+                
+                if np.dot(tri_normal, ref_normal) >= 0:
+                    faces.append([vi, c_curr_idx, c_next_idx])
+                else:
+                    faces.append([vi, c_next_idx, c_curr_idx])
+                
+                tip_fan_triangles_created += 1
+            
+            logger.debug(f"  High-valence vertex {vi}: created fan triangles")
     
-    logger.info(f"Created {tip_fan_triangles_created} fan triangles at {len(isolated_tip_vertices)} isolated tips "
+    logger.info(f"Created {tip_fan_triangles_created} fan triangles at {len(fan_vertex_set)} fan vertices "
                f"({tip_arc_vertices_created} arc vertices)")
     
     # =========================================================================
