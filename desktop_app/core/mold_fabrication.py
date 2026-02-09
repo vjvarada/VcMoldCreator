@@ -996,7 +996,7 @@ def _create_tall_cutting_blade(
     membrane: trimesh.Trimesh,
     direction: np.ndarray,
     extrusion_distance: float = 100.0,
-    blade_thickness: float = 0.00001
+    blade_thickness: float = 0.0001
 ) -> trimesh.Trimesh:
     """
     Create a tall cutting blade by extruding the membrane far in both directions.
@@ -1012,7 +1012,7 @@ def _create_tall_cutting_blade(
         membrane: The membrane mesh (parting surface + outer collar)
         direction: Pouring direction (extrusion axis)
         extrusion_distance: How far to extrude above and below (default: 100mm each way)
-        blade_thickness: Gap thickness for CSG subtraction (default: 0.01 micron)
+        blade_thickness: Gap thickness for CSG subtraction (default: 0.1 micron)
         
     Returns:
         A tall prism-shaped blade mesh
@@ -1284,7 +1284,7 @@ def split_shell_with_membrane(
     shell_with_cavity: trimesh.Trimesh,
     membrane: trimesh.Trimesh,
     pouring_direction: np.ndarray,
-    blade_thickness: float = 0.00001
+    blade_thickness: float = 0.0001
 ) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool]:
     """
     Split the shell into two manifold halves using the membrane as a cutting blade.
@@ -1303,7 +1303,7 @@ def split_shell_with_membrane(
         shell_with_cavity: The shell mesh (prism - hull)
         membrane: The cutting membrane (outer collar extended parting surface)
         pouring_direction: Unit vector defining the "upper" direction
-        blade_thickness: Thickness of the cutting blade (default: 0.00001mm = 0.01 micron)
+        blade_thickness: Thickness of the cutting blade (default: 0.0001mm = 0.1 micron)
                         The blade is centered on the membrane (±thickness/2 each side)
         
     Returns:
@@ -1461,7 +1461,7 @@ def split_shell_with_tall_blade(
     membrane: trimesh.Trimesh,
     pouring_direction: np.ndarray,
     extrusion_distance: float = 200.0,
-    blade_gap: float = 0.00001
+    blade_gap: float = 0.0001
 ) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool]:
     """
     Split a shell using a tall cutting blade that extends far above and below the membrane.
@@ -1481,7 +1481,7 @@ def split_shell_with_tall_blade(
         membrane: The cutting membrane (parting surface + outer collar from hard shell)
         pouring_direction: Unit vector defining the "upper" direction
         extrusion_distance: How far to extrude blade above/below membrane (default: 200mm)
-        blade_gap: The thin gap created by the cut (default: 0.01 micron)
+        blade_gap: The thin gap created by the cut (default: 0.1 micron)
         
     Returns:
         Tuple of (shell_half_1, shell_half_2, computation_time_ms, success)
