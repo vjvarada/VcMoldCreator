@@ -9,9 +9,9 @@ Key constraints:
 - Each triangle is owned by at most one direction (no double-counting)
 - Self-occlusion is handled via Embree raycasting
 
-GPU Acceleration:
-- CUDA-accelerated batch visibility computation when available
-- Falls back to Embree raycasting on CPU
+Acceleration:
+- Embree-accelerated BVH raycasting when available (via embreex package)
+- Multi-threaded parallel batch processing for candidate directions
 """
 
 import logging
@@ -26,21 +26,6 @@ import trimesh
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================================
-# TORCH/CUDA AVAILABILITY CHECK
-# ============================================================================
-
-try:
-    import torch
-    TORCH_AVAILABLE = True
-    CUDA_AVAILABLE = torch.cuda.is_available()
-    if CUDA_AVAILABLE:
-        logger.info(f"PyTorch CUDA available: {torch.cuda.get_device_name(0)}")
-except ImportError:
-    TORCH_AVAILABLE = False
-    CUDA_AVAILABLE = False
-    logger.info("PyTorch not available - GPU acceleration disabled for parting direction")
 
 
 # ============================================================================

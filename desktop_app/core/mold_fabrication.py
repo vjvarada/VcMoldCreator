@@ -20,7 +20,7 @@ Author: VcMoldCreator
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple, Dict, Set
+from typing import Optional, List, Tuple, Dict
 import numpy as np
 
 import trimesh

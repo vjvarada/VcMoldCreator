@@ -22,7 +22,7 @@ escape labeling to find the parting surface.
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Set, Optional
+from typing import Dict, List, Tuple, Optional
 import numpy as np
 import trimesh
 

@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QFileDialog, QScrollArea, QCheckBox,
     QPlainTextEdit, QSplitter, QDialog, QSlider, QSpinBox,
     QRadioButton, QButtonGroup, QGroupBox, QSizePolicy,
-    QDoubleSpinBox, QComboBox
+    QDoubleSpinBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
@@ -1332,7 +1332,7 @@ class TetrahedralizeWorker(QThread):
         import time
         import multiprocessing as mp
         import concurrent.futures
-        from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError
+        from concurrent.futures import ProcessPoolExecutor
         from core.tetrahedral_mesh import extract_edges, compute_edge_lengths, extract_boundary_surface, TetrahedralMeshResult
         
         try:
@@ -1541,7 +1541,6 @@ class EdgeWeightsWorker(QThread):
     def run(self):
         try:
             from core.tetrahedral_mesh import (
-                compute_distances_to_mesh,
                 compute_distances_and_closest_points_gpu,
                 identify_boundary_vertices,
                 label_boundary_from_classification,
@@ -2831,7 +2830,6 @@ class CombinedSurfaceSmoothingWorker(QThread):
             from core.surface_propagation import smooth_membrane_with_boundary_reprojection
             from core.tetrahedral_mesh import extract_labeled_boundary_meshes
             from core.parting_surface import (
-                detect_floating_boundary_edges,
                 create_robust_collar_extension
             )
             import time
@@ -6261,8 +6259,6 @@ class MainWindow(QMainWindow):
     
     def _on_mold_aware_pouring_complete(self, result):
         """Handle mold-aware pouring direction optimization complete."""
-        from core.pouring_direction import MoldAwarePouringDirections
-        
         self._mold_aware_pouring_result = result
         
         # Show the H1/H2 split meshes for visualization
@@ -7421,7 +7417,39 @@ class MainWindow(QMainWindow):
         self._mold_halves_result = None
         
         # Clear tetrahedral mesh results
-        self._tet_mesh_result = None
+        self._tet_result = None
+        
+        # Clear parting surface results
+        self._parting_surface_result = None
+        self._parting_surface_smooth_result = None
+        self._primary_smoothing_result = None
+        self._combined_smooth_result = None
+        
+        # Clear secondary surface results
+        self._secondary_parting_surface_result = None
+        self._propagation_result = None
+        self._secondary_smoothing_result = None
+        self._secondary_surface_result = None
+        
+        # Clear registration noise results
+        self._registration_noise_result = None
+        
+        # Clear hard shell results
+        self._hard_shell_prism_result = None
+        self._shell_with_cavity = None
+        self._outer_collar_result = None
+        self._shell_half_1 = None
+        self._shell_half_2 = None
+        self._csg_success = False
+        
+        # Clear metamold results
+        self._metamold_prism_result = None
+        self._metamold_with_cavity = None
+        self._metamold_half_1 = None
+        self._metamold_half_2 = None
+        self._metamold_half_1_with_part = None
+        self._metamold_half_2_with_part = None
+        self._metamold_csg_success = False
         
         # Reset current mesh
         self._current_mesh = None
@@ -7432,16 +7460,9 @@ class MainWindow(QMainWindow):
         # Reset step buttons - import available, others locked
         self.step_buttons[Step.IMPORT].set_status('available')
         self.step_buttons[Step.IMPORT].set_active(True)
-        if Step.PARTING in self.step_buttons:
-            self.step_buttons[Step.PARTING].set_status('locked')
-        if Step.HULL in self.step_buttons:
-            self.step_buttons[Step.HULL].set_status('locked')
-        if Step.MOLD_HALVES in self.step_buttons:
-            self.step_buttons[Step.MOLD_HALVES].set_status('locked')
-        if Step.TETRAHEDRALIZE in self.step_buttons:
-            self.step_buttons[Step.TETRAHEDRALIZE].set_status('locked')
-        if Step.EDGE_WEIGHTS in self.step_buttons:
-            self.step_buttons[Step.EDGE_WEIGHTS].set_status('locked')
+        for step in self.step_buttons:
+            if step != Step.IMPORT:
+                self.step_buttons[step].set_status('locked')
         self._active_step = Step.IMPORT
         
         # Reset title bar
@@ -7453,6 +7474,13 @@ class MainWindow(QMainWindow):
         self.display_options.show_hull_option(False)
         self.display_options.show_tet_mesh_option(False)
         self.display_options.show_mold_halves_option(False)
+        self.display_options.show_edge_weight_options(False)
+        self.display_options.show_dijkstra_result_option(False)
+        self.display_options.show_secondary_cuts_option(False)
+        self.display_options.show_parting_surface_options(show_primary=False, show_secondary=False)
+        self.display_options.show_pouring_options(show_arrows=False, show_split_mesh=False, show_maxima=False)
+        self.display_options.show_hard_shell_options(show_cavity=False, show_prism=False, show_collar=False, show_halves=False)
+        self.display_options.show_metamold_options(show_prism=False, show_cavity=False, show_halves=False, show_halves_with_part=False)
         
         # Update context panel
         self._update_context_panel()
@@ -7623,7 +7651,7 @@ class MainWindow(QMainWindow):
             return data
         
         session = {
-            'version': 2,  # Incremented version for new fields
+            'version': 3,  # Version 3: added hard shell + metamold state
             'filename': self._loaded_filename,
             'active_step': self._active_step.value if self._active_step else None,
             
@@ -7675,6 +7703,23 @@ class MainWindow(QMainWindow):
             'mold_aware_pouring_result': result_to_dict(
                 self._mold_aware_pouring_result if hasattr(self, '_mold_aware_pouring_result') else None
             ),
+            
+            # Hard shell state
+            'hard_shell_prism_result': result_to_dict(self._hard_shell_prism_result),
+            'shell_with_cavity': mesh_to_dict(self._shell_with_cavity),
+            'outer_collar_result': result_to_dict(self._outer_collar_result),
+            'shell_half_1': mesh_to_dict(self._shell_half_1),
+            'shell_half_2': mesh_to_dict(self._shell_half_2),
+            'csg_success': self._csg_success,
+            
+            # Metamold state
+            'metamold_prism_result': result_to_dict(self._metamold_prism_result),
+            'metamold_with_cavity': mesh_to_dict(self._metamold_with_cavity),
+            'metamold_half_1': mesh_to_dict(self._metamold_half_1),
+            'metamold_half_2': mesh_to_dict(self._metamold_half_2),
+            'metamold_half_1_with_part': mesh_to_dict(self._metamold_half_1_with_part),
+            'metamold_half_2_with_part': mesh_to_dict(self._metamold_half_2_with_part),
+            'metamold_csg_success': self._metamold_csg_success,
         }
         
         return session
@@ -7840,6 +7885,17 @@ class MainWindow(QMainWindow):
                     # Show secondary cuts if they exist
                     if hasattr(self._tet_result, 'secondary_cut_edges') and self._tet_result.secondary_cut_edges is not None:
                         self.display_options.show_secondary_cuts_option(True)
+                
+                # Rebuild edge_to_index (skipped during serialization due to tuple keys)
+                # This is needed by downstream steps like parting surface extraction
+                if (hasattr(self._tet_result, 'edges') and self._tet_result.edges is not None and
+                    (not hasattr(self._tet_result, 'edge_to_index') or self._tet_result.edge_to_index is None)):
+                    try:
+                        from core.tetrahedral_mesh import build_edge_to_index_map
+                        self._tet_result.edge_to_index = build_edge_to_index_map(self._tet_result.edges)
+                        logger.info(f"Rebuilt edge_to_index map with {len(self._tet_result.edge_to_index)} entries")
+                    except Exception as e:
+                        logger.warning(f"Could not rebuild edge_to_index: {e}")
         
         # Restore parting surface results
         if session.get('parting_surface_result'):
@@ -7936,7 +7992,6 @@ class MainWindow(QMainWindow):
         
         # Restore registration noise result
         if session.get('registration_noise_result'):
-            from core.registration_marks import SinusoidalRegistrationResult
             self._registration_noise_result = type('Result', (), {})()
             for k, v in session['registration_noise_result'].items():
                 if isinstance(v, dict) and 'vertices' in v and 'faces' in v:
@@ -7998,6 +8053,118 @@ class MainWindow(QMainWindow):
                         self.display_options.show_pouring_options(show_arrows=True, show_split_mesh=True, show_maxima=True)
             except Exception as e:
                 logger.warning(f"Could not restore pouring direction visualization: {e}")
+        
+        # Restore hard shell results
+        if session.get('hard_shell_prism_result'):
+            from core.mold_fabrication import HardShellPrismResult
+            self._hard_shell_prism_result = dict_to_result(session['hard_shell_prism_result'], HardShellPrismResult)
+        
+        if session.get('shell_with_cavity'):
+            self._shell_with_cavity = dict_to_mesh(session['shell_with_cavity'])
+        
+        if session.get('outer_collar_result'):
+            from core.mold_fabrication import OuterCollarResult
+            self._outer_collar_result = dict_to_result(session['outer_collar_result'], OuterCollarResult)
+        
+        if session.get('shell_half_1'):
+            self._shell_half_1 = dict_to_mesh(session['shell_half_1'])
+        
+        if session.get('shell_half_2'):
+            self._shell_half_2 = dict_to_mesh(session['shell_half_2'])
+        
+        self._csg_success = session.get('csg_success', False)
+        
+        # Restore hard shell viewer state
+        if self._hard_shell_prism_result is not None:
+            has_prism = (hasattr(self._hard_shell_prism_result, 'prism_mesh') and 
+                        self._hard_shell_prism_result.prism_mesh is not None)
+            has_cavity = self._shell_with_cavity is not None and self._csg_success
+            has_collar = (self._outer_collar_result is not None and 
+                         hasattr(self._outer_collar_result, 'mesh') and 
+                         self._outer_collar_result.mesh is not None)
+            has_halves = self._shell_half_1 is not None and self._shell_half_2 is not None
+            
+            try:
+                if has_collar:
+                    self.mesh_viewer.show_outer_collar(self._outer_collar_result.mesh)
+                    self.mesh_viewer.set_outer_collar_visible(False)
+                
+                if has_prism:
+                    self.mesh_viewer.show_hard_shell_prism(self._hard_shell_prism_result.prism_mesh)
+                    self.mesh_viewer.set_hard_shell_prism_visible(False)
+                
+                if has_cavity:
+                    self.mesh_viewer.show_shell_with_cavity(self._shell_with_cavity)
+                    self.mesh_viewer.set_shell_with_cavity_visible(False)
+                
+                if has_halves:
+                    self.mesh_viewer.show_shell_half_1(self._shell_half_1)
+                    self.mesh_viewer.show_shell_half_2(self._shell_half_2)
+                
+                self.display_options.show_hard_shell_options(
+                    show_cavity=has_cavity,
+                    show_prism=has_prism,
+                    show_collar=has_collar,
+                    show_halves=has_halves
+                )
+            except Exception as e:
+                logger.warning(f"Could not restore hard shell visualization: {e}")
+        
+        # Restore metamold results
+        if session.get('metamold_prism_result'):
+            from core.mold_fabrication import MetamoldPrismResult
+            self._metamold_prism_result = dict_to_result(session['metamold_prism_result'], MetamoldPrismResult)
+        
+        if session.get('metamold_with_cavity'):
+            self._metamold_with_cavity = dict_to_mesh(session['metamold_with_cavity'])
+        
+        if session.get('metamold_half_1'):
+            self._metamold_half_1 = dict_to_mesh(session['metamold_half_1'])
+        
+        if session.get('metamold_half_2'):
+            self._metamold_half_2 = dict_to_mesh(session['metamold_half_2'])
+        
+        if session.get('metamold_half_1_with_part'):
+            self._metamold_half_1_with_part = dict_to_mesh(session['metamold_half_1_with_part'])
+        
+        if session.get('metamold_half_2_with_part'):
+            self._metamold_half_2_with_part = dict_to_mesh(session['metamold_half_2_with_part'])
+        
+        self._metamold_csg_success = session.get('metamold_csg_success', False)
+        
+        # Restore metamold viewer state
+        if self._metamold_prism_result is not None:
+            has_prism = (hasattr(self._metamold_prism_result, 'prism_mesh') and 
+                        self._metamold_prism_result.prism_mesh is not None)
+            has_cavity = self._metamold_with_cavity is not None and self._metamold_csg_success
+            has_half_1 = self._metamold_half_1 is not None
+            has_half_2 = self._metamold_half_2 is not None
+            has_valid_halves = has_half_1 and has_half_2
+            has_half_1_with_part = self._metamold_half_1_with_part is not None
+            has_half_2_with_part = self._metamold_half_2_with_part is not None
+            has_valid_halves_with_part = has_half_1_with_part and has_half_2_with_part
+            
+            try:
+                # Show the best available visualization
+                if has_valid_halves_with_part:
+                    self.mesh_viewer.show_metamold_half_1_with_part(self._metamold_half_1_with_part)
+                    self.mesh_viewer.show_metamold_half_2_with_part(self._metamold_half_2_with_part)
+                elif has_valid_halves:
+                    self.mesh_viewer.show_metamold_half_1(self._metamold_half_1)
+                    self.mesh_viewer.show_metamold_half_2(self._metamold_half_2)
+                elif has_cavity:
+                    self.mesh_viewer.show_metamold_with_cavity(self._metamold_with_cavity)
+                elif has_prism:
+                    self.mesh_viewer.show_metamold_prism(self._metamold_prism_result.prism_mesh)
+                
+                self.display_options.show_metamold_options(
+                    show_prism=has_prism,
+                    show_cavity=has_cavity,
+                    show_halves=has_valid_halves,
+                    show_halves_with_part=has_valid_halves_with_part
+                )
+            except Exception as e:
+                logger.warning(f"Could not restore metamold visualization: {e}")
         
         # Restore step statuses
         step_status = session.get('step_status', {})

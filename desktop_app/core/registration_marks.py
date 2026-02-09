@@ -20,7 +20,7 @@ Author: VcMoldCreator
 
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Tuple
 import logging
 import time
 
