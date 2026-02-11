@@ -2339,7 +2339,7 @@ def detect_floating_boundary_edges(
             try:
                 closest_pts, dists, _ = trimesh.proximity.closest_point(part_mesh, [sample_pt])
                 sample_distances.append(dists[0])
-            except:
+            except Exception:
                 continue
         
         if not sample_distances:
@@ -3447,7 +3447,7 @@ def _create_collar_vertex(
         try:
             if part_mesh.contains([planar_pt])[0]:
                 return planar_pt
-        except:
+        except Exception:
             pass
     
     # Standard approach: project to part and offset inward
@@ -3470,11 +3470,11 @@ def _create_collar_vertex(
                 alt_pt = closest_pt - collar_depth * into_part
                 if part_mesh.contains([alt_pt])[0]:
                     collar_pt = alt_pt
-        except:
+        except Exception:
             pass
         
         return collar_pt
-    except:
+    except Exception:
         # Fallback to simple offset
         return vi_pos + collar_depth * (collar_dir_hint if collar_dir_hint is not None else np.array([0, 0, -1]))
 
@@ -3598,7 +3598,7 @@ def _create_fan_triangles(
             # Check containment
             try:
                 inside = part_mesh.contains([arc_pt])[0]
-            except:
+            except Exception:
                 inside = False
             
             if not inside:
@@ -3730,7 +3730,7 @@ def create_robust_collar_extension(
         try:
             _, dists_to_hull, _ = trimesh.proximity.closest_point(hull_mesh, boundary_vert_positions)
             vert_to_hull_dist = dict(zip(boundary_verts, dists_to_hull))
-        except:
+        except Exception:
             pass
     
     inner_boundary_edges = []

@@ -295,20 +295,6 @@ class MeshAnalyzer:
         return max(0.0, score)
 
 
-def analyze_mesh(mesh: trimesh.Trimesh) -> MeshDiagnostics:
-    """
-    Convenience function to analyze a mesh.
-    
-    Args:
-        mesh: The trimesh mesh to analyze
-        
-    Returns:
-        MeshDiagnostics containing all analysis results
-    """
-    analyzer = MeshAnalyzer(mesh)
-    return analyzer.analyze()
-
-
 # ============================================================================
 # HEIGHT FIELD AND ADJACENCY FUNCTIONS
 # ============================================================================

@@ -510,19 +510,6 @@ def is_cpp_available() -> bool:
     return CPP_AVAILABLE
 
 
-def get_implementation_info() -> dict:
-    """Get information about available implementations."""
-    return {
-        'cpp_available': CPP_AVAILABLE,
-        'dijkstra': 'C++' if CPP_AVAILABLE else 'Python',
-        'edge_labels': 'C++' if CPP_AVAILABLE else 'Python',
-        'secondary_cuts': 'C++ (OpenMP)' if CPP_AVAILABLE else 'Python/GPU',
-        'mold_half_classification': 'C++ (OpenMP)' if CPP_AVAILABLE else 'Python/GPU',
-        'laplacian_smoothing': 'C++ (OpenMP)' if CPP_AVAILABLE else 'Python',
-        'speedup_estimate': '10-50x' if CPP_AVAILABLE else 'N/A (using Python)',
-    }
-
-
 # =============================================================================
 # FAST LAPLACIAN SMOOTHING
 # =============================================================================

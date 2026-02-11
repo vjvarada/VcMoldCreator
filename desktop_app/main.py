@@ -133,5 +133,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as e:
-        logger.exception(f"Fatal error: {e}")
+        logger.exception("Fatal error: %s", e)
         sys.exit(1)

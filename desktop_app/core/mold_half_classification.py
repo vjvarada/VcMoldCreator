@@ -105,19 +105,6 @@ class TriangleInfo:
 
 
 # ============================================================================
-# COLORS FOR MOLD HALVES (Same as parting directions)
-# ============================================================================
-
-class MoldHalfColors:
-    """Colors for mold half visualization (RGBA, 0-255)."""
-    H1 = np.array([0, 255, 0, 255], dtype=np.uint8)           # Green (same as D1)
-    H2 = np.array([255, 102, 0, 255], dtype=np.uint8)         # Orange (same as D2)
-    BOUNDARY_ZONE = np.array([180, 180, 180, 255], dtype=np.uint8)  # Light gray
-    INNER = np.array([80, 80, 80, 255], dtype=np.uint8)       # Dark gray
-    UNCLASSIFIED = np.array([136, 136, 136, 255], dtype=np.uint8)   # Gray
-
-
-# ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
 
@@ -182,7 +169,7 @@ def classify_hull_faces_fast(
     hull_mesh: trimesh.Trimesh,
     d1: np.ndarray,
     d2: np.ndarray,
-    boundary_zone_threshold: float = 0.15
+    boundary_zone_threshold: float = 0.05
 ) -> MoldHalfClassificationResult:
     """
     Fast hull face classification following the paper's algorithm exactly.
@@ -2131,45 +2118,6 @@ def classify_mold_halves(
         total_triangles=n_triangles,
         outer_boundary_count=len(effective_outer_triangles),
     )
-
-
-def get_mold_half_face_colors(
-    n_faces: int,
-    classification: MoldHalfClassificationResult
-) -> np.ndarray:
-    """
-    Generate face colors array for mold half visualization.
-    
-    Args:
-        n_faces: Number of faces in the mesh
-        classification: The mold half classification result
-    
-    Returns:
-        Array of shape (n_faces, 4) with RGBA colors (0-255)
-    """
-    colors = np.tile(MoldHalfColors.UNCLASSIFIED, (n_faces, 1))
-    
-    # Color H₁ triangles (green)
-    for tri_idx in classification.h1_triangles:
-        if tri_idx < n_faces:
-            colors[tri_idx] = MoldHalfColors.H1
-    
-    # Color H₂ triangles (orange)
-    for tri_idx in classification.h2_triangles:
-        if tri_idx < n_faces:
-            colors[tri_idx] = MoldHalfColors.H2
-    
-    # Color boundary zone triangles (light gray)
-    for tri_idx in classification.boundary_zone_triangles:
-        if tri_idx < n_faces:
-            colors[tri_idx] = MoldHalfColors.BOUNDARY_ZONE
-    
-    # Color inner boundary triangles (dark gray)
-    for tri_idx in classification.inner_boundary_triangles:
-        if tri_idx < n_faces:
-            colors[tri_idx] = MoldHalfColors.INNER
-    
-    return colors
 
 
 def classify_mold_halves_via_hull(

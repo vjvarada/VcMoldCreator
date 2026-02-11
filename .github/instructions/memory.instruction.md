@@ -139,7 +139,19 @@ biased_dist = δ + max(λ_w, 0)
 
 ## Recent Changes
 
-### January 2026
+### January 2026 - Static Analysis Refactoring (Session 4)
+- **Bare except removal:** Fixed 11 bare `except:` → `except Exception:` across 4 files (mesh_viewer.py, main_window.py, parting_surface.py, mold_fabrication.py)
+- **Print→logger conversion:** Converted ~100 debug print() calls in mesh_viewer.py to logger.debug() using lines-list pattern. Renamed `_print_tet_edge_info` → `_get_tet_edge_info_lines` (returns List[str])
+- **Logger lazy formatting:** Converted 30 `logger.exception(f"...")` calls to `logger.exception("...: %s", e)` across main_window.py, main.py, mesh_repair.py
+- **Dead code removal:**
+  - Removed unused backward-compat aliases: `RegistrationNoiseResult`, `PerlinRegistrationResult` (registration_marks.py)
+  - Removed unused convenience functions: `analyze_mesh()` (mesh_analysis.py), `repair_mesh()` (mesh_repair.py), `get_band_visualization_data()` (registration_marks.py), `get_mold_half_face_colors()` + `MoldHalfColors` class (mold_half_classification.py), `get_implementation_info()` (fast_algorithms_wrapper.py)
+  - Removed unused `Tuple` import from registration_marks.py
+
+### January 2026 - Unused Import Cleanup (Session 3)
+- Cleaned unused imports across 6 core files
+
+### January 2026 - Earlier
 - Implemented 5-edge and 6-edge Marching Tetrahedra configurations
 - Added face vertex and inner vertex computation
 - Completed persistence-based pouring direction optimization

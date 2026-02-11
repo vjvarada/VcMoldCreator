@@ -1367,12 +1367,13 @@ def split_shell_with_membrane(
         logger.info(f"  Blade:    min={blade_bounds[0]}, max={blade_bounds[1]}")
         
         # Check overlap along pouring direction
-        # Project bounds onto pouring direction
-        shell_proj_min = np.dot(shell_bounds[0], direction)
-        shell_proj_max = np.dot(shell_bounds[1], direction)
-        blade_proj_min = np.dot(blade_bounds[0], direction)
-
-        blade_proj_max = np.dot(blade_bounds[1], direction)
+        # Project all vertices onto pouring direction for accurate range
+        shell_projections = shell_with_cavity.vertices @ direction
+        blade_projections = blade.vertices @ direction
+        shell_proj_min = float(shell_projections.min())
+        shell_proj_max = float(shell_projections.max())
+        blade_proj_min = float(blade_projections.min())
+        blade_proj_max = float(blade_projections.max())
         
         logger.info(f"  Shell extent along pouring dir: [{shell_proj_min:.2f}, {shell_proj_max:.2f}]")
         logger.info(f"  Blade extent along pouring dir: [{blade_proj_min:.2f}, {blade_proj_max:.2f}]")
@@ -2180,6 +2181,59 @@ def _offset_polygon_2d(polygon: np.ndarray, offset: float) -> np.ndarray:
     return np.array(offset_polygon, dtype=np.float64)
 
 
+def _ray_2d_convex_polygon_exit(
+    origin: np.ndarray,
+    direction: np.ndarray,
+    polygon: np.ndarray
+) -> Optional[float]:
+    """
+    Find the distance from a point inside a convex polygon to its boundary along a ray.
+    
+    For a point inside a convex polygon, casts a ray along the given direction and
+    finds the exit distance (closest forward intersection with a polygon edge).
+    
+    This is used by the adaptive collar extension to determine exactly how far each
+    boundary vertex needs to extend to pass through the prism's offset silhouette.
+    
+    Args:
+        origin: 2D point (2,) - assumed to be inside the polygon
+        direction: 2D unit direction vector (2,)
+        polygon: (N, 2) convex polygon vertices
+        
+    Returns:
+        Distance along ray to exit the polygon, or None if no intersection found.
+    """
+    n = len(polygon)
+    min_positive_t = None
+    
+    for i in range(n):
+        j = (i + 1) % n
+        
+        # Edge from polygon[i] to polygon[j]
+        p0 = polygon[i]
+        edge = polygon[j] - p0
+        
+        # Solve: origin + t * direction = p0 + s * edge
+        # t * direction - s * edge = p0 - origin
+        # Using Cramer's rule:
+        # denom = direction[0] * (-edge[1]) - direction[1] * (-edge[0])
+        denom = direction[1] * edge[0] - direction[0] * edge[1]
+        
+        if abs(denom) < 1e-12:
+            continue  # Ray parallel to edge
+        
+        diff = p0 - origin
+        t = (diff[1] * edge[0] - diff[0] * edge[1]) / denom
+        s = (diff[1] * direction[0] - diff[0] * direction[1]) / denom
+        
+        # Valid intersection: t > 0 (forward along ray) and 0 <= s <= 1 (on edge segment)
+        if t > 1e-8 and -1e-8 <= s <= 1.0 + 1e-8:
+            if min_positive_t is None or t < min_positive_t:
+                min_positive_t = t
+    
+    return min_positive_t
+
+
 def _extrude_polygon_to_prism(
     polygon_2d: np.ndarray,
     world_to_2d: np.ndarray,
@@ -2395,32 +2449,46 @@ def create_outer_collar_extension(
     vertex_boundary_type: np.ndarray,
     pouring_direction: np.ndarray,
     extension_distance: float = 10.0,
-    collar_subdivisions: int = DEFAULT_COLLAR_SUBDIVISIONS
+    collar_subdivisions: int = DEFAULT_COLLAR_SUBDIVISIONS,
+    wall_thickness: Optional[float] = None,
+    prism_margin: float = 0.0,
+    safety_margin: float = 2.0
 ) -> OuterCollarResult:
     """
-    Extend the parting surface outward by a fixed distance.
+    Extend the parting surface outward to pass through the hard shell prism boundary.
     
     This creates a "collar" around the outer boundary of the parting surface,
-    extending it by extension_distance so it fully passes through the hard shell prism.
+    ensuring it fully passes through the hard shell prism for proper CSG cutting.
+    
+    When wall_thickness is provided, uses adaptive per-vertex extension distances
+    computed by ray-casting against the prism's 2D offset silhouette. This
+    guarantees each collar vertex exits the prism boundary, even at sharp corners
+    where a fixed multiplier would be insufficient.
     
     The extension is performed perpendicular to the pouring direction to 
     maintain the prism-like structure of the hard shell.
     
     Algorithm:
     1. Find outer boundary edges of parting surface (edges on hull, type 1 or 2)
-    2. For each outer boundary vertex:
+    2. If wall_thickness provided, compute the prism's 2D offset silhouette
+    3. For each outer boundary vertex:
        - Compute extension direction (perpendicular to pouring, outward from hull)
-       - Extend by extension_distance
+       - If adaptive: ray-cast in 2D to find exit distance from offset silhouette
+       - Extend by max(computed_distance + safety_margin, extension_distance)
        - Create collar quad connecting parting surface to extended boundary
-    3. Handle corners with fan triangles
+    4. Handle corners with fan triangles
     
     Args:
         parting_surface: The smoothed parting surface mesh
         inner_hull: The current hull mesh (∂H)
         vertex_boundary_type: Array with -1=part, 0=interior, 1/2=hull
         pouring_direction: Unit vector for resin pouring direction
-        extension_distance: Distance to extend outward (typically 2x wall_thickness)
+        extension_distance: Minimum/fallback distance to extend outward (mm)
         collar_subdivisions: Number of fan subdivisions at corners
+        wall_thickness: If provided, enables adaptive extension by computing
+                       the prism's offset silhouette (same as create_hard_shell_prism)
+        prism_margin: Additional margin used by the prism beyond wall_thickness (mm)
+        safety_margin: Extra distance beyond the prism boundary for each vertex (mm)
         
     Returns:
         OuterCollarResult with the extended parting surface
@@ -2455,6 +2523,50 @@ def create_outer_collar_extension(
     # Normalize pouring direction
     pouring_dir = np.array(pouring_direction, dtype=np.float64)
     pouring_dir = pouring_dir / (np.linalg.norm(pouring_dir) + 1e-10)
+    
+    # =========================================================================
+    # ADAPTIVE EXTENSION: Compute prism's 2D offset silhouette for per-vertex distances
+    # =========================================================================
+    
+    offset_silhouette_2d = None
+    _collar_u_axis = None
+    _collar_v_axis = None
+    
+    if wall_thickness is not None:
+        # Build orthonormal basis for the projection plane (same as create_hard_shell_prism)
+        if abs(pouring_dir[0]) < 0.9:
+            arbitrary = np.array([1.0, 0.0, 0.0])
+        else:
+            arbitrary = np.array([0.0, 1.0, 0.0])
+        
+        _collar_u_axis = arbitrary - np.dot(arbitrary, pouring_dir) * pouring_dir
+        _collar_u_axis = _collar_u_axis / np.linalg.norm(_collar_u_axis)
+        _collar_v_axis = np.cross(pouring_dir, _collar_u_axis)
+        _collar_v_axis = _collar_v_axis / np.linalg.norm(_collar_v_axis)
+        
+        _collar_world_to_2d = np.column_stack([_collar_u_axis, _collar_v_axis, pouring_dir]).T
+        
+        # Project hull vertices to 2D and compute silhouette (same algorithm as prism)
+        hull_vertices_3d = np.array(inner_hull.vertices, dtype=np.float64)
+        hull_transformed = hull_vertices_3d @ _collar_world_to_2d.T
+        projected_2d = hull_transformed[:, :2]
+        
+        try:
+            hull_2d = ConvexHull(projected_2d)
+            silhouette_indices = hull_2d.vertices
+            silhouette_2d = projected_2d[silhouette_indices]
+            
+            # Offset by the same amount as the prism: wall_thickness + prism_margin
+            total_offset = wall_thickness + prism_margin
+            offset_silhouette_2d = _offset_polygon_2d(silhouette_2d, total_offset)
+            
+            logger.info(f"Adaptive extension: computed offset silhouette "
+                       f"({len(offset_silhouette_2d)} vertices, offset={total_offset:.1f}mm, "
+                       f"safety_margin={safety_margin:.1f}mm)")
+        except Exception as e:
+            logger.warning(f"Failed to compute offset silhouette for adaptive extension: {e}")
+            logger.warning("Falling back to fixed extension_distance")
+            offset_silhouette_2d = None
     
     # =========================================================================
     # STEP 1: Find all mesh boundary edges and classify as inner/outer
@@ -2514,7 +2626,7 @@ def create_outer_collar_extension(
                 _, dists_to_hull, _ = trimesh.proximity.closest_point(inner_hull, boundary_vert_positions)
                 # If close to hull, it's outer
                 is_outer = np.min(dists_to_hull) < 1.0  # 1mm threshold
-            except:
+            except Exception:
                 is_outer = True
         
         if is_outer:
@@ -2572,6 +2684,7 @@ def create_outer_collar_extension(
     edge_endpoint_collar: Dict[Tuple[int, int], Dict[int, int]] = {}
     
     collar_vertices_created = 0
+    _adaptive_extensions = []  # Track per-vertex computed extensions for diagnostics
     
     for v0, v1 in outer_boundary_edges:
         edge_key = (min(v0, v1), max(v0, v1))
@@ -2605,7 +2718,7 @@ def create_outer_collar_extension(
                 closest_pt = closest_pts[0]
                 closest_face = closest_faces[0]
                 hull_normal = inner_hull.face_normals[closest_face]
-            except:
+            except Exception:
                 hull_normal = face_normal
             
             # The extension direction should be:
@@ -2636,11 +2749,37 @@ def create_outer_collar_extension(
                     extension_dir = extension_dir / np.linalg.norm(extension_dir)
             
             # ==================================================================
-            # Extend vertex by fixed extension_distance
+            # Compute extension distance (adaptive or fixed)
             # ==================================================================
             
-            # Simply offset the vertex by extension_distance along the extension direction
-            collar_pt = vi_pos + extension_dir * extension_distance
+            actual_extension = extension_distance  # Default fallback
+            
+            if offset_silhouette_2d is not None and _collar_u_axis is not None:
+                # Project vertex position and extension direction to 2D
+                vi_2d = np.array([
+                    np.dot(vi_pos, _collar_u_axis),
+                    np.dot(vi_pos, _collar_v_axis)
+                ])
+                ext_2d = np.array([
+                    np.dot(extension_dir, _collar_u_axis),
+                    np.dot(extension_dir, _collar_v_axis)
+                ])
+                ext_2d_norm = np.linalg.norm(ext_2d)
+                
+                if ext_2d_norm > 1e-8:
+                    ext_2d_unit = ext_2d / ext_2d_norm
+                    exit_dist = _ray_2d_convex_polygon_exit(
+                        vi_2d, ext_2d_unit, offset_silhouette_2d
+                    )
+                    
+                    if exit_dist is not None:
+                        # Convert 2D exit distance to 3D extension distance
+                        # (accounts for ext_dir not being perfectly unit in 2D)
+                        required_extension = (exit_dist + safety_margin) / ext_2d_norm
+                        actual_extension = max(required_extension, extension_distance)
+            
+            collar_pt = vi_pos + extension_dir * actual_extension
+            _adaptive_extensions.append(actual_extension)
             
             # Create collar vertex
             collar_idx = len(vertices)
@@ -2654,6 +2793,14 @@ def create_outer_collar_extension(
             collar_vertices_created += 1
     
     logger.info(f"Created {collar_vertices_created} collar vertices")
+    
+    # Log adaptive extension diagnostics
+    if _adaptive_extensions and offset_silhouette_2d is not None:
+        ext_arr = np.array(_adaptive_extensions)
+        n_above_default = int(np.sum(ext_arr > extension_distance + 0.01))
+        logger.info(f"Adaptive extension stats: min={ext_arr.min():.2f}mm, max={ext_arr.max():.2f}mm, "
+                   f"mean={ext_arr.mean():.2f}mm, {n_above_default}/{len(ext_arr)} exceeded "
+                   f"default ({extension_distance:.1f}mm)")
     
     # =========================================================================
     # STEP 5: Create quad collars for each edge

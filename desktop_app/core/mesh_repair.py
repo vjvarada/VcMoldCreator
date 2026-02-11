@@ -213,7 +213,7 @@ class MeshRepairer:
                     repair_methods_used.append("normal fix")
             
         except Exception as e:
-            logger.exception(f"MeshLib repair failed: {e}")
+            logger.exception("MeshLib repair failed: %s", e)
             self._repair_steps.append(f"MeshLib repair error: {e}")
             # Fall back to basic trimesh repair
             logger.info("Falling back to basic trimesh repair...")
@@ -615,21 +615,6 @@ class MeshRepairer:
         box.apply_translation(center)
         
         return box
-
-
-def repair_mesh(mesh: trimesh.Trimesh, **kwargs) -> MeshRepairResult:
-    """
-    Convenience function to repair a mesh.
-    
-    Args:
-        mesh: The trimesh mesh to repair
-        **kwargs: Additional arguments passed to MeshRepairer.repair()
-        
-    Returns:
-        MeshRepairResult with the repaired mesh and diagnostics
-    """
-    repairer = MeshRepairer(mesh)
-    return repairer.repair(**kwargs)
 
 
 def is_meshlib_available() -> bool:

@@ -463,7 +463,7 @@ class MeshViewer(QWidget):
         for actor in self._scale_actors:
             try:
                 self.plotter.remove_actor(actor)
-            except:
+            except Exception:
                 pass
         self._scale_actors = []
         
@@ -691,7 +691,7 @@ class MeshViewer(QWidget):
         
         # Add grid plane (like Three.js GridHelper)
         if self._pv_mesh is not None:
-            self._add_grid_plane(self._pv_mesh.bounds)
+            # Grid removed - clean ground plane preferred
             
             # Add scale rulers on X and Y axes
             self._add_scale_rulers(self._pv_mesh.bounds)
@@ -2464,7 +2464,7 @@ class MeshViewer(QWidget):
         
         # Re-add grid and scale rulers
         if self._pv_mesh is not None:
-            self._add_grid_plane(self._pv_mesh.bounds)
+            # Grid removed - clean ground plane preferred
             self._add_scale_rulers(self._pv_mesh.bounds)
         
         # Re-add parting direction arrows if they exist
@@ -4621,123 +4621,115 @@ class MeshViewer(QWidget):
         # Highlight selected edge
         self._highlight_selected_edge(v0, v1)
         
-        # Print debug info
-        print("\n" + "="*70)
-        print("🔍 PARTING SURFACE BOUNDARY EDGE DEBUG")
-        print("="*70)
-        print(f"Boundary edge index: {nearest_idx}")
-        print(f"PS vertex indices: {ps_edge[0]} → {ps_edge[1]}")
-        print(f"Vertex 0: [{v0[0]:.4f}, {v0[1]:.4f}, {v0[2]:.4f}]")
-        print(f"Vertex 1: [{v1[0]:.4f}, {v1[1]:.4f}, {v1[2]:.4f}]")
-        print(f"Midpoint: [{midpoint[0]:.4f}, {midpoint[1]:.4f}, {midpoint[2]:.4f}]")
-        print(f"Length: {length:.4f}")
+        # Build debug output
+        lines = [
+            "",
+            "=" * 70,
+            "PARTING SURFACE BOUNDARY EDGE DEBUG",
+            "=" * 70,
+            f"Boundary edge index: {nearest_idx}",
+            f"PS vertex indices: {ps_edge[0]} -> {ps_edge[1]}",
+            f"Vertex 0: [{v0[0]:.4f}, {v0[1]:.4f}, {v0[2]:.4f}]",
+            f"Vertex 1: [{v1[0]:.4f}, {v1[1]:.4f}, {v1[2]:.4f}]",
+            f"Midpoint: [{midpoint[0]:.4f}, {midpoint[1]:.4f}, {midpoint[2]:.4f}]",
+            f"Length: {length:.4f}",
+        ]
         
         # Try to trace back to tetrahedral mesh edges
         if self._parting_surface_result_ref is not None and self._tet_result_ref is not None:
-            self._print_tet_edge_info(ps_edge, ps_vertices)
+            lines.extend(self._get_tet_edge_info_lines(ps_edge, ps_vertices))
         
         if 'part_distances' in self._boundary_edges_data:
             dist = self._boundary_edges_data['part_distances'][nearest_idx]
-            print(f"\n📏 DISTANCE TO PART MESH")
-            print(f"   Minimum distance: {dist:.4f}")
+            lines.append(f"\nDISTANCE TO PART MESH")
+            lines.append(f"   Minimum distance: {dist:.4f}")
             
             if 'nearest_part_points' in self._boundary_edges_data:
                 nearest_pt = self._boundary_edges_data['nearest_part_points'][nearest_idx]
                 nearest_idx_part = self._boundary_edges_data['nearest_part_vertex_indices'][nearest_idx]
-                print(f"   Nearest part point: [{nearest_pt[0]:.4f}, {nearest_pt[1]:.4f}, {nearest_pt[2]:.4f}]")
-                print(f"   Nearest part vertex index: {nearest_idx_part}")
+                lines.append(f"   Nearest part point: [{nearest_pt[0]:.4f}, {nearest_pt[1]:.4f}, {nearest_pt[2]:.4f}]")
+                lines.append(f"   Nearest part vertex index: {nearest_idx_part}")
                 
-                # Check if edge should be connected (distance very small)
                 if dist < 0.1:
-                    print(f"   ✅ Edge is CLOSE to part (dist < 0.1)")
+                    lines.append("   Edge is CLOSE to part (dist < 0.1)")
                 elif dist < 1.0:
-                    print(f"   ⚠️  Edge is NEAR part (0.1 < dist < 1.0)")
+                    lines.append("   Edge is NEAR part (0.1 < dist < 1.0)")
                 else:
-                    print(f"   ❌ Edge is FAR from part (dist >= 1.0)")
+                    lines.append("   Edge is FAR from part (dist >= 1.0)")
         
         # Additional analysis: check edge direction
         edge_direction = v1 - v0
         edge_direction_normalized = edge_direction / np.linalg.norm(edge_direction)
-        print(f"\n📐 EDGE GEOMETRY")
-        print(f"   Direction: [{edge_direction_normalized[0]:.4f}, {edge_direction_normalized[1]:.4f}, {edge_direction_normalized[2]:.4f}]")
+        lines.append(f"\nEDGE GEOMETRY")
+        lines.append(f"   Direction: [{edge_direction_normalized[0]:.4f}, {edge_direction_normalized[1]:.4f}, {edge_direction_normalized[2]:.4f}]")
         
-        # Check if edge is mostly horizontal or vertical
         z_component = abs(edge_direction_normalized[2])
         if z_component > 0.9:
-            print(f"   Orientation: VERTICAL (Z-aligned)")
+            lines.append("   Orientation: VERTICAL (Z-aligned)")
         elif z_component < 0.1:
-            print(f"   Orientation: HORIZONTAL (XY-plane)")
+            lines.append("   Orientation: HORIZONTAL (XY-plane)")
         else:
-            print(f"   Orientation: DIAGONAL (mixed)")
+            lines.append("   Orientation: DIAGONAL (mixed)")
         
-        print("="*70 + "\n")
+        lines.append("=" * 70)
         
-        # Also log to the logger
-        logger.info(f"Selected edge {nearest_idx}: vertices {ps_edge}, length={length:.4f}, "
-                   f"part_dist={self._boundary_edges_data.get('part_distances', [0])[nearest_idx] if 'part_distances' in self._boundary_edges_data else 'N/A':.4f}")
+        logger.debug("\n".join(lines))
     
-    def _print_tet_edge_info(self, ps_edge, ps_vertices):
-        """Print tetrahedral mesh edge info for the parting surface edge vertices."""
+    def _get_tet_edge_info_lines(self, ps_edge, ps_vertices) -> List[str]:
+        """Get tetrahedral mesh edge info lines for the parting surface edge vertices."""
+        lines: List[str] = []
         ps_result = self._parting_surface_result_ref
         tet_result = self._tet_result_ref
         
-        # Check if vertex_to_edge is available
         vertex_to_edge = getattr(ps_result, 'vertex_to_edge', None)
         if vertex_to_edge is None:
-            print("\n⚠️  No vertex_to_edge mapping available (surface may have been repaired/smoothed)")
-            return
+            lines.append("\nNo vertex_to_edge mapping available (surface may have been repaired/smoothed)")
+            return lines
         
-        print(f"\n🔬 TETRAHEDRAL MESH ANALYSIS")
+        lines.append(f"\nTETRAHEDRAL MESH ANALYSIS")
         
-        # Each parting surface vertex corresponds to the midpoint of a tet mesh edge
-        # vertex_to_edge[ps_vertex] = tet_edge_index
         for i, ps_v_idx in enumerate(ps_edge):
             if ps_v_idx < len(vertex_to_edge):
                 tet_edge_idx = vertex_to_edge[ps_v_idx]
                 tet_edge = tet_result.edges[tet_edge_idx]
                 tet_v0_idx, tet_v1_idx = int(tet_edge[0]), int(tet_edge[1])
                 
-                print(f"\n   PS Vertex {ps_v_idx} → Tet Edge {tet_edge_idx}: ({tet_v0_idx}, {tet_v1_idx})")
+                lines.append(f"\n   PS Vertex {ps_v_idx} -> Tet Edge {tet_edge_idx}: ({tet_v0_idx}, {tet_v1_idx})")
                 
-                # Get tet vertex positions
                 tet_verts = tet_result.vertices_original if tet_result.vertices_original is not None else tet_result.vertices
                 tv0 = tet_verts[tet_v0_idx]
                 tv1 = tet_verts[tet_v1_idx]
-                print(f"      Tet V{tet_v0_idx}: [{tv0[0]:.4f}, {tv0[1]:.4f}, {tv0[2]:.4f}]")
-                print(f"      Tet V{tet_v1_idx}: [{tv1[0]:.4f}, {tv1[1]:.4f}, {tv1[2]:.4f}]")
+                lines.append(f"      Tet V{tet_v0_idx}: [{tv0[0]:.4f}, {tv0[1]:.4f}, {tv0[2]:.4f}]")
+                lines.append(f"      Tet V{tet_v1_idx}: [{tv1[0]:.4f}, {tv1[1]:.4f}, {tv1[2]:.4f}]")
                 
-                # Get boundary labels for these vertices
                 if tet_result.boundary_labels is not None:
                     bl0 = tet_result.boundary_labels[tet_v0_idx]
                     bl1 = tet_result.boundary_labels[tet_v1_idx]
                     label_names = {-1: "INNER_BOUNDARY (part)", 0: "INTERIOR", 1: "H1", 2: "H2"}
-                    print(f"      Boundary labels: V{tet_v0_idx}={label_names.get(bl0, bl0)}, V{tet_v1_idx}={label_names.get(bl1, bl1)}")
+                    lines.append(f"      Boundary labels: V{tet_v0_idx}={label_names.get(bl0, bl0)}, V{tet_v1_idx}={label_names.get(bl1, bl1)}")
                 
-                # Get escape labels if available
                 if tet_result.seed_vertex_indices is not None and tet_result.seed_escape_labels is not None:
                     seed_indices = tet_result.seed_vertex_indices
                     escape_labels = tet_result.seed_escape_labels
-                    
-                    # Find if these vertices are in the seed list
-                    escape_names = {0: "UNREACHABLE", 1: "→H1", 2: "→H2"}
+                    escape_names = {0: "UNREACHABLE", 1: "->H1", 2: "->H2"}
                     
                     for v_idx in [tet_v0_idx, tet_v1_idx]:
                         if v_idx in seed_indices:
                             seed_pos = np.where(seed_indices == v_idx)[0][0]
                             el = escape_labels[seed_pos]
-                            print(f"      Escape label V{v_idx}: {escape_names.get(el, el)}")
-                        else:
-                            # Vertex not in seed list - it's on H1 or H2 boundary
-                            if tet_result.boundary_labels is not None:
-                                bl = tet_result.boundary_labels[v_idx]
-                                if bl == 1:
-                                    print(f"      Escape label V{v_idx}: ON_H1 (boundary)")
-                                elif bl == 2:
-                                    print(f"      Escape label V{v_idx}: ON_H2 (boundary)")
-                                else:
-                                    print(f"      Escape label V{v_idx}: NOT_IN_SEEDS (bl={bl})")
+                            lines.append(f"      Escape label V{v_idx}: {escape_names.get(el, el)}")
+                        elif tet_result.boundary_labels is not None:
+                            bl = tet_result.boundary_labels[v_idx]
+                            if bl == 1:
+                                lines.append(f"      Escape label V{v_idx}: ON_H1 (boundary)")
+                            elif bl == 2:
+                                lines.append(f"      Escape label V{v_idx}: ON_H2 (boundary)")
+                            else:
+                                lines.append(f"      Escape label V{v_idx}: NOT_IN_SEEDS (bl={bl})")
             else:
-                print(f"\n   PS Vertex {ps_v_idx}: No mapping available")
+                lines.append(f"\n   PS Vertex {ps_v_idx}: No mapping available")
+        
+        return lines
     
     def _highlight_selected_edge(self, v0: np.ndarray, v1: np.ndarray):
         """Highlight the selected edge in red."""
@@ -4825,13 +4817,8 @@ class MeshViewer(QWidget):
             
             # Enable cell picking
             self._enable_triangle_picking()
-            logger.info("🔍 Triangle debug mode ENABLED - Click on triangles to analyze them")
-            print("\n" + "="*70)
-            print("🔍 TRIANGLE DEBUG MODE ENABLED")
-            print("="*70)
-            print("Click on any triangle in the membrane to see detailed analysis.")
-            print("This will help identify problematic triangles.")
-            print("="*70 + "\n")
+            logger.info("Triangle debug mode ENABLED - Click on triangles to analyze them")
+            logger.debug("Triangle debug mode enabled. Click on any triangle in the membrane to see detailed analysis.")
         else:
             # Disable picking and clear visualization
             self._disable_triangle_picking()
@@ -4855,7 +4842,7 @@ class MeshViewer(QWidget):
                 pickable_window=True,  # Pick anywhere in window
             )
             logger.debug("Triangle picking enabled (point-based)")
-            print("🎯 Click anywhere on the membrane to select a triangle")
+            logger.debug("Click anywhere on the membrane to select a triangle")
         except Exception as e:
             logger.error(f"Failed to enable triangle picking: {e}")
     
@@ -5001,46 +4988,47 @@ class MeshViewer(QWidget):
         # Highlight the selected triangle
         self._highlight_selected_triangle(v0, v1, v2)
         
-        # Print detailed debug info
-        print("\n" + "="*70)
-        print("🔺 TRIANGLE DEBUG ANALYSIS")
-        print("="*70)
-        print(f"Face Index: {cell_id}")
-        print(f"Vertex Indices: [{v0_idx}, {v1_idx}, {v2_idx}]")
-        print(f"\n📍 VERTEX POSITIONS:")
-        print(f"   V0 [{v0_idx}]: [{v0[0]:.6f}, {v0[1]:.6f}, {v0[2]:.6f}]")
-        print(f"   V1 [{v1_idx}]: [{v1[0]:.6f}, {v1[1]:.6f}, {v1[2]:.6f}]")
-        print(f"   V2 [{v2_idx}]: [{v2[0]:.6f}, {v2[1]:.6f}, {v2[2]:.6f}]")
+        # Build structured debug output
+        lines = [
+            "",
+            "=" * 70,
+            "TRIANGLE DEBUG ANALYSIS",
+            "=" * 70,
+            f"Face Index: {cell_id}",
+            f"Vertex Indices: [{v0_idx}, {v1_idx}, {v2_idx}]",
+            f"\nVERTEX POSITIONS:",
+            f"   V0 [{v0_idx}]: [{v0[0]:.6f}, {v0[1]:.6f}, {v0[2]:.6f}]",
+            f"   V1 [{v1_idx}]: [{v1[0]:.6f}, {v1[1]:.6f}, {v1[2]:.6f}]",
+            f"   V2 [{v2_idx}]: [{v2[0]:.6f}, {v2[1]:.6f}, {v2[2]:.6f}]",
+            f"\nEDGE LENGTHS:",
+            f"   Edge V0->V1: {edge_a:.6f}",
+            f"   Edge V1->V2: {edge_b:.6f}",
+            f"   Edge V2->V0: {edge_c:.6f}",
+            f"   Min edge: {min(edge_a, edge_b, edge_c):.6f}",
+            f"   Max edge: {max(edge_a, edge_b, edge_c):.6f}",
+            f"   Edge ratio (max/min): {max(edge_a, edge_b, edge_c) / max(min(edge_a, edge_b, edge_c), 1e-10):.2f}",
+            f"\nQUALITY METRICS:",
+            f"   Area: {area:.8f}",
+            f"   Aspect Ratio: {aspect_ratio:.4f} (1.0 = equilateral, 0.0 = degenerate)",
+            f"   Centroid: [{centroid[0]:.6f}, {centroid[1]:.6f}, {centroid[2]:.6f}]",
+            f"   Normal: [{normal[0]:.6f}, {normal[1]:.6f}, {normal[2]:.6f}]",
+        ]
         
-        print(f"\n📐 EDGE LENGTHS:")
-        print(f"   Edge V0→V1: {edge_a:.6f}")
-        print(f"   Edge V1→V2: {edge_b:.6f}")
-        print(f"   Edge V2→V0: {edge_c:.6f}")
-        print(f"   Min edge: {min(edge_a, edge_b, edge_c):.6f}")
-        print(f"   Max edge: {max(edge_a, edge_b, edge_c):.6f}")
-        print(f"   Edge ratio (max/min): {max(edge_a, edge_b, edge_c) / max(min(edge_a, edge_b, edge_c), 1e-10):.2f}")
+        quality_status = "GOOD" if aspect_ratio > 0.3 else ("POOR" if aspect_ratio > 0.1 else "BAD")
+        lines.append(f"   Quality: {quality_status}")
         
-        print(f"\n📊 QUALITY METRICS:")
-        print(f"   Area: {area:.8f}")
-        print(f"   Aspect Ratio: {aspect_ratio:.4f} (1.0 = equilateral, 0.0 = degenerate)")
-        print(f"   Centroid: [{centroid[0]:.6f}, {centroid[1]:.6f}, {centroid[2]:.6f}]")
-        print(f"   Normal: [{normal[0]:.6f}, {normal[1]:.6f}, {normal[2]:.6f}]")
+        lines.extend([
+            f"\nCONNECTIVITY:",
+            f"   Neighbor faces: {neighbors}",
+            f"   Number of neighbors: {len(neighbors)}",
+            f"   Is boundary triangle: {'YES' if is_boundary else 'NO'}",
+        ])
         
-        # Quality assessment
-        quality_status = "✅ GOOD" if aspect_ratio > 0.3 else ("⚠️ POOR" if aspect_ratio > 0.1 else "❌ BAD")
-        print(f"   Quality: {quality_status}")
-        
-        print(f"\n🔗 CONNECTIVITY:")
-        print(f"   Neighbor faces: {neighbors}")
-        print(f"   Number of neighbors: {len(neighbors)}")
-        print(f"   Is boundary triangle: {'YES' if is_boundary else 'NO'}")
-        
-        # Check which edges of this triangle are actually mesh boundary edges
-        print(f"\n🔺 MESH BOUNDARY EDGE CHECK:")
+        # Mesh boundary edge check
+        lines.append(f"\nMESH BOUNDARY EDGE CHECK:")
         edges = [(v0_idx, v1_idx), (v1_idx, v2_idx), (v2_idx, v0_idx)]
-        edge_names = ["V0→V1", "V1→V2", "V2→V0"]
+        edge_names = ["V0->V1", "V1->V2", "V2->V0"]
         
-        # Build edge-to-face count for entire mesh
         edge_face_count = {}
         for fi, face in enumerate(mesh.faces):
             for i in range(3):
@@ -5052,13 +5040,12 @@ class MeshViewer(QWidget):
             edge_key = (min(e0, e1), max(e0, e1))
             face_count = edge_face_count.get(edge_key, 0)
             is_mesh_boundary = (face_count == 1)
-            status = "🔴 MESH BOUNDARY (1 face)" if is_mesh_boundary else f"⚪ Interior ({face_count} faces)"
-            print(f"   {edge_name} [{e0}→{e1}]: {status}")
+            status = "MESH BOUNDARY (1 face)" if is_mesh_boundary else f"Interior ({face_count} faces)"
+            lines.append(f"   {edge_name} [{e0}->{e1}]: {status}")
         
-        # For each vertex, check if it has ANY mesh boundary edges
-        print(f"\n🔍 VERTEX BOUNDARY EDGE CHECK:")
+        # Vertex boundary edge check
+        lines.append(f"\nVERTEX BOUNDARY EDGE CHECK:")
         for vi, v_idx in enumerate([v0_idx, v1_idx, v2_idx]):
-            # Find all edges containing this vertex
             vertex_boundary_edges = []
             for (e0, e1), count in edge_face_count.items():
                 if count == 1 and (e0 == v_idx or e1 == v_idx):
@@ -5066,116 +5053,104 @@ class MeshViewer(QWidget):
                     vertex_boundary_edges.append(other)
             
             if len(vertex_boundary_edges) == 0:
-                print(f"   V{vi} [{v_idx}]: ❌ NO mesh boundary edges (interior vertex)")
+                lines.append(f"   V{vi} [{v_idx}]: NO mesh boundary edges (interior vertex)")
             elif len(vertex_boundary_edges) == 1:
-                print(f"   V{vi} [{v_idx}]: ⚠️  1 mesh boundary edge (to vertex {vertex_boundary_edges[0]}) - NO FAN POSSIBLE")
+                lines.append(f"   V{vi} [{v_idx}]: 1 mesh boundary edge (to vertex {vertex_boundary_edges[0]}) - NO FAN POSSIBLE")
             else:
-                print(f"   V{vi} [{v_idx}]: ✅ {len(vertex_boundary_edges)} mesh boundary edges (to vertices {vertex_boundary_edges}) - fan should exist")
+                lines.append(f"   V{vi} [{v_idx}]: {len(vertex_boundary_edges)} mesh boundary edges (to vertices {vertex_boundary_edges}) - fan should exist")
         
-        # Vertex boundary types if available
+        # Vertex boundary types
         if self._triangle_debug_boundary_type_ref is not None:
             bt = self._triangle_debug_boundary_type_ref
-            print(f"\n🏷️ VERTEX BOUNDARY TYPES:")
+            lines.append(f"\nVERTEX BOUNDARY TYPES:")
             for vi, v_idx in enumerate([v0_idx, v1_idx, v2_idx]):
                 if v_idx < len(bt):
                     btype = bt[v_idx]
                     btype_name = {-1: "INNER (part)", 0: "INTERIOR", 1: "OUTER (H1)", 2: "OUTER (H2)"}.get(btype, f"UNKNOWN ({btype})")
-                    print(f"   V{vi} [{v_idx}]: {btype_name}")
+                    lines.append(f"   V{vi} [{v_idx}]: {btype_name}")
         
-        # Distance to part if available
+        # Distance to part
         if self._part_mesh_ref is not None:
             try:
                 pts = np.array([v0, v1, v2, centroid])
                 closest_pts, distances, closest_faces = trimesh.proximity.closest_point(self._part_mesh_ref, pts)
-                print(f"\n📏 DISTANCE TO PART MESH:")
-                print(f"   V0 distance: {distances[0]:.6f}")
-                print(f"   V1 distance: {distances[1]:.6f}")
-                print(f"   V2 distance: {distances[2]:.6f}")
-                print(f"   Centroid distance: {distances[3]:.6f}")
+                lines.extend([
+                    f"\nDISTANCE TO PART MESH:",
+                    f"   V0 distance: {distances[0]:.6f}",
+                    f"   V1 distance: {distances[1]:.6f}",
+                    f"   V2 distance: {distances[2]:.6f}",
+                    f"   Centroid distance: {distances[3]:.6f}",
+                ])
                 
-                # ========================================================
-                # COLLAR EXTENSION DEBUG INFO
-                # ========================================================
-                print(f"\n🔧 COLLAR EXTENSION DEBUG:")
+                # Collar extension debug
+                lines.append(f"\nCOLLAR EXTENSION DEBUG:")
                 part_face_normals = self._part_mesh_ref.face_normals
                 
                 for vi, (v_idx, v, closest_pt, closest_face, dist) in enumerate(zip(
                     [v0_idx, v1_idx, v2_idx], [v0, v1, v2], closest_pts[:3], closest_faces[:3], distances[:3]
                 )):
-                    print(f"\n   --- Vertex V{vi} [{v_idx}] ---")
-                    print(f"   Position: [{v[0]:.6f}, {v[1]:.6f}, {v[2]:.6f}]")
-                    print(f"   Closest pt on part: [{closest_pt[0]:.6f}, {closest_pt[1]:.6f}, {closest_pt[2]:.6f}]")
-                    print(f"   Distance to part: {dist:.6f}")
+                    lines.append(f"\n   --- Vertex V{vi} [{v_idx}] ---")
+                    lines.append(f"   Position: [{v[0]:.6f}, {v[1]:.6f}, {v[2]:.6f}]")
+                    lines.append(f"   Closest pt on part: [{closest_pt[0]:.6f}, {closest_pt[1]:.6f}, {closest_pt[2]:.6f}]")
+                    lines.append(f"   Distance to part: {dist:.6f}")
                     
-                    # Part normal at closest point
                     if closest_face < len(part_face_normals):
                         part_normal = part_face_normals[closest_face]
-                        print(f"   Part normal at closest: [{part_normal[0]:.4f}, {part_normal[1]:.4f}, {part_normal[2]:.4f}]")
+                        lines.append(f"   Part normal at closest: [{part_normal[0]:.4f}, {part_normal[1]:.4f}, {part_normal[2]:.4f}]")
                         
-                        # Into-part direction
                         into_part = -part_normal
-                        print(f"   Into-part direction: [{into_part[0]:.4f}, {into_part[1]:.4f}, {into_part[2]:.4f}]")
+                        lines.append(f"   Into-part direction: [{into_part[0]:.4f}, {into_part[1]:.4f}, {into_part[2]:.4f}]")
                         
-                        # Collar point (closest + 2mm into part)
                         collar_depth = 2.0
                         collar_pt = closest_pt + collar_depth * into_part
-                        print(f"   Collar point (2mm depth): [{collar_pt[0]:.6f}, {collar_pt[1]:.6f}, {collar_pt[2]:.6f}]")
+                        lines.append(f"   Collar point (2mm depth): [{collar_pt[0]:.6f}, {collar_pt[1]:.6f}, {collar_pt[2]:.6f}]")
                         
-                        # Check if collar point is inside part
                         try:
                             inside = self._part_mesh_ref.contains([collar_pt])[0]
-                            inside_status = "✅ INSIDE" if inside else "❌ OUTSIDE"
-                            print(f"   Collar point containment: {inside_status}")
+                            inside_status = "INSIDE" if inside else "OUTSIDE"
+                            lines.append(f"   Collar point containment: {inside_status}")
                             
-                            # Try opposite direction
                             alt_collar_pt = closest_pt - collar_depth * into_part
                             alt_inside = self._part_mesh_ref.contains([alt_collar_pt])[0]
-                            alt_status = "✅ INSIDE" if alt_inside else "❌ OUTSIDE"
-                            print(f"   Alt collar (opposite dir): {alt_status}")
+                            alt_status = "INSIDE" if alt_inside else "OUTSIDE"
+                            lines.append(f"   Alt collar (opposite dir): {alt_status}")
                         except Exception as ce:
-                            print(f"   Containment check failed: {ce}")
+                            lines.append(f"   Containment check failed: {ce}")
                         
-                        # Direction from vertex to closest point
                         to_part_dir = closest_pt - v
                         to_part_len = np.linalg.norm(to_part_dir)
                         if to_part_len > 1e-8:
                             to_part_dir_unit = to_part_dir / to_part_len
-                            print(f"   Dir vertex→closest: [{to_part_dir_unit[0]:.4f}, {to_part_dir_unit[1]:.4f}, {to_part_dir_unit[2]:.4f}]")
+                            lines.append(f"   Dir vertex->closest: [{to_part_dir_unit[0]:.4f}, {to_part_dir_unit[1]:.4f}, {to_part_dir_unit[2]:.4f}]")
                             
-                            # Angle between into_part and to_part_dir
                             angle = np.degrees(np.arccos(np.clip(np.dot(into_part, to_part_dir_unit), -1, 1)))
-                            print(f"   Angle (into_part vs vertex→closest): {angle:.1f}°")
+                            lines.append(f"   Angle (into_part vs vertex->closest): {angle:.1f} deg")
                 
-                # ========================================================
-                # INNER BOUNDARY EDGE ANALYSIS
-                # ========================================================
+                # Inner boundary edge analysis
                 if self._triangle_debug_boundary_type_ref is not None:
                     bt = self._triangle_debug_boundary_type_ref
-                    print(f"\n🔲 INNER BOUNDARY EDGE ANALYSIS:")
+                    lines.append(f"\nINNER BOUNDARY EDGE ANALYSIS:")
                     
-                    edges = [(v0_idx, v1_idx, v0, v1), (v1_idx, v2_idx, v1, v2), (v2_idx, v0_idx, v2, v0)]
-                    edge_names = ["V0→V1", "V1→V2", "V2→V0"]
+                    analysis_edges = [(v0_idx, v1_idx, v0, v1), (v1_idx, v2_idx, v1, v2), (v2_idx, v0_idx, v2, v0)]
+                    analysis_edge_names = ["V0->V1", "V1->V2", "V2->V0"]
                     
-                    for (idx_a, idx_b, va, vb), edge_name in zip(edges, edge_names):
+                    for (idx_a, idx_b, va, vb), edge_name in zip(analysis_edges, analysis_edge_names):
                         bt_a = bt[idx_a] if idx_a < len(bt) else 0
                         bt_b = bt[idx_b] if idx_b < len(bt) else 0
                         
-                        # Check if edge touches inner boundary (part)
                         is_inner_edge = (bt_a == -1 or bt_b == -1)
                         edge_type = "INNER BOUNDARY" if is_inner_edge else "INTERIOR"
                         
-                        # Edge midpoint and direction
                         edge_mid = (va + vb) / 2
                         edge_dir = vb - va
                         edge_len = np.linalg.norm(edge_dir)
                         
-                        print(f"\n   --- Edge {edge_name} ({edge_type}) ---")
-                        print(f"   Vertices: [{idx_a}] bt={bt_a} → [{idx_b}] bt={bt_b}")
-                        print(f"   Edge length: {edge_len:.6f}")
-                        print(f"   Edge midpoint: [{edge_mid[0]:.6f}, {edge_mid[1]:.6f}, {edge_mid[2]:.6f}]")
+                        lines.append(f"\n   --- Edge {edge_name} ({edge_type}) ---")
+                        lines.append(f"   Vertices: [{idx_a}] bt={bt_a} -> [{idx_b}] bt={bt_b}")
+                        lines.append(f"   Edge length: {edge_len:.6f}")
+                        lines.append(f"   Edge midpoint: [{edge_mid[0]:.6f}, {edge_mid[1]:.6f}, {edge_mid[2]:.6f}]")
                         
                         if is_inner_edge:
-                            # This edge needs collar - compute collar direction for midpoint
                             mid_closest, mid_dist, mid_face = trimesh.proximity.closest_point(
                                 self._part_mesh_ref, [edge_mid]
                             )
@@ -5183,8 +5158,8 @@ class MeshViewer(QWidget):
                             mid_dist = mid_dist[0]
                             mid_face = mid_face[0]
                             
-                            print(f"   Closest pt (midpoint): [{mid_closest[0]:.6f}, {mid_closest[1]:.6f}, {mid_closest[2]:.6f}]")
-                            print(f"   Distance to part: {mid_dist:.6f}")
+                            lines.append(f"   Closest pt (midpoint): [{mid_closest[0]:.6f}, {mid_closest[1]:.6f}, {mid_closest[2]:.6f}]")
+                            lines.append(f"   Distance to part: {mid_dist:.6f}")
                             
                             if mid_face < len(part_face_normals):
                                 mid_part_normal = part_face_normals[mid_face]
@@ -5193,49 +5168,47 @@ class MeshViewer(QWidget):
                                 
                                 try:
                                     inside = self._part_mesh_ref.contains([collar_pt])[0]
-                                    status = "✅ INSIDE" if inside else "❌ OUTSIDE"
-                                    print(f"   Collar at midpoint: {status}")
+                                    status = "INSIDE" if inside else "OUTSIDE"
+                                    lines.append(f"   Collar at midpoint: {status}")
                                 except Exception:
                                     pass
                                 
             except Exception as e:
-                print(f"\n📏 DISTANCE TO PART: Error computing - {e}")
+                lines.append(f"\nDISTANCE TO PART: Error computing - {e}")
         
-        # Analyze potential issues
-        print(f"\n🔎 POTENTIAL ISSUES:")
+        # Potential issues
+        lines.append(f"\nPOTENTIAL ISSUES:")
         issues_found = False
         
         if aspect_ratio < 0.1:
-            print(f"   ❌ Very thin/degenerate triangle (aspect ratio {aspect_ratio:.4f} < 0.1)")
+            lines.append(f"   Very thin/degenerate triangle (aspect ratio {aspect_ratio:.4f} < 0.1)")
             issues_found = True
         elif aspect_ratio < 0.2:
-            print(f"   ⚠️ Thin triangle (aspect ratio {aspect_ratio:.4f} < 0.2)")
+            lines.append(f"   Thin triangle (aspect ratio {aspect_ratio:.4f} < 0.2)")
             issues_found = True
         
         edge_ratio = max(edge_a, edge_b, edge_c) / max(min(edge_a, edge_b, edge_c), 1e-10)
         if edge_ratio > 10:
-            print(f"   ❌ Extreme edge length ratio ({edge_ratio:.1f}:1)")
+            lines.append(f"   Extreme edge length ratio ({edge_ratio:.1f}:1)")
             issues_found = True
         elif edge_ratio > 5:
-            print(f"   ⚠️ High edge length ratio ({edge_ratio:.1f}:1)")
+            lines.append(f"   High edge length ratio ({edge_ratio:.1f}:1)")
             issues_found = True
         
         if area < 1e-8:
-            print(f"   ❌ Near-zero area ({area:.2e})")
+            lines.append(f"   Near-zero area ({area:.2e})")
             issues_found = True
         
         if is_boundary and len(neighbors) == 0:
-            print(f"   ❌ Isolated triangle (no neighbors)")
+            lines.append(f"   Isolated triangle (no neighbors)")
             issues_found = True
         
         if not issues_found:
-            print(f"   ✅ No obvious issues detected")
+            lines.append(f"   No obvious issues detected")
         
-        print("="*70 + "\n")
+        lines.append("=" * 70)
         
-        # Also log to logger
-        logger.info(f"Triangle {cell_id} analyzed: aspect={aspect_ratio:.4f}, area={area:.6f}, "
-                   f"edges=[{edge_a:.4f}, {edge_b:.4f}, {edge_c:.4f}], neighbors={len(neighbors)}")
+        logger.debug("\n".join(lines))
     
     def _find_nearest_triangle(self, picked_info) -> Optional[int]:
         """Find the nearest triangle to a picked point."""
@@ -5869,7 +5842,7 @@ class MeshViewer(QWidget):
         self._metamold_prism_actor = self.plotter.add_mesh(
             pv_mesh,
             color='#4CAF50',  # Material Green
-            opacity=0.25,
+            opacity=0.4,
             show_edges=True,
             edge_color='#2E7D32',  # Dark Green
             line_width=1.0,
@@ -5944,7 +5917,7 @@ class MeshViewer(QWidget):
         self._metamold_cavity_actor = self.plotter.add_mesh(
             pv_mesh,
             color='#81C784',  # Light Green
-            opacity=0.4,
+            opacity=0.55,
             show_edges=True,
             edge_color='#388E3C',  # Green
             line_width=0.5,
@@ -6022,7 +5995,7 @@ class MeshViewer(QWidget):
         self._metamold_half_1_actor = self.plotter.add_mesh(
             pv_mesh,
             color='#66BB6A',  # Green 400
-            opacity=0.6,
+            opacity=0.75,
             show_edges=True,
             edge_color='#43A047',  # Green 600
             line_width=0.5,
@@ -6096,7 +6069,7 @@ class MeshViewer(QWidget):
         self._metamold_half_2_actor = self.plotter.add_mesh(
             pv_mesh,
             color='#AB47BC',  # Purple 400
-            opacity=0.6,
+            opacity=0.75,
             show_edges=True,
             edge_color='#8E24AA',  # Purple 600
             line_width=0.5,
@@ -6175,7 +6148,7 @@ class MeshViewer(QWidget):
         self._metamold_half_1_with_part_actor = self.plotter.add_mesh(
             pv_mesh,
             color='#00BCD4',  # Cyan 500
-            opacity=0.7,
+            opacity=0.85,
             show_edges=True,
             edge_color='#0097A7',  # Cyan 700
             line_width=0.5,
@@ -6250,7 +6223,7 @@ class MeshViewer(QWidget):
         self._metamold_half_2_with_part_actor = self.plotter.add_mesh(
             pv_mesh,
             color='#FF9800',  # Orange 500
-            opacity=0.7,
+            opacity=0.85,
             show_edges=True,
             edge_color='#F57C00',  # Orange 700
             line_width=0.5,

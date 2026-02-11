@@ -20,7 +20,6 @@ Author: VcMoldCreator
 
 import numpy as np
 from dataclasses import dataclass
-from typing import Tuple
 import logging
 import time
 
@@ -69,11 +68,6 @@ class SinusoidalRegistrationResult:
     
     # Timing
     computation_time_ms: float
-
-
-# Aliases for backward compatibility
-RegistrationNoiseResult = SinusoidalRegistrationResult
-PerlinRegistrationResult = SinusoidalRegistrationResult
 
 
 # ============================================================================
@@ -491,53 +485,3 @@ def _compute_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarr
     return vertex_normals
 
 
-def get_band_visualization_data(
-    parting_surface: trimesh.Trimesh,
-    part_mesh: trimesh.Trimesh,
-    hull_mesh: trimesh.Trimesh,
-    vertex_boundary_type: np.ndarray,
-    hull_offset_fraction: float = DEFAULT_HULL_OFFSET_FRACTION,
-    band_width_fraction: float = DEFAULT_BAND_WIDTH_FRACTION
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Get visualization data for the registration band (for preview).
-    
-    Returns:
-        Tuple of:
-            - band_positions: (K, 3) positions of vertices in band
-            - band_indices: (K,) indices of vertices in band
-            - intermediate_hull_positions: (K, 3) positions on intermediate hull
-    """
-    vertices = np.array(parting_surface.vertices, dtype=np.float64)
-    bbox_diag = np.linalg.norm(parting_surface.bounds[1] - parting_surface.bounds[0])
-    band_width = band_width_fraction * bbox_diag
-    
-    # Find interior vertices
-    interior_mask = vertex_boundary_type == 0
-    interior_indices = np.where(interior_mask)[0]
-    
-    if len(interior_indices) == 0:
-        return np.array([]), np.array([]), np.array([])
-    
-    interior_positions = vertices[interior_indices]
-    
-    # Compute distances
-    part_proximity = trimesh.proximity.ProximityQuery(part_mesh)
-    hull_proximity = trimesh.proximity.ProximityQuery(hull_mesh)
-    
-    closest_part, _, _ = part_proximity.on_surface(interior_positions)
-    closest_hull, _, _ = hull_proximity.on_surface(interior_positions)
-    
-    # Compute intermediate positions
-    intermediate_positions = closest_part + hull_offset_fraction * (closest_hull - closest_part)
-    dist_to_intermediate = np.linalg.norm(interior_positions - intermediate_positions, axis=1)
-    
-    # Find vertices in band
-    half_band_width = band_width / 2.0
-    in_band_mask = dist_to_intermediate <= half_band_width
-    
-    band_indices = interior_indices[in_band_mask]
-    band_positions = vertices[band_indices]
-    band_intermediate = intermediate_positions[in_band_mask]
-    
-    return band_positions, band_indices, band_intermediate

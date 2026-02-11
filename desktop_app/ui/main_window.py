@@ -664,7 +664,7 @@ class MeshLoadWorker(QThread):
             self.progress.emit("Mesh processing complete")
                 
         except Exception as e:
-            logger.exception(f"Error in mesh processing: {e}")
+            logger.exception("Error in mesh processing: %s", e)
             self.error.emit(str(e))
 
 
@@ -711,7 +711,7 @@ class PartingDirectionWorker(QThread):
             self.complete.emit(result)
             
         except Exception as e:
-            logger.exception(f"Error computing parting directions: {e}")
+            logger.exception("Error computing parting directions: %s", e)
             self.error.emit(str(e))
 
 
@@ -760,7 +760,7 @@ class VisibilityPaintWorker(QThread):
             self.complete.emit(paint_data, face_colors)
             
         except Exception as e:
-            logger.exception(f"Error computing visibility paint: {e}")
+            logger.exception("Error computing visibility paint: %s", e)
             self.error.emit(str(e))
 
 
@@ -800,7 +800,7 @@ class HullWorker(QThread):
             self.complete.emit(result)
             
         except Exception as e:
-            logger.exception(f"Error computing inflated hull: {e}")
+            logger.exception("Error computing inflated hull: %s", e)
             self.error.emit(str(e))
 
 
@@ -869,7 +869,7 @@ class MoldAwarePouringDirectionWorker(QThread):
             self.complete.emit(result)
             
         except Exception as e:
-            logger.exception(f"Error computing mold-aware pouring directions: {e}")
+            logger.exception("Error computing mold-aware pouring directions: %s", e)
             self.error.emit(str(e))
 
 
@@ -910,18 +910,24 @@ class HardShellWorker(QThread):
             logger.info(f"Generating hard shell with wall_thickness={self.wall_thickness}mm")
             
             # Step 1: Create the outer collar extension (extend parting surface outward)
-            # This extends the parting surface by 2x wall_thickness to fully cut through the shell
+            # Uses adaptive per-vertex extension: ray-casts against the prism's 2D offset
+            # silhouette to guarantee each collar vertex passes through the prism wall,
+            # even at sharp silhouette corners where a fixed multiplier would fail.
             self.progress.emit("Creating outer collar extension...")
-            extension_distance = self.wall_thickness * 2.5  # Extend beyond the prism
+            prism_margin = 0.0  # Must match the margin used in create_hard_shell_prism below
             collar_result = create_outer_collar_extension(
                 self.parting_surface,
                 self.inner_hull,
                 self.vertex_boundary_type,
                 self.pouring_direction,
-                extension_distance=extension_distance
+                extension_distance=self.wall_thickness * 1.5,  # Minimum fallback
+                wall_thickness=self.wall_thickness,
+                prism_margin=prism_margin,
+                safety_margin=2.0  # 2mm beyond prism boundary
             )
             logger.info(f"Outer collar extension: +{collar_result.collar_vertex_count} vertices, "
-                       f"+{collar_result.collar_face_count} faces, extended {extension_distance:.1f}mm")
+                       f"+{collar_result.collar_face_count} faces, "
+                       f"extended {collar_result.extension_distance:.1f}mm (adaptive)")
             
             # Step 2: Create the prism (paper Section 5 - aligned with pouring direction)
             self.progress.emit("Creating hard shell prism (aligned with pouring direction)...")
@@ -929,7 +935,7 @@ class HardShellWorker(QThread):
                 self.inner_hull,
                 self.pouring_direction,
                 wall_thickness=self.wall_thickness,
-                margin=0.0
+                margin=prism_margin
             )
             logger.info(f"Hard shell prism: {prism_result.vertex_count} vertices, "
                        f"silhouette has {len(prism_result.silhouette_2d)} points")
@@ -969,7 +975,7 @@ class HardShellWorker(QThread):
             self.complete.emit(prism_result, shell_with_cavity, collar_result, shell_half_1, shell_half_2, csg_success)
             
         except Exception as e:
-            logger.exception(f"Error generating hard shell: {e}")
+            logger.exception("Error generating hard shell: %s", e)
             self.error.emit(str(e))
 
 
@@ -1112,7 +1118,7 @@ class MetamoldWorker(QThread):
                              half_1_with_part, half_2_with_part, csg_success)
             
         except Exception as e:
-            logger.exception(f"Error generating metamold: {e}")
+            logger.exception("Error generating metamold: %s", e)
             self.error.emit(str(e))
 
 
@@ -1129,7 +1135,7 @@ class MoldHalvesWorker(QThread):
         hull_mesh,
         d1: np.ndarray,
         d2: np.ndarray,
-        boundary_zone_threshold: float = 0.15,
+        boundary_zone_threshold: float = 0.05,
         part_mesh=None,
         use_proximity_method: bool = False,
         tet_vertices: np.ndarray = None,
@@ -1184,7 +1190,7 @@ class MoldHalvesWorker(QThread):
             self.complete.emit(result)
             
         except Exception as e:
-            logger.exception(f"Error classifying mold halves: {e}")
+            logger.exception("Error classifying mold halves: %s", e)
             self.error.emit(str(e))
 
 
@@ -1496,7 +1502,7 @@ class TetrahedralizeWorker(QThread):
             self.complete.emit(result)
             
         except Exception as e:
-            logger.exception(f"Error generating tetrahedral mesh: {e}")
+            logger.exception("Error generating tetrahedral mesh: %s", e)
             self.error.emit(str(e))
 
 
@@ -1729,7 +1735,7 @@ class EdgeWeightsWorker(QThread):
             self.complete.emit(result)
             
         except Exception as e:
-            logger.exception(f"Error computing edge weights: {e}")
+            logger.exception("Error computing edge weights: %s", e)
             self.error.emit(str(e))
 
 
@@ -1792,7 +1798,7 @@ class DijkstraWorker(QThread):
             self.complete.emit(self.tet_result)
             
         except Exception as e:
-            logger.exception(f"Error in Dijkstra: {e}")
+            logger.exception("Error in Dijkstra: %s", e)
             self.error.emit(str(e))
     
     def _compute_primary_cut_edges(
@@ -2280,7 +2286,7 @@ class SecondaryCutsWorker(QThread):
             self.complete.emit(self.tet_result)
             
         except Exception as e:
-            logger.exception(f"Error in secondary cuts detection: {e}")
+            logger.exception("Error in secondary cuts detection: %s", e)
             self.error.emit(str(e))
 
 
@@ -2550,7 +2556,7 @@ class PrimarySurfaceExtractionWorker(QThread):
             self.complete.emit(result)
             
         except Exception as e:
-            logger.exception(f"Error in primary surface extraction: {e}")
+            logger.exception("Error in primary surface extraction: %s", e)
             self.error.emit(str(e))
 
 
@@ -2735,7 +2741,7 @@ class SecondarySurfaceExtractionWorker(QThread):
             self.complete.emit(result)
             
         except Exception as e:
-            logger.exception(f"Error in secondary surface extraction: {e}")
+            logger.exception("Error in secondary surface extraction: %s", e)
             self.error.emit(str(e))
 
 
@@ -2947,7 +2953,7 @@ class CombinedSurfaceSmoothingWorker(QThread):
             self.complete.emit(result)
             
         except Exception as e:
-            logger.exception(f"Error in combined surface smoothing: {e}")
+            logger.exception("Error in combined surface smoothing: %s", e)
             self.error.emit(str(e))
     
     def _smooth_single_surface(self, mesh, vertex_boundary_type, part_mesh, hull_mesh, label: str):
@@ -3246,7 +3252,7 @@ class PartingSurfaceWorker(QThread):
             self.complete.emit(result)
             
         except Exception as e:
-            logger.exception(f"Error in parting surface extraction: {e}")
+            logger.exception("Error in parting surface extraction: %s", e)
             self.error.emit(str(e))
 
 
@@ -3315,7 +3321,7 @@ class SurfacePropagationWorker(QThread):
             self.complete.emit(result)
             
         except Exception as e:
-            logger.exception(f"Error in surface propagation: {e}")
+            logger.exception("Error in surface propagation: %s", e)
             self.error.emit(str(e))
 
 
@@ -3406,7 +3412,7 @@ class MembraneSmoothingWorker(QThread):
             self.complete.emit(result)
             
         except Exception as e:
-            logger.exception(f"Error in membrane smoothing: {e}")
+            logger.exception("Error in membrane smoothing: %s", e)
             self.error.emit(str(e))
 
 
@@ -3466,7 +3472,7 @@ class RegistrationPatternWorker(QThread):
             self.complete.emit(result)
 
         except Exception as e:
-            logger.exception(f"Error applying registration pattern: {e}")
+            logger.exception("Error applying registration pattern: %s", e)
             self.error.emit(str(e))
 
 
@@ -5199,7 +5205,7 @@ class MainWindow(QMainWindow):
         # Mold halves classification state
         self._mold_halves_worker = None
         self._mold_halves_result: Optional[MoldHalfClassificationResult] = None
-        self._boundary_zone_threshold: float = 0.15  # Default 15%
+        self._boundary_zone_threshold: float = 0.05  # Default 5%
         
         # Tetrahedral mesh state
         self._tet_worker = None
@@ -5758,7 +5764,7 @@ class MainWindow(QMainWindow):
                     logger.warning("Failed to generate feature debug data")
                     
             except Exception as e:
-                logger.exception(f"Error showing feature debug visualization: {e}")
+                logger.exception("Error showing feature debug visualization: %s", e)
         else:
             # Remove feature debug visualization
             self.mesh_viewer.remove_feature_debug_visualization()
@@ -7540,7 +7546,7 @@ class MainWindow(QMainWindow):
             )
             
         except Exception as e:
-            logger.exception(f"Failed to save session: {e}")
+            logger.exception("Failed to save session: %s", e)
             QMessageBox.critical(
                 self,
                 "Save Error",
@@ -7580,7 +7586,7 @@ class MainWindow(QMainWindow):
             )
             
         except Exception as e:
-            logger.exception(f"Failed to load session: {e}")
+            logger.exception("Failed to load session: %s", e)
             QMessageBox.critical(
                 self,
                 "Load Error",
@@ -7830,7 +7836,7 @@ class MainWindow(QMainWindow):
         if session.get('mold_halves_result'):
             from core.mold_half_classification import MoldHalfClassificationResult
             self._mold_halves_result = dict_to_result(session['mold_halves_result'], MoldHalfClassificationResult)
-            self._boundary_zone_threshold = session.get('boundary_zone_threshold', 0.15)
+            self._boundary_zone_threshold = session.get('boundary_zone_threshold', 0.05)
             # Note: Visualization is applied after tet_result is restored below
         
         # Restore tet result
@@ -10890,7 +10896,7 @@ class MainWindow(QMainWindow):
                        f"{f', {len(fill_face_indices)} fill faces in yellow' if fill_face_indices is not None else ''}")
                     
         except Exception as e:
-            logger.exception(f"Error visualizing parting surface: {e}")
+            logger.exception("Error visualizing parting surface: %s", e)
             QMessageBox.warning(
                 self,
                 "Visualization Warning",
@@ -11272,7 +11278,7 @@ class MainWindow(QMainWindow):
             logger.info(f"Smoothed primary surface visualized: {result.primary_num_vertices} vertices, {result.primary_num_faces} faces"
                        f"{f', {len(fill_face_indices)} fill faces in yellow' if fill_face_indices is not None else ''}")
         except Exception as e:
-            logger.exception(f"Error visualizing smoothed primary surface: {e}")
+            logger.exception("Error visualizing smoothed primary surface: %s", e)
         
         # Visualize the smoothed SECONDARY parting surface (if exists)
         if has_secondary:
@@ -11286,7 +11292,7 @@ class MainWindow(QMainWindow):
                 logger.info(f"Smoothed secondary surface visualized: {result.secondary_num_vertices} vertices, {result.secondary_num_faces} faces"
                            f"{f', {len(fill_face_indices)} fill faces in orange' if fill_face_indices is not None else ''}")
             except Exception as e:
-                logger.exception(f"Error visualizing smoothed secondary surface: {e}")
+                logger.exception("Error visualizing smoothed secondary surface: %s", e)
         
         # Mark step complete and unlock REGISTRATION_NOISE step (not POURING directly)
         if Step.PARTING_SURFACE_SMOOTH in self.step_buttons:
@@ -11439,7 +11445,7 @@ class MainWindow(QMainWindow):
             logger.info(f"Secondary parting surface visualized: {result.num_vertices} vertices, {result.num_faces} faces")
                     
         except Exception as e:
-            logger.exception(f"Error visualizing secondary parting surface: {e}")
+            logger.exception("Error visualizing secondary parting surface: %s", e)
             QMessageBox.warning(
                 self,
                 "Visualization Warning",
@@ -11693,7 +11699,7 @@ class MainWindow(QMainWindow):
             
             logger.info(f"Secondary surface (extracted, unsmoothed) visualized: {result.num_vertices} vertices, {result.num_faces} faces")
         except Exception as e:
-            logger.exception(f"Error visualizing secondary surface: {e}")
+            logger.exception("Error visualizing secondary surface: %s", e)
         
         # Mark step complete
         if Step.SECONDARY_SURFACE in self.step_buttons:
@@ -11757,7 +11763,7 @@ class MainWindow(QMainWindow):
             # Get file size
             try:
                 file_size = Path(self._loaded_filename).stat().st_size
-            except:
+            except Exception:
                 file_size = 0
             
             self.title_bar.set_file_info(filename, triangle_count, file_size)
@@ -11794,7 +11800,7 @@ class MainWindow(QMainWindow):
                 triangle_count = len(result.mesh.faces)
                 try:
                     file_size = Path(self._loaded_filename).stat().st_size
-                except:
+                except Exception:
                     file_size = 0
                 self.title_bar.set_file_info(filename, triangle_count, file_size)
         
@@ -11886,7 +11892,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Decimation Failed", error_msg)
                 
         except Exception as e:
-            logger.exception(f"Decimation error: {e}")
+            logger.exception("Decimation error: %s", e)
             self.progress_label.setText(f"Decimation error")
             self.progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
             QMessageBox.critical(self, "Error", f"Decimation failed: {str(e)}")
