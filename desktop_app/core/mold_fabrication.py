@@ -2036,6 +2036,133 @@ def add_part_to_metamold_halves(
     return half_1_with_part, half_2_with_part, elapsed_ms, True
 
 
+def trim_metamold_halves(
+    upper_half: trimesh.Trimesh,
+    lower_half: trimesh.Trimesh,
+    parting_surface: trimesh.Trimesh,
+    pouring_direction: np.ndarray,
+    trim_threshold: float = 4.0
+) -> Tuple[trimesh.Trimesh, trimesh.Trimesh, float, float, float]:
+    """
+    Trim each metamold half's BASE to save 3D printing material.
+    
+    The upper half (positive pouring direction side) has its TOP trimmed.
+    The lower half (negative pouring direction side) has its BOTTOM trimmed.
+    Each half is trimmed independently so one never cuts into the other.
+    
+    Must be called AFTER all CSG operations (cavity, split, part union)
+    so both prism walls and part geometry are cleanly clipped.
+    
+    The caller must pass the halves in the correct order as returned by
+    ``split_shell_with_membrane``:
+        half_1 → upper_half (positive pouring direction)
+        half_2 → lower_half (negative pouring direction)
+    
+    Args:
+        upper_half: The metamold half on the positive pouring-direction side.
+        lower_half: The metamold half on the negative pouring-direction side.
+        parting_surface: The parting surface mesh (height reference).
+        pouring_direction: Unit vector for the resin pouring direction.
+        trim_threshold: Keep at least this much material (mm) between the
+            parting surface and the trimmed base.  Set ≤ 0 to disable.
+    
+    Returns:
+        (trimmed_upper, trimmed_lower, upper_saved_mm, lower_saved_mm,
+         computation_time_ms).
+    """
+    start_time = time.time()
+    
+    if not MANIFOLD_AVAILABLE:
+        logger.warning("manifold3d not available – cannot trim metamold halves")
+        return upper_half, lower_half, 0.0, 0.0, 0.0
+    
+    if trim_threshold <= 0:
+        logger.info("Metamold trim disabled (threshold=%s)", trim_threshold)
+        elapsed_ms = (time.time() - start_time) * 1000
+        return upper_half, lower_half, 0.0, 0.0, elapsed_ms
+    
+    pouring_dir = np.asarray(pouring_direction, dtype=np.float64)
+    pouring_dir = pouring_dir / (np.linalg.norm(pouring_dir) + 1e-10)
+    
+    # ------------------------------------------------------------------
+    # Parting surface height extent along the pouring direction
+    # ------------------------------------------------------------------
+    ps_verts = np.asarray(parting_surface.vertices, dtype=np.float64)
+    ps_heights = ps_verts @ pouring_dir
+    ps_min_height = float(np.min(ps_heights))
+    ps_max_height = float(np.max(ps_heights))
+    
+    logger.info(f"Trimming metamold halves (threshold={trim_threshold:.1f}mm)")
+    logger.info(f"  Parting surface height: {ps_min_height:.2f} to {ps_max_height:.2f}")
+    
+    upper_saved = 0.0
+    lower_saved = 0.0
+    
+    # ------------------------------------------------------------------
+    # Trim the UPPER half's TOP (its base, away from PS)
+    # Keep everything BELOW (ps_max + threshold)
+    # ------------------------------------------------------------------
+    trimmed_upper = upper_half
+    if upper_half is not None and len(upper_half.vertices) > 0:
+        try:
+            uh = np.asarray(upper_half.vertices, dtype=np.float64) @ pouring_dir
+            half_max = float(np.max(uh))
+            trim_at = ps_max_height + trim_threshold
+            gap = half_max - trim_at
+            
+            logger.info(f"  Upper half extent: {float(np.min(uh)):.2f} to {half_max:.2f}")
+            
+            if gap > 0.01:
+                manifold = _trimesh_to_manifold(upper_half)
+                # trim_by_plane(normal, offset): keeps the side in normal direction
+                # normal = -pouring_dir, offset = -trim_at → keeps below trim_at
+                manifold = manifold.trim_by_plane(
+                    (-pouring_dir).tolist(), float(-trim_at)
+                )
+                trimmed_upper = _manifold_to_trimesh(manifold)
+                upper_saved = gap
+                logger.info(f"    Trimmed upper top by {gap:.2f}mm (cut at h={trim_at:.2f})")
+            else:
+                logger.info(f"    Upper half: no trim needed (gap={gap:.2f}mm)")
+        except Exception as e:
+            logger.error(f"Failed to trim upper half: {e}")
+    
+    # ------------------------------------------------------------------
+    # Trim the LOWER half's BOTTOM (its base, away from PS)
+    # Keep everything ABOVE (ps_min - threshold)
+    # ------------------------------------------------------------------
+    trimmed_lower = lower_half
+    if lower_half is not None and len(lower_half.vertices) > 0:
+        try:
+            lh = np.asarray(lower_half.vertices, dtype=np.float64) @ pouring_dir
+            half_min = float(np.min(lh))
+            trim_at = ps_min_height - trim_threshold
+            gap = trim_at - half_min
+            
+            logger.info(f"  Lower half extent: {half_min:.2f} to {float(np.max(lh)):.2f}")
+            
+            if gap > 0.01:
+                manifold = _trimesh_to_manifold(lower_half)
+                # normal = pouring_dir, offset = trim_at → keeps above trim_at
+                manifold = manifold.trim_by_plane(
+                    pouring_dir.tolist(), float(trim_at)
+                )
+                trimmed_lower = _manifold_to_trimesh(manifold)
+                lower_saved = gap
+                logger.info(f"    Trimmed lower bottom by {gap:.2f}mm (cut at h={trim_at:.2f})")
+            else:
+                logger.info(f"    Lower half: no trim needed (gap={gap:.2f}mm)")
+        except Exception as e:
+            logger.error(f"Failed to trim lower half: {e}")
+    
+    elapsed_ms = (time.time() - start_time) * 1000
+    
+    logger.info(f"Metamold trim complete in {elapsed_ms:.1f}ms "
+               f"(upper saved: {upper_saved:.2f}mm, lower saved: {lower_saved:.2f}mm)")
+    
+    return trimmed_upper, trimmed_lower, upper_saved, lower_saved, elapsed_ms
+
+
 def create_split_hard_shell(
     prism_result: HardShellPrismResult,
     hull_mesh: trimesh.Trimesh,

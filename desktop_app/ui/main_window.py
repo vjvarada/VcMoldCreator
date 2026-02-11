@@ -1020,7 +1020,8 @@ class MetamoldWorker(QThread):
                 create_shell_with_cavity,
                 split_shell_with_membrane,
                 add_part_to_metamold_halves,
-                create_part_with_thickened_secondary
+                create_part_with_thickened_secondary,
+                trim_metamold_halves
             )
             
             logger.info(f"Generating metamold with wall_thickness={self.wall_thickness}mm, "
@@ -1106,6 +1107,21 @@ class MetamoldWorker(QThread):
                         logger.info(f"Part added to metamold halves in {add_time_ms:.1f}ms")
                         logger.info(f"  Half 1 with part: {len(half_1_with_part.vertices)} verts, {len(half_1_with_part.faces)} faces")
                         logger.info(f"  Half 2 with part: {len(half_2_with_part.vertices)} verts, {len(half_2_with_part.faces)} faces")
+                        
+                        # Step 6: Trim both halves to save 3D printing material
+                        # This is done AFTER part union so the planar cut clips
+                        # both prism walls and part geometry cleanly.
+                        self.progress.emit("Trimming metamold halves to save material...")
+                        half_1_with_part, half_2_with_part, bot_saved, top_saved, trim_ms = trim_metamold_halves(
+                            half_1_with_part,
+                            half_2_with_part,
+                            self.outer_collar_mesh,
+                            self.resin_pouring_direction,
+                            trim_threshold=4.0
+                        )
+                        if bot_saved > 0 or top_saved > 0:
+                            logger.info(f"Metamold trim: bottom saved {bot_saved:.1f}mm, "
+                                       f"top saved {top_saved:.1f}mm in {trim_ms:.1f}ms")
                     else:
                         logger.warning("Adding part to metamold halves failed")
                 else:
