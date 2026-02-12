@@ -6259,3 +6259,76 @@ class MeshViewer(QWidget):
             self._metamold_half_2_with_part_actor.SetVisibility(visible)
             self.plotter.update()
             logger.debug(f"Metamold half 2 with part visibility set to {visible}")
+
+    # =========================================================================
+    # RESIN PLUG VISUALIZATION
+    # =========================================================================
+    
+    def show_resin_plug(self, mesh: 'trimesh.Trimesh'):
+        """
+        Display the resin pouring plug in yellow.
+        
+        Args:
+            mesh: The plug mesh
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+        
+        import pyvista as pv
+        
+        self.remove_resin_plug()
+        
+        if mesh is None or len(mesh.vertices) == 0:
+            logger.warning("No valid resin plug mesh to display")
+            return
+        
+        self._resin_plug_mesh = mesh
+        
+        try:
+            vertices = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.faces)
+            faces_pv = np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64)
+            pv_mesh = pv.PolyData(vertices, faces_pv.flatten())
+        except Exception as e:
+            logger.error(f"Failed to convert resin plug mesh to PyVista: {e}")
+            return
+        
+        self._resin_plug_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='#FFD700',  # Gold / Yellow
+            opacity=0.85,
+            show_edges=True,
+            edge_color='#B8860B',  # Dark Goldenrod
+            line_width=0.5,
+        )
+        self._resin_plug_visible = True
+        logger.info(f"Resin plug displayed: {len(vertices)} vertices, {len(faces)} faces")
+        
+        self.plotter.update()
+    
+    def remove_resin_plug(self):
+        """Remove resin plug from the display."""
+        if hasattr(self, '_resin_plug_actor') and self._resin_plug_actor is not None:
+            try:
+                self.plotter.remove_actor(self._resin_plug_actor)
+            except Exception:
+                pass
+            self._resin_plug_actor = None
+        
+        if hasattr(self, '_resin_plug_mesh'):
+            self._resin_plug_mesh = None
+        
+        self.plotter.update()
+    
+    def set_resin_plug_visible(self, visible: bool):
+        """
+        Set visibility of the resin plug.
+        
+        Args:
+            visible: True to show, False to hide
+        """
+        self._resin_plug_visible = visible
+        if hasattr(self, '_resin_plug_actor') and self._resin_plug_actor is not None:
+            self._resin_plug_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Resin plug visibility set to {visible}")

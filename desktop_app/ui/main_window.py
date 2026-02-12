@@ -1186,7 +1186,8 @@ class ResinChannelsWorker(QThread):
                 create_resin_channels_on_both_halves,
                 determine_shell_half_for_inlet,
                 create_hard_shell_inlet,
-                create_hard_shell_air_escapes
+                create_hard_shell_air_escapes,
+                create_resin_plug
             )
             
             self.progress.emit("Determining which half contains maxima...")
@@ -1258,6 +1259,29 @@ class ResinChannelsWorker(QThread):
                             logger.warning("Failed to drill air escape holes in shell")
                 else:
                     logger.warning("Failed to drill hard shell inlet")
+            
+            # Create the resin pouring plug
+            if (channel_result.success and
+                channel_result.inlet_cylinder_center is not None and
+                channel_result.modified_shell_mesh is not None):
+                
+                self.progress.emit("Creating resin pouring plug...")
+                
+                plug = create_resin_plug(
+                    inlet_cylinder_center=channel_result.inlet_cylinder_center,
+                    resin_direction=self.resin_direction,
+                    part_mesh=self.part_mesh,
+                    shell_half=channel_result.modified_shell_mesh,
+                    inlet_diameter_mm=self.global_diameter_mm,
+                    shell_inlet_diameter_mm=self.shell_inlet_diameter_mm,
+                    inlet_depth_mm=channel_result.inlet_depth_mm
+                )
+                
+                if plug is not None:
+                    channel_result.plug_mesh = plug
+                    logger.info(f"Resin plug created: {len(plug.vertices)} verts")
+                else:
+                    logger.warning("Failed to create resin plug")
             
             self.progress.emit("Resin channels complete")
             self.complete.emit(channel_result, other_half)
@@ -4419,6 +4443,7 @@ class DisplayOptionsPanel(QFrame):
     show_metamold_half_2_changed = pyqtSignal(bool)  # Toggle metamold half 2 (lower half)
     show_metamold_half_1_with_part_changed = pyqtSignal(bool)  # Toggle metamold half 1 with part added
     show_metamold_half_2_with_part_changed = pyqtSignal(bool)  # Toggle metamold half 2 with part added
+    show_resin_plug_changed = pyqtSignal(bool)  # Toggle resin pouring plug (yellow)
 
     # Individual feature type visibility signals
     # Target mesh features:
@@ -4967,6 +4992,13 @@ class DisplayOptionsPanel(QFrame):
         self.show_metamold_half_2_with_part_cb.hide()
         layout.addWidget(self.show_metamold_half_2_with_part_cb)
         
+        # Resin plug (yellow) checkbox
+        self.show_resin_plug_cb = QCheckBox('Resin Plug (Yellow)')
+        self.show_resin_plug_cb.setChecked(True)  # Shown by default
+        self.show_resin_plug_cb.stateChanged.connect(lambda s: self.show_resin_plug_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_resin_plug_cb.hide()
+        layout.addWidget(self.show_resin_plug_cb)
+        
         # Store reference to feature debug data (set externally)
         self._feature_debug_data = None
         self._mesh_viewer = None
@@ -5265,6 +5297,14 @@ class DisplayOptionsPanel(QFrame):
             self.show_metamold_half_2_with_part_cb.hide()
         
         self.adjustSize()
+
+    def show_resin_plug_option(self, show: bool = True):
+        """Show or hide the resin plug checkbox."""
+        if show:
+            self.show_resin_plug_cb.show()
+            self.show_resin_plug_cb.setChecked(True)
+        else:
+            self.show_resin_plug_cb.hide()
 
     def eventFilter(self, watched, event):
         """Resize panel to match parent height when parent resizes."""
@@ -5808,6 +5848,9 @@ class MainWindow(QMainWindow):
         )
         self.display_options.show_metamold_half_2_with_part_changed.connect(
             self._on_toggle_metamold_half_2_with_part
+        )
+        self.display_options.show_resin_plug_changed.connect(
+            self._on_toggle_resin_plug
         )
         
         return wrapper
@@ -6891,6 +6934,10 @@ class MainWindow(QMainWindow):
         """Toggle visibility of metamold half 2 with part added."""
         self.mesh_viewer.set_metamold_half_2_with_part_visible(show)
 
+    def _on_toggle_resin_plug(self, show: bool):
+        """Toggle visibility of the resin pouring plug."""
+        self.mesh_viewer.set_resin_plug_visible(show)
+
     # =========================================================================
     # METAMOLD STEP
     # =========================================================================
@@ -7500,6 +7547,11 @@ class MainWindow(QMainWindow):
             elif result.shell_half_modified == 0:
                 self.resin_channels_stats.add_row('Shell holes: no shell halves available')
             
+            if result.plug_mesh is not None:
+                self.resin_channels_stats.add_row(
+                    f'Plug: {len(result.plug_mesh.vertices):,} verts'
+                )
+            
             if result.mesh is not None:
                 self.resin_channels_stats.add_row(f'Result mesh: {len(result.mesh.vertices):,} verts, {len(result.mesh.faces):,} faces')
             
@@ -7592,6 +7644,15 @@ class MainWindow(QMainWindow):
                     logger.info(f"Updated shell half {shell_half} viewer with through-hole")
                 except Exception as e:
                     logger.warning(f"Could not update shell viewer: {e}")
+            
+            # Show resin plug if created
+            if channel_result.plug_mesh is not None:
+                try:
+                    self.mesh_viewer.show_resin_plug(channel_result.plug_mesh)
+                    self.display_options.show_resin_plug_option(True)
+                    logger.info("Resin plug displayed in yellow")
+                except Exception as e:
+                    logger.warning(f"Could not display resin plug: {e}")
             
             logger.info(f"Resin channels created in half {channel_result.mold_half}: "
                        f"{channel_result.n_local_channels} local + {channel_result.n_global_channels} global channels "
@@ -8718,6 +8779,13 @@ class MainWindow(QMainWindow):
                     else:
                         self.mesh_viewer.show_shell_half_2(self._resin_channel_result.modified_shell_mesh)
                     logger.info(f"Restored shell half {shell_half} with inlet through-hole")
+                
+                # Restore resin plug visualization
+                if (hasattr(self._resin_channel_result, 'plug_mesh') and
+                    self._resin_channel_result.plug_mesh is not None):
+                    self.mesh_viewer.show_resin_plug(self._resin_channel_result.plug_mesh)
+                    self.display_options.show_resin_plug_option(True)
+                    logger.info("Restored resin plug visualization")
                     
             except Exception as e:
                 logger.warning(f"Could not restore resin channel visualization: {e}")

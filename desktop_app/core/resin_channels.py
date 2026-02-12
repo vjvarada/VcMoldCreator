@@ -43,6 +43,8 @@ DEFAULT_INLET_MIN_DEPTH_MM = 1.5     # Minimum depth of resin inlet hole
 DEFAULT_LOCAL_DIAMETER_MM = 1.2       # Diameter for air escape holes (local maxima)
 DEFAULT_GLOBAL_DIAMETER_MM = 5.2      # Diameter for resin inlet hole (global maximum)
 DEFAULT_SHELL_INLET_DIAMETER_MM = 12.2  # Diameter for hard shell through-hole
+PLUG_TOLERANCE_MM = 0.2                   # Tolerance clearance for plug dimensions
+PLUG_TAPER_ANGLE_DEG = 20.0               # Taper half-angle in degrees
 CYLINDER_SEGMENTS = 32                # Number of segments for cylinder approximation
 INLET_DEPTH_SAMPLE_POINTS = 24        # Points around circumference for depth ray-casting
 
@@ -89,6 +91,9 @@ class ResinChannelResult:
     shell_inlet_diameter_mm: float = DEFAULT_SHELL_INLET_DIAMETER_MM
     n_shell_air_escapes: int = 0          # Number of air escape holes drilled in shell
     modified_shell_mesh: Optional[trimesh.Trimesh] = None  # The shell half with through-holes
+    
+    # Resin plug
+    plug_mesh: Optional[trimesh.Trimesh] = None  # The resin pouring plug
     
     # Success flag
     success: bool = False
@@ -934,3 +939,184 @@ def create_hard_shell_air_escapes(
     logger.info(f"Air escape shell holes complete: {len(current_mesh.vertices)} verts, "
                 f"{len(current_mesh.faces)} faces")
     return current_mesh
+
+
+def create_resin_plug(
+    inlet_cylinder_center: np.ndarray,
+    resin_direction: np.ndarray,
+    part_mesh: trimesh.Trimesh,
+    shell_half: trimesh.Trimesh,
+    inlet_diameter_mm: float,
+    shell_inlet_diameter_mm: float,
+    inlet_depth_mm: float,
+    tolerance_mm: float = PLUG_TOLERANCE_MM,
+    taper_angle_deg: float = PLUG_TAPER_ANGLE_DEG,
+    segments: int = CYLINDER_SEGMENTS
+) -> Optional[trimesh.Trimesh]:
+    """
+    Create a resin pouring plug that fits into the inlet + shell through-holes.
+    
+    The plug is a 3-section solid of revolution:
+      1. Narrow cylinder (bottom): ⌀ = inlet_diameter - tolerance.
+         Starts at the BASE of the inlet hole (where it touches the part,
+         i.e. inlet_cylinder_center offset downward by inlet_depth) and
+         extends upward to the part's max height along resin direction.
+      2. Taper (middle): expands from narrow ⌀ to shell ⌀ - tolerance
+         at the specified taper half-angle.
+      3. Wide cylinder (top): ⌀ = shell_inlet_diameter - tolerance,
+         extends from the taper top to the top of the hard shell.
+    
+    Args:
+        inlet_cylinder_center: (3,) center of the resin inlet cylinder
+            (at the metamold surface, the TOP of the hole)
+        resin_direction: (3,) resin pouring direction unit vector
+        part_mesh: The original part mesh (for computing max height)
+        shell_half: The hard shell half (for computing shell top)
+        inlet_diameter_mm: Resin inlet hole diameter
+        shell_inlet_diameter_mm: Hard shell through-hole diameter
+        inlet_depth_mm: Depth of the inlet hole drilled into the metamold
+        tolerance_mm: Clearance tolerance subtracted from diameters
+        taper_angle_deg: Taper half-angle in degrees (from the vertical axis)
+        segments: Number of segments for circular cross-section
+        
+    Returns:
+        Plug mesh as trimesh.Trimesh, or None on failure
+    """
+    if inlet_cylinder_center is None or part_mesh is None or shell_half is None:
+        logger.error("Missing data for resin plug creation")
+        return None
+    
+    resin_dir = np.asarray(resin_direction, dtype=np.float64)
+    resin_dir = resin_dir / (np.linalg.norm(resin_dir) + 1e-10)
+    center = np.asarray(inlet_cylinder_center, dtype=np.float64)
+    
+    # Radii with tolerance
+    narrow_radius = (inlet_diameter_mm - tolerance_mm) / 2.0
+    wide_radius = (shell_inlet_diameter_mm - tolerance_mm) / 2.0
+    
+    if narrow_radius <= 0 or wide_radius <= 0 or wide_radius <= narrow_radius:
+        logger.error(f"Invalid plug radii: narrow={narrow_radius:.2f}, wide={wide_radius:.2f}")
+        return None
+    
+    # The plug base is at the BOTTOM of the inlet hole.
+    # inlet_cylinder_center is at the metamold surface (top of hole).
+    # The hole drills downward (opposite resin_dir) by inlet_depth_mm.
+    # So the base = center - resin_dir * inlet_depth_mm
+    plug_base = center - resin_dir * inlet_depth_mm
+    
+    # Project plug base, part vertices, and shell vertices onto resin direction
+    base_proj = np.dot(plug_base, resin_dir)
+    part_projs = np.dot(np.asarray(part_mesh.vertices), resin_dir)
+    shell_projs = np.dot(np.asarray(shell_half.vertices), resin_dir)
+    
+    part_max_proj = np.max(part_projs)
+    shell_top_proj = np.max(shell_projs)
+    
+    # Section 1: narrow cylinder from hole bottom up to part max height
+    narrow_height = part_max_proj - base_proj
+    if narrow_height < 0.5:
+        logger.warning(f"Narrow section height too small ({narrow_height:.2f}mm), clamping to 0.5mm")
+        narrow_height = 0.5
+    
+    # Section 2: taper from narrow_radius to wide_radius at specified angle
+    # half-angle from axis: tan(angle) = (wide_r - narrow_r) / taper_height
+    # taper_height = (wide_r - narrow_r) / tan(angle)
+    taper_angle_rad = np.radians(taper_angle_deg)
+    radius_diff = wide_radius - narrow_radius
+    taper_height = radius_diff / np.tan(taper_angle_rad)
+    
+    # Section 3: wide cylinder from taper top to shell top
+    taper_top_proj = base_proj + narrow_height + taper_height
+    wide_height = shell_top_proj - taper_top_proj
+    if wide_height < 0.5:
+        logger.warning(f"Wide section height too small ({wide_height:.2f}mm), clamping to 0.5mm")
+        wide_height = 0.5
+    
+    total_height = narrow_height + taper_height + wide_height
+    
+    logger.info(f"Creating resin plug (base at hole bottom):")
+    logger.info(f"  Narrow: ⌀{narrow_radius*2:.1f}mm × {narrow_height:.1f}mm")
+    logger.info(f"  Taper:  {taper_angle_deg:.0f}° × {taper_height:.1f}mm")
+    logger.info(f"  Wide:   ⌀{wide_radius*2:.1f}mm × {wide_height:.1f}mm")
+    logger.info(f"  Total height: {total_height:.1f}mm")
+    
+    # Build as solid of revolution: profile = [(height_from_base, radius), ...]
+    profile = [
+        (0.0, narrow_radius),
+        (narrow_height, narrow_radius),
+        (narrow_height + taper_height, wide_radius),
+        (narrow_height + taper_height + wide_height, wide_radius),
+    ]
+    
+    n_rings = len(profile)
+    angles = np.linspace(0, 2 * np.pi, segments, endpoint=False)
+    cos_a = np.cos(angles)
+    sin_a = np.sin(angles)
+    
+    # Create ring vertices in local space (revolution around Z axis)
+    vertices = []
+    for h, r in profile:
+        for j in range(segments):
+            vertices.append([r * cos_a[j], r * sin_a[j], h])
+    
+    # Add cap center vertices
+    bottom_center_idx = len(vertices)
+    vertices.append([0.0, 0.0, profile[0][0]])
+    top_center_idx = len(vertices)
+    vertices.append([0.0, 0.0, profile[-1][0]])
+    
+    vertices = np.array(vertices, dtype=np.float64)
+    
+    # Build faces
+    faces = []
+    
+    # Side quads (as triangle pairs) between adjacent rings
+    for i in range(n_rings - 1):
+        for j in range(segments):
+            j_next = (j + 1) % segments
+            v0 = i * segments + j
+            v1 = i * segments + j_next
+            v2 = (i + 1) * segments + j_next
+            v3 = (i + 1) * segments + j
+            faces.append([v0, v2, v1])
+            faces.append([v0, v3, v2])
+    
+    # Bottom cap
+    for j in range(segments):
+        j_next = (j + 1) % segments
+        faces.append([bottom_center_idx, j, j_next])
+    
+    # Top cap
+    last_ring = (n_rings - 1) * segments
+    for j in range(segments):
+        j_next = (j + 1) % segments
+        faces.append([top_center_idx, last_ring + j_next, last_ring + j])
+    
+    faces = np.array(faces, dtype=np.int64)
+    
+    # Transform from local Z-axis to resin direction, positioned at plug_base
+    z_axis = np.array([0.0, 0.0, 1.0])
+    dot = np.dot(z_axis, resin_dir)
+    
+    if abs(dot - 1.0) < 1e-8:
+        R = np.eye(3)
+    elif abs(dot + 1.0) < 1e-8:
+        R = np.diag([1.0, -1.0, -1.0])
+    else:
+        axis = np.cross(z_axis, resin_dir)
+        axis = axis / (np.linalg.norm(axis) + 1e-10)
+        angle = np.arccos(np.clip(dot, -1.0, 1.0))
+        K = np.array([[0, -axis[2], axis[1]],
+                      [axis[2], 0, -axis[0]],
+                      [-axis[1], axis[0], 0]])
+        R = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+    
+    # Position at plug_base (bottom of hole), not inlet_cylinder_center
+    vertices = (R @ vertices.T).T + plug_base
+    
+    plug = trimesh.Trimesh(vertices=vertices, faces=faces)
+    plug.fix_normals()
+    
+    logger.info(f"Resin plug created: {len(plug.vertices)} verts, {len(plug.faces)} faces")
+    
+    return plug
