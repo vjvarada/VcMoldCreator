@@ -79,6 +79,7 @@ class Step(Enum):
     POURING = 'pouring'                # Pouring direction optimization (final step)
     HARD_SHELL = 'hard-shell'          # Hard shell generation (outer collar + prism)
     METAMOLD = 'metamold'              # Metamold prism for casting silicone mold
+    RESIN_CHANNELS = 'resin-channels'  # Resin pouring inlets and air escape holes
 
 
 STEPS = [
@@ -97,6 +98,7 @@ STEPS = [
     {'id': Step.POURING, 'icon': '🧪', 'title': 'Pouring Directions', 'description': 'Optimize silicone/resin pouring directions for each mold half'},
     {'id': Step.HARD_SHELL, 'icon': '🏠', 'title': 'Hard Shell', 'description': 'Generate hard shell geometry with outer collar extension'},
     {'id': Step.METAMOLD, 'icon': '🧊', 'title': 'Metamold', 'description': 'Generate metamold prism for casting silicone mold halves'},
+    {'id': Step.RESIN_CHANNELS, 'icon': '🕳️', 'title': 'Resin Channels', 'description': 'Create resin pouring inlets and air escape holes in metamold'},
 ]
 
 
@@ -1135,6 +1137,133 @@ class MetamoldWorker(QThread):
             
         except Exception as e:
             logger.exception("Error generating metamold: %s", e)
+            self.error.emit(str(e))
+
+
+class ResinChannelsWorker(QThread):
+    """Background worker for creating resin pouring inlets and air escape holes in metamold,
+    and a through-hole in the corresponding hard shell half."""
+    
+    progress = pyqtSignal(str)
+    # (ResinChannelResult, other_half_mesh)
+    complete = pyqtSignal(object, object)
+    error = pyqtSignal(str)
+    
+    def __init__(
+        self,
+        metamold_half_1_with_part,
+        metamold_half_2_with_part,
+        resin_direction,
+        local_maxima_positions,
+        global_maximum_position,
+        part_mesh=None,
+        shell_half_1=None,
+        shell_half_2=None,
+        air_escape_depth_mm=1.5,
+        inlet_min_depth_mm=1.5,
+        local_diameter_mm=1.0,
+        global_diameter_mm=5.0,
+        shell_inlet_diameter_mm=12.0
+    ):
+        super().__init__()
+        self.metamold_half_1_with_part = metamold_half_1_with_part
+        self.metamold_half_2_with_part = metamold_half_2_with_part
+        self.resin_direction = resin_direction
+        self.local_maxima_positions = local_maxima_positions
+        self.global_maximum_position = global_maximum_position
+        self.part_mesh = part_mesh
+        self.shell_half_1 = shell_half_1
+        self.shell_half_2 = shell_half_2
+        self.air_escape_depth_mm = air_escape_depth_mm
+        self.inlet_min_depth_mm = inlet_min_depth_mm
+        self.local_diameter_mm = local_diameter_mm
+        self.global_diameter_mm = global_diameter_mm
+        self.shell_inlet_diameter_mm = shell_inlet_diameter_mm
+    
+    def run(self):
+        try:
+            from core.resin_channels import (
+                create_resin_channels_on_both_halves,
+                determine_shell_half_for_inlet,
+                create_hard_shell_inlet,
+                create_hard_shell_air_escapes
+            )
+            
+            self.progress.emit("Determining which half contains maxima...")
+            
+            logger.info(f"Creating resin channels: air_depth={self.air_escape_depth_mm}mm, "
+                       f"inlet_min_depth={self.inlet_min_depth_mm}mm, "
+                       f"local_diam={self.local_diameter_mm}mm, global_diam={self.global_diameter_mm}mm")
+            
+            self.progress.emit("Drilling resin channels into metamold half...")
+            
+            channel_result, other_half = create_resin_channels_on_both_halves(
+                self.metamold_half_1_with_part,
+                self.metamold_half_2_with_part,
+                self.resin_direction,
+                self.local_maxima_positions,
+                self.global_maximum_position,
+                part_mesh=self.part_mesh,
+                air_escape_depth_mm=self.air_escape_depth_mm,
+                inlet_min_depth_mm=self.inlet_min_depth_mm,
+                local_diameter_mm=self.local_diameter_mm,
+                global_diameter_mm=self.global_diameter_mm
+            )
+            
+            # Drill hard shell through-hole if we have shell halves and a global inlet
+            if (channel_result.success and
+                channel_result.inlet_cylinder_center is not None and
+                self.shell_half_1 is not None and
+                self.shell_half_2 is not None):
+                
+                self.progress.emit("Drilling through-hole in hard shell...")
+                
+                target_shell = determine_shell_half_for_inlet(
+                    self.shell_half_1,
+                    self.shell_half_2,
+                    self.resin_direction
+                )
+                
+                shell_to_drill = (self.shell_half_1 if target_shell == 1
+                                  else self.shell_half_2)
+                
+                modified_shell = create_hard_shell_inlet(
+                    shell_half=shell_to_drill,
+                    inlet_cylinder_center=channel_result.inlet_cylinder_center,
+                    resin_direction=self.resin_direction,
+                    inlet_diameter_mm=self.shell_inlet_diameter_mm
+                )
+                
+                if modified_shell is not None:
+                    channel_result.shell_half_modified = target_shell
+                    channel_result.shell_inlet_diameter_mm = self.shell_inlet_diameter_mm
+                    channel_result.modified_shell_mesh = modified_shell
+                    logger.info(f"Hard shell inlet drilled in shell half {target_shell}")
+                    
+                    # Also drill air escape through-holes in the same shell half
+                    if (channel_result.local_channel_positions is not None and
+                        len(channel_result.local_channel_positions) > 0):
+                        self.progress.emit("Drilling air escape holes in hard shell...")
+                        modified_shell = create_hard_shell_air_escapes(
+                            shell_half=modified_shell,
+                            local_channel_positions=channel_result.local_channel_positions,
+                            resin_direction=self.resin_direction,
+                            air_escape_diameter_mm=channel_result.local_diameter_mm
+                        )
+                        if modified_shell is not None:
+                            channel_result.modified_shell_mesh = modified_shell
+                            channel_result.n_shell_air_escapes = len(channel_result.local_channel_positions)
+                            logger.info(f"Air escape shell holes drilled: {channel_result.n_shell_air_escapes}")
+                        else:
+                            logger.warning("Failed to drill air escape holes in shell")
+                else:
+                    logger.warning("Failed to drill hard shell inlet")
+            
+            self.progress.emit("Resin channels complete")
+            self.complete.emit(channel_result, other_half)
+            
+        except Exception as e:
+            logger.exception("Error creating resin channels: %s", e)
             self.error.emit(str(e))
 
 
@@ -5207,6 +5336,11 @@ class MainWindow(QMainWindow):
         self._metamold_half_2_with_part = None  # Lower half with part added back (manifold)
         self._metamold_csg_success = False
         
+        # Resin channels state
+        self._resin_channels_worker = None
+        self._resin_channel_result = None  # ResinChannelResult (modified half with channels)
+        self._resin_channel_other_half = None  # The unmodified other half
+        
         # Registration noise state
         self._registration_noise_result = None  # SinusoidalRegistrationResult
         self._registration_worker = None
@@ -5851,6 +5985,8 @@ class MainWindow(QMainWindow):
             self._setup_hard_shell_step()
         elif self._active_step == Step.METAMOLD:
             self._setup_metamold_step()
+        elif self._active_step == Step.RESIN_CHANNELS:
+            self._setup_resin_channels_step()
         
         self.context_layout.addStretch()
     
@@ -7102,6 +7238,10 @@ class MainWindow(QMainWindow):
         self._update_metamold_step_ui()
         self.step_buttons[Step.METAMOLD].set_status('completed')
         
+        # Unlock resin channels step if metamold halves with part are available
+        if half_1_with_part is not None and half_2_with_part is not None:
+            self.step_buttons[Step.RESIN_CHANNELS].set_status('available')
+        
         logger.info(f"Metamold generated in {prism_result.computation_time_ms:.0f}ms ")
         if csg_success:
             logger.info(f"  CSG cavity subtraction successful")
@@ -7128,6 +7268,352 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'metamold_progress'):
             self.metamold_progress.hide()
         self._metamold_worker = None
+
+    # =========================================================================
+    # RESIN CHANNELS STEP
+    # =========================================================================
+    
+    def _setup_resin_channels_step(self):
+        """Setup the resin channels step UI."""
+        has_metamold_halves = (
+            self._metamold_half_1_with_part is not None and
+            self._metamold_half_2_with_part is not None
+        )
+        
+        has_pouring = (
+            self._mold_aware_pouring_result is not None and
+            self._mold_aware_pouring_result.resin_direction is not None
+        )
+        
+        has_maxima = (
+            has_pouring and (
+                self._mold_aware_pouring_result.resin_maxima_positions is not None or
+                self._mold_aware_pouring_result.resin_global_maximum_position is not None
+            )
+        )
+        
+        if not has_metamold_halves:
+            no_data_label = QLabel("Please generate the metamold first (with halves + part).")
+            no_data_label.setStyleSheet(f"color: {Colors.WARNING}; font-size: 13px; padding: 12px;")
+            no_data_label.setWordWrap(True)
+            self.context_layout.addWidget(no_data_label)
+            return
+        
+        if not has_pouring or not has_maxima:
+            no_data_label = QLabel("Please compute pouring directions first (need maxima positions).")
+            no_data_label.setStyleSheet(f"color: {Colors.WARNING}; font-size: 13px; padding: 12px;")
+            no_data_label.setWordWrap(True)
+            self.context_layout.addWidget(no_data_label)
+            return
+        
+        header = QLabel("Resin Channels")
+        header.setStyleSheet(f"font-size: 14px; font-weight: 500; color: {Colors.DARK};")
+        self.context_layout.addWidget(header)
+        
+        desc = QLabel("Create cylindrical holes in the metamold for resin pouring inlets (at global maximum) "
+                      "and air escape holes (at local maxima). Holes are drilled opposite to the resin pouring direction.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"font-size: 12px; color: {Colors.GRAY}; margin-bottom: 8px;")
+        self.context_layout.addWidget(desc)
+        
+        # Parameters group
+        params_group = QGroupBox("Channel Parameters")
+        params_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 12px;
+                font-weight: bold;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+            QLabel {{
+                color: {Colors.DARK};
+                font-size: 12px;
+            }}
+        """)
+        params_layout = QFormLayout(params_group)
+        params_layout.setContentsMargins(8, 16, 8, 8)
+        params_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        
+        spin_style = f"""
+            QDoubleSpinBox {{
+                background-color: {Colors.WHITE};
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 4px;
+                padding: 4px 6px;
+                font-size: 12px;
+                min-width: 60px;
+                max-width: 100px;
+            }}
+        """
+        
+        # Air escape hole depth
+        self.resin_air_depth_spin = QDoubleSpinBox()
+        self.resin_air_depth_spin.setRange(0.5, 20.0)
+        self.resin_air_depth_spin.setValue(1.5)
+        self.resin_air_depth_spin.setSuffix(" mm")
+        self.resin_air_depth_spin.setSingleStep(0.5)
+        self.resin_air_depth_spin.setDecimals(1)
+        self.resin_air_depth_spin.setStyleSheet(spin_style)
+        params_layout.addRow("Air hole depth:", self.resin_air_depth_spin)
+        
+        # Resin inlet minimum depth
+        self.resin_inlet_depth_spin = QDoubleSpinBox()
+        self.resin_inlet_depth_spin.setRange(0.5, 20.0)
+        self.resin_inlet_depth_spin.setValue(1.5)
+        self.resin_inlet_depth_spin.setSuffix(" mm")
+        self.resin_inlet_depth_spin.setSingleStep(0.5)
+        self.resin_inlet_depth_spin.setDecimals(1)
+        self.resin_inlet_depth_spin.setToolTip(
+            "Minimum depth for resin inlet. Actual depth is auto-computed\n"
+            "based on surface incline to ensure a full circular cutout."
+        )
+        self.resin_inlet_depth_spin.setStyleSheet(spin_style)
+        params_layout.addRow("Inlet min depth:", self.resin_inlet_depth_spin)
+        
+        # Local maxima diameter (air escape)
+        self.resin_local_diameter_spin = QDoubleSpinBox()
+        self.resin_local_diameter_spin.setRange(0.5, 10.0)
+        self.resin_local_diameter_spin.setValue(1.2)
+        self.resin_local_diameter_spin.setSuffix(" mm")
+        self.resin_local_diameter_spin.setSingleStep(0.5)
+        self.resin_local_diameter_spin.setDecimals(1)
+        self.resin_local_diameter_spin.setStyleSheet(spin_style)
+        params_layout.addRow("Air escape ⌀:", self.resin_local_diameter_spin)
+        
+        # Global maximum diameter (resin inlet)
+        self.resin_global_diameter_spin = QDoubleSpinBox()
+        self.resin_global_diameter_spin.setRange(1.0, 20.0)
+        self.resin_global_diameter_spin.setValue(5.2)
+        self.resin_global_diameter_spin.setSuffix(" mm")
+        self.resin_global_diameter_spin.setSingleStep(0.5)
+        self.resin_global_diameter_spin.setDecimals(1)
+        self.resin_global_diameter_spin.setStyleSheet(spin_style)
+        params_layout.addRow("Resin inlet ⌀:", self.resin_global_diameter_spin)
+        
+        # Hard shell through-hole diameter
+        self.resin_shell_diameter_spin = QDoubleSpinBox()
+        self.resin_shell_diameter_spin.setRange(2.0, 30.0)
+        self.resin_shell_diameter_spin.setValue(12.2)
+        self.resin_shell_diameter_spin.setSuffix(" mm")
+        self.resin_shell_diameter_spin.setSingleStep(1.0)
+        self.resin_shell_diameter_spin.setDecimals(1)
+        self.resin_shell_diameter_spin.setToolTip(
+            "Diameter of the through-hole drilled into the hard shell\n"
+            "for resin pouring access. Drilled from the inlet center."
+        )
+        self.resin_shell_diameter_spin.setStyleSheet(spin_style)
+        params_layout.addRow("Shell hole ⌀:", self.resin_shell_diameter_spin)
+        
+        # Info about detected maxima
+        n_local = 0
+        if self._mold_aware_pouring_result.resin_maxima_positions is not None:
+            n_local = len(self._mold_aware_pouring_result.resin_maxima_positions)
+        has_global = self._mold_aware_pouring_result.resin_global_maximum_position is not None
+        
+        maxima_info = QLabel(
+            f"{n_local} air escape + "
+            f"{'1' if has_global else '0'} resin inlet"
+        )
+        maxima_info.setWordWrap(True)
+        maxima_info.setStyleSheet(f"color: {Colors.INFO if n_local > 0 or has_global else Colors.GRAY}; "
+                                  f"font-size: 11px; margin-top: 4px;")
+        params_layout.addRow("Detected:", maxima_info)
+        
+        self.context_layout.addWidget(params_group)
+        
+        # Generate button
+        self.resin_channels_btn = QPushButton("Create Resin Channels")
+        self.resin_channels_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.resin_channels_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #1565C0;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+            }}
+            QPushButton:hover {{ background-color: #0D47A1; }}
+            QPushButton:disabled {{ background-color: {Colors.GRAY_LIGHT}; color: {Colors.GRAY}; }}
+        """)
+        self.resin_channels_btn.clicked.connect(self._on_create_resin_channels)
+        self.context_layout.addWidget(self.resin_channels_btn)
+        
+        # Progress
+        self.resin_channels_progress = QProgressBar()
+        self.resin_channels_progress.setRange(0, 0)
+        self.resin_channels_progress.setTextVisible(False)
+        self.resin_channels_progress.hide()
+        self.context_layout.addWidget(self.resin_channels_progress)
+        
+        self.resin_channels_progress_label = QLabel("")
+        self.resin_channels_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.resin_channels_progress_label.hide()
+        self.context_layout.addWidget(self.resin_channels_progress_label)
+        
+        # Results
+        self.resin_channels_stats = StatsBox()
+        self.resin_channels_stats.hide()
+        self.context_layout.addWidget(self.resin_channels_stats)
+        
+        self._update_resin_channels_step_ui()
+    
+    def _update_resin_channels_step_ui(self):
+        """Update resin channels step UI based on current state."""
+        if not hasattr(self, 'resin_channels_stats'):
+            return
+        
+        if self._resin_channel_result is not None and self._resin_channel_result.success:
+            result = self._resin_channel_result
+            
+            self.resin_channels_stats.clear()
+            self.resin_channels_stats.show()
+            
+            self.resin_channels_stats.add_header('Resin Channels Created', Colors.SUCCESS)
+            self.resin_channels_stats.add_row(f'Target half: {result.mold_half}')
+            self.resin_channels_stats.add_row(f'Air escape: {result.n_local_channels} × ⌀{result.local_diameter_mm:.1f}mm, depth {result.air_escape_depth_mm:.1f}mm')
+            self.resin_channels_stats.add_row(f'Resin inlet: {result.n_global_channels} × ⌀{result.global_diameter_mm:.1f}mm')
+            if result.inlet_depth_auto > 0:
+                self.resin_channels_stats.add_row(f'Inlet depth: {result.inlet_depth_mm:.1f}mm (auto)')
+            else:
+                self.resin_channels_stats.add_row(f'Inlet depth: {result.inlet_depth_mm:.1f}mm')
+            
+            if result.shell_half_modified > 0 and result.modified_shell_mesh is not None:
+                self.resin_channels_stats.add_row(
+                    f'Shell inlet: ⌀{result.shell_inlet_diameter_mm:.0f}mm '
+                    f'in shell half {result.shell_half_modified}'
+                )
+                if result.n_shell_air_escapes > 0:
+                    self.resin_channels_stats.add_row(
+                        f'Shell air escapes: {result.n_shell_air_escapes} × '
+                        f'⌀{result.local_diameter_mm:.1f}mm'
+                    )
+            elif result.shell_half_modified == 0:
+                self.resin_channels_stats.add_row('Shell holes: no shell halves available')
+            
+            if result.mesh is not None:
+                self.resin_channels_stats.add_row(f'Result mesh: {len(result.mesh.vertices):,} verts, {len(result.mesh.faces):,} faces')
+            
+            self.resin_channels_stats.add_row(f'Time: {result.computation_time_ms:.0f}ms')
+    
+    def _on_create_resin_channels(self):
+        """Start resin channel creation."""
+        if self._metamold_half_1_with_part is None or self._metamold_half_2_with_part is None:
+            QMessageBox.warning(self, "Missing Data", "Please generate metamold halves with part first.")
+            return
+        
+        if self._mold_aware_pouring_result is None:
+            QMessageBox.warning(self, "Missing Data", "Please compute pouring directions first.")
+            return
+        
+        self.resin_channels_btn.setEnabled(False)
+        self.resin_channels_progress.show()
+        self.resin_channels_progress_label.setText("Creating resin channels...")
+        self.resin_channels_progress_label.show()
+        
+        # Clear previous results
+        self._resin_channel_result = None
+        self._resin_channel_other_half = None
+        
+        # Get parameters from UI
+        air_escape_depth = self.resin_air_depth_spin.value()
+        inlet_min_depth = self.resin_inlet_depth_spin.value()
+        local_diameter = self.resin_local_diameter_spin.value()
+        global_diameter = self.resin_global_diameter_spin.value()
+        shell_inlet_diameter = self.resin_shell_diameter_spin.value()
+        
+        self._resin_channels_worker = ResinChannelsWorker(
+            self._metamold_half_1_with_part,
+            self._metamold_half_2_with_part,
+            self._mold_aware_pouring_result.resin_direction,
+            self._mold_aware_pouring_result.resin_maxima_positions,
+            self._mold_aware_pouring_result.resin_global_maximum_position,
+            part_mesh=self._current_mesh,
+            shell_half_1=self._shell_half_1,
+            shell_half_2=self._shell_half_2,
+            air_escape_depth_mm=air_escape_depth,
+            inlet_min_depth_mm=inlet_min_depth,
+            local_diameter_mm=local_diameter,
+            global_diameter_mm=global_diameter,
+            shell_inlet_diameter_mm=shell_inlet_diameter
+        )
+        self._resin_channels_worker.progress.connect(self._on_resin_channels_progress)
+        self._resin_channels_worker.complete.connect(self._on_resin_channels_complete)
+        self._resin_channels_worker.error.connect(self._on_resin_channels_error)
+        self._resin_channels_worker.finished.connect(self._on_resin_channels_worker_finished)
+        self._resin_channels_worker.start()
+    
+    def _on_resin_channels_progress(self, message: str):
+        if hasattr(self, 'resin_channels_progress_label'):
+            self.resin_channels_progress_label.setText(message)
+    
+    def _on_resin_channels_complete(self, channel_result, other_half):
+        """Handle resin channels creation complete."""
+        self._resin_channel_result = channel_result
+        self._resin_channel_other_half = other_half
+        
+        if channel_result.success and channel_result.mesh is not None:
+            # Update the viewer: show the modified halves
+            # Remove old metamold displays
+            self.mesh_viewer.remove_metamold_half_1_with_part()
+            self.mesh_viewer.remove_metamold_half_2_with_part()
+            
+            # Show the updated halves (modified one and unmodified one)
+            # NOTE: Do NOT overwrite _metamold_half_X_with_part — those are the
+            # ORIGINALS from the metamold step. We keep them pristine so that
+            # re-running resin channels with different parameters always starts
+            # from the un-channeled originals. The channeled mesh is stored in
+            # _resin_channel_result.mesh and _resin_channel_other_half.
+            if channel_result.mold_half == 1:
+                self.mesh_viewer.show_metamold_half_1_with_part(channel_result.mesh)
+                self.mesh_viewer.show_metamold_half_2_with_part(other_half)
+            else:
+                self.mesh_viewer.show_metamold_half_1_with_part(other_half)
+                self.mesh_viewer.show_metamold_half_2_with_part(channel_result.mesh)
+            
+            # Update hard shell viewer if shell was modified
+            if (channel_result.modified_shell_mesh is not None and
+                channel_result.shell_half_modified > 0):
+                shell_half = channel_result.shell_half_modified
+                try:
+                    if shell_half == 1:
+                        self.mesh_viewer.show_shell_half_1(channel_result.modified_shell_mesh)
+                    else:
+                        self.mesh_viewer.show_shell_half_2(channel_result.modified_shell_mesh)
+                    logger.info(f"Updated shell half {shell_half} viewer with through-hole")
+                except Exception as e:
+                    logger.warning(f"Could not update shell viewer: {e}")
+            
+            logger.info(f"Resin channels created in half {channel_result.mold_half}: "
+                       f"{channel_result.n_local_channels} local + {channel_result.n_global_channels} global channels "
+                       f"in {channel_result.computation_time_ms:.0f}ms")
+        else:
+            logger.warning("Resin channel creation failed or produced no result")
+        
+        self._update_resin_channels_step_ui()
+        self.step_buttons[Step.RESIN_CHANNELS].set_status('completed')
+    
+    def _on_resin_channels_error(self, message: str):
+        if hasattr(self, 'resin_channels_progress_label'):
+            self.resin_channels_progress_label.setText(f"Error: {message}")
+            self.resin_channels_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+        QMessageBox.critical(self, "Error", f"Resin channel creation failed:\n{message}")
+    
+    def _on_resin_channels_worker_finished(self):
+        if hasattr(self, 'resin_channels_btn'):
+            self.resin_channels_btn.setEnabled(True)
+        if hasattr(self, 'resin_channels_progress'):
+            self.resin_channels_progress.hide()
+        self._resin_channels_worker = None
 
     # =========================================================================
     # HULL STEP
@@ -7473,6 +7959,10 @@ class MainWindow(QMainWindow):
         self._metamold_half_2_with_part = None
         self._metamold_csg_success = False
         
+        # Clear resin channels results
+        self._resin_channel_result = None
+        self._resin_channel_other_half = None
+        
         # Reset current mesh
         self._current_mesh = None
         self._current_diagnostics = None
@@ -7673,7 +8163,7 @@ class MainWindow(QMainWindow):
             return data
         
         session = {
-            'version': 3,  # Version 3: added hard shell + metamold state
+            'version': 4,  # Version 4: added resin channels state
             'filename': self._loaded_filename,
             'active_step': self._active_step.value if self._active_step else None,
             
@@ -7742,6 +8232,10 @@ class MainWindow(QMainWindow):
             'metamold_half_1_with_part': mesh_to_dict(self._metamold_half_1_with_part),
             'metamold_half_2_with_part': mesh_to_dict(self._metamold_half_2_with_part),
             'metamold_csg_success': self._metamold_csg_success,
+            
+            # Resin channels state
+            'resin_channel_result': result_to_dict(self._resin_channel_result),
+            'resin_channel_other_half': mesh_to_dict(self._resin_channel_other_half),
         }
         
         return session
@@ -8188,6 +8682,46 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logger.warning(f"Could not restore metamold visualization: {e}")
         
+        # Restore resin channels state
+        if session.get('resin_channel_result'):
+            from core.resin_channels import ResinChannelResult
+            self._resin_channel_result = dict_to_result(session['resin_channel_result'], ResinChannelResult)
+        
+        if session.get('resin_channel_other_half'):
+            self._resin_channel_other_half = dict_to_mesh(session['resin_channel_other_half'])
+        
+        # If resin channels were computed, update the viewer to show channeled halves
+        # instead of the originals that were shown above in the metamold restore
+        if (self._resin_channel_result is not None and 
+            self._resin_channel_result.success and 
+            self._resin_channel_result.mesh is not None and
+            self._resin_channel_other_half is not None):
+            try:
+                self.mesh_viewer.remove_metamold_half_1_with_part()
+                self.mesh_viewer.remove_metamold_half_2_with_part()
+                if self._resin_channel_result.mold_half == 1:
+                    self.mesh_viewer.show_metamold_half_1_with_part(self._resin_channel_result.mesh)
+                    self.mesh_viewer.show_metamold_half_2_with_part(self._resin_channel_other_half)
+                else:
+                    self.mesh_viewer.show_metamold_half_1_with_part(self._resin_channel_other_half)
+                    self.mesh_viewer.show_metamold_half_2_with_part(self._resin_channel_result.mesh)
+                logger.info("Restored resin channel visualization (channeled metamold halves)")
+                
+                # Also update hard shell viewer if modified shell is stored
+                if (hasattr(self._resin_channel_result, 'modified_shell_mesh') and
+                    self._resin_channel_result.modified_shell_mesh is not None and
+                    hasattr(self._resin_channel_result, 'shell_half_modified') and
+                    self._resin_channel_result.shell_half_modified > 0):
+                    shell_half = self._resin_channel_result.shell_half_modified
+                    if shell_half == 1:
+                        self.mesh_viewer.show_shell_half_1(self._resin_channel_result.modified_shell_mesh)
+                    else:
+                        self.mesh_viewer.show_shell_half_2(self._resin_channel_result.modified_shell_mesh)
+                    logger.info(f"Restored shell half {shell_half} with inlet through-hole")
+                    
+            except Exception as e:
+                logger.warning(f"Could not restore resin channel visualization: {e}")
+        
         # Restore step statuses
         step_status = session.get('step_status', {})
         for step_val, status in step_status.items():
@@ -8197,6 +8731,14 @@ class MainWindow(QMainWindow):
                     self.step_buttons[step].set_status(status)
             except ValueError:
                 pass
+        
+        # Ensure resin channels step is available if metamold halves with part exist
+        # (handles sessions saved before this step was added)
+        if (self._metamold_half_1_with_part is not None and
+            self._metamold_half_2_with_part is not None and
+            Step.RESIN_CHANNELS in self.step_buttons and
+            self.step_buttons[Step.RESIN_CHANNELS]._status == 'locked'):
+            self.step_buttons[Step.RESIN_CHANNELS].set_status('available')
         
         # Restore active step
         active_step_val = session.get('active_step')
