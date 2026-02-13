@@ -728,6 +728,58 @@ def extract_parting_surface(
         logger.info(f"Cut point boundary types: {n_part_boundary} near part M, "
                     f"{n_hull_boundary} near hull ∂H, {n_interior} interior")
     
+    # Post-processing for secondary surfaces: detect bt=4 (primary-then-part)
+    # 
+    # A bt=3 vertex that is connected by a surface edge to a bt=-1 vertex sits
+    # at the triple junction where secondary membrane, primary membrane, and part
+    # all meet. This vertex needs DUAL reprojection: first to the primary surface,
+    # then to the part surface — pinning it to the curve where primary meets part.
+    n_primary_then_part = 0
+    if is_secondary and len(cut_edge_indices) > 0:
+        # Build adjacency from the triangles we're about to create — but we don't
+        # have triangles yet. Instead, check all pairs of cut vertices that share
+        # a tetrahedron edge. Two cut vertices are adjacent in the surface if they
+        # appear in the same tet's marching configuration.
+        # 
+        # Simpler approach: iterate over all cut edge pairs within each tet.
+        # If both edges are cut, the resulting surface vertices are adjacent.
+        cut_edge_set = set(int(e) for e in cut_edge_indices)
+        
+        # For each tet, find pairs of cut edges → pairs of surface vertices
+        bt3_adjacent_to_part = set()
+        for t in range(len(tetrahedra)):
+            tet_edges_global = tet_edge_indices[t]
+            # Find which of the 6 edges are cut
+            cut_local = [k for k in range(6) if int(tet_edges_global[k]) in cut_edge_set]
+            if len(cut_local) < 2:
+                continue
+            # Check all pairs of cut edges in this tet
+            for a_idx in range(len(cut_local)):
+                for b_idx in range(a_idx + 1, len(cut_local)):
+                    ea = int(tet_edges_global[cut_local[a_idx]])
+                    eb = int(tet_edges_global[cut_local[b_idx]])
+                    sa = edge_to_surface_vertex.get(ea)
+                    sb = edge_to_surface_vertex.get(eb)
+                    if sa is None or sb is None:
+                        continue
+                    bta = vertex_boundary_type[sa]
+                    btb = vertex_boundary_type[sb]
+                    # If one is part (-1) and other is primary junction (3),
+                    # upgrade the bt=3 vertex to bt=4
+                    if bta == -1 and btb == 3:
+                        bt3_adjacent_to_part.add(sb)
+                    elif btb == -1 and bta == 3:
+                        bt3_adjacent_to_part.add(sa)
+        
+        for si in bt3_adjacent_to_part:
+            vertex_boundary_type[si] = 4
+            n_primary_then_part += 1
+            n_primary_junction -= 1
+        
+        if n_primary_then_part > 0:
+            logger.info(f"Detected {n_primary_then_part} primary-then-part (bt=4) vertices "
+                       f"at triple junctions (primary ∩ part ∩ secondary)")
+    
     # Step 2: Process each tetrahedron using marching tetrahedra
     # 
     # For PRIMARY surfaces (use_label_derived_cuts=True): compute cut edges directly
@@ -1764,9 +1816,11 @@ def repair_parting_surface(
                 if has_boundary_type:
                     merged_types = [current_boundary_type[j] for j in neighbors]
                     if is_secondary:
-                        # Secondary priority: part > primary_junction > hull > interior
+                        # Secondary priority: part > primary_then_part > primary_junction > hull > interior
                         if -1 in merged_types:
                             new_boundary_type.append(-1)
+                        elif 4 in merged_types:
+                            new_boundary_type.append(4)
                         elif 3 in merged_types:
                             new_boundary_type.append(3)
                         elif 1 in merged_types or 2 in merged_types:
@@ -1865,6 +1919,7 @@ def repair_parting_surface(
             else:
                 logger.info(f"Preserved boundary types: {np.sum(bt == -1)} part, "
                            f"{np.sum(bt == 3)} primary junction, "
+                           f"{np.sum(bt == 4)} primary→part, "
                            f"{np.sum(bt == 1) + np.sum(bt == 2)} hull, "
                            f"{np.sum(bt == 0)} interior")
         

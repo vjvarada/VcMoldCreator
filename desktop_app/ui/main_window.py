@@ -8848,6 +8848,8 @@ class MainWindow(QMainWindow):
                     
                     if dp < on_surface_tol and dp <= dh and dp <= dpr:
                         vbt[i] = -1  # Part boundary
+                    elif label == 'secondary' and dpr < on_surface_tol and dp < on_surface_tol:
+                        vbt[i] = 4   # Primary-then-part (close to both)
                     elif label == 'secondary' and dpr < on_surface_tol and dpr < dp:
                         vbt[i] = 3   # Primary junction (secondary only)
                     elif dh < on_surface_tol and dh < dp:
@@ -8860,9 +8862,11 @@ class MainWindow(QMainWindow):
                 n_part = np.sum(vbt == -1)
                 n_hull = np.sum((vbt == 1) | (vbt == 2))
                 n_primary_junc = np.sum(vbt == 3)
+                n_primary_part = np.sum(vbt == 4)
                 n_interior = np.sum(vbt == 0)
                 logger.info(f"Reconstructed {label} vertex_boundary_type: "
-                           f"{n_part} part, {n_hull} hull, {n_primary_junc} primary junction, "
+                           f"{n_part} part, {n_hull} hull, {n_primary_junc} primary, "
+                           f"{n_primary_part} primary→part, "
                            f"{n_interior} interior (from {n_verts} vertices)")
         except Exception as e:
             logger.warning(f"Failed to reconstruct vertex_boundary_type: {e}")

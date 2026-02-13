@@ -1328,16 +1328,27 @@ def smooth_membrane_with_boundary_reprojection(
             n_type_part = np.sum(vertex_boundary_type == -1)
             n_type_hull = np.sum((vertex_boundary_type == 1) | (vertex_boundary_type == 2))
             n_type_primary_junc = np.sum(vertex_boundary_type == 3)
+            n_type_primary_part = np.sum(vertex_boundary_type == 4)
             n_type_interior = np.sum(vertex_boundary_type == 0)
             logger.info(f"vertex_boundary_type distribution (all {len(vertex_boundary_type)} verts): "
                        f"{n_type_part} part (-1), {n_type_hull} hull (1/2), "
-                       f"{n_type_primary_junc} primary junction (3), {n_type_interior} interior (0)")
+                       f"{n_type_primary_junc} primary junction (3), "
+                       f"{n_type_primary_part} primary+part (4), "
+                       f"{n_type_interior} interior (0)")
         
         for vi in boundary_verts:
             bt = vertex_boundary_type[vi]
             if bt == -1:
                 # INNER boundary - originally on part surface M
                 boundary_surface[vi] = 'part'
+            elif bt == 4:
+                # PRIMARY-THEN-PART - triple junction vertex where secondary,
+                # primary, and part all meet. First reprojected to primary,
+                # then reprojected to part → pinned to primary∩part curve.
+                if primary_mesh is not None:
+                    boundary_surface[vi] = 'primary_then_part'
+                else:
+                    boundary_surface[vi] = 'part'
             elif bt == 3:
                 # PRIMARY JUNCTION - secondary vertex on a primary cut edge.
                 # This vertex must lie on the primary surface to ensure the
@@ -1345,32 +1356,27 @@ def smooth_membrane_with_boundary_reprojection(
                 if primary_mesh is not None:
                     boundary_surface[vi] = 'primary'
                 else:
-                    # No primary mesh available - fall back to hull
                     boundary_surface[vi] = 'hull'
             elif bt in (1, 2):
                 # OUTER boundary - originally on hull boundary ∂H (H1 or H2)
-                # Always re-project to hull, even for secondary surfaces.
-                # Only bt=3 (primary junction) vertices go to the primary surface.
                 boundary_surface[vi] = 'hull'
             elif bt == 0:
-                # Type 0 = interior vertex or boundary-zone vertex.
-                # For secondary surfaces: transition-zone vertices (e.g., one part
-                # endpoint + one interior) — float freely during smoothing.
-                # For primary surfaces: boundary zone on hull → re-project to hull.
-                # In both cases, classified as 'hull'. When reproject_to_hull=False
-                # (secondary), these become free-floating.
+                # Type 0 = interior or boundary-zone vertex.
+                # Classified as 'hull'; when reproject_to_hull=False (secondary),
+                # these become free-floating.
                 boundary_surface[vi] = 'hull'
             else:
-                # Unexpected value - use fallback
                 boundary_surface[vi] = 'patch'
         
         part_count = sum(1 for s in boundary_surface.values() if s == 'part')
         hull_count = sum(1 for s in boundary_surface.values() if s == 'hull')
         primary_count = sum(1 for s in boundary_surface.values() if s == 'primary')
+        ptp_count = sum(1 for s in boundary_surface.values() if s == 'primary_then_part')
         patch_count = sum(1 for s in boundary_surface.values() if s == 'patch')
         
-        logger.info(f"Boundary classification (from extraction): {part_count} to part, "
-                   f"{hull_count} to hull, {primary_count} to primary, {patch_count} patch")
+        logger.info(f"Boundary classification (from extraction): {part_count} part, "
+                   f"{hull_count} hull, {primary_count} primary, "
+                   f"{ptp_count} primary→part, {patch_count} patch")
         
         # For 'patch' vertices, use NEIGHBOR PROPAGATION first, then distance as last resort
         # This is important because the inflated hull CONTAINS the part mesh, so interior-
@@ -1599,6 +1605,7 @@ def smooth_membrane_with_boundary_reprojection(
     part_boundary_indices = []
     hull_boundary_indices = []
     primary_boundary_indices = []
+    primary_then_part_indices = []  # bt=4: dual reprojection (primary first, then part)
     
     for vi in boundary_verts:
         if vi in excluded_set:
@@ -1606,6 +1613,8 @@ def smooth_membrane_with_boundary_reprojection(
         surface_type = boundary_surface.get(vi, 'patch')
         if surface_type in ('part', 'closest_part', 'propagated_part'):
             part_boundary_indices.append(vi)
+        elif surface_type == 'primary_then_part':
+            primary_then_part_indices.append(vi)
         elif surface_type in ('hull', 'closest_hull', 'propagated_hull'):
             # Only add to hull re-projection list if reproject_to_hull is True
             if reproject_to_hull:
@@ -1617,25 +1626,17 @@ def smooth_membrane_with_boundary_reprojection(
     part_boundary_indices = np.array(part_boundary_indices, dtype=np.int64)
     hull_boundary_indices = np.array(hull_boundary_indices, dtype=np.int64)
     primary_boundary_indices = np.array(primary_boundary_indices, dtype=np.int64)
+    primary_then_part_indices = np.array(primary_then_part_indices, dtype=np.int64)
     
     # Count how many boundary vertices are FREE (not re-projected anywhere)
-    n_free_boundary = len(boundary_verts) - len(part_boundary_indices) - len(hull_boundary_indices) - len(primary_boundary_indices)
+    n_pinned = len(part_boundary_indices) + len(hull_boundary_indices) + len(primary_boundary_indices) + len(primary_then_part_indices)
+    n_free_boundary = len(boundary_verts) - n_pinned
     
-    if reproject_to_hull:
-        logger.info(f"Batched re-projection: {len(part_boundary_indices)} part, "
-                   f"{len(hull_boundary_indices)} hull, {len(primary_boundary_indices)} primary, "
-                   f"{n_free_boundary} free")
-    else:
-        logger.info(f"Batched re-projection: {len(part_boundary_indices)} part, "
-                   f"{len(primary_boundary_indices)} primary, "
-                   f"{n_free_boundary} free (hull re-projection disabled)")
-    
-    # Summary of what will happen during smoothing
-    logger.info(f"Smoothing summary: {len(part_boundary_indices)} part, "
+    logger.info(f"Batched re-projection: {len(part_boundary_indices)} part, "
                f"{len(primary_boundary_indices)} primary, "
+               f"{len(primary_then_part_indices)} primary→part, "
                f"{len(hull_boundary_indices)} hull, "
-               f"{n_free_boundary} free, "
-               f"{len(interior_verts)} interior")
+               f"{n_free_boundary} free")
     
     # === Feature detection is now done inline for part boundary only ===
     # The new approach analyzes membrane-part connections directly rather than
@@ -2054,21 +2055,35 @@ def smooth_membrane_with_boundary_reprojection(
                 vertices[hull_boundary_indices] = closest_pts
         
         # Re-project to primary mesh (for secondary surfaces)
-        # Each vertex goes to exactly ONE target based on its classification — no dual re-projection.
-        if len(primary_boundary_indices) > 0 and primary_mesh is not None:
+        # bt=3 vertices go to primary only.
+        # bt=4 vertices go to primary first, then part (handled below).
+        all_primary_indices = primary_boundary_indices
+        if len(primary_then_part_indices) > 0:
+            all_primary_indices = np.concatenate([primary_boundary_indices, primary_then_part_indices])
+        
+        if len(all_primary_indices) > 0 and primary_mesh is not None:
             if primary_feature_types is not None:
                 vertices = reproject_with_feature_awareness(
                     vertices=vertices,
-                    boundary_indices=primary_boundary_indices,
+                    boundary_indices=all_primary_indices,
                     target_mesh=primary_mesh,
                     feature_types=primary_feature_types,
                     sharp_edge_info=primary_sharp_edge_info,
                     search_radius=search_radius
                 )
             elif primary_proximity is not None:
-                primary_positions = vertices[primary_boundary_indices]
+                primary_positions = vertices[all_primary_indices]
                 closest_pts, _, _ = primary_proximity.on_surface(primary_positions)
-                vertices[primary_boundary_indices] = closest_pts
+                vertices[all_primary_indices] = closest_pts
+        
+        # Dual re-projection for bt=4 (primary-then-part):
+        # After being placed on the primary surface above, now snap to part.
+        # This pins them to the curve where primary surface intersects part.
+        if len(primary_then_part_indices) > 0 and part_mesh is not None:
+            if part_proximity is not None:
+                ptp_positions = vertices[primary_then_part_indices]
+                closest_pts, _, _ = part_proximity.on_surface(ptp_positions)
+                vertices[primary_then_part_indices] = closest_pts
         
         # === Step 3: Smooth interior vertices (boundary vertices now fixed) ===
         # Per paper: "Then, we smooth all the interior vertices, keeping the ones 
