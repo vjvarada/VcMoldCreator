@@ -49,3 +49,6 @@ Thumbs.db
 # Local configuration
 .env.local
 .env.*.local
+
+# Export artifacts
+.tmp/

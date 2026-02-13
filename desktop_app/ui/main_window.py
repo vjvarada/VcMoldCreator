@@ -6,6 +6,7 @@ Designed to match the React frontend's UI/UX with Shards Dashboard theme.
 """
 
 import logging
+import os
 from typing import Optional, Dict, List, Tuple
 from pathlib import Path
 from enum import Enum
@@ -80,6 +81,7 @@ class Step(Enum):
     HARD_SHELL = 'hard-shell'          # Hard shell generation (outer collar + prism)
     METAMOLD = 'metamold'              # Metamold prism for casting silicone mold
     RESIN_CHANNELS = 'resin-channels'  # Resin pouring inlets and air escape holes
+    EXPORT = 'export'                  # Export final artifacts to .tmp folder
 
 
 STEPS = [
@@ -99,6 +101,7 @@ STEPS = [
     {'id': Step.HARD_SHELL, 'icon': '🏠', 'title': 'Hard Shell', 'description': 'Generate hard shell geometry with outer collar extension'},
     {'id': Step.METAMOLD, 'icon': '🧊', 'title': 'Metamold', 'description': 'Generate metamold prism for casting silicone mold halves'},
     {'id': Step.RESIN_CHANNELS, 'icon': '🕳️', 'title': 'Resin Channels', 'description': 'Create resin pouring inlets and air escape holes in metamold'},
+    {'id': Step.EXPORT, 'icon': '📦', 'title': 'Export', 'description': 'Export hard shells, metamolds and pouring plug to .tmp folder'},
 ]
 
 
@@ -1288,6 +1291,63 @@ class ResinChannelsWorker(QThread):
             
         except Exception as e:
             logger.exception("Error creating resin channels: %s", e)
+            self.error.emit(str(e))
+
+
+class ExportWorker(QThread):
+    """Background worker for exporting fabrication artifacts to .tmp folder."""
+    
+    progress = pyqtSignal(str)
+    complete = pyqtSignal(object)  # ExportResult
+    error = pyqtSignal(str)
+    
+    def __init__(
+        self,
+        export_dir: str,
+        shell_half_1,
+        shell_half_2,
+        metamold_half_1,
+        metamold_half_2,
+        plug_mesh,
+        hull_mesh=None,
+        part_mesh=None,
+        model_name: str = "Unknown",
+    ):
+        super().__init__()
+        self.export_dir = export_dir
+        self.shell_half_1 = shell_half_1
+        self.shell_half_2 = shell_half_2
+        self.metamold_half_1 = metamold_half_1
+        self.metamold_half_2 = metamold_half_2
+        self.plug_mesh = plug_mesh
+        self.hull_mesh = hull_mesh
+        self.part_mesh = part_mesh
+        self.model_name = model_name
+    
+    def run(self):
+        try:
+            from core.export_artifacts import export_artifacts
+            
+            self.progress.emit("Creating export directory...")
+            
+            self.progress.emit("Exporting STL files...")
+            result = export_artifacts(
+                export_dir=self.export_dir,
+                shell_half_1=self.shell_half_1,
+                shell_half_2=self.shell_half_2,
+                metamold_half_1=self.metamold_half_1,
+                metamold_half_2=self.metamold_half_2,
+                plug_mesh=self.plug_mesh,
+                hull_mesh=self.hull_mesh,
+                part_mesh=self.part_mesh,
+                model_name=self.model_name,
+            )
+            
+            self.progress.emit("Export complete")
+            self.complete.emit(result)
+            
+        except Exception as e:
+            logger.exception("Error exporting artifacts: %s", e)
             self.error.emit(str(e))
 
 
@@ -5297,6 +5357,10 @@ class MainWindow(QMainWindow):
         self._resin_channel_result = None  # ResinChannelResult (modified half with channels)
         self._resin_channel_other_half = None  # The unmodified other half
         
+        # Export state
+        self._export_worker = None
+        self._export_result = None  # ExportResult
+        
         # Registration noise state
         self._registration_noise_result = None  # SinusoidalRegistrationResult
         self._registration_worker = None
@@ -5946,6 +6010,8 @@ class MainWindow(QMainWindow):
             self._setup_metamold_step()
         elif self._active_step == Step.RESIN_CHANNELS:
             self._setup_resin_channels_step()
+        elif self._active_step == Step.EXPORT:
+            self._setup_export_step()
         
         self.context_layout.addStretch()
     
@@ -7591,6 +7657,261 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'resin_channels_progress'):
             self.resin_channels_progress.hide()
         self._resin_channels_worker = None
+
+    # =========================================================================
+    # EXPORT STEP
+    # =========================================================================
+
+    def _setup_export_step(self):
+        """Setup the export artifacts step UI."""
+        # Check prerequisites
+        missing = []
+        if self._shell_half_1 is None or self._shell_half_2 is None:
+            missing.append("hard shell halves")
+        if self._metamold_half_1_with_part is None or self._metamold_half_2_with_part is None:
+            missing.append("metamold halves")
+        if self._resin_channel_result is None or not self._resin_channel_result.success:
+            missing.append("resin channels")
+
+        if missing:
+            warn_label = QLabel(f"⚠️ Missing: {', '.join(missing)}.\n"
+                                "Complete previous steps first. Partial export is still possible.")
+            warn_label.setStyleSheet(f"""
+                color: {Colors.WARNING};
+                font-size: 13px;
+                padding: 12px;
+                background-color: rgba(255, 180, 0, 0.1);
+                border: 1px solid {Colors.WARNING};
+                border-radius: 6px;
+            """)
+            warn_label.setWordWrap(True)
+            self.context_layout.addWidget(warn_label)
+
+        # Info about what will be exported
+        info_group = QGroupBox("Export Contents")
+        info_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-weight: bold;
+                border: 1px solid {Colors.GRAY_LIGHT};
+                border-radius: 6px;
+                margin-top: 12px;
+                padding-top: 20px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+            }}
+        """)
+        info_layout = QVBoxLayout()
+        info_group.setLayout(info_layout)
+
+        artifacts = [
+            ("🏠 Hard Shell Half 1", self._get_export_shell_half_1() is not None),
+            ("🏠 Hard Shell Half 2", self._get_export_shell_half_2() is not None),
+            ("🧊 Metamold Half 1", self._get_export_metamold_half_1() is not None),
+            ("🧊 Metamold Half 2", self._get_export_metamold_half_2() is not None),
+            ("🔌 Pouring Plug", self._get_export_plug() is not None),
+        ]
+
+        for name, available in artifacts:
+            status_icon = "✅" if available else "❌"
+            color = Colors.SUCCESS if available else Colors.DANGER
+            row = QLabel(f"{status_icon} {name}")
+            row.setStyleSheet(f"color: {color}; font-size: 12px; padding: 2px 0;")
+            info_layout.addWidget(row)
+
+        self.context_layout.addWidget(info_group)
+
+        # Export button
+        self.export_btn = QPushButton("Export Artifacts")
+        self.export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.export_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #2E7D32;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px 16px;
+                font-size: 13px;
+            }}
+            QPushButton:hover {{ background-color: #1B5E20; }}
+            QPushButton:disabled {{ background-color: {Colors.GRAY_LIGHT}; color: {Colors.GRAY}; }}
+        """)
+        self.export_btn.clicked.connect(self._on_export_artifacts)
+        self.context_layout.addWidget(self.export_btn)
+
+        # Progress
+        self.export_progress = QProgressBar()
+        self.export_progress.setRange(0, 0)
+        self.export_progress.setTextVisible(False)
+        self.export_progress.hide()
+        self.context_layout.addWidget(self.export_progress)
+
+        self.export_progress_label = QLabel("")
+        self.export_progress_label.setStyleSheet(f'color: {Colors.GRAY}; font-size: 12px;')
+        self.export_progress_label.hide()
+        self.context_layout.addWidget(self.export_progress_label)
+
+        # Results
+        self.export_stats = StatsBox()
+        self.export_stats.hide()
+        self.context_layout.addWidget(self.export_stats)
+
+        self._update_export_step_ui()
+
+    def _get_export_shell_half_1(self) -> 'Optional[trimesh.Trimesh]':
+        """Get the final shell half 1 (with through-holes if drilled)."""
+        if (self._resin_channel_result is not None and
+            self._resin_channel_result.success and
+            self._resin_channel_result.shell_half_modified == 1 and
+            self._resin_channel_result.modified_shell_mesh is not None):
+            return self._resin_channel_result.modified_shell_mesh
+        return self._shell_half_1
+
+    def _get_export_shell_half_2(self) -> 'Optional[trimesh.Trimesh]':
+        """Get the final shell half 2 (with through-holes if drilled)."""
+        if (self._resin_channel_result is not None and
+            self._resin_channel_result.success and
+            self._resin_channel_result.shell_half_modified == 2 and
+            self._resin_channel_result.modified_shell_mesh is not None):
+            return self._resin_channel_result.modified_shell_mesh
+        return self._shell_half_2
+
+    def _get_export_metamold_half_1(self) -> 'Optional[trimesh.Trimesh]':
+        """Get the final metamold half 1 (with channels if created)."""
+        if (self._resin_channel_result is not None and
+            self._resin_channel_result.success and
+            self._resin_channel_result.mesh is not None):
+            if self._resin_channel_result.mold_half == 1:
+                return self._resin_channel_result.mesh
+            else:
+                return self._resin_channel_other_half
+        return self._metamold_half_1_with_part
+
+    def _get_export_metamold_half_2(self) -> 'Optional[trimesh.Trimesh]':
+        """Get the final metamold half 2 (with channels if created)."""
+        if (self._resin_channel_result is not None and
+            self._resin_channel_result.success and
+            self._resin_channel_result.mesh is not None):
+            if self._resin_channel_result.mold_half == 2:
+                return self._resin_channel_result.mesh
+            else:
+                return self._resin_channel_other_half
+        return self._metamold_half_2_with_part
+
+    def _get_export_plug(self) -> 'Optional[trimesh.Trimesh]':
+        """Get the pouring plug mesh."""
+        if (self._resin_channel_result is not None and
+            self._resin_channel_result.plug_mesh is not None):
+            return self._resin_channel_result.plug_mesh
+        return None
+
+    def _update_export_step_ui(self):
+        """Update export step UI based on current state."""
+        if not hasattr(self, 'export_stats'):
+            return
+
+        if self._export_result is not None and self._export_result.success:
+            result = self._export_result
+            self.export_stats.clear()
+            self.export_stats.show()
+
+            self.export_stats.add_header('Export Complete', Colors.SUCCESS)
+            self.export_stats.add_row(f'Directory: .tmp/')
+
+            if result.exported_files:
+                self.export_stats.add_row(f'Exported: {len(result.exported_files)} files')
+                for f in result.exported_files:
+                    self.export_stats.add_row(f'  ✅ {f}')
+
+            if result.skipped_files:
+                for f in result.skipped_files:
+                    self.export_stats.add_row(f'  ❌ {f} (missing)')
+
+            if result.volume_metadata is not None:
+                vm = result.volume_metadata
+                self.export_stats.add_row('')
+                self.export_stats.add_row(f'Silicone: {vm.silicone_volume_mm3 / 1000:.2f} cm³')
+                self.export_stats.add_row(f'Resin: {vm.resin_volume_mm3 / 1000:.2f} cm³')
+
+    def _on_export_artifacts(self):
+        """Start exporting artifacts."""
+        self.export_btn.setEnabled(False)
+        self.export_progress.show()
+        self.export_progress_label.setText("Exporting artifacts...")
+        self.export_progress_label.show()
+
+        # Clear previous results
+        self._export_result = None
+
+        # Determine export directory: .tmp/<model_name>/
+        model_name = "model"
+        if self._loaded_filename:
+            model_name = os.path.splitext(os.path.basename(self._loaded_filename))[0]
+
+        # Place .tmp at the workspace root (parent of desktop_app)
+        workspace_root = Path(__file__).resolve().parent.parent.parent
+        export_dir = str(workspace_root / ".tmp" / model_name)
+
+        # Gather final meshes
+        shell_half_1 = self._get_export_shell_half_1()
+        shell_half_2 = self._get_export_shell_half_2()
+        metamold_half_1 = self._get_export_metamold_half_1()
+        metamold_half_2 = self._get_export_metamold_half_2()
+        plug_mesh = self._get_export_plug()
+
+        hull_mesh = self._hull_result.mesh if self._hull_result is not None else None
+        part_mesh = self._current_mesh
+
+        self._export_worker = ExportWorker(
+            export_dir=export_dir,
+            shell_half_1=shell_half_1,
+            shell_half_2=shell_half_2,
+            metamold_half_1=metamold_half_1,
+            metamold_half_2=metamold_half_2,
+            plug_mesh=plug_mesh,
+            hull_mesh=hull_mesh,
+            part_mesh=part_mesh,
+            model_name=model_name,
+        )
+        self._export_worker.progress.connect(self._on_export_progress)
+        self._export_worker.complete.connect(self._on_export_complete)
+        self._export_worker.error.connect(self._on_export_error)
+        self._export_worker.finished.connect(self._on_export_worker_finished)
+        self._export_worker.start()
+
+    def _on_export_progress(self, message: str):
+        if hasattr(self, 'export_progress_label'):
+            self.export_progress_label.setText(message)
+
+    def _on_export_complete(self, export_result):
+        """Handle export complete."""
+        self._export_result = export_result
+
+        if export_result.success:
+            logger.info("Export complete: %d files to %s",
+                        len(export_result.exported_files), export_result.export_dir)
+        else:
+            logger.warning("Export failed: %s", export_result.error_message)
+            QMessageBox.warning(self, "Export Warning",
+                                f"Export had issues:\n{export_result.error_message}")
+
+        self._update_export_step_ui()
+        self.step_buttons[Step.EXPORT].set_status('completed')
+
+    def _on_export_error(self, message: str):
+        if hasattr(self, 'export_progress_label'):
+            self.export_progress_label.setText(f"Error: {message}")
+            self.export_progress_label.setStyleSheet(f'color: {Colors.DANGER}; font-size: 12px;')
+        QMessageBox.critical(self, "Error", f"Export failed:\n{message}")
+
+    def _on_export_worker_finished(self):
+        if hasattr(self, 'export_btn'):
+            self.export_btn.setEnabled(True)
+        if hasattr(self, 'export_progress'):
+            self.export_progress.hide()
+        self._export_worker = None
 
     # =========================================================================
     # HULL STEP
