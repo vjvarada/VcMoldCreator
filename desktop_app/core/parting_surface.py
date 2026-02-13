@@ -462,7 +462,9 @@ def extract_parting_surface(
     boundary_labels: Optional[np.ndarray] = None,
     vertex_mold_labels: Optional[np.ndarray] = None,
     vertex_escape_distances: Optional[np.ndarray] = None,
-    use_label_derived_cuts: bool = True
+    use_label_derived_cuts: bool = True,
+    is_secondary: bool = False,
+    primary_cut_vertex_mask: Optional[np.ndarray] = None
 ) -> PartingSurfaceResult:
     """
     Extract the parting surface mesh using Marching Tetrahedra.
@@ -508,6 +510,15 @@ def extract_parting_surface(
         vertex_mold_labels: (N,) mold half labels: 1=H1, 2=H2 for all vertices
         vertex_escape_distances: (N,) geodesic distance from each vertex to its escape boundary.
             Used for weighted cut point placement per Nielson & Franke. If None, uses midpoint.
+        is_secondary: If True, use stricter vertex_boundary_type assignment for secondary surfaces.
+            For secondary surfaces, a cut vertex is only labeled -1 (part) if BOTH tet endpoints
+            are on the part surface. If only one endpoint is on the part, the vertex is labeled 0
+            (interior) so it can be re-projected to the primary membrane instead.
+        primary_cut_vertex_mask: (N,) boolean mask where True means the vertex is an endpoint
+            of a primary cut edge. Used only when is_secondary=True to detect junction edges —
+            secondary cut edges whose tet-mesh endpoints touch primary cut vertices get
+            vertex_boundary_type=3 (primary junction), meaning they should be re-projected
+            to the closest primary surface during smoothing.
     
     Returns:
         PartingSurfaceResult with the extracted surface mesh
@@ -583,9 +594,19 @@ def extract_parting_surface(
     # Track statistics for logging
     n_part_boundary = 0   # Cut points near part surface M (will re-project later)
     n_hull_boundary = 0   # Cut points near hull boundary ∂H (will re-project later)
+    n_primary_junction = 0  # Cut points at primary junction (will re-project to primary)
     n_interior = 0        # Cut points in interior (no re-projection needed)
     n_weighted = 0        # Cut points placed using weighted interpolation
     n_midpoint = 0        # Cut points placed at midpoint (fallback)
+    
+    # For secondary surfaces: identify cut edges adjacent to primary cuts.
+    # A secondary cut edge is "adjacent" if either of its tet-mesh endpoints
+    # is also an endpoint of a primary cut edge. Such vertices lie at the
+    # junction between the secondary and primary surfaces and must be
+    # re-projected to the primary surface during smoothing.
+    has_primary_vertex_mask = (is_secondary and 
+                               primary_cut_vertex_mask is not None and
+                               len(primary_cut_vertex_mask) > 0)
     
     # Check if weighted placement is possible
     use_weighted = (vertex_escape_distances is not None and 
@@ -630,31 +651,82 @@ def extract_parting_surface(
             bl0 = boundary_labels[v0]
             bl1 = boundary_labels[v1]
             
-            # Priority: Part surface M (-1) > Hull (1,2) > Interior (0)
-            # If either endpoint is on part surface, mark for re-projection to part M
-            if bl0 == -1 or bl1 == -1:
-                vertex_boundary_type[i] = -1  # Will re-project to part M later
-                n_part_boundary += 1
-            # Else if either endpoint is on hull boundary, mark for re-projection to hull
-            elif bl0 in (1, 2) or bl1 in (1, 2):
-                # Use the non-zero hull label (prefer H1 if both are hull vertices)
-                if bl0 in (1, 2):
-                    vertex_boundary_type[i] = bl0
+            if is_secondary:
+                # SECONDARY SURFACE: Adjacency-aware labeling.
+                #
+                # For secondary membranes, the boundary condition is the PRIMARY parting
+                # surface, not the hull. We use two complementary signals:
+                #
+                # 1. PRIMARY ADJACENCY: If this edge is also a primary cut edge, the
+                #    secondary surface must connect to the primary here. Mark as bt=3
+                #    (primary junction) so it gets re-projected to the primary surface.
+                #
+                # 2. BOUNDARY LABELS: For non-junction edges, use tet vertex labels:
+                #    - BOTH on part (-1/-1) → -1 (genuine part boundary)
+                #    - ONE on part + anything → 0 (interior, free to smooth)
+                #    - Hull endpoints → hull label (outer boundary)
+                #    - BOTH interior → 0 (interior, free to smooth)
+                
+                # Check if this edge is ADJACENT to a primary cut edge.
+                # An edge is adjacent if either tet-mesh endpoint is an
+                # endpoint of any primary cut edge. This detects the junction
+                # where the secondary surface meets the primary surface.
+                if has_primary_vertex_mask and (primary_cut_vertex_mask[v0] or primary_cut_vertex_mask[v1]):
+                    # At least one endpoint touches a primary cut edge.
+                    # The secondary vertex here must lie on the primary surface.
+                    vertex_boundary_type[i] = 3  # Primary junction
+                    n_primary_junction += 1
+                elif bl0 == -1 and bl1 == -1:
+                    # Both endpoints on part surface - genuine part boundary
+                    vertex_boundary_type[i] = -1
+                    n_part_boundary += 1
+                elif bl0 == -1 or bl1 == -1:
+                    # ONE endpoint on part, other is interior or hull.
+                    # Do NOT pin to part mesh — would fold the membrane.
+                    # Label as interior so it can float freely during smoothing.
+                    vertex_boundary_type[i] = 0
+                    n_interior += 1
+                elif bl0 in (1, 2) or bl1 in (1, 2):
+                    if bl0 in (1, 2):
+                        vertex_boundary_type[i] = bl0
+                    else:
+                        vertex_boundary_type[i] = bl1
+                    n_hull_boundary += 1
                 else:
-                    vertex_boundary_type[i] = bl1
-                n_hull_boundary += 1
+                    vertex_boundary_type[i] = 0
+                    n_interior += 1
             else:
-                # Both interior - no re-projection needed
-                vertex_boundary_type[i] = 0
-                n_interior += 1
+                # PRIMARY SURFACE: Original logic
+                # Priority: Part surface M (-1) > Hull (1,2) > Interior (0)
+                # If either endpoint is on part surface, mark for re-projection to part M
+                if bl0 == -1 or bl1 == -1:
+                    vertex_boundary_type[i] = -1  # Will re-project to part M later
+                    n_part_boundary += 1
+                # Else if either endpoint is on hull boundary, mark for re-projection to hull
+                elif bl0 in (1, 2) or bl1 in (1, 2):
+                    # Use the non-zero hull label (prefer H1 if both are hull vertices)
+                    if bl0 in (1, 2):
+                        vertex_boundary_type[i] = bl0
+                    else:
+                        vertex_boundary_type[i] = bl1
+                    n_hull_boundary += 1
+                else:
+                    # Both interior - no re-projection needed
+                    vertex_boundary_type[i] = 0
+                    n_interior += 1
         else:
             # No boundary labels available
             vertex_boundary_type[i] = 0
             n_interior += 1
     
     logger.info(f"Cut point placement: {n_weighted} weighted, {n_midpoint} midpoint")
-    logger.info(f"Cut point boundary types: {n_part_boundary} near part M, "
-                f"{n_hull_boundary} near hull ∂H, {n_interior} interior")
+    if is_secondary:
+        logger.info(f"Cut point boundary types: {n_part_boundary} part M, "
+                    f"{n_hull_boundary} hull ∂H, {n_primary_junction} primary junction, "
+                    f"{n_interior} interior")
+    else:
+        logger.info(f"Cut point boundary types: {n_part_boundary} near part M, "
+                    f"{n_hull_boundary} near hull ∂H, {n_interior} interior")
     
     # Step 2: Process each tetrahedron using marching tetrahedra
     # 
@@ -1474,6 +1546,34 @@ def extract_parting_surface_from_tet_result(
     else:
         logger.info("No seed_distances available - will use midpoint cut point placement")
     
+    # For secondary surfaces: build a vertex mask of primary cut edge endpoints.
+    # Any secondary cut edge whose tet-mesh endpoint touches a primary cut
+    # vertex is at the junction between secondary and primary surfaces.
+    # The cut vertex there gets vertex_boundary_type=3 → reprojected to primary.
+    primary_vertex_mask = None
+    if cut_type == 'secondary' and tet_result.primary_cut_edges is not None:
+        n_verts = len(tet_result.vertices)
+        primary_vertex_mask = np.zeros(n_verts, dtype=bool)
+        for vi, vj in tet_result.primary_cut_edges:
+            primary_vertex_mask[vi] = True
+            primary_vertex_mask[vj] = True
+        n_primary_verts = np.sum(primary_vertex_mask)
+        logger.info(f"Primary cut vertex mask: {n_primary_verts} vertices "
+                   f"from {len(tet_result.primary_cut_edges)} primary cut edges")
+        
+        # Diagnostic: count how many secondary cut edges are adjacent to primary
+        secondary_cut_edge_indices = np.where(cut_flags)[0]
+        n_adjacent = 0
+        for e_idx in secondary_cut_edge_indices:
+            v0, v1 = tet_result.edges[e_idx]
+            if primary_vertex_mask[v0] or primary_vertex_mask[v1]:
+                n_adjacent += 1
+        logger.info(f"Secondary cut edges adjacent to primary: {n_adjacent} / "
+                   f"{len(secondary_cut_edge_indices)} "
+                   f"({100*n_adjacent/max(1,len(secondary_cut_edge_indices)):.1f}%)")
+    elif cut_type == 'secondary':
+        logger.warning("No primary_cut_edges on tet_result — bt=3 junction detection disabled")
+    
     return extract_parting_surface(
         vertices=tet_result.vertices,
         tetrahedra=tet_result.tetrahedra,
@@ -1482,10 +1582,12 @@ def extract_parting_surface_from_tet_result(
         tet_edge_indices=tet_result.tet_edge_indices,
         use_original_vertices=use_original_vertices,
         vertices_original=tet_result.vertices_original,
-        boundary_labels=tet_result.boundary_labels,  # Pass for boundary-aware cut point placement
-        vertex_mold_labels=vertex_labels_for_cuts,  # Pass computed labels (primary only, None for secondary)
-        vertex_escape_distances=vertex_escape_distances,  # Pass for weighted cut point placement
-        use_label_derived_cuts=use_label_derived_cuts  # True for PRIMARY, False for SECONDARY
+        boundary_labels=tet_result.boundary_labels,
+        vertex_mold_labels=vertex_labels_for_cuts,
+        vertex_escape_distances=vertex_escape_distances,
+        use_label_derived_cuts=use_label_derived_cuts,
+        is_secondary=(cut_type == 'secondary'),
+        primary_cut_vertex_mask=primary_vertex_mask
     )
 
 
@@ -1575,7 +1677,8 @@ def smooth_parting_surface(
 def repair_parting_surface(
     surface: PartingSurfaceResult,
     merge_vertices: bool = True,
-    merge_threshold: float = 1e-8
+    merge_threshold: float = 1e-8,
+    is_secondary: bool = False
 ) -> PartingSurfaceResult:
     """
     Clean the parting surface mesh by merging vertices and removing degenerate faces.
@@ -1592,6 +1695,9 @@ def repair_parting_surface(
         surface: PartingSurfaceResult to clean
         merge_vertices: Whether to merge close vertices
         merge_threshold: Distance threshold for vertex merging
+        is_secondary: If True, use part-priority merge (part > hull > interior)
+                      to prevent secondary vertices from being re-projected
+                      to the primary membrane instead of staying on the part.
     
     Returns:
         Cleaned PartingSurfaceResult with updated vertex_boundary_type
@@ -1643,24 +1749,40 @@ def repair_parting_surface(
                 
                 new_vertices.append(vertices[i])
                 
-                # For boundary type, take the most "extreme" type from merged vertices
-                # Priority: 1/2 (hull/outer) > -1 (part/inner) > 0 (interior)
-                # 
-                # IMPORTANT: Hull takes priority because for the PRIMARY parting surface,
-                # we want the OUTER boundary to project to the hull ∂H, not the part M.
-                # If a part vertex and hull vertex are close enough to merge, they're
-                # at a seam edge and the outer boundary projection is more critical.
+                # For boundary type, choose the most appropriate type from merged vertices.
+                #
+                # PRIMARY surfaces: hull(1/2) > part(-1) > interior(0)
+                #   Hull takes priority because the OUTER boundary should project to
+                #   hull ∂H, not part M. If a part and hull vertex merge at a seam,
+                #   the outer boundary projection is more critical.
+                #
+                # SECONDARY surfaces: part(-1) > primary_junction(3) > hull(1/2) > interior(0)
+                #   Part takes priority because secondary part-boundary vertices must
+                #   stay on the part surface M. Primary junction (3) next so that
+                #   junction vertices re-project to the primary membrane. Hull last
+                #   among boundary types.
                 if has_boundary_type:
                     merged_types = [current_boundary_type[j] for j in neighbors]
-                    if 1 in merged_types or 2 in merged_types:
-                        # Outer boundary (hull) takes priority
-                        hull_types = [t for t in merged_types if t in (1, 2)]
-                        new_boundary_type.append(hull_types[0])
-                    elif -1 in merged_types:
-                        # Inner boundary (part)
-                        new_boundary_type.append(-1)
+                    if is_secondary:
+                        # Secondary priority: part > primary_junction > hull > interior
+                        if -1 in merged_types:
+                            new_boundary_type.append(-1)
+                        elif 3 in merged_types:
+                            new_boundary_type.append(3)
+                        elif 1 in merged_types or 2 in merged_types:
+                            hull_types = [t for t in merged_types if t in (1, 2)]
+                            new_boundary_type.append(hull_types[0])
+                        else:
+                            new_boundary_type.append(0)
                     else:
-                        new_boundary_type.append(0)
+                        # Primary priority: hull > part > interior
+                        if 1 in merged_types or 2 in merged_types:
+                            hull_types = [t for t in merged_types if t in (1, 2)]
+                            new_boundary_type.append(hull_types[0])
+                        elif -1 in merged_types:
+                            new_boundary_type.append(-1)
+                        else:
+                            new_boundary_type.append(0)
             
             new_vertices = np.array(new_vertices)
             new_faces = vertex_map[faces]
@@ -1671,7 +1793,7 @@ def repair_parting_surface(
                               (new_faces[:, 0] != new_faces[:, 2])
             new_faces = new_faces[valid_faces_mask]
             
-            mesh = trimesh.Trimesh(vertices=new_vertices, faces=new_faces)
+            mesh = trimesh.Trimesh(vertices=new_vertices, faces=new_faces, process=False)
             current_boundary_type = np.array(new_boundary_type, dtype=np.int8) if has_boundary_type else None
             
             logger.debug(f"Vertex merge: {initial_verts} -> {len(new_vertices)} vertices")
@@ -1735,10 +1857,16 @@ def repair_parting_surface(
         vert_diff = initial_verts - result.num_vertices
         face_diff = initial_faces - result.num_faces
         logger.info(f"Cleaned parting surface: merged {vert_diff} verts, removed {face_diff} faces in {elapsed:.1f}ms")
-        if has_boundary_type:
+        if has_boundary_type and result.vertex_boundary_type is not None:
             bt = result.vertex_boundary_type
-            logger.info(f"Preserved boundary types: {np.sum(bt == -1)} part (inner), "
-                       f"{np.sum(bt == 1) + np.sum(bt == 2)} hull (outer), {np.sum(bt == 0)} interior")
+            if len(bt) != result.num_vertices:
+                logger.error(f"vertex_boundary_type length mismatch after repair: "
+                           f"{len(bt)} entries vs {result.num_vertices} vertices")
+            else:
+                logger.info(f"Preserved boundary types: {np.sum(bt == -1)} part, "
+                           f"{np.sum(bt == 3)} primary junction, "
+                           f"{np.sum(bt == 1) + np.sum(bt == 2)} hull, "
+                           f"{np.sum(bt == 0)} interior")
         
         return result
         
@@ -1749,7 +1877,8 @@ def repair_parting_surface(
 
 def repair_parting_surface_with_part(
     surface: PartingSurfaceResult,
-    part_mesh: trimesh.Trimesh
+    part_mesh: trimesh.Trimesh,
+    is_secondary: bool = False
 ) -> PartingSurfaceResult:
     """
     Clean parting surface (merge vertices, remove degenerates).
@@ -1757,6 +1886,7 @@ def repair_parting_surface_with_part(
     Args:
         surface: PartingSurfaceResult to clean
         part_mesh: The original part mesh (reserved for future use)
+        is_secondary: If True, use part-priority merge for secondary surfaces
     
     Returns:
         Cleaned PartingSurfaceResult
@@ -1765,7 +1895,7 @@ def repair_parting_surface_with_part(
         return surface
     
     # Basic cleanup: merge vertices and remove degenerate faces
-    return repair_parting_surface(surface, merge_vertices=True)
+    return repair_parting_surface(surface, merge_vertices=True, is_secondary=is_secondary)
 
 
 def remove_small_islands(
@@ -1784,52 +1914,105 @@ def remove_small_islands(
     multiple disconnected patches - we keep all significant patches but
     remove tiny noise fragments.
     
+    IMPORTANT: This function preserves vertex_boundary_type through the
+    removal process by using face-level component labeling and vertex
+    compaction (rather than split/concatenate which loses vertex metadata).
+    
     Args:
         surface: PartingSurfaceResult to clean
         min_triangles: Minimum triangles to keep an island (default: 10)
         min_area_fraction: Minimum area fraction of total (default: 0.01 = 1%)
     
     Returns:
-        Cleaned PartingSurfaceResult with small islands removed
+        Cleaned PartingSurfaceResult with small islands removed and
+        vertex_boundary_type preserved
     """
     if surface.mesh is None or len(surface.mesh.faces) == 0:
         return surface
     
     try:
-        mesh = surface.mesh.copy()
+        mesh = surface.mesh
+        faces = np.array(mesh.faces)
+        vertices = np.array(mesh.vertices)
+        n_faces = len(faces)
+        n_verts = len(vertices)
         
-        # Split into connected components
-        try:
-            components = mesh.split(only_watertight=False)
-        except Exception as e:
-            logger.warning(f"Could not split mesh for island removal: {e}")
-            return surface
+        has_boundary_type = (
+            surface.vertex_boundary_type is not None and
+            len(surface.vertex_boundary_type) == n_verts
+        )
         
-        if len(components) <= 1:
+        # Build face adjacency to find connected components via BFS
+        # Two faces are adjacent if they share an edge
+        from collections import deque
+        
+        # Build edge-to-face map
+        edge_to_faces = {}
+        for fi in range(n_faces):
+            f = faces[fi]
+            for e in [(f[0], f[1]), (f[1], f[2]), (f[0], f[2])]:
+                edge_key = (min(e), max(e))
+                if edge_key not in edge_to_faces:
+                    edge_to_faces[edge_key] = []
+                edge_to_faces[edge_key].append(fi)
+        
+        # BFS to label connected components
+        component_label = np.full(n_faces, -1, dtype=np.int32)
+        current_label = 0
+        
+        for start_face in range(n_faces):
+            if component_label[start_face] >= 0:
+                continue
+            
+            # BFS from this face
+            queue = deque([start_face])
+            component_label[start_face] = current_label
+            
+            while queue:
+                fi = queue.popleft()
+                f = faces[fi]
+                for e in [(f[0], f[1]), (f[1], f[2]), (f[0], f[2])]:
+                    edge_key = (min(e), max(e))
+                    for neighbor_fi in edge_to_faces.get(edge_key, []):
+                        if component_label[neighbor_fi] < 0:
+                            component_label[neighbor_fi] = current_label
+                            queue.append(neighbor_fi)
+            
+            current_label += 1
+        
+        n_components = current_label
+        
+        if n_components <= 1:
             # Only one component - nothing to remove
             return surface
         
-        # Calculate total area for percentage threshold
-        total_area = sum(c.area for c in components)
+        # Calculate per-component statistics
+        # Compute face areas
+        v0 = vertices[faces[:, 0]]
+        v1 = vertices[faces[:, 1]]
+        v2 = vertices[faces[:, 2]]
+        face_areas = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1)
+        
+        total_area = np.sum(face_areas)
         min_area = total_area * min_area_fraction
         
-        # Identify components to keep
-        # Keep a component if it has enough triangles OR enough area
-        kept_components = []
+        # Decide which components to keep
+        keep_component = np.zeros(n_components, dtype=bool)
         removed_count = 0
         removed_triangles = 0
         removed_area = 0.0
         
-        for comp in components:
-            n_tris = len(comp.faces)
-            area = comp.area
+        for ci in range(n_components):
+            comp_mask = component_label == ci
+            comp_n_tris = np.sum(comp_mask)
+            comp_area = np.sum(face_areas[comp_mask])
             
-            if n_tris >= min_triangles or area >= min_area:
-                kept_components.append(comp)
+            if comp_n_tris >= min_triangles or comp_area >= min_area:
+                keep_component[ci] = True
             else:
                 removed_count += 1
-                removed_triangles += n_tris
-                removed_area += area
+                removed_triangles += comp_n_tris
+                removed_area += comp_area
         
         if removed_count == 0:
             # Nothing to remove
@@ -1838,34 +2021,50 @@ def remove_small_islands(
         logger.info(f"Removing {removed_count} small islands "
                    f"({removed_triangles} triangles, {removed_area:.2f} area)")
         
-        if len(kept_components) == 0:
+        if not np.any(keep_component):
             logger.warning("All components were too small - keeping original mesh")
             return surface
         
-        # Merge kept components back into a single mesh
-        if len(kept_components) == 1:
-            combined = kept_components[0]
-        else:
-            combined = trimesh.util.concatenate(kept_components)
+        # Build mask of faces to keep
+        faces_to_keep = keep_component[component_label]
+        kept_faces = faces[faces_to_keep]
         
-        # Build result
-        # Note: vertex_boundary_type is invalidated because vertices are re-indexed
-        # If needed, the caller should track vertex_boundary_type through this operation
+        # Compact vertices: keep only referenced vertices and remap face indices
+        referenced = np.unique(kept_faces.ravel())
+        old_to_new = np.full(n_verts, -1, dtype=np.int64)
+        old_to_new[referenced] = np.arange(len(referenced))
+        
+        new_vertices = vertices[referenced]
+        new_faces = old_to_new[kept_faces]
+        
+        # Preserve vertex_boundary_type through the compaction
+        new_boundary_type = None
+        if has_boundary_type:
+            new_boundary_type = surface.vertex_boundary_type[referenced]
+        
+        combined = trimesh.Trimesh(vertices=new_vertices, faces=new_faces, process=False)
+        
+        # Build result with preserved vertex_boundary_type
         result = PartingSurfaceResult(
             mesh=combined,
-            vertices=np.array(combined.vertices),
-            faces=np.array(combined.faces),
+            vertices=new_vertices,
+            faces=new_faces,
             vertex_to_edge=None,  # Invalidated
-            vertex_boundary_type=None,  # Invalidated by component merge
-            num_vertices=len(combined.vertices),
-            num_faces=len(combined.faces),
+            vertex_boundary_type=new_boundary_type,  # PRESERVED through compaction
+            num_vertices=len(new_vertices),
+            num_faces=len(new_faces),
             num_tets_processed=surface.num_tets_processed,
             num_tets_contributing=surface.num_tets_contributing,
             extraction_time_ms=surface.extraction_time_ms
         )
         
-        logger.info(f"Island removal complete: {len(components)} -> {len(kept_components)} components, "
+        kept_count = np.sum(keep_component)
+        logger.info(f"Island removal complete: {n_components} -> {kept_count} components, "
                    f"{surface.num_faces} -> {result.num_faces} faces")
+        if has_boundary_type and new_boundary_type is not None:
+            logger.info(f"Preserved boundary types: {np.sum(new_boundary_type == -1)} part, "
+                       f"{np.sum((new_boundary_type == 1) | (new_boundary_type == 2))} hull, "
+                       f"{np.sum(new_boundary_type == 0)} interior")
         
         return result
         

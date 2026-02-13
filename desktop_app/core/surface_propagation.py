@@ -1327,32 +1327,39 @@ def smooth_membrane_with_boundary_reprojection(
         if vertex_boundary_type is not None:
             n_type_part = np.sum(vertex_boundary_type == -1)
             n_type_hull = np.sum((vertex_boundary_type == 1) | (vertex_boundary_type == 2))
+            n_type_primary_junc = np.sum(vertex_boundary_type == 3)
             n_type_interior = np.sum(vertex_boundary_type == 0)
             logger.info(f"vertex_boundary_type distribution (all {len(vertex_boundary_type)} verts): "
-                       f"{n_type_part} part (-1), {n_type_hull} hull (1/2), {n_type_interior} interior (0)")
+                       f"{n_type_part} part (-1), {n_type_hull} hull (1/2), "
+                       f"{n_type_primary_junc} primary junction (3), {n_type_interior} interior (0)")
         
         for vi in boundary_verts:
             bt = vertex_boundary_type[vi]
             if bt == -1:
                 # INNER boundary - originally on part surface M
                 boundary_surface[vi] = 'part'
+            elif bt == 3:
+                # PRIMARY JUNCTION - secondary vertex on a primary cut edge.
+                # This vertex must lie on the primary surface to ensure the
+                # secondary membrane connects seamlessly to the primary.
+                if primary_mesh is not None:
+                    boundary_surface[vi] = 'primary'
+                else:
+                    # No primary mesh available - fall back to hull
+                    boundary_surface[vi] = 'hull'
             elif bt in (1, 2):
                 # OUTER boundary - originally on hull boundary ∂H (H1 or H2)
-                # For SECONDARY with reproject_to_primary: re-project to primary membrane
-                # For PRIMARY: re-project to hull
-                if reproject_to_primary and primary_mesh is not None:
-                    boundary_surface[vi] = 'primary'
-                else:
-                    boundary_surface[vi] = 'hull'
+                # Always re-project to hull, even for secondary surfaces.
+                # Only bt=3 (primary junction) vertices go to the primary surface.
+                boundary_surface[vi] = 'hull'
             elif bt == 0:
-                # Type 0 = interior midpoint of an edge where both tet verts were interior
-                # For SECONDARY with reproject_to_primary: re-project to primary membrane
-                # For PRIMARY: boundary zone on hull → re-project to hull
-                # For SECONDARY without primary: free to move (marked as hull but filtered later)
-                if reproject_to_primary and primary_mesh is not None:
-                    boundary_surface[vi] = 'primary'
-                else:
-                    boundary_surface[vi] = 'hull'
+                # Type 0 = interior vertex or boundary-zone vertex.
+                # For secondary surfaces: transition-zone vertices (e.g., one part
+                # endpoint + one interior) — float freely during smoothing.
+                # For primary surfaces: boundary zone on hull → re-project to hull.
+                # In both cases, classified as 'hull'. When reproject_to_hull=False
+                # (secondary), these become free-floating.
+                boundary_surface[vi] = 'hull'
             else:
                 # Unexpected value - use fallback
                 boundary_surface[vi] = 'patch'
@@ -1369,86 +1376,98 @@ def smooth_membrane_with_boundary_reprojection(
         # This is important because the inflated hull CONTAINS the part mesh, so interior-
         # turned-boundary vertices may be closer to part by distance but topologically
         # belong to the outer (hull) boundary chain.
+        #
+        # For SECONDARY surfaces: skip distance fallback entirely — patch vertices stay free.
+        is_secondary_surface = reproject_to_primary and not reproject_to_hull
+        
         if patch_count > 0:
             from trimesh.proximity import ProximityQuery
             
-            # Build boundary adjacency to find neighbors along boundary edges
-            boundary_adjacency = {v: set() for v in boundary_verts}
-            for v0, v1 in boundary_edges:
-                boundary_adjacency[v0].add(v1)
-                boundary_adjacency[v1].add(v0)
-            
-            # STEP 1: Propagate from already-classified vertices to their patch neighbors
-            # This uses the boundary chain topology rather than distance
-            # Use CONVERGENCE-BASED stopping: continue until no changes occur
-            # Maximum rounds is set very high as a safety limit only
-            propagated_count = 0
-            changed = True
-            max_propagation_rounds = len(boundary_verts)  # Worst case: propagate through entire chain
-            propagation_round = 0
-            
-            while changed and propagation_round < max_propagation_rounds:
-                changed = False
-                propagation_round += 1
-                for vi in list(boundary_verts):
-                    if boundary_surface.get(vi) != 'patch':
-                        continue
-                    
-                    # Look at neighbors along boundary edges
-                    neighbors = boundary_adjacency.get(vi, set())
-                    neighbor_types = [boundary_surface.get(n) for n in neighbors if n in boundary_surface]
-                    
-                    # Count non-patch classifications (including propagated ones)
-                    part_neighbors = sum(1 for t in neighbor_types if t in ('part', 'closest_part', 'propagated_part'))
-                    hull_neighbors = sum(1 for t in neighbor_types if t in ('hull', 'closest_hull', 'propagated_hull'))
-                    
-                    # If ALL classified neighbors agree, propagate that classification
-                    if part_neighbors > 0 and hull_neighbors == 0:
-                        boundary_surface[vi] = 'propagated_part'
-                        changed = True
-                        propagated_count += 1
-                    elif hull_neighbors > 0 and part_neighbors == 0:
-                        boundary_surface[vi] = 'propagated_hull'
-                        changed = True
-                        propagated_count += 1
-                    # If neighbors disagree (mixed), leave as 'patch' for distance fallback
-            
-            logger.info(f"Propagation classified {propagated_count} patch vertices in {propagation_round} rounds "
-                       f"(converged: {not changed or propagation_round < max_propagation_rounds})")
-            
-            # STEP 2: For remaining 'patch' vertices, use distance-based fallback
-            remaining_patches = [vi for vi in boundary_verts if boundary_surface.get(vi) == 'patch']
-            
-            if len(remaining_patches) > 0 and (part_mesh is not None or hull_mesh is not None):
-                patch_positions = vertices[remaining_patches]
+            if is_secondary_surface:
+                # SECONDARY: Make all patch vertices free (hull with reproject_to_hull=False)
+                for vi in boundary_verts:
+                    if boundary_surface.get(vi) == 'patch':
+                        boundary_surface[vi] = 'hull'  # Free (reproject_to_hull=False)
+                logger.info(f"Secondary surface: {patch_count} patch vertices set to free (no distance fallback)")
+            else:
+                # PRIMARY: Use neighbor propagation + distance fallback
+                # Build boundary adjacency to find neighbors along boundary edges
+                boundary_adjacency = {v: set() for v in boundary_verts}
+                for v0, v1 in boundary_edges:
+                    boundary_adjacency[v0].add(v1)
+                    boundary_adjacency[v1].add(v0)
                 
-                # Build proximity queries
-                if part_mesh is not None and len(part_mesh.faces) > 0:
-                    part_prox = ProximityQuery(part_mesh)
-                    _, dist_to_part, _ = part_prox.on_surface(patch_positions)
-                else:
-                    dist_to_part = np.full(len(remaining_patches), np.inf)
+                # STEP 1: Propagate from already-classified vertices to their patch neighbors
+                # This uses the boundary chain topology rather than distance
+                # Use CONVERGENCE-BASED stopping: continue until no changes occur
+                # Maximum rounds is set very high as a safety limit only
+                propagated_count = 0
+                changed = True
+                max_propagation_rounds = len(boundary_verts)  # Worst case: propagate through entire chain
+                propagation_round = 0
                 
-                if hull_mesh is not None and len(hull_mesh.faces) > 0:
-                    hull_prox = ProximityQuery(hull_mesh)
-                    _, dist_to_hull, _ = hull_prox.on_surface(patch_positions)
-                else:
-                    dist_to_hull = np.full(len(remaining_patches), np.inf)
+                while changed and propagation_round < max_propagation_rounds:
+                    changed = False
+                    propagation_round += 1
+                    for vi in list(boundary_verts):
+                        if boundary_surface.get(vi) != 'patch':
+                            continue
+                        
+                        # Look at neighbors along boundary edges
+                        neighbors = boundary_adjacency.get(vi, set())
+                        neighbor_types = [boundary_surface.get(n) for n in neighbors if n in boundary_surface]
+                        
+                        # Count non-patch classifications (including propagated ones)
+                        part_neighbors = sum(1 for t in neighbor_types if t in ('part', 'closest_part', 'propagated_part'))
+                        hull_neighbors = sum(1 for t in neighbor_types if t in ('hull', 'closest_hull', 'propagated_hull'))
+                        
+                        # If ALL classified neighbors agree, propagate that classification
+                        if part_neighbors > 0 and hull_neighbors == 0:
+                            boundary_surface[vi] = 'propagated_part'
+                            changed = True
+                            propagated_count += 1
+                        elif hull_neighbors > 0 and part_neighbors == 0:
+                            boundary_surface[vi] = 'propagated_hull'
+                            changed = True
+                            propagated_count += 1
+                        # If neighbors disagree (mixed), leave as 'patch' for distance fallback
                 
-                for i, vi in enumerate(remaining_patches):
-                    if dist_to_part[i] < dist_to_hull[i]:
-                        boundary_surface[vi] = 'closest_part'
+                logger.info(f"Propagation classified {propagated_count} patch vertices in {propagation_round} rounds "
+                           f"(converged: {not changed or propagation_round < max_propagation_rounds})")
+                
+                # STEP 2: For remaining 'patch' vertices, use distance-based fallback
+                remaining_patches = [vi for vi in boundary_verts if boundary_surface.get(vi) == 'patch']
+                
+                if len(remaining_patches) > 0 and (part_mesh is not None or hull_mesh is not None):
+                    patch_positions = vertices[remaining_patches]
+                    
+                    # Build proximity queries
+                    if part_mesh is not None and len(part_mesh.faces) > 0:
+                        part_prox = ProximityQuery(part_mesh)
+                        _, dist_to_part, _ = part_prox.on_surface(patch_positions)
                     else:
-                        boundary_surface[vi] = 'closest_hull'
+                        dist_to_part = np.full(len(remaining_patches), np.inf)
+                    
+                    if hull_mesh is not None and len(hull_mesh.faces) > 0:
+                        hull_prox = ProximityQuery(hull_mesh)
+                        _, dist_to_hull, _ = hull_prox.on_surface(patch_positions)
+                    else:
+                        dist_to_hull = np.full(len(remaining_patches), np.inf)
+                    
+                    for i, vi in enumerate(remaining_patches):
+                        if dist_to_part[i] < dist_to_hull[i]:
+                            boundary_surface[vi] = 'closest_part'
+                        else:
+                            boundary_surface[vi] = 'closest_hull'
+                    
+                    logger.info(f"Distance fallback for {len(remaining_patches)} remaining patch vertices: "
+                               f"{sum(1 for vi in remaining_patches if boundary_surface[vi] == 'closest_part')} to part, "
+                               f"{sum(1 for vi in remaining_patches if boundary_surface[vi] == 'closest_hull')} to hull")
                 
-                logger.info(f"Distance fallback for {len(remaining_patches)} remaining patch vertices: "
-                           f"{sum(1 for vi in remaining_patches if boundary_surface[vi] == 'closest_part')} to part, "
-                           f"{sum(1 for vi in remaining_patches if boundary_surface[vi] == 'closest_hull')} to hull")
-            
-            # Summary of all fallback classifications
-            total_part = sum(1 for vi in boundary_verts if boundary_surface.get(vi) in ('propagated_part', 'closest_part'))
-            total_hull = sum(1 for vi in boundary_verts if boundary_surface.get(vi) in ('propagated_hull', 'closest_hull'))
-            logger.info(f"Total fallback classification: {total_part} to part, {total_hull} to hull")
+                # Summary of all fallback classifications
+                total_part = sum(1 for vi in boundary_verts if boundary_surface.get(vi) in ('propagated_part', 'closest_part'))
+                total_hull = sum(1 for vi in boundary_verts if boundary_surface.get(vi) in ('propagated_hull', 'closest_hull'))
+                logger.info(f"Total fallback classification: {total_part} to part, {total_hull} to hull")
         
         primary_count = 0  # Not used for primary surfaces
         closest_count = sum(1 for s in boundary_surface.values() if s.startswith('closest_'))
@@ -1457,6 +1476,13 @@ def smooth_membrane_with_boundary_reprojection(
         # === FALLBACK: DISTANCE-BASED CLASSIFICATION ===
         # This is the old method - may cause incorrect re-projection
         logger.warning("No vertex_boundary_type provided - using distance-based classification (may be inaccurate)")
+        
+        # For SECONDARY surfaces: prefer free-floating over distance-guessing.
+        # Only pin to part if clearly on it; everything else stays free.
+        # Distance-based primary detection is unreliable and can cause folding.
+        is_secondary_surface = reproject_to_primary and not reproject_to_hull
+        if is_secondary_surface:
+            logger.info("Secondary surface: using part-only distance classification (all other verts free)")
         
         # Tight tolerance for classification (which surface is this vertex ON)
         on_surface_tolerance = mesh_scale * ON_SURFACE_TOLERANCE_FRACTION
@@ -1477,11 +1503,13 @@ def smooth_membrane_with_boundary_reprojection(
         if part_proximity is not None:
             _, dist_to_part, _ = part_proximity.on_surface(boundary_positions)
         
-        if hull_proximity is not None:
-            _, dist_to_hull, _ = hull_proximity.on_surface(boundary_positions)
-        
-        if primary_proximity is not None:
-            _, dist_to_primary, _ = primary_proximity.on_surface(boundary_positions)
+        if not is_secondary_surface:
+            # Only compute hull/primary distances for primary surfaces
+            if hull_proximity is not None:
+                _, dist_to_hull, _ = hull_proximity.on_surface(boundary_positions)
+            
+            if primary_proximity is not None:
+                _, dist_to_primary, _ = primary_proximity.on_surface(boundary_positions)
         
         # Classify each boundary vertex based on distances
         for i, vi in enumerate(boundary_verts):
@@ -1489,27 +1517,34 @@ def smooth_membrane_with_boundary_reprojection(
             d_hull = dist_to_hull[i]
             d_primary = dist_to_primary[i]
             
-            # First, check if vertex is clearly ON one surface (within tight tolerance)
-            # Priority: primary > part > hull (for secondary surfaces touching primary)
-            if primary_proximity is not None and d_primary < on_surface_tolerance:
-                boundary_surface[vi] = 'primary'
-            elif d_part < on_surface_tolerance:
-                boundary_surface[vi] = 'part'
-            elif d_hull < on_surface_tolerance:
-                boundary_surface[vi] = 'hull'
-            else:
-                # Not clearly ON any surface - find the CLOSEST surface within max distance
-                min_dist = min(d_part, d_hull, d_primary if primary_proximity else np.inf)
-                
-                if min_dist < max_reproject_distance:
-                    if d_part == min_dist:
-                        boundary_surface[vi] = 'closest_part'
-                    elif d_hull == min_dist:
-                        boundary_surface[vi] = 'closest_hull'
-                    else:
-                        boundary_surface[vi] = 'closest_primary'
+            if is_secondary_surface:
+                # SECONDARY: Only pin to part if clearly on it. Everything else free.
+                if d_part < on_surface_tolerance:
+                    boundary_surface[vi] = 'part'
                 else:
-                    boundary_surface[vi] = 'patch'
+                    boundary_surface[vi] = 'hull'  # Free (reproject_to_hull=False)
+            else:
+                # PRIMARY: Full distance-based classification
+                # Priority: primary > part > hull (for secondary surfaces touching primary)
+                if primary_proximity is not None and d_primary < on_surface_tolerance:
+                    boundary_surface[vi] = 'primary'
+                elif d_part < on_surface_tolerance:
+                    boundary_surface[vi] = 'part'
+                elif d_hull < on_surface_tolerance:
+                    boundary_surface[vi] = 'hull'
+                else:
+                    # Not clearly ON any surface - find the CLOSEST surface within max distance
+                    min_dist = min(d_part, d_hull, d_primary if primary_proximity else np.inf)
+                    
+                    if min_dist < max_reproject_distance:
+                        if d_part == min_dist:
+                            boundary_surface[vi] = 'closest_part'
+                        elif d_hull == min_dist:
+                            boundary_surface[vi] = 'closest_hull'
+                        else:
+                            boundary_surface[vi] = 'closest_primary'
+                    else:
+                        boundary_surface[vi] = 'patch'
         
         part_count = sum(1 for s in boundary_surface.values() if s in ('part', 'closest_part'))
         hull_count = sum(1 for s in boundary_surface.values() if s in ('hull', 'closest_hull'))
@@ -1583,22 +1618,6 @@ def smooth_membrane_with_boundary_reprojection(
     hull_boundary_indices = np.array(hull_boundary_indices, dtype=np.int64)
     primary_boundary_indices = np.array(primary_boundary_indices, dtype=np.int64)
     
-    # Detect "transition vertices" - primary-bound vertices that have part-bound neighbors along boundary edges.
-    # These need dual re-projection: first to part, then to primary, to ensure smooth transition.
-    part_boundary_set = set(part_boundary_indices)
-    transition_vertex_indices = []
-    if len(primary_boundary_indices) > 0 and len(part_boundary_indices) > 0:
-        for vi in primary_boundary_indices:
-            neighbors_along_boundary = boundary_neighbors.get(vi, set())
-            # Check if any boundary neighbor is part-bound
-            if neighbors_along_boundary & part_boundary_set:
-                transition_vertex_indices.append(vi)
-    transition_vertex_indices = np.array(transition_vertex_indices, dtype=np.int64)
-    
-    if len(transition_vertex_indices) > 0:
-        logger.info(f"Detected {len(transition_vertex_indices)} transition vertices "
-                   f"(primary-bound with part-bound neighbors) for dual re-projection")
-    
     # Count how many boundary vertices are FREE (not re-projected anywhere)
     n_free_boundary = len(boundary_verts) - len(part_boundary_indices) - len(hull_boundary_indices) - len(primary_boundary_indices)
     
@@ -1607,14 +1626,16 @@ def smooth_membrane_with_boundary_reprojection(
                    f"{len(hull_boundary_indices)} hull, {len(primary_boundary_indices)} primary, "
                    f"{n_free_boundary} free")
     else:
-        logger.info(f"Batched re-projection: {len(part_boundary_indices)} part only "
-                   f"(hull re-projection disabled: {len(boundary_verts) - len(part_boundary_indices)} boundary verts free to move)")
+        logger.info(f"Batched re-projection: {len(part_boundary_indices)} part, "
+                   f"{len(primary_boundary_indices)} primary, "
+                   f"{n_free_boundary} free (hull re-projection disabled)")
     
     # Summary of what will happen during smoothing
-    logger.info(f"Smoothing summary: {len(part_boundary_indices)} verts re-projected to part, "
-               f"{len(interior_verts)} interior verts free, "
-               f"{len(boundary_verts) - len(part_boundary_indices)} other boundary verts "
-               f"{'re-projected to hull/primary' if reproject_to_hull else 'free to move'}")
+    logger.info(f"Smoothing summary: {len(part_boundary_indices)} part, "
+               f"{len(primary_boundary_indices)} primary, "
+               f"{len(hull_boundary_indices)} hull, "
+               f"{n_free_boundary} free, "
+               f"{len(interior_verts)} interior")
     
     # === Feature detection is now done inline for part boundary only ===
     # The new approach analyzes membrane-part connections directly rather than
@@ -2032,32 +2053,10 @@ def smooth_membrane_with_boundary_reprojection(
                 closest_pts, _, _ = hull_proximity.on_surface(hull_positions)
                 vertices[hull_boundary_indices] = closest_pts
         
-        # Re-project to primary mesh (for secondary surfaces, excluding concave corners)
+        # Re-project to primary mesh (for secondary surfaces)
+        # Each vertex goes to exactly ONE target based on its classification — no dual re-projection.
         if len(primary_boundary_indices) > 0 and primary_mesh is not None:
-            # DUAL RE-PROJECTION for transition vertices:
-            # Vertices on edges connecting to part-bound vertices need to be projected
-            # to part FIRST, then to primary. This ensures the secondary membrane
-            # maintains a smooth transition at the part boundary interface.
-            if len(transition_vertex_indices) > 0 and part_mesh is not None:
-                if part_feature_types is not None:
-                    # Use feature-aware reprojection for transition vertices to part
-                    vertices = reproject_with_feature_awareness(
-                        vertices=vertices,
-                        boundary_indices=transition_vertex_indices,
-                        target_mesh=part_mesh,
-                        feature_types=part_feature_types,
-                        sharp_edge_info=part_sharp_edge_info,
-                        search_radius=search_radius
-                    )
-                elif part_proximity is not None:
-                    # Fallback to standard reprojection
-                    transition_positions = vertices[transition_vertex_indices]
-                    closest_pts, _, _ = part_proximity.on_surface(transition_positions)
-                    vertices[transition_vertex_indices] = closest_pts
-            
-            # Now project ALL primary vertices to primary mesh (including transition vertices)
             if primary_feature_types is not None:
-                # Use feature-aware reprojection to skip concave corners
                 vertices = reproject_with_feature_awareness(
                     vertices=vertices,
                     boundary_indices=primary_boundary_indices,
@@ -2067,7 +2066,6 @@ def smooth_membrane_with_boundary_reprojection(
                     search_radius=search_radius
                 )
             elif primary_proximity is not None:
-                # Fallback to standard reprojection
                 primary_positions = vertices[primary_boundary_indices]
                 closest_pts, _, _ = primary_proximity.on_surface(primary_positions)
                 vertices[primary_boundary_indices] = closest_pts

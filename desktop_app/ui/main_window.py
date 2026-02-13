@@ -2677,9 +2677,12 @@ class PrimarySurfaceExtractionWorker(QThread):
             if result.vertex_boundary_type is not None:
                 n_part = np.sum(result.vertex_boundary_type == -1)
                 n_hull = np.sum(result.vertex_boundary_type == 1) + np.sum(result.vertex_boundary_type == 2)
+                n_primary_junc = np.sum(result.vertex_boundary_type == 3)
                 n_interior = np.sum(result.vertex_boundary_type == 0)
-                self.progress.emit(f"Boundary classification: {n_part} inner (M), "
-                                 f"{n_hull} outer (∂H), {n_interior} interior")
+                msg = f"Boundary classification: {n_part} inner (M), {n_hull} outer (∂H), {n_interior} interior"
+                if n_primary_junc > 0:
+                    msg += f", {n_primary_junc} primary junction"
+                self.progress.emit(msg)
             
             # =====================================================================
             # STEP 4: Remove small disconnected islands (noise fragments)
@@ -2701,13 +2704,10 @@ class PrimarySurfaceExtractionWorker(QThread):
                 result.mesh = cleaned_result.mesh
                 result.num_vertices = cleaned_result.num_vertices
                 result.num_faces = cleaned_result.num_faces
-                # vertex_boundary_type may be None after island removal
-                # but we can try to preserve it if only the main component remains
-                if cleaned_result.num_vertices == repaired_result.num_vertices:
-                    result.vertex_boundary_type = repaired_result.vertex_boundary_type
-                else:
-                    result.vertex_boundary_type = None
-                    self.progress.emit("Note: boundary type info invalidated by island removal")
+                # Update vertex_boundary_type from cleaned result
+                # (remove_small_islands now preserves it through compaction)
+                if cleaned_result.vertex_boundary_type is not None:
+                    result.vertex_boundary_type = cleaned_result.vertex_boundary_type
             
             # =====================================================================
             # STEP 5: Fix normals for consistent orientation
@@ -2853,13 +2853,15 @@ class SecondarySurfaceExtractionWorker(QThread):
             if self.part_mesh is not None:
                 repaired_result = repair_parting_surface_with_part(
                     extraction_result,
-                    self.part_mesh
+                    self.part_mesh,
+                    is_secondary=True  # Use part-priority merge for secondary
                 )
             else:
                 repaired_result = repair_parting_surface(
                     extraction_result,
                     merge_vertices=True,
-                    merge_threshold=1e-8
+                    merge_threshold=1e-8,
+                    is_secondary=True  # Use part-priority merge for secondary
                 )
             
             result.repair_time_ms = (time.time() - repair_start) * 1000
@@ -2898,7 +2900,10 @@ class SecondarySurfaceExtractionWorker(QThread):
                 result.mesh = cleaned_result.mesh
                 result.num_vertices = cleaned_result.num_vertices
                 result.num_faces = cleaned_result.num_faces
-                # Note: vertex_boundary_type may be None after island removal
+                # Update vertex_boundary_type from cleaned result
+                # (remove_small_islands now preserves it through compaction)
+                if cleaned_result.vertex_boundary_type is not None:
+                    result.vertex_boundary_type = cleaned_result.vertex_boundary_type
             
             result.total_time_ms = (time.time() - total_start) * 1000
             
@@ -3269,26 +3274,28 @@ class CombinedSurfaceSmoothingWorker(QThread):
         #   - Other boundary vertices → re-project to primary membrane if close
         #   - Interior vertices → free to smooth
         if self.smooth_iterations > 0:
-            self.progress.emit(f"{label}: Two-phase smoothing ({self.smooth_iterations} iters, λ={self.damping_factor})...")
-            if primary_mesh is not None:
+            has_primary = primary_mesh is not None and len(primary_mesh.faces) > 0
+            if has_primary:
+                self.progress.emit(f"{label}: Two-phase smoothing ({self.smooth_iterations} iters, λ={self.damping_factor})...")
                 self.progress.emit(f"{label}: Re-projecting to part mesh + primary membrane")
             else:
-                self.progress.emit(f"{label}: Re-projecting to part mesh only (no primary mesh available)")
+                self.progress.emit(f"{label}: Two-phase smoothing ({self.smooth_iterations} iters, λ={self.damping_factor})...")
+                self.progress.emit(f"{label}: Re-projecting to part mesh only (no primary available)")
             
             smoothing_start = time.time()
             
             smoothing_result = smooth_membrane_with_boundary_reprojection(
                 current_mesh,
                 part_mesh=part_mesh,
-                hull_mesh=hull_mesh,
-                primary_mesh=primary_mesh,  # Pass primary mesh for secondary boundary re-projection
+                hull_mesh=None,              # No hull re-projection for secondary
+                primary_mesh=primary_mesh,   # Re-project non-part boundaries to primary
                 iterations=self.smooth_iterations,
                 damping_factor=self.damping_factor,
                 excluded_vertices=None,
                 vertex_boundary_type=current_boundary_type,
                 feature_aware_smoothing=self.feature_aware_smoothing,
-                reproject_to_hull=False,  # Secondary: don't re-project to hull
-                reproject_to_primary=True  # Secondary: re-project non-part boundaries to primary
+                reproject_to_hull=False,          # Secondary: don't re-project to hull
+                reproject_to_primary=has_primary   # Secondary: re-project to primary if available
             )
             
             smoothing_time_ms = (time.time() - smoothing_start) * 1000
@@ -3491,97 +3498,6 @@ class SurfacePropagationWorker(QThread):
             
         except Exception as e:
             logger.exception("Error in surface propagation: %s", e)
-            self.error.emit(str(e))
-
-
-class MembraneSmoothingWorker(QThread):
-    """Background worker for boundary-aware membrane smoothing."""
-    
-    progress = pyqtSignal(str)
-    complete = pyqtSignal(object)  # SmoothingResult
-    error = pyqtSignal(str)
-    
-    def __init__(self, membrane_mesh, part_mesh=None, hull_mesh=None, primary_mesh=None,
-                 iterations: int = 5, damping_factor: float = 0.5, feature_aware_smoothing: bool = True):
-        """
-        Initialize membrane smoothing worker.
-        
-        Args:
-            membrane_mesh: The membrane surface to smooth (primary or secondary)
-            part_mesh: The part/object mesh M for boundary re-projection
-            hull_mesh: The hull mesh ∂H for boundary re-projection
-            primary_mesh: The primary parting surface for secondary smoothing (re-projection)
-            iterations: Number of alternating smooth/re-project iterations
-            damping_factor: Smoothing damping factor (0.5 recommended)
-            feature_aware_smoothing: If True, detect and preserve concave corners
-        """
-        super().__init__()
-        self.membrane_mesh = membrane_mesh
-        self.part_mesh = part_mesh
-        self.hull_mesh = hull_mesh
-        self.primary_mesh = primary_mesh
-        self.iterations = iterations
-        self.damping_factor = damping_factor
-        self.feature_aware_smoothing = feature_aware_smoothing
-    
-    def run(self):
-        try:
-            from core.surface_propagation import smooth_membrane_with_boundary_reprojection
-            import time
-            
-            start_time = time.time()
-            
-            self.progress.emit(f"Smoothing membrane ({self.iterations} iterations, λ={self.damping_factor})...")
-            
-            result = smooth_membrane_with_boundary_reprojection(
-                self.membrane_mesh,
-                part_mesh=self.part_mesh,
-                hull_mesh=self.hull_mesh,
-                primary_mesh=self.primary_mesh,
-                iterations=self.iterations,
-                damping_factor=self.damping_factor,
-                feature_aware_smoothing=self.feature_aware_smoothing
-            )
-            
-            # Fill floating edge gaps after smoothing
-            if result.mesh is not None and self.part_mesh is not None:
-                from core.parting_surface import create_robust_collar_extension
-                
-                self.progress.emit("Creating robust collar extension...")
-                # Pass hull_mesh for accurate inner/outer boundary classification
-                fill_result = create_robust_collar_extension(
-                    membrane_mesh=result.mesh,
-                    part_mesh=self.part_mesh,
-                    hull_mesh=self.hull_mesh,
-                    vertex_boundary_type=None,  # Use distance-based detection
-                    collar_depth=0.5,
-                    fan_subdivisions=4
-                )
-                
-                if fill_result.fill_triangles_added > 0:
-                    self.progress.emit(f"Created collar: "
-                                     f"{fill_result.fill_triangles_added} triangles")
-                    if fill_result.mesh is not None:
-                        result.mesh = fill_result.mesh
-                        result.final_vertices = len(fill_result.mesh.vertices)
-                else:
-                    self.progress.emit("No inner boundary edges found")
-            
-            elapsed = (time.time() - start_time) * 1000
-            
-            if result.mesh is not None:
-                self.progress.emit(
-                    f"Complete: {result.final_vertices:,} vertices "
-                    f"({result.boundary_vertices} boundary, {result.interior_vertices} interior) "
-                    f"in {elapsed:.0f}ms"
-                )
-            else:
-                self.progress.emit("Smoothing failed - no mesh output")
-            
-            self.complete.emit(result)
-            
-        except Exception as e:
-            logger.exception("Error in membrane smoothing: %s", e)
             self.error.emit(str(e))
 
 
@@ -8567,6 +8483,16 @@ class MainWindow(QMainWindow):
                     self.mesh_viewer.set_secondary_parting_surface(self._secondary_surface_result.mesh)
                     self.display_options.show_parting_surface_options(show_primary=True, show_secondary=True)
         
+        # =====================================================================
+        # REPAIR: Reconstruct vertex_boundary_type for old sessions
+        #
+        # Sessions saved with older code may have vertex_boundary_type=None
+        # because remove_small_islands() used to discard it. Reconstruct it
+        # from geometry (proximity to part mesh and hull mesh) so that the
+        # smoothing step can correctly classify boundary vertices.
+        # =====================================================================
+        self._reconstruct_missing_vertex_boundary_types()
+        
         # Restore registration noise result
         if session.get('registration_noise_result'):
             self._registration_noise_result = type('Result', (), {})()
@@ -8827,6 +8753,119 @@ class MainWindow(QMainWindow):
             self.display_options.raise_()  # Bring to front
         
         logger.info(f"Session restored, active step: {self._active_step}")
+
+    def _reconstruct_missing_vertex_boundary_types(self):
+        """
+        Reconstruct vertex_boundary_type arrays for extraction results that are missing them.
+        
+        Old sessions (saved before the remove_small_islands fix) may have
+        vertex_boundary_type=None. This reconstructs it using proximity queries
+        to part mesh and hull mesh, which is the same approach as the distance-based
+        fallback in the smoother — but done once at load time so the smoother
+        receives proper classification.
+        
+        For each surface vertex:
+          - If closest to part mesh → -1 (part boundary)
+          - If closest to hull mesh → 1 (hull boundary)  
+          - Otherwise → 0 (interior)
+          
+        For secondary surfaces with a primary surface available:
+          - Vertices close to the primary surface → 3 (primary junction)
+        """
+        part_mesh = self._current_mesh
+        hull_mesh = self._hull_result.mesh if self._hull_result is not None else None
+        primary_mesh = (self._parting_surface_result.mesh 
+                       if self._parting_surface_result is not None and
+                       hasattr(self._parting_surface_result, 'mesh') and
+                       self._parting_surface_result.mesh is not None
+                       else None)
+        
+        if part_mesh is None:
+            return
+        
+        surfaces_to_repair = []
+        
+        # Check primary extraction result
+        if (self._parting_surface_result is not None and
+            hasattr(self._parting_surface_result, 'mesh') and
+            self._parting_surface_result.mesh is not None):
+            vbt = getattr(self._parting_surface_result, 'vertex_boundary_type', None)
+            n_verts = len(self._parting_surface_result.mesh.vertices)
+            if vbt is None or len(vbt) != n_verts:
+                surfaces_to_repair.append(('primary', self._parting_surface_result))
+        
+        # Check secondary extraction result
+        if (self._secondary_surface_result is not None and
+            hasattr(self._secondary_surface_result, 'mesh') and
+            self._secondary_surface_result.mesh is not None):
+            vbt = getattr(self._secondary_surface_result, 'vertex_boundary_type', None)
+            n_verts = len(self._secondary_surface_result.mesh.vertices)
+            if vbt is None or len(vbt) != n_verts:
+                surfaces_to_repair.append(('secondary', self._secondary_surface_result))
+        
+        if not surfaces_to_repair:
+            return
+        
+        logger.info(f"Reconstructing vertex_boundary_type for {len(surfaces_to_repair)} surface(s) from old session")
+        
+        try:
+            from trimesh.proximity import ProximityQuery
+            
+            part_proximity = ProximityQuery(part_mesh)
+            hull_proximity = ProximityQuery(hull_mesh) if hull_mesh is not None else None
+            # Build primary proximity only for secondary surface reconstruction
+            primary_proximity = ProximityQuery(primary_mesh) if primary_mesh is not None else None
+            
+            for label, result in surfaces_to_repair:
+                mesh = result.mesh
+                n_verts = len(mesh.vertices)
+                vertices = np.array(mesh.vertices)
+                
+                # Compute distances to part and hull
+                _, dist_to_part, _ = part_proximity.on_surface(vertices)
+                
+                if hull_proximity is not None:
+                    _, dist_to_hull, _ = hull_proximity.on_surface(vertices)
+                else:
+                    dist_to_hull = np.full(n_verts, np.inf)
+                
+                # For secondary surfaces, also compute distance to primary
+                dist_to_primary = np.full(n_verts, np.inf)
+                if label == 'secondary' and primary_proximity is not None:
+                    _, dist_to_primary, _ = primary_proximity.on_surface(vertices)
+                
+                # Classify: closer to part → -1, closer to hull → 1/2, else → 0
+                # Use a tolerance based on mesh scale
+                mesh_scale = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
+                on_surface_tol = mesh_scale * 0.02  # 2% of bbox diagonal
+                
+                vbt = np.zeros(n_verts, dtype=np.int8)
+                
+                for i in range(n_verts):
+                    dp = dist_to_part[i]
+                    dh = dist_to_hull[i]
+                    dpr = dist_to_primary[i]
+                    
+                    if dp < on_surface_tol and dp <= dh and dp <= dpr:
+                        vbt[i] = -1  # Part boundary
+                    elif label == 'secondary' and dpr < on_surface_tol and dpr < dp:
+                        vbt[i] = 3   # Primary junction (secondary only)
+                    elif dh < on_surface_tol and dh < dp:
+                        vbt[i] = 1   # Hull boundary
+                    else:
+                        vbt[i] = 0   # Interior
+                
+                result.vertex_boundary_type = vbt
+                
+                n_part = np.sum(vbt == -1)
+                n_hull = np.sum((vbt == 1) | (vbt == 2))
+                n_primary_junc = np.sum(vbt == 3)
+                n_interior = np.sum(vbt == 0)
+                logger.info(f"Reconstructed {label} vertex_boundary_type: "
+                           f"{n_part} part, {n_hull} hull, {n_primary_junc} primary junction, "
+                           f"{n_interior} interior (from {n_verts} vertices)")
+        except Exception as e:
+            logger.warning(f"Failed to reconstruct vertex_boundary_type: {e}")
 
     def _on_view_changed(self, view: str):
         """Handle view change from title bar."""
@@ -11624,9 +11663,12 @@ class MainWindow(QMainWindow):
             if secondary_result.vertex_boundary_type is not None:
                 n_part = np.sum(secondary_result.vertex_boundary_type == -1)
                 n_hull = np.sum(secondary_result.vertex_boundary_type == 1) + np.sum(secondary_result.vertex_boundary_type == 2)
+                n_primary_junc = np.sum(secondary_result.vertex_boundary_type == 3)
                 n_interior = np.sum(secondary_result.vertex_boundary_type == 0)
                 secondary_info.add_row(f'Boundary (M): {n_part:,} verts')
                 secondary_info.add_row(f'Boundary (∂H): {n_hull:,} verts')
+                if n_primary_junc > 0:
+                    secondary_info.add_row(f'Primary junction: {n_primary_junc:,} verts')
                 secondary_info.add_row(f'Interior: {n_interior:,} verts')
             
             self.context_layout.addWidget(secondary_info)
