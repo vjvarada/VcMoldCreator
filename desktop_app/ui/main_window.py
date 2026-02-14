@@ -1328,9 +1328,7 @@ class ExportWorker(QThread):
         try:
             from core.export_artifacts import export_artifacts
             
-            self.progress.emit("Creating export directory...")
-            
-            self.progress.emit("Exporting STL files...")
+            self.progress.emit("Exporting STL files and metadata...")
             result = export_artifacts(
                 export_dir=self.export_dir,
                 shell_half_1=self.shell_half_1,
@@ -7644,6 +7642,10 @@ class MainWindow(QMainWindow):
         
         self._update_resin_channels_step_ui()
         self.step_buttons[Step.RESIN_CHANNELS].set_status('completed')
+        
+        # Unlock export step now that resin channels are done
+        if Step.EXPORT in self.step_buttons:
+            self.step_buttons[Step.EXPORT].set_status('available')
     
     def _on_resin_channels_error(self, message: str):
         if hasattr(self, 'resin_channels_progress_label'):
@@ -7707,10 +7709,10 @@ class MainWindow(QMainWindow):
         info_group.setLayout(info_layout)
 
         artifacts = [
-            ("🏠 Hard Shell Half 1", self._get_export_shell_half_1() is not None),
-            ("🏠 Hard Shell Half 2", self._get_export_shell_half_2() is not None),
-            ("🧊 Metamold Half 1", self._get_export_metamold_half_1() is not None),
-            ("🧊 Metamold Half 2", self._get_export_metamold_half_2() is not None),
+            ("🏠 Hard Shell Half 1", self._get_export_shell_half(1) is not None),
+            ("🏠 Hard Shell Half 2", self._get_export_shell_half(2) is not None),
+            ("🧊 Metamold Half 1", self._get_export_metamold_half(1) is not None),
+            ("🧊 Metamold Half 2", self._get_export_metamold_half(2) is not None),
             ("🔌 Pouring Plug", self._get_export_plug() is not None),
         ]
 
@@ -7760,45 +7762,38 @@ class MainWindow(QMainWindow):
 
         self._update_export_step_ui()
 
-    def _get_export_shell_half_1(self) -> 'Optional[trimesh.Trimesh]':
-        """Get the final shell half 1 (with through-holes if drilled)."""
+    def _get_export_shell_half(self, half: int) -> 'Optional[trimesh.Trimesh]':
+        """Get the final shell half (with through-holes if drilled).
+
+        Args:
+            half: Which half to get (1 or 2).
+
+        Returns:
+            The best available shell half mesh, or None.
+        """
         if (self._resin_channel_result is not None and
             self._resin_channel_result.success and
-            self._resin_channel_result.shell_half_modified == 1 and
+            self._resin_channel_result.shell_half_modified == half and
             self._resin_channel_result.modified_shell_mesh is not None):
             return self._resin_channel_result.modified_shell_mesh
-        return self._shell_half_1
+        return self._shell_half_1 if half == 1 else self._shell_half_2
 
-    def _get_export_shell_half_2(self) -> 'Optional[trimesh.Trimesh]':
-        """Get the final shell half 2 (with through-holes if drilled)."""
-        if (self._resin_channel_result is not None and
-            self._resin_channel_result.success and
-            self._resin_channel_result.shell_half_modified == 2 and
-            self._resin_channel_result.modified_shell_mesh is not None):
-            return self._resin_channel_result.modified_shell_mesh
-        return self._shell_half_2
+    def _get_export_metamold_half(self, half: int) -> 'Optional[trimesh.Trimesh]':
+        """Get the final metamold half (with channels if created).
 
-    def _get_export_metamold_half_1(self) -> 'Optional[trimesh.Trimesh]':
-        """Get the final metamold half 1 (with channels if created)."""
+        Args:
+            half: Which half to get (1 or 2).
+
+        Returns:
+            The best available metamold half mesh, or None.
+        """
         if (self._resin_channel_result is not None and
             self._resin_channel_result.success and
             self._resin_channel_result.mesh is not None):
-            if self._resin_channel_result.mold_half == 1:
+            if self._resin_channel_result.mold_half == half:
                 return self._resin_channel_result.mesh
-            else:
-                return self._resin_channel_other_half
-        return self._metamold_half_1_with_part
-
-    def _get_export_metamold_half_2(self) -> 'Optional[trimesh.Trimesh]':
-        """Get the final metamold half 2 (with channels if created)."""
-        if (self._resin_channel_result is not None and
-            self._resin_channel_result.success and
-            self._resin_channel_result.mesh is not None):
-            if self._resin_channel_result.mold_half == 2:
-                return self._resin_channel_result.mesh
-            else:
-                return self._resin_channel_other_half
-        return self._metamold_half_2_with_part
+            return self._resin_channel_other_half
+        return self._metamold_half_1_with_part if half == 1 else self._metamold_half_2_with_part
 
     def _get_export_plug(self) -> 'Optional[trimesh.Trimesh]':
         """Get the pouring plug mesh."""
@@ -7818,7 +7813,7 @@ class MainWindow(QMainWindow):
             self.export_stats.show()
 
             self.export_stats.add_header('Export Complete', Colors.SUCCESS)
-            self.export_stats.add_row(f'Directory: .tmp/')
+            self.export_stats.add_row(f'Directory: {result.export_dir}')
 
             if result.exported_files:
                 self.export_stats.add_row(f'Exported: {len(result.exported_files)} files')
@@ -7855,10 +7850,10 @@ class MainWindow(QMainWindow):
         export_dir = str(workspace_root / ".tmp" / model_name)
 
         # Gather final meshes
-        shell_half_1 = self._get_export_shell_half_1()
-        shell_half_2 = self._get_export_shell_half_2()
-        metamold_half_1 = self._get_export_metamold_half_1()
-        metamold_half_2 = self._get_export_metamold_half_2()
+        shell_half_1 = self._get_export_shell_half(1)
+        shell_half_2 = self._get_export_shell_half(2)
+        metamold_half_1 = self._get_export_metamold_half(1)
+        metamold_half_2 = self._get_export_metamold_half(2)
         plug_mesh = self._get_export_plug()
 
         hull_mesh = self._hull_result.mesh if self._hull_result is not None else None
@@ -9054,6 +9049,17 @@ class MainWindow(QMainWindow):
             Step.RESIN_CHANNELS in self.step_buttons and
             self.step_buttons[Step.RESIN_CHANNELS]._status == 'locked'):
             self.step_buttons[Step.RESIN_CHANNELS].set_status('available')
+        
+        # Ensure export step is available if we have exportable artifacts
+        # (handles sessions saved before this step was added)
+        if (Step.EXPORT in self.step_buttons and
+            self.step_buttons[Step.EXPORT]._status == 'locked'):
+            has_shells = (self._shell_half_1 is not None and
+                         self._shell_half_2 is not None)
+            has_metamolds = (self._metamold_half_1_with_part is not None and
+                            self._metamold_half_2_with_part is not None)
+            if has_shells or has_metamolds:
+                self.step_buttons[Step.EXPORT].set_status('available')
         
         # Restore active step
         active_step_val = session.get('active_step')

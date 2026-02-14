@@ -26,16 +26,15 @@ import numpy as np
 import trimesh
 from scipy.spatial import ConvexHull
 
+logger = logging.getLogger(__name__)
+
 # CSG operations via manifold3d
 try:
     import manifold3d
     MANIFOLD_AVAILABLE = True
 except ImportError:
     MANIFOLD_AVAILABLE = False
-    logger = logging.getLogger(__name__)
     logger.warning("manifold3d not available - CSG operations will be disabled")
-
-logger = logging.getLogger(__name__)
 
 
 # ============================================================================

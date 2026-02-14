@@ -19,13 +19,10 @@ from core.pouring_direction import (
     PouringDirectionResult as PouringDirResult,
     PersistencePair,
     evaluate_candidate_directions,
-    evaluate_candidate_directions_gpu,
     score_pouring_direction,
     compute_persistence_pairs,
     find_mold_aware_pouring_directions,
     MoldAwarePouringDirections,
-    CUDA_AVAILABLE as POURING_CUDA_AVAILABLE,
-    TORCH_AVAILABLE as POURING_TORCH_AVAILABLE,
 )
 from core.inflated_hull import (
     generate_inflated_hull,
@@ -90,6 +87,21 @@ from core.mold_fabrication import (
     OuterShellHullResult,
     OuterCollarResult,
 )
+from core.registration_marks import (
+    apply_registration_noise,
+    SinusoidalRegistrationResult,
+)
+from core.resin_channels import (
+    ResinChannelResult,
+)
+from core.export_artifacts import (
+    export_artifacts,
+    compute_volume_metadata,
+    generate_metadata_text,
+    ExportArtifact,
+    VolumeMetadata,
+    ExportResult,
+)
 
 __all__ = [
     'STLLoader',
@@ -148,6 +160,7 @@ __all__ = [
     'smooth_parting_surface',
     'repair_parting_surface',
     'remove_small_boundary_loops',
+    'remove_small_islands',
     'close_parting_surface_gaps',
     'PartingSurfaceResult',
     'SmallHoleRemovalResult',
@@ -171,5 +184,17 @@ __all__ = [
     'extend_membrane_height',
     'OuterShellHullResult',
     'OuterCollarResult',
+    # Registration marks
+    'apply_registration_noise',
+    'SinusoidalRegistrationResult',
+    # Resin channels
+    'ResinChannelResult',
+    # Export artifacts
+    'export_artifacts',
+    'compute_volume_metadata',
+    'generate_metadata_text',
+    'ExportArtifact',
+    'VolumeMetadata',
+    'ExportResult',
 ]
 

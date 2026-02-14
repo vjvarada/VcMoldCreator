@@ -19,13 +19,11 @@ Metadata file:
 """
 
 import logging
-import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
 
-import numpy as np
 import trimesh
 
 logger = logging.getLogger(__name__)
@@ -74,6 +72,28 @@ class ExportResult:
 # VOLUME COMPUTATION
 # ============================================================================
 
+def _safe_mesh_volume(mesh: Optional[trimesh.Trimesh], label: str) -> float:
+    """Compute the volume of a mesh, falling back to convex hull if not watertight.
+
+    Args:
+        mesh: The mesh to compute volume for, or None.
+        label: Human-readable label for log messages (e.g. 'hull', 'part').
+
+    Returns:
+        Absolute volume in mesh units (mm³), or 0.0 if mesh is None or fails.
+    """
+    if mesh is None:
+        return 0.0
+    try:
+        if mesh.is_watertight:
+            return abs(float(mesh.volume))
+        logger.warning("%s mesh is not watertight; using convex hull volume as approximation", label)
+        return abs(float(mesh.convex_hull.volume))
+    except Exception as e:
+        logger.warning("Could not compute %s volume: %s", label, e)
+        return 0.0
+
+
 def compute_volume_metadata(
     hull_mesh: Optional[trimesh.Trimesh],
     part_mesh: Optional[trimesh.Trimesh],
@@ -95,37 +115,9 @@ def compute_volume_metadata(
         All volumes in mm³ (assuming mesh units are mm).
     """
     metadata = VolumeMetadata()
-
-    if hull_mesh is not None:
-        try:
-            if hull_mesh.is_watertight:
-                metadata.hull_volume_mm3 = abs(float(hull_mesh.volume))
-            else:
-                # Use convex hull volume as approximation
-                metadata.hull_volume_mm3 = abs(float(hull_mesh.convex_hull.volume))
-                logger.warning("Hull mesh is not watertight; using convex hull volume as approximation")
-        except Exception as e:
-            logger.warning("Could not compute hull volume: %s", e)
-
-    if part_mesh is not None:
-        try:
-            if part_mesh.is_watertight:
-                metadata.part_volume_mm3 = abs(float(part_mesh.volume))
-            else:
-                metadata.part_volume_mm3 = abs(float(part_mesh.convex_hull.volume))
-                logger.warning("Part mesh is not watertight; using convex hull volume as approximation")
-        except Exception as e:
-            logger.warning("Could not compute part volume: %s", e)
-
-    if plug_mesh is not None:
-        try:
-            if plug_mesh.is_watertight:
-                metadata.plug_volume_mm3 = abs(float(plug_mesh.volume))
-            else:
-                metadata.plug_volume_mm3 = abs(float(plug_mesh.convex_hull.volume))
-                logger.warning("Plug mesh is not watertight; using convex hull volume as approximation")
-        except Exception as e:
-            logger.warning("Could not compute plug volume: %s", e)
+    metadata.hull_volume_mm3 = _safe_mesh_volume(hull_mesh, "Hull")
+    metadata.part_volume_mm3 = _safe_mesh_volume(part_mesh, "Part")
+    metadata.plug_volume_mm3 = _safe_mesh_volume(plug_mesh, "Plug")
 
     # Derived volumes
     metadata.silicone_volume_mm3 = max(
@@ -257,7 +249,8 @@ def export_artifacts(
 
     try:
         # Create export directory
-        os.makedirs(export_dir, exist_ok=True)
+        export_path = Path(export_dir)
+        export_path.mkdir(parents=True, exist_ok=True)
         result.export_dir = export_dir
         logger.info("Export directory: %s", export_dir)
 
@@ -273,8 +266,8 @@ def export_artifacts(
         # Export each artifact
         for artifact in artifacts:
             if artifact.mesh is not None:
-                filepath = os.path.join(export_dir, artifact.filename)
-                artifact.mesh.export(filepath, file_type='stl')
+                filepath = export_path / artifact.filename
+                artifact.mesh.export(str(filepath), file_type='stl')
                 result.exported_files.append(artifact.filename)
                 logger.info("Exported %s: %s (%d verts, %d faces)",
                            artifact.description, artifact.filename,
@@ -293,9 +286,8 @@ def export_artifacts(
             model_name=model_name,
             exported_files=result.exported_files,
         )
-        metadata_path = os.path.join(export_dir, "metadata.txt")
-        with open(metadata_path, 'w', encoding='utf-8') as f:
-            f.write(metadata_text)
+        metadata_path = export_path / "metadata.txt"
+        metadata_path.write_text(metadata_text, encoding='utf-8')
         result.metadata_file = "metadata.txt"
         logger.info("Metadata written to %s", metadata_path)
 

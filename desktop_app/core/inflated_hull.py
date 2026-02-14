@@ -157,13 +157,8 @@ def _compute_smooth_vertex_normals_gpu(
     normal_accum = torch.zeros((num_vertices, 3), dtype=torch.float64, device=device)
     
     # For each corner of each face, accumulate the weighted normal
-    # Flatten: each face contributes to 3 vertices
-    # indices: (F*3,) - vertex indices to scatter to
-    # values: (F*3, 3) - weighted normals repeated 3 times per face
-    indices = faces_t.flatten()  # (F*3,)
-    values = weighted_normals.repeat_interleave(3, dim=0).reshape(-1, 3)  # This doesn't work right
-    
-    # Better approach: scatter each corner separately
+    # Scatter each corner's weighted normal to its vertex
+    # (flatten+repeat_interleave was incorrect; scatter per corner is correct)
     for corner in range(3):
         corner_indices = faces_t[:, corner].unsqueeze(1).expand(-1, 3)  # (F, 3)
         normal_accum.scatter_add_(0, corner_indices, weighted_normals)

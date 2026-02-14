@@ -83,8 +83,6 @@ def apply_registration_noise(
     band_width_fraction: float = DEFAULT_BAND_WIDTH_FRACTION,
     noise_amplitude_mm: float = DEFAULT_AMPLITUDE_MM,
     noise_interval_mm: float = DEFAULT_WAVELENGTH_MM,
-    pattern_type: str = "sinusoidal",  # Ignored, kept for API compatibility
-    seed: int = 42,  # Ignored, kept for API compatibility
     smoothing_iterations: int = DEFAULT_SMOOTHING_ITERATIONS
 ) -> SinusoidalRegistrationResult:
     """
@@ -105,8 +103,6 @@ def apply_registration_noise(
         band_width_fraction: Fraction of bbox diagonal for band width
         noise_amplitude_mm: Pattern amplitude in mm (gives +/- this displacement)
         noise_interval_mm: Wavelength (distance between ridge peaks) in mm
-        pattern_type: Ignored (kept for API compatibility)
-        seed: Ignored (kept for API compatibility)
         smoothing_iterations: Number of Laplacian smoothing passes on pattern values
     
     Returns:

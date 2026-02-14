@@ -31,7 +31,7 @@ class STLLoader:
     Uses trimesh library for robust STL parsing and initial mesh construction.
     """
     
-    SUPPORTED_EXTENSIONS = {'.stl', '.STL'}
+    SUPPORTED_EXTENSIONS = {'.stl'}
     
     def __init__(self):
         self._last_result: Optional[LoadResult] = None

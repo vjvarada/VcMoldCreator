@@ -63,14 +63,8 @@ from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
 N_CPU_CORES = multiprocessing.cpu_count()
 
-# Check if C++ fast_algorithms is available (already compiled for this project)
-try:
-    from . import fast_algorithms as _cpp
-    HAS_CPP = True
-    logger.info("C++ fast_algorithms available for acceleration")
-except ImportError:
-    HAS_CPP = False
-    _cpp = None
+# Note: C++ fast_algorithms acceleration is available via tetrahedral_mesh.py
+# and fast_algorithms_wrapper.py. Pouring direction uses ThreadPoolExecutor instead.
 
 
 # ============================================================================
