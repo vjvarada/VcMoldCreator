@@ -1,19 +1,42 @@
 # Core module for mesh operations
-from core.stl_loader import STLLoader, load_stl_file, LoadResult
+from core.stl_loader import (
+    STLLoader,
+    load_stl_file,
+    LoadResult,
+    ValidationError,
+    validate_stl_path,
+)
 from core.mesh_analysis import (
     MeshAnalyzer,
     MeshDiagnostics,
+    BoundingBox,
     compute_height_field,
     build_vertex_neighbors,
     build_face_neighbors,
 )
-from core.mesh_repair import MeshRepairer, MeshRepairResult, is_meshlib_available
+from core.mesh_repair import (
+    MeshRepairer,
+    MeshRepairResult,
+    RepairMethod,
+    RepairContext,
+    is_meshlib_available,
+    trimesh_to_meshlib,
+    meshlib_to_trimesh,
+)
 from core.parting_direction import (
     find_parting_directions,
     compute_visibility_paint,
     get_face_colors,
     PartingDirectionResult,
     VisibilityPaintData,
+    DirectionScore,
+    MeshTriangleData,
+    fibonacci_sphere,
+    extract_triangle_data,
+    PAINT_COLORS,
+    MIN_ANGLE_DEGREES,
+    MIN_ANGLE_COS,
+    PAIR_SELECTION_TOP_K,
 )
 from core.pouring_direction import (
     PouringDirectionResult as PouringDirResult,
@@ -27,14 +50,28 @@ from core.pouring_direction import (
 from core.inflated_hull import (
     generate_inflated_hull,
     compute_default_offset,
+    compute_bounding_box_diagonal,
     compute_smooth_vertex_normals,
     validate_manifold,
+    validate_input_mesh,
+    validate_offset,
+    inflate_vertices,
+    subdivide_mesh,
     InflatedHullResult,
     ManifoldValidation,
+    HullGenerationError,
+    DEFAULT_INFLATION_PERCENT,
+    DEFAULT_SUBDIVISION_ITERATIONS,
+    GPU_FACE_THRESHOLD,
 )
 from core.mold_half_classification import (
     classify_mold_halves,
     MoldHalfClassificationResult,
+    # Constants (Paper Section 4.1)
+    STRONG_ALIGNMENT_THRESHOLD,
+    DEFAULT_BOUNDARY_ZONE_THRESHOLD,
+    PAPER_BOUNDARY_ZONE_THRESHOLD,
+    ORPHAN_REGION_AREA_THRESHOLD,
 )
 from core.tetrahedral_mesh import (
     generate_tetrahedral_mesh,
@@ -51,8 +88,35 @@ from core.tetrahedral_mesh import (
     build_edge_to_index_map,
     build_tet_edge_indices,
     compute_cut_edge_flags,
+    # Edge weight functions (Paper Section 4.5)
+    compute_edge_weights_simple,
+    compute_edge_boundary_labels,
+    # Dijkstra and primary cut functions (Paper Section 4.5)
+    run_dijkstra_escape_labeling,
+    compute_primary_cut_edges,
+    propagate_vertex_labels,
+    smooth_vertex_labels,
+    filter_small_label_components,
+    detect_and_eliminate_tet_pockets,
+    break_cut_edge_loops,
+    build_vertex_adjacency_dict,
     TetrahedralMeshResult,
     PYTETWILD_AVAILABLE,
+    # Constants (Paper Section 4)
+    EDGE_WEIGHT_EPSILON,
+    DEFAULT_EDGE_LENGTH_FAC,
+    BOUNDARY_ZONE_THRESHOLD,
+    GPU_DISTANCE_FACE_THRESHOLD,
+    GPU_DISTANCE_BATCH_SIZE,
+    # Label smoothing constants (Tunnel Prevention)
+    LABEL_SMOOTH_ITERATIONS,
+    LABEL_SMOOTH_THRESHOLD,
+    MIN_COMPONENT_SIZE_ABSOLUTE,
+    MIN_COMPONENT_SIZE_FRACTION,
+    MIN_TET_COMPONENT_SIZE_ABSOLUTE,
+    MIN_TET_COMPONENT_SIZE_FRACTION,
+    MAX_CUT_VALENCE,
+    MAX_LABEL_PROPAGATION_ITERATIONS,
 )
 from core.parting_surface import (
     extract_parting_surface,
@@ -67,6 +131,17 @@ from core.parting_surface import (
     GapClosingResult,
     MARCHING_TET_TABLE,
     TET_EDGES,
+    # Cut point placement constants (Paper Section 4.3)
+    CUT_POINT_INTERPOLATION_MIN_T,
+    CUT_POINT_INTERPOLATION_MAX_T,
+    VERTEX_MERGE_EPSILON,
+    # Boundary type codes for vertex classification
+    BOUNDARY_TYPE_PART,
+    BOUNDARY_TYPE_INTERIOR,
+    BOUNDARY_TYPE_H1,
+    BOUNDARY_TYPE_H2,
+    BOUNDARY_TYPE_PRIMARY_JUNCTION,
+    BOUNDARY_TYPE_PRIMARY_THEN_PART,
 )
 from core.secondary_membrane import (
     classify_secondary_membranes_by_mold_half,
@@ -104,18 +179,27 @@ from core.export_artifacts import (
 )
 
 __all__ = [
+    # STL Loading
     'STLLoader',
     'load_stl_file',
     'LoadResult',
+    'ValidationError',
+    'validate_stl_path',
+    # Mesh Analysis
     'MeshAnalyzer',
     'MeshDiagnostics',
-    'MeshRepairer',
-    'MeshRepairResult',
-    'is_meshlib_available',
-    # Mesh analysis utilities
+    'BoundingBox',
     'compute_height_field',
     'build_vertex_neighbors',
     'build_face_neighbors',
+    # Mesh Repair
+    'MeshRepairer',
+    'MeshRepairResult',
+    'RepairMethod',
+    'RepairContext',
+    'is_meshlib_available',
+    'trimesh_to_meshlib',
+    'meshlib_to_trimesh',
     # Parting direction
     'find_parting_directions',
     'compute_visibility_paint',

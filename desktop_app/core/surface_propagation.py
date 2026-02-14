@@ -36,7 +36,7 @@ EDGE_WEIGHT_EPSILON = 0.25  # Minimum edge weight to prevent division issues
 MIN_TRIANGLE_AREA_FRACTION = 0.01  # Triangles with area < 1% of median are considered degenerate
 
 # Feature detection thresholds - only detect concave corners
-SHARP_EDGE_ANGLE_THRESHOLD = 30.0  # degrees - edges sharper than this are classified as "sharp"
+SHARP_EDGE_ANGLE_THRESHOLD = 60.0  # degrees - edges sharper than this are classified as "sharp"
 CORNER_SHARP_EDGE_COUNT = 2        # A vertex with >= this many sharp edges meeting is a "corner"
 
 

@@ -2,210 +2,383 @@
 Tetrahedral Mesh Generation for Mold Volume
 
 This module generates a tetrahedral mesh of the mold bounding volume using fTetWild
-via the pytetwild package.
+via the pytetwild package. This corresponds to Paper Section 4.
 
 The tetrahedral mesh replaces the voxel grid approach for:
 - More accurate volume representation
 - Better boundary conforming
 - Edge-based weight assignment for parting surface computation
 
-Algorithm:
-1. Tetrahedralize the complete bounding hull mesh
-2. Classify tetrahedra as inside or outside the part mesh (using centroid test)
-3. Filter to keep only tetrahedra in the mold cavity (outside the part)
+Algorithm (Paper Section 4):
+1. Tetrahedralize the complete bounding hull mesh ∂H
+2. Classify tetrahedra as inside or outside the part mesh M (using centroid test)
+3. Filter to keep only tetrahedra in the mold cavity O (outside the part)
 4. Build edge connectivity (walk graph) from the filtered tetrahedra
 5. Compute distances from tet vertices/edges to part surface and shell boundary
+6. Run Dijkstra escape labeling (Paper Section 4.5)
+7. Detect primary and secondary cut edges (Paper Sections 4.1, 4.2)
 
 The walk graph (edges from outside-part tetrahedra) is used for Dijkstra-based 
 escape labeling to find the parting surface.
+
+Key Functions:
+- generate_tetrahedral_mesh(): Main entry point
+- tetrahedralize_mesh(): fTetWild wrapper
+- run_dijkstra_escape_labeling(): Section 4.5 weighted geodesics
+- compute_cut_edge_flags(): Section 4.1 primary cuts
+- find_secondary_cutting_edges(): Section 4.2 secondary cuts
+
+Reference:
+    Alderighi et al., "Volume-Aware Design of Composite Molds", SIGGRAPH 2019
 """
 
 import logging
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Set
 import numpy as np
 import trimesh
 
-# Import pytetwild for tetrahedralization
-try:
-    import pytetwild
-    PYTETWILD_AVAILABLE = True
-except ImportError:
-    PYTETWILD_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
-# Log pytetwild availability
+
+# =============================================================================
+# DEPENDENCY DETECTION
+# =============================================================================
+
+def _check_pytetwild() -> bool:
+    """Check if pytetwild is available."""
+    try:
+        import pytetwild
+        return True
+    except ImportError:
+        return False
+
+
+def _check_torch() -> Tuple[bool, bool]:
+    """Check if PyTorch and CUDA are available."""
+    try:
+        import torch
+        return True, torch.cuda.is_available()
+    except ImportError:
+        return False, False
+
+
+def _check_cpp_fast() -> bool:
+    """Check if C++ fast_algorithms module is available."""
+    try:
+        from . import fast_algorithms
+        return True
+    except ImportError:
+        return False
+
+
+PYTETWILD_AVAILABLE = _check_pytetwild()
+TORCH_AVAILABLE, CUDA_AVAILABLE = _check_torch()
+CPP_FAST_AVAILABLE = _check_cpp_fast()
+
+# Import C++ module if available (for use in functions)
+_cpp_fast = None
+if CPP_FAST_AVAILABLE:
+    from . import fast_algorithms as _cpp_fast
+
+# Log availability
 if PYTETWILD_AVAILABLE:
     logger.info("pytetwild available for tetrahedralization")
 else:
-    logger.warning("pytetwild not available - tetrahedralization will fail. Install with: pip install pytetwild")
-
-# Check for GPU acceleration options
-try:
-    import torch
-    TORCH_AVAILABLE = True
-    CUDA_AVAILABLE = torch.cuda.is_available()
-except ImportError:
-    TORCH_AVAILABLE = False
-    CUDA_AVAILABLE = False
-
-# Check for C++ fast algorithms
-try:
-    from . import fast_algorithms as _cpp_fast
-    CPP_FAST_AVAILABLE = True
-except ImportError:
-    CPP_FAST_AVAILABLE = False
+    logger.warning(
+        "pytetwild not available - tetrahedralization will fail. "
+        "Install with: pip install pytetwild"
+    )
 
 if CPP_FAST_AVAILABLE:
-    logger.info("C++ fast_algorithms available - using optimized Dijkstra and edge labeling")
+    logger.info(
+        "C++ fast_algorithms available - using optimized Dijkstra and edge labeling"
+    )
 else:
-    logger.info("C++ fast_algorithms not compiled - using Python implementations. "
-                "For 10-20x speedup: cd desktop_app/core && python setup_cpp.py build_ext --inplace")
+    logger.info(
+        "C++ fast_algorithms not compiled - using Python implementations. "
+        "For 10-20x speedup: cd desktop_app/core && python setup_cpp.py build_ext --inplace"
+    )
+
+
+# =============================================================================
+# CONSTANTS (Paper-referenced values)
+# =============================================================================
+
+# Edge weight epsilon (Paper Section 4.5)
+# "weighting... by a scalar function that depends on the squared distance from M"
+# weight = 1 / (dist² + EPSILON)
+EDGE_WEIGHT_EPSILON = 0.25
+
+# Default tetrahedralization edge length factor
+# Fraction of bounding box diagonal: 0.05 = bbox/20
+DEFAULT_EDGE_LENGTH_FAC = 0.05
+
+# Boundary zone threshold (Paper Section 4.1)
+# Vertices within this fraction of bbox diagonal from H1/H2 seam are excluded
+# from being valid escape destinations
+BOUNDARY_ZONE_THRESHOLD = 0.15
+
+# Tolerance for distance comparisons
+DISTANCE_TOLERANCE = 1e-6
+
+# Minimum faces for GPU distance computation
+GPU_DISTANCE_FACE_THRESHOLD = 1000
+
+# Batch size for GPU distance computation
+GPU_DISTANCE_BATCH_SIZE = 50000
+
+# Maximum edge length ratio for valid tetrahedra
+MAX_EDGE_LENGTH_RATIO = 100.0
+
+# =============================================================================
+# LABEL SMOOTHING CONSTANTS (Tunnel Prevention)
+# =============================================================================
+
+# Label smoothing iterations for removing isolated pockets (majority-vote smoothing)
+# Each iteration can flip labels of vertices surrounded by opposite-label neighbors
+LABEL_SMOOTH_ITERATIONS = 2
+
+# Threshold for label smoothing: fraction of neighbors that must agree to flip
+# If vertex's label matches < (1 - threshold) of neighbors, flip the label
+# Higher values (0.7-0.9) are more conservative, preserving more structure
+LABEL_SMOOTH_THRESHOLD = 0.7
+
+# Minimum connected component size for label filtering (fraction of interior vertices)
+# Small isolated regions below this size are flipped to surrounding label
+# Value is: max(MIN_COMPONENT_SIZE_ABSOLUTE, interior_count * MIN_COMPONENT_SIZE_FRACTION)
+MIN_COMPONENT_SIZE_ABSOLUTE = 10
+MIN_COMPONENT_SIZE_FRACTION = 0.001  # 0.1% of interior
+
+# Minimum tet component size for pocket detection (fraction of total tets)
+# Small isolated pockets below this size surrounded by cut tets are eliminated
+MIN_TET_COMPONENT_SIZE_ABSOLUTE = 5
+MIN_TET_COMPONENT_SIZE_FRACTION = 0.002  # 0.2% of tets
+
+# Maximum cut valence for tunnel loop detection
+# Vertices with more incident cut edges than this are junction vertices
+# that may form closed loops causing tunnels
+MAX_CUT_VALENCE = 4
+
+# Maximum label propagation iterations (to prevent infinite loops)
+MAX_LABEL_PROPAGATION_ITERATIONS = 100
+
+
+# =============================================================================
+# BACKWARD COMPATIBILITY IMPORTS
+# =============================================================================
+
+# Import pytetwild if available (needed by functions below)
+if PYTETWILD_AVAILABLE:
+    import pytetwild
+
+
+# =============================================================================
+# DATA CLASSES
+# =============================================================================
 
 
 @dataclass
 class TetrahedralMeshResult:
-    """Result of tetrahedral mesh generation."""
+    """
+    Result of tetrahedral mesh generation for mold volume.
     
-    # Vertex positions (N x 3) - these are the CURRENT (possibly inflated) positions
+    This dataclass holds all data produced during tetrahedral mesh generation
+    and the subsequent Dijkstra escape labeling. It is used by downstream
+    modules (parting_surface.py) to extract the parting surface.
+    
+    The fields are organized into groups:
+    - PRIMARY GEOMETRY: Core mesh data (vertices, tetrahedra, edges)
+    - BOUNDARY DATA: Boundary mesh and classification
+    - EDGE WEIGHTS: Distance-based weights for Dijkstra (Paper Section 4.5)
+    - DIJKSTRA RESULTS: Escape labeling from interior to boundary
+    - CUT EDGES: Primary and secondary cutting edges
+    - CACHED DATA: Pre-computed data for secondary cut detection
+    - PARTING SURFACE: Data for marching tetrahedra
+    - TIMING: Performance metrics
+    
+    Boundary Label Encoding:
+        -1 = Inner boundary (part surface / seed vertices)
+         0 = Interior (cavity)
+         1 = Outer boundary H1
+         2 = Outer boundary H2
+        -2 = Boundary zone (excluded from escape destinations)
+    
+    Reference:
+        Paper Section 4: "Parting Surface Computation"
+    """
+    
+    # =========================================================================
+    # PRIMARY GEOMETRY
+    # =========================================================================
+    
+    # Vertex positions (N, 3) - CURRENT (possibly inflated) positions
     vertices: np.ndarray
     
-    # Tetrahedra indices (M x 4) - each row is 4 vertex indices
+    # Tetrahedra indices (M, 4) - each row is 4 vertex indices
     tetrahedra: np.ndarray
     
-    # Edge list (E x 2) - unique edges extracted from tetrahedra
+    # Edge list (E, 2) - unique edges extracted from tetrahedra
     edges: np.ndarray
     
     # Edge lengths (E,) - computed on CURRENT vertex positions
     edge_lengths: np.ndarray
     
-    # Boundary surface mesh (extracted from tetrahedral mesh outer faces)
-    # Uses CURRENT (possibly inflated) vertex positions
+    # =========================================================================
+    # BOUNDARY DATA
+    # =========================================================================
+    
+    # Boundary surface mesh (extracted from tet mesh outer faces)
     boundary_mesh: Optional[trimesh.Trimesh] = None
     
-    # ORIGINAL (non-inflated) vertex positions (N x 3)
-    # Used for parting surface construction
+    # ORIGINAL (non-inflated) vertex positions (N, 3)
     vertices_original: Optional[np.ndarray] = None
     
     # ORIGINAL boundary surface mesh (non-inflated)
-    # Used for parting surface construction
     boundary_mesh_original: Optional[trimesh.Trimesh] = None
+    
+    # Boundary vertex mask - True if vertex is on boundary surface (N,)
+    boundary_vertices: Optional[np.ndarray] = None
+    
+    # Shell boundary vertex labels: -1=inner, 0=interior, 1=H1, 2=H2 (N,)
+    boundary_labels: Optional[np.ndarray] = None
+    
+    # Edge boundary labels: -1=inner, 0=interior, 1=H1, 2=H2, -2=boundary zone (E,)
+    edge_boundary_labels: Optional[np.ndarray] = None
+    
+    # Whether the mesh has been inflated
+    is_inflated: bool = False
+    
+    # =========================================================================
+    # EDGE WEIGHTS (Paper Section 4.5)
+    # =========================================================================
     
     # Edge midpoint distances to part mesh (E,) - for weight computation
     edge_dist_to_part: Optional[np.ndarray] = None
     
-    # Edge weights (E,) - weight = 1 / (dist^2 + epsilon)
+    # Edge weights (E,) - weight = 1 / (dist² + EDGE_WEIGHT_EPSILON)
     edge_weights: Optional[np.ndarray] = None
     
     # Weighted edge lengths (E,) = edge_length * edge_weight
     weighted_edge_lengths: Optional[np.ndarray] = None
     
-    # Boundary vertex mask - True if vertex is on boundary surface (N,)
-    boundary_vertices: Optional[np.ndarray] = None
-    
-    # Shell boundary vertex labels: 0=interior, 1=H1, 2=H2, -1=inner boundary (N,)
-    boundary_labels: Optional[np.ndarray] = None
-    
-    # Edge boundary labels: 0=interior, 1=H1, 2=H2, -1=inner boundary, -2=boundary zone (E,)
-    edge_boundary_labels: Optional[np.ndarray] = None
-    
     # R value - maximum distance from hull vertices to part surface
+    # Used for exterior boundary reshape (Paper Figure 8)
     r_value: Optional[float] = None
     r_hull_point: Optional[np.ndarray] = None  # Point on hull with max distance
     r_part_point: Optional[np.ndarray] = None  # Closest point on part surface
     
-    # Whether the mesh has been inflated
-    is_inflated: bool = False
+    # =========================================================================
+    # DIJKSTRA RESULTS (Paper Section 4.5)
+    # =========================================================================
     
-    # Statistics
-    num_vertices: int = 0
-    num_tetrahedra: int = 0
-    num_edges: int = 0
-    num_boundary_faces: int = 0
-    
-    # Dijkstra results - interior vertex escape labels (includes both part surface and cavity interior)
-    # seed_escape_labels: (I,) int8 - 1=escapes to H1, 2=escapes to H2, 0=unreachable
+    # Escape labels for interior vertices (I,) int8
+    # 1=escapes to H1, 2=escapes to H2, 0=unreachable
     seed_escape_labels: Optional[np.ndarray] = None
     
-    # Interior vertex indices in the tet mesh (I,) - indices of all interior vertices (not on H1/H2)
+    # Interior vertex indices in the tet mesh (I,)
     seed_vertex_indices: Optional[np.ndarray] = None
     
-    # Interior vertex distances to boundary (I,) - shortest path distance to H1/H2
+    # Shortest path distances to boundary (I,)
     seed_distances: Optional[np.ndarray] = None
     
-    # Escape destination vertices for each interior vertex (I,) - the boundary vertex reached
+    # Boundary vertex reached for each interior vertex (I,)
     seed_escape_destinations: Optional[np.ndarray] = None
     
-    # Escape paths for each interior vertex - list of vertex index lists
-    # seed_escape_paths[i] = [start_v, v1, v2, ..., dest_v] path from interior vertex to boundary
+    # Escape paths: seed_escape_paths[i] = [start_v, ..., dest_v]
     seed_escape_paths: Optional[List[List[int]]] = None
     
-    # Full vertex mold labels (N,) - final H1(1) or H2(2) classification for ALL vertices
-    # After Dijkstra + propagation, every vertex should have label 1 or 2
-    # Used by marching tetrahedra for parting surface extraction
+    # Full vertex mold labels (N,) - final H1(1) or H2(2) for ALL vertices
     vertex_mold_labels: Optional[np.ndarray] = None
     
-    # Primary cutting edges - edges where one vertex escapes to H1 and the other to H2
-    # These are the edges the parting surface passes through (shown in yellow)
-    # List of (vi, vj) tuples representing primary cut edges
+    # =========================================================================
+    # CUT EDGES (Paper Sections 4.1, 4.2)
+    # =========================================================================
+    
+    # Primary cutting edges - where one vertex escapes to H1, other to H2
+    # List of (vi, vj) tuples (Paper Section 4.1)
     primary_cut_edges: Optional[List[Tuple[int, int]]] = None
     
-    # Secondary cutting edges - edges between same-label seeds where membrane intersects part
-    # List of (vi, vj) tuples representing secondary cut edges
+    # Secondary cutting edges - same-label edges where membrane intersects part
+    # List of (vi, vj) tuples (Paper Section 4.2)
     secondary_cut_edges: Optional[List[Tuple[int, int]]] = None
     
+    # Cut edge flags (E,) - True if edge is cut (primary OR secondary)
+    cut_edge_flags: Optional[np.ndarray] = None
+    
     # =========================================================================
-    # CACHED DATA FOR SECONDARY CUT DETECTION (computed once, reused)
+    # CACHED DATA FOR SECONDARY CUT DETECTION
     # =========================================================================
     
-    # Boundary mesh adjacency list: Dict[vertex_idx, List[(neighbor_idx, edge_length)]]
-    # Built from boundary_mesh edges, used for shortest path computation on ∂H
-    # Caching this avoids rebuilding it each time secondary cuts are computed
+    # Boundary mesh adjacency: vertex_idx -> [(neighbor_idx, edge_length), ...]
     boundary_adjacency: Optional[Dict[int, List[Tuple[int, float]]]] = None
     
-    # Part mesh vertex to tet mesh vertex mapping (computed via KDTree)
-    # part_to_tet_vertex[part_mesh_vertex_idx] = closest_tet_vertex_idx
-    # Caching this avoids expensive KDTree queries during secondary cut detection
+    # Part mesh vertex to tet mesh vertex mapping
     part_to_tet_vertex: Optional[np.ndarray] = None
     
     # Seed triangles for secondary cut detection
-    # List of (tet_v0, tet_v1, tet_v2) representing part surface in tet mesh resolution
-    # Only includes triangles where all 3 vertices are on part surface (boundary_labels == -1)
     cached_seed_triangles: Optional[List[Tuple[int, int, int]]] = None
     cached_seed_triangle_positions: Optional[List[Tuple[np.ndarray, np.ndarray, np.ndarray]]] = None
     
-    # Cached boundary paths for secondary cut detection
-    # Dict[(min_vertex, max_vertex), path] - shortest paths on boundary mesh ∂H
-    # Persisted across secondary cut detection runs to avoid redundant Dijkstra
+    # Cached boundary paths: (min_v, max_v) -> path
     cached_boundary_paths: Optional[Dict[Tuple[int, int], List[int]]] = None
     
     # =========================================================================
     # PARTING SURFACE EXTRACTION DATA
     # =========================================================================
     
-    # Cut edge flags - True if edge is cut (primary OR secondary)
-    # Indexed by global edge ID (same ordering as self.edges)
-    # cut_edge_flags[e] = 1 means edge e is cut by parting/secondary surface
-    cut_edge_flags: Optional[np.ndarray] = None  # (E,) bool or int8
-    
-    # Edge index lookup - maps (min(vi,vj), max(vi,vj)) to global edge index
-    # Used for fast edge-to-index lookup during marching tets
+    # Edge index lookup: (min(vi,vj), max(vi,vj)) -> edge index
     edge_to_index: Optional[Dict[Tuple[int, int], int]] = None
     
-    # Tet-to-edge mapping - for each tet, its 6 global edge indices
-    # tet_edge_indices[t, :] = [e0, e1, e2, e3, e4, e5] for tet t
+    # Tet-to-edge mapping (M, 6) - edge indices for each tet
     # Edge order: (0,1), (0,2), (0,3), (1,2), (1,3), (2,3)
-    tet_edge_indices: Optional[np.ndarray] = None  # (M, 6) int64
+    tet_edge_indices: Optional[np.ndarray] = None
     
-    # Timing
+    # =========================================================================
+    # STATISTICS AND TIMING
+    # =========================================================================
+    
+    num_vertices: int = 0
+    num_tetrahedra: int = 0
+    num_edges: int = 0
+    num_boundary_faces: int = 0
     tetrahedralize_time_ms: float = 0.0
     total_time_ms: float = 0.0
+    
+    # =========================================================================
+    # HELPER METHODS
+    # =========================================================================
+    
+    @property
+    def has_escape_labels(self) -> bool:
+        """Return True if Dijkstra escape labeling has been computed."""
+        return self.seed_escape_labels is not None
+    
+    @property
+    def has_cut_edges(self) -> bool:
+        """Return True if cut edges have been computed."""
+        return self.cut_edge_flags is not None
+    
+    @property
+    def num_primary_cuts(self) -> int:
+        """Return number of primary cut edges."""
+        return len(self.primary_cut_edges) if self.primary_cut_edges else 0
+    
+    @property
+    def num_secondary_cuts(self) -> int:
+        """Return number of secondary cut edges."""
+        return len(self.secondary_cut_edges) if self.secondary_cut_edges else 0
+
+
+# =============================================================================
+# TETRAHEDRALIZATION
+# =============================================================================
 
 
 def tetrahedralize_mesh(
     surface_mesh: trimesh.Trimesh,
-    edge_length_fac: float = 0.05,
+    edge_length_fac: float = DEFAULT_EDGE_LENGTH_FAC,
     optimize: bool = True
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -757,6 +930,10 @@ def inflate_boundary_vertices(
     return inflated_result
 
 
+# =============================================================================
+# EDGE OPERATIONS
+# =============================================================================
+
 def extract_edges(tetrahedra: np.ndarray) -> np.ndarray:
     """
     Extract unique edges from tetrahedra.
@@ -866,6 +1043,10 @@ def build_tet_edge_indices(
     
     return tet_edge_indices
 
+
+# =============================================================================
+# CUT EDGE DETECTION
+# =============================================================================
 
 def compute_cut_edge_flags(
     edges: np.ndarray,
@@ -1271,24 +1452,32 @@ def prepare_parting_surface_data(tet_result: 'TetrahedralMeshResult') -> 'Tetrah
     return tet_result
 
 
+# =============================================================================
+# EDGE WEIGHT COMPUTATION (Paper Section 4.5)
+# =============================================================================
+
 def compute_edge_weights_simple(
     tet_result: 'TetrahedralMeshResult',
     part_mesh: trimesh.Trimesh,
-    epsilon: float = 0.25,
+    epsilon: float = EDGE_WEIGHT_EPSILON,
     use_gpu: bool = True
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Compute edge weights based on distance to part surface.
+    Compute edge weights based on distance to part surface (Paper Section 4.5).
     
-    Simple formula (no boundary bias since inflation already handles that):
-        weight = 1 / (distance^2 + epsilon)
+    Per paper: "weighting the Euclidean arc length by a scalar function 
+    that depends on the squared distance from M" where M is the part surface.
     
-    Higher weights mean lower traversal cost (edges near the part are "cheaper").
+    Formula: weight = 1 / (distance² + epsilon)
+    
+    Higher weights mean lower traversal cost - edges near the part surface
+    are "cheaper" to traverse. This biases Dijkstra paths toward the part
+    surface, which creates perpendicular parting membranes.
     
     Args:
         tet_result: Tetrahedral mesh result (uses inflated vertex positions)
         part_mesh: Original part mesh for distance computation
-        epsilon: Small constant to avoid division by zero (default 0.25)
+        epsilon: Small constant to avoid division by zero (default EDGE_WEIGHT_EPSILON=0.25)
         use_gpu: Whether to use GPU acceleration
     
     Returns:
@@ -1329,6 +1518,10 @@ def compute_edge_weights_simple(
     
     return edge_weights, edge_dist_to_part
 
+
+# =============================================================================
+# EDGE BOUNDARY LABELS
+# =============================================================================
 
 def compute_edge_boundary_labels(
     tet_result: 'TetrahedralMeshResult'
@@ -1540,10 +1733,14 @@ def _compute_edge_boundary_labels_python(
     return edge_labels
 
 
+# =============================================================================
+# GPU DISTANCE COMPUTATION
+# =============================================================================
+
 def compute_distances_to_mesh_gpu(
     query_points: np.ndarray,
     target_mesh: trimesh.Trimesh,
-    batch_size: int = 50000
+    batch_size: int = GPU_DISTANCE_BATCH_SIZE
 ) -> np.ndarray:
     """
     GPU-accelerated distance computation from points to mesh surface.
@@ -1848,10 +2045,14 @@ def _point_to_triangles_distance_gpu_efficient(
     return min_dist
 
 
+# =============================================================================
+# CPU DISTANCE COMPUTATION
+# =============================================================================
+
 def compute_distances_to_mesh_cpu(
     query_points: np.ndarray,
     target_mesh: trimesh.Trimesh,
-    batch_size: int = 50000
+    batch_size: int = GPU_DISTANCE_BATCH_SIZE
 ) -> np.ndarray:
     """
     CPU distance computation from points to mesh surface.
@@ -1918,7 +2119,7 @@ def compute_distances_to_mesh(
         return compute_distances_to_mesh_gpu(
             query_points, 
             target_mesh, 
-            batch_size=batch_size or 50000
+            batch_size=batch_size or GPU_DISTANCE_BATCH_SIZE
         )
     else:
         if use_gpu and not CUDA_AVAILABLE:
@@ -1926,7 +2127,7 @@ def compute_distances_to_mesh(
         return compute_distances_to_mesh_cpu(
             query_points, 
             target_mesh, 
-            batch_size=batch_size or 50000
+            batch_size=batch_size or GPU_DISTANCE_BATCH_SIZE
         )
 
 
@@ -2096,7 +2297,7 @@ def generate_tetrahedral_mesh(
     hull_mesh: trimesh.Trimesh,
     part_mesh: trimesh.Trimesh,
     classification_result=None,  # MoldHalfClassificationResult
-    edge_length_fac: float = 0.05,
+    edge_length_fac: float = DEFAULT_EDGE_LENGTH_FAC,
     optimize: bool = True,
     compute_distances: bool = True
 ) -> TetrahedralMeshResult:
@@ -2105,9 +2306,9 @@ def generate_tetrahedral_mesh(
     
     This is the main entry point for tetrahedral mesh generation.
     
-    Algorithm for edge weights:
+    Algorithm for edge weights (Paper Section 4.5):
     1. For each edge, compute midpoint distance to part mesh surface
-    2. edge_weight = 1 / (distance^2 + 0.25)
+    2. edge_weight = 1 / (distance^2 + EDGE_WEIGHT_EPSILON)
     3. weighted_edge_length = edge_length * edge_weight
     
     Args:
@@ -2170,9 +2371,10 @@ def generate_tetrahedral_mesh(
         edge_dist_to_part = compute_distances_to_mesh(edge_midpoints, part_mesh)
         result.edge_dist_to_part = edge_dist_to_part
         
-        # Compute edge weights: weight = 1 / (dist^2 + 0.25)
+        # Compute edge weights: weight = 1 / (dist^2 + epsilon)
         # This gives higher weight (shorter effective distance) near the part surface
-        result.edge_weights = 1.0 / (edge_dist_to_part ** 2 + 0.25)
+        # Paper Section 4.5: epsilon = 0.25 prevents division by zero
+        result.edge_weights = 1.0 / (edge_dist_to_part ** 2 + EDGE_WEIGHT_EPSILON)
         
         # Compute weighted edge lengths
         result.weighted_edge_lengths = edge_lengths * result.edge_weights
@@ -2246,6 +2448,10 @@ def build_edge_index_map(edges: np.ndarray) -> Dict[Tuple[int, int], int]:
     
     return edge_map
 
+
+# =============================================================================
+# DIJKSTRA ESCAPE LABELING (Paper Section 4.5)
+# =============================================================================
 
 def run_dijkstra_escape_labeling(
     tet_result: 'TetrahedralMeshResult',
@@ -2480,6 +2686,506 @@ def _run_dijkstra_escape_labeling_python(
     return interior_escape_labels, interior_vertex_indices, interior_distances, interior_escape_destinations, interior_escape_paths
 
 
+# =============================================================================
+# PRIMARY CUT EDGE COMPUTATION (Paper Section 4.1)
+# =============================================================================
+
+def build_vertex_adjacency_dict(
+    edges: np.ndarray,
+    n_vertices: int
+) -> Dict[int, List[int]]:
+    """
+    Build vertex adjacency dictionary from edge array.
+    
+    Args:
+        edges: (E, 2) edge vertex indices
+        n_vertices: Total number of vertices
+    
+    Returns:
+        Dict mapping vertex index to list of adjacent vertex indices
+    """
+    adjacency = {i: [] for i in range(n_vertices)}
+    for v0, v1 in edges:
+        adjacency[v0].append(v1)
+        adjacency[v1].append(v0)
+    return adjacency
+
+
+def propagate_vertex_labels(
+    vertex_labels: np.ndarray,
+    adjacency: Dict[int, List[int]],
+    unlabeled_value: int = 0,
+    max_iterations: int = MAX_LABEL_PROPAGATION_ITERATIONS
+) -> Tuple[np.ndarray, int]:
+    """
+    Propagate H1/H2 labels to unlabeled vertices via neighbor majority vote.
+    
+    Uses iterative nearest-neighbor propagation through the edge graph.
+    Each unlabeled vertex is assigned the majority label of its labeled neighbors.
+    
+    Args:
+        vertex_labels: (N,) array with 0=unlabeled, 1=H1, 2=H2
+        adjacency: Vertex adjacency dictionary
+        unlabeled_value: Value indicating unlabeled vertices (default 0)
+        max_iterations: Maximum propagation iterations
+    
+    Returns:
+        Tuple of (updated labels array, number of iterations)
+    """
+    labels = vertex_labels.copy()
+    
+    for iteration in range(max_iterations):
+        newly_labeled = 0
+        unlabeled_indices = np.where(labels == unlabeled_value)[0]
+        
+        if len(unlabeled_indices) == 0:
+            break
+        
+        for vi in unlabeled_indices:
+            h1_neighbors = sum(1 for n in adjacency[vi] if labels[n] == 1)
+            h2_neighbors = sum(1 for n in adjacency[vi] if labels[n] == 2)
+            
+            if h1_neighbors > 0 or h2_neighbors > 0:
+                labels[vi] = 1 if h1_neighbors >= h2_neighbors else 2
+                newly_labeled += 1
+        
+        if newly_labeled == 0:
+            break
+    
+    # Fallback: assign remaining unlabeled to H1
+    final_unlabeled = np.sum(labels == unlabeled_value)
+    if final_unlabeled > 0:
+        logger.warning(f"{final_unlabeled} vertices remain unlabeled, assigning to H1")
+        labels[labels == unlabeled_value] = 1
+    
+    return labels, iteration + 1
+
+
+def smooth_vertex_labels(
+    vertex_labels: np.ndarray,
+    adjacency: Dict[int, List[int]],
+    interior_vertices: Set[int],
+    iterations: int = LABEL_SMOOTH_ITERATIONS,
+    threshold: float = LABEL_SMOOTH_THRESHOLD
+) -> np.ndarray:
+    """
+    Apply majority-vote label smoothing to remove isolated pockets (tunnel prevention).
+    
+    If a vertex's label disagrees with a supermajority of its neighbors, flip it.
+    Only interior vertices are smoothed; boundary vertices keep original labels.
+    
+    Args:
+        vertex_labels: (N,) array with 1=H1, 2=H2 labels
+        adjacency: Vertex adjacency dictionary
+        interior_vertices: Set of interior vertex indices (not on H1/H2 boundary)
+        iterations: Number of smoothing iterations
+        threshold: Fraction of neighbors that must agree to flip (0.5-0.9)
+    
+    Returns:
+        Smoothed labels array
+    """
+    labels = vertex_labels.copy()
+    
+    for smooth_iter in range(iterations):
+        flipped_count = 0
+        new_labels = labels.copy()
+        
+        for vi in interior_vertices:
+            current_label = labels[vi]
+            if current_label not in (1, 2):
+                continue
+            
+            neighbors = adjacency[vi]
+            if len(neighbors) < 3:
+                continue
+            
+            h1_count = sum(1 for n in neighbors if labels[n] == 1)
+            h2_count = sum(1 for n in neighbors if labels[n] == 2)
+            total_labeled = h1_count + h2_count
+            
+            if total_labeled == 0:
+                continue
+            
+            my_fraction = (h1_count if current_label == 1 else h2_count) / total_labeled
+            
+            if my_fraction < (1.0 - threshold):
+                new_labels[vi] = 2 if current_label == 1 else 1
+                flipped_count += 1
+        
+        labels = new_labels
+        
+        if flipped_count > 0:
+            logger.info(f"Label smoothing iteration {smooth_iter + 1}: flipped {flipped_count} vertices")
+        else:
+            logger.debug(f"Label smoothing converged after {smooth_iter + 1} iterations")
+            break
+    
+    return labels
+
+
+def filter_small_label_components(
+    vertex_labels: np.ndarray,
+    adjacency: Dict[int, List[int]],
+    interior_vertices: Set[int],
+    min_size_absolute: int = MIN_COMPONENT_SIZE_ABSOLUTE,
+    min_size_fraction: float = MIN_COMPONENT_SIZE_FRACTION
+) -> np.ndarray:
+    """
+    Remove small isolated label regions by flipping them to surrounding label.
+    
+    Finds connected components of same-labeled interior vertices and flips
+    small components to the opposite label.
+    
+    Args:
+        vertex_labels: (N,) array with 1=H1, 2=H2 labels
+        adjacency: Vertex adjacency dictionary
+        interior_vertices: Set of interior vertex indices
+        min_size_absolute: Absolute minimum component size
+        min_size_fraction: Minimum size as fraction of interior count
+    
+    Returns:
+        Labels array with small components flipped
+    """
+    labels = vertex_labels.copy()
+    min_component_size = max(min_size_absolute, int(len(interior_vertices) * min_size_fraction))
+    
+    for target_label in [1, 2]:
+        opposite_label = 2 if target_label == 1 else 1
+        target_verts = set(vi for vi in interior_vertices if labels[vi] == target_label)
+        
+        if len(target_verts) == 0:
+            continue
+        
+        # Find connected components via BFS
+        visited = set()
+        components = []
+        
+        for start_v in target_verts:
+            if start_v in visited:
+                continue
+            
+            component = []
+            queue = [start_v]
+            visited.add(start_v)
+            
+            while queue:
+                v = queue.pop(0)
+                component.append(v)
+                
+                for neighbor in adjacency[v]:
+                    if neighbor in target_verts and neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+            
+            components.append(component)
+        
+        # Flip small components
+        small_verts = []
+        small_count = 0
+        for comp in components:
+            if len(comp) < min_component_size:
+                small_verts.extend(comp)
+                small_count += 1
+        
+        if small_verts:
+            for vi in small_verts:
+                labels[vi] = opposite_label
+            logger.info(f"Flipped {len(small_verts)} vertices in {small_count} small H{target_label} "
+                       f"components (< {min_component_size} vertices)")
+    
+    return labels
+
+
+def detect_and_eliminate_tet_pockets(
+    vertex_labels: np.ndarray,
+    tetrahedra: np.ndarray,
+    interior_vertices: Set[int],
+    min_size_absolute: int = MIN_TET_COMPONENT_SIZE_ABSOLUTE,
+    min_size_fraction: float = MIN_TET_COMPONENT_SIZE_FRACTION
+) -> np.ndarray:
+    """
+    Detect isolated tetrahedral pockets that would create tunnels and eliminate them.
+    
+    A "pocket" is a small group of non-contributing tets (all vertices same label)
+    completely surrounded by contributing tets (mixed labels). These create tunnels
+    when the parting surface wraps around them.
+    
+    Args:
+        vertex_labels: (N,) array with 1=H1, 2=H2 labels
+        tetrahedra: (T, 4) tetrahedron vertex indices
+        interior_vertices: Set of interior vertex indices
+        min_size_absolute: Absolute minimum tet component size
+        min_size_fraction: Minimum size as fraction of tet count
+    
+    Returns:
+        Labels array with pocket vertices flipped
+    """
+    if tetrahedra is None or len(tetrahedra) == 0:
+        return vertex_labels
+    
+    labels = vertex_labels.copy()
+    min_tet_component_size = max(min_size_absolute, int(len(tetrahedra) * min_size_fraction))
+    
+    # Classify tets: contributing (mixed labels) vs non-contributing (same label)
+    tet_labels = labels[tetrahedra]  # (T, 4)
+    tet_has_h1 = np.any(tet_labels == 1, axis=1)
+    tet_has_h2 = np.any(tet_labels == 2, axis=1)
+    contributing_mask = tet_has_h1 & tet_has_h2
+    
+    non_contributing_indices = np.where(~contributing_mask)[0]
+    if len(non_contributing_indices) == 0 or len(non_contributing_indices) >= len(tetrahedra) * 0.5:
+        return labels
+    
+    logger.info(f"Tetrahedra: {np.sum(contributing_mask)} contributing, {len(non_contributing_indices)} non-contributing")
+    
+    # Build tet adjacency (tets sharing a face)
+    face_to_tets = {}
+    for ti, tet in enumerate(tetrahedra):
+        for face_indices in [(0,1,2), (0,1,3), (0,2,3), (1,2,3)]:
+            face = frozenset([tet[i] for i in face_indices])
+            face_to_tets.setdefault(face, []).append(ti)
+    
+    tet_adjacency = {ti: set() for ti in range(len(tetrahedra))}
+    for tet_list in face_to_tets.values():
+        for i, ti in enumerate(tet_list):
+            for tj in tet_list[i+1:]:
+                tet_adjacency[ti].add(tj)
+                tet_adjacency[tj].add(ti)
+    
+    # Find connected components of non-contributing tets
+    non_contributing_set = set(non_contributing_indices)
+    visited_tets = set()
+    tet_components = []
+    
+    for start_ti in non_contributing_indices:
+        if start_ti in visited_tets:
+            continue
+        
+        component = []
+        queue = [start_ti]
+        visited_tets.add(start_ti)
+        
+        while queue:
+            ti = queue.pop(0)
+            component.append(ti)
+            
+            for neighbor_ti in tet_adjacency[ti]:
+                if neighbor_ti in non_contributing_set and neighbor_ti not in visited_tets:
+                    visited_tets.add(neighbor_ti)
+                    queue.append(neighbor_ti)
+        
+        tet_components.append(component)
+    
+    # Eliminate small pockets surrounded by contributing tets
+    pockets_eliminated = 0
+    verts_flipped = 0
+    
+    for comp in tet_components:
+        if len(comp) >= min_tet_component_size:
+            continue
+        
+        # Check if surrounded by contributing tets
+        comp_set = set(comp)
+        surrounding = set()
+        for ti in comp:
+            for neighbor_ti in tet_adjacency[ti]:
+                if neighbor_ti not in comp_set:
+                    surrounding.add(neighbor_ti)
+        
+        if len(surrounding) > 0 and all(contributing_mask[ti] for ti in surrounding):
+            pocket_verts = set()
+            for ti in comp:
+                pocket_verts.update(tetrahedra[ti])
+            
+            interior_pocket_verts = [v for v in pocket_verts if v in interior_vertices]
+            if not interior_pocket_verts:
+                continue
+            
+            pocket_label = labels[interior_pocket_verts[0]]
+            opposite_label = 2 if pocket_label == 1 else 1
+            
+            for vi in interior_pocket_verts:
+                if labels[vi] == pocket_label:
+                    labels[vi] = opposite_label
+                    verts_flipped += 1
+            
+            pockets_eliminated += 1
+    
+    if pockets_eliminated > 0:
+        logger.info(f"Eliminated {pockets_eliminated} tunnel pockets by flipping {verts_flipped} vertices")
+    
+    return labels
+
+
+def break_cut_edge_loops(
+    vertex_labels: np.ndarray,
+    edges: np.ndarray,
+    adjacency: Dict[int, List[int]],
+    interior_vertices: Set[int],
+    max_valence: int = MAX_CUT_VALENCE
+) -> np.ndarray:
+    """
+    Break potential tunnel loops by fixing high-valence cut vertices.
+    
+    Vertices with many incident cut edges may form closed loops causing tunnels.
+    These junction vertices are flipped to match their local majority.
+    
+    Args:
+        vertex_labels: (N,) array with 1=H1, 2=H2 labels
+        edges: (E, 2) edge array
+        adjacency: Vertex adjacency dictionary
+        interior_vertices: Set of interior vertex indices
+        max_valence: Maximum cut valence before intervention
+    
+    Returns:
+        Labels array with high-valence vertices fixed
+    """
+    labels = vertex_labels.copy()
+    n_verts = len(labels)
+    
+    # Compute cut edges and valences
+    edge_labels_v0 = labels[edges[:, 0]]
+    edge_labels_v1 = labels[edges[:, 1]]
+    cut_mask = ((edge_labels_v0 == 1) & (edge_labels_v1 == 2)) | \
+               ((edge_labels_v0 == 2) & (edge_labels_v1 == 1))
+    cut_edges = edges[cut_mask]
+    
+    cut_valence = np.zeros(n_verts, dtype=np.int32)
+    for v0, v1 in cut_edges:
+        cut_valence[v0] += 1
+        cut_valence[v1] += 1
+    
+    # Find high-valence interior vertices
+    high_valence_verts = np.where(cut_valence > max_valence)[0]
+    high_valence_interior = [v for v in high_valence_verts if v in interior_vertices]
+    
+    if not high_valence_interior:
+        return labels
+    
+    logger.info(f"Found {len(high_valence_interior)} interior vertices with cut valence > {max_valence}")
+    
+    # Flip to local majority
+    flipped = 0
+    for vi in high_valence_interior:
+        current_label = labels[vi]
+        neighbors = adjacency[vi]
+        
+        h1_count = sum(1 for n in neighbors if labels[n] == 1)
+        h2_count = sum(1 for n in neighbors if labels[n] == 2)
+        
+        if h1_count + h2_count == 0:
+            continue
+        
+        if h1_count > h2_count and current_label != 1:
+            labels[vi] = 1
+            flipped += 1
+        elif h2_count > h1_count and current_label != 2:
+            labels[vi] = 2
+            flipped += 1
+    
+    if flipped > 0:
+        logger.info(f"Flipped {flipped} high-valence vertices to break potential tunnel loops")
+    
+    return labels
+
+
+def compute_primary_cut_edges(
+    edges: np.ndarray,
+    interior_vertex_indices: np.ndarray,
+    interior_escape_labels: np.ndarray,
+    boundary_labels: Optional[np.ndarray],
+    tetrahedra: Optional[np.ndarray] = None,
+    smooth_labels: bool = True,
+    smooth_iterations: int = LABEL_SMOOTH_ITERATIONS,
+    smooth_threshold: float = LABEL_SMOOTH_THRESHOLD
+) -> Tuple[List[Tuple[int, int]], np.ndarray]:
+    """
+    Compute primary cut edges - edges where vertices are on opposite sides of the membrane.
+    
+    Per Paper Section 4.1, a cut edge separates H1 from H2. This includes:
+    1. Interior vertex→H1 adjacent to Interior vertex→H2
+    2. H1 boundary vertex adjacent to Interior vertex→H2  
+    3. H2 boundary vertex adjacent to Interior vertex→H1
+    
+    Applies label propagation and smoothing to ensure all vertices are labeled
+    and to prevent tunnels caused by isolated pockets.
+    
+    Args:
+        edges: (E, 2) all tetrahedral mesh edges
+        interior_vertex_indices: (I,) indices of interior vertices
+        interior_escape_labels: (I,) escape labels (1=H1, 2=H2, 0=unreachable)
+        boundary_labels: (N,) optional boundary labels (-1=inner, 0=interior, 1=H1, 2=H2)
+        tetrahedra: (T, 4) optional tetrahedra for pocket detection
+        smooth_labels: If True, apply label smoothing for tunnel prevention
+        smooth_iterations: Number of smoothing iterations
+        smooth_threshold: Fraction of neighbors required to flip a label
+    
+    Returns:
+        Tuple of:
+            - List of (vi, vj) tuples for primary cut edges
+            - (N,) vertex mold labels array (1=H1, 2=H2 for all vertices)
+    """
+    import time
+    start_time = time.time()
+    
+    n_verts = np.max(edges) + 1 if len(edges) > 0 else 0
+    vertex_labels = np.zeros(n_verts, dtype=np.int8)
+    
+    # Step 1: Assign H1/H2 boundary vertices their boundary labels
+    if boundary_labels is not None:
+        vertex_labels[boundary_labels == 1] = 1
+        vertex_labels[boundary_labels == 2] = 2
+    
+    # Step 2: Assign interior vertices their escape labels
+    for i, vert_idx in enumerate(interior_vertex_indices):
+        escape_label = interior_escape_labels[i]
+        if escape_label in (1, 2):
+            vertex_labels[vert_idx] = escape_label
+    
+    # Build adjacency
+    adjacency = build_vertex_adjacency_dict(edges, n_verts)
+    
+    # Step 3: Propagate labels to unlabeled vertices
+    unlabeled_count = np.sum(vertex_labels == 0)
+    if unlabeled_count > 0:
+        logger.info(f"Propagating labels to {unlabeled_count} unlabeled vertices...")
+        vertex_labels, iterations = propagate_vertex_labels(vertex_labels, adjacency)
+        logger.info(f"Label propagation complete in {iterations} iterations")
+    
+    interior_set = set(interior_vertex_indices.tolist())
+    
+    # Step 4: Label smoothing (tunnel prevention)
+    if smooth_labels:
+        vertex_labels = smooth_vertex_labels(
+            vertex_labels, adjacency, interior_set, smooth_iterations, smooth_threshold
+        )
+        
+        # Step 5: Filter small connected components
+        vertex_labels = filter_small_label_components(vertex_labels, adjacency, interior_set)
+        
+        # Step 6: Detect and eliminate tetrahedral pockets
+        vertex_labels = detect_and_eliminate_tet_pockets(vertex_labels, tetrahedra, interior_set)
+        
+        # Step 7: Break cut edge loops
+        vertex_labels = break_cut_edge_loops(vertex_labels, edges, adjacency, interior_set)
+    
+    # Step 8: Find primary cut edges (vectorized)
+    edge_labels_v0 = vertex_labels[edges[:, 0]]
+    edge_labels_v1 = vertex_labels[edges[:, 1]]
+    cut_mask = ((edge_labels_v0 == 1) & (edge_labels_v1 == 2)) | \
+               ((edge_labels_v0 == 2) & (edge_labels_v1 == 1))
+    
+    cut_edge_indices = np.where(cut_mask)[0]
+    primary_cuts = [(int(edges[i, 0]), int(edges[i, 1])) for i in cut_edge_indices]
+    
+    elapsed = (time.time() - start_time) * 1000
+    n_h1 = np.sum(vertex_labels == 1)
+    n_h2 = np.sum(vertex_labels == 2)
+    logger.info(f"Primary cut edges computed in {elapsed:.0f}ms: {len(primary_cuts)} edges, {n_h1} H1, {n_h2} H2 vertices")
+    
+    return primary_cuts, vertex_labels
+
+
 def prepare_secondary_cuts_cache(
     tet_result: TetrahedralMeshResult,
     part_mesh: trimesh.Trimesh,
@@ -2593,6 +3299,10 @@ def prepare_secondary_cuts_cache(
     
     return tet_result
 
+
+# =============================================================================
+# SECONDARY CUT DETECTION (Paper Section 4.2)
+# =============================================================================
 
 def find_secondary_cutting_edges(
     tet_result: TetrahedralMeshResult,

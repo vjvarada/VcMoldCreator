@@ -13,20 +13,54 @@ Analyzes:
 - Mesh quality issues
 - Height fields for direction analysis
 - Vertex/face adjacency structures
+
+Design Principles:
+- Immutable data structures for diagnostics
+- Clear separation between analysis and utility functions
+- Consistent type hints and error handling
+- Efficient adjacency computation using half-edges
 """
 
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Set, Tuple
+import logging
 from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
+
 import numpy as np
 import trimesh
 
 
-@dataclass
+logger = logging.getLogger(__name__)
+
+# Constants for analysis thresholds
+DEGENERATE_FACE_AREA_THRESHOLD = 1e-10
+QUALITY_PENALTY_NON_MANIFOLD = 30
+QUALITY_PENALTY_NOT_WATERTIGHT = 20
+QUALITY_PENALTY_DEGENERATE = 10
+QUALITY_PENALTY_DUPLICATE = 10
+QUALITY_PENALTY_FLIPPED = 10
+QUALITY_PENALTY_PER_GENUS = 5
+QUALITY_MAX_GENUS_PENALTY = 20
+
+
+@dataclass(frozen=True)
 class BoundingBox:
-    """3D bounding box representation."""
-    min_point: np.ndarray  # [x, y, z]
-    max_point: np.ndarray  # [x, y, z]
+    """
+    Immutable 3D bounding box representation.
+    
+    Attributes:
+        min_point: Minimum corner coordinates [x, y, z]
+        max_point: Maximum corner coordinates [x, y, z]
+    """
+    min_point: np.ndarray
+    max_point: np.ndarray
+    
+    def __post_init__(self):
+        # Ensure arrays are immutable views
+        object.__setattr__(self, 'min_point', np.asarray(self.min_point).copy())
+        object.__setattr__(self, 'max_point', np.asarray(self.max_point).copy())
+        self.min_point.flags.writeable = False
+        self.max_point.flags.writeable = False
     
     @property
     def size(self) -> np.ndarray:
@@ -46,6 +80,9 @@ class BoundingBox:
     def __str__(self) -> str:
         size = self.size
         return f"Size: {size[0]:.2f} x {size[1]:.2f} x {size[2]:.2f}"
+    
+    def __hash__(self):
+        return hash((tuple(self.min_point), tuple(self.max_point)))
 
 
 @dataclass
@@ -54,6 +91,18 @@ class MeshDiagnostics:
     Comprehensive mesh diagnostics.
     
     Mirrors the MeshDiagnostics interface from the frontend.
+    
+    Attributes:
+        vertex_count: Number of vertices in the mesh
+        face_count: Number of faces in the mesh
+        is_manifold: Whether the mesh is manifold (no non-manifold edges/vertices)
+        is_watertight: Whether the mesh is watertight (no boundary edges)
+        genus: Topological genus (number of handles), -1 if not computable
+        volume: Mesh volume (0 if not watertight)
+        surface_area: Total surface area
+        bounding_box: Axis-aligned bounding box
+        euler_number: Euler characteristic (V - E + F)
+        issues: List of identified issues
     """
     vertex_count: int
     face_count: int
@@ -84,13 +133,7 @@ class MeshDiagnostics:
         ]
         
         if self.genus >= 0:
-            genus_desc = ""
-            if self.genus == 0:
-                genus_desc = "(sphere-like)"
-            elif self.genus == 1:
-                genus_desc = "(torus-like)"
-            else:
-                genus_desc = f"({self.genus} holes/handles)"
+            genus_desc = self._get_genus_description()
             lines.append(f"Genus: {self.genus} {genus_desc}")
         
         lines.append(f"Euler Number: {self.euler_number}")
@@ -111,8 +154,17 @@ class MeshDiagnostics:
         
         return "\n".join(lines)
     
+    def _get_genus_description(self) -> str:
+        """Get human-readable description of genus value."""
+        if self.genus == 0:
+            return "(sphere-like)"
+        elif self.genus == 1:
+            return "(torus-like)"
+        else:
+            return f"({self.genus} holes/handles)"
+    
     def to_dict(self) -> dict:
-        """Convert diagnostics to dictionary."""
+        """Convert diagnostics to dictionary for serialization."""
         return {
             'vertex_count': self.vertex_count,
             'face_count': self.face_count,
@@ -132,11 +184,21 @@ class MeshDiagnostics:
         }
 
 
+# =============================================================================
+# MESH ANALYZER
+# =============================================================================
+
 class MeshAnalyzer:
     """
     Mesh analysis and diagnostics.
     
     Provides comprehensive analysis of mesh properties, quality, and issues.
+    Results are cached after first analysis.
+    
+    Example:
+        >>> analyzer = MeshAnalyzer(mesh)
+        >>> diagnostics = analyzer.analyze()
+        >>> print(diagnostics.format())
     """
     
     def __init__(self, mesh: trimesh.Trimesh):
@@ -165,10 +227,9 @@ class MeshAnalyzer:
         edge_count = len(mesh.edges_unique) if hasattr(mesh, 'edges_unique') else 0
         
         # Bounding box
-        bounds = mesh.bounds
         bounding_box = BoundingBox(
-            min_point=bounds[0].copy(),
-            max_point=bounds[1].copy()
+            min_point=mesh.bounds[0],
+            max_point=mesh.bounds[1]
         )
         
         # Manifold and watertight checks
@@ -182,54 +243,17 @@ class MeshAnalyzer:
             issues.append("Mesh is not watertight (has holes)")
         
         # Euler characteristic and genus
-        # Euler characteristic: V - E + F = 2 - 2g (for closed surfaces)
-        # where g is the genus
         euler_number = mesh.euler_number
-        
-        # For a closed manifold: genus = (2 - euler) / 2
-        if is_watertight:
-            genus = (2 - euler_number) // 2
-        else:
-            genus = -1  # Cannot determine for non-closed meshes
-            issues.append("Genus cannot be determined for non-watertight mesh")
+        genus = self._compute_genus(euler_number, is_watertight, issues)
         
         # Volume and surface area
-        if is_watertight:
-            volume = float(mesh.volume) if mesh.volume > 0 else 0.0
-        else:
-            volume = 0.0
-            issues.append("Volume cannot be computed for non-watertight mesh")
-        
+        volume = self._compute_volume(mesh, is_watertight, issues)
         surface_area = float(mesh.area)
         
-        # Check for degenerate faces (zero area)
-        face_areas = mesh.area_faces
-        degenerate_count = np.sum(face_areas < 1e-10)
-        has_degenerate_faces = degenerate_count > 0
-        if has_degenerate_faces:
-            issues.append(f"Found {degenerate_count} degenerate (zero-area) faces")
-        
-        # Check for duplicate faces
-        has_duplicate_faces = False
-        try:
-            # trimesh doesn't have a direct method, but we can check face count before/after
-            unique_faces = np.unique(np.sort(mesh.faces, axis=1), axis=0)
-            if len(unique_faces) < len(mesh.faces):
-                has_duplicate_faces = True
-                dup_count = len(mesh.faces) - len(unique_faces)
-                issues.append(f"Found {dup_count} duplicate faces")
-        except Exception:
-            pass
-        
-        # Check for inverted/flipped normals
-        has_flipped_normals = False
-        if is_watertight and volume < 0:
-            has_flipped_normals = True
-            issues.append("Mesh has inverted normals (inside-out)")
-        
-        # Check for non-manifold vertices
-        # A vertex is non-manifold if it's shared by faces that don't form a fan
-        # trimesh handles this internally, but we can check edge manifoldness
+        # Quality checks
+        has_degenerate_faces = self._check_degenerate_faces(mesh, issues)
+        has_duplicate_faces = self._check_duplicate_faces(mesh, issues)
+        has_flipped_normals = self._check_flipped_normals(mesh, is_watertight, volume, issues)
         
         self._diagnostics = MeshDiagnostics(
             vertex_count=vertex_count,
@@ -250,6 +274,62 @@ class MeshAnalyzer:
         
         return self._diagnostics
     
+    @staticmethod
+    def _compute_genus(euler_number: int, is_watertight: bool, issues: List[str]) -> int:
+        """Compute genus from Euler characteristic."""
+        if is_watertight:
+            # For a closed manifold: genus = (2 - euler) / 2
+            return (2 - euler_number) // 2
+        else:
+            issues.append("Genus cannot be determined for non-watertight mesh")
+            return -1
+    
+    @staticmethod
+    def _compute_volume(mesh: trimesh.Trimesh, is_watertight: bool, issues: List[str]) -> float:
+        """Compute mesh volume if possible."""
+        if is_watertight:
+            vol = float(mesh.volume) if mesh.volume > 0 else 0.0
+            return vol
+        else:
+            issues.append("Volume cannot be computed for non-watertight mesh")
+            return 0.0
+    
+    @staticmethod
+    def _check_degenerate_faces(mesh: trimesh.Trimesh, issues: List[str]) -> bool:
+        """Check for degenerate (zero-area) faces."""
+        face_areas = mesh.area_faces
+        degenerate_count = int(np.sum(face_areas < DEGENERATE_FACE_AREA_THRESHOLD))
+        if degenerate_count > 0:
+            issues.append(f"Found {degenerate_count} degenerate (zero-area) faces")
+            return True
+        return False
+    
+    @staticmethod
+    def _check_duplicate_faces(mesh: trimesh.Trimesh, issues: List[str]) -> bool:
+        """Check for duplicate faces."""
+        try:
+            unique_faces = np.unique(np.sort(mesh.faces, axis=1), axis=0)
+            if len(unique_faces) < len(mesh.faces):
+                dup_count = len(mesh.faces) - len(unique_faces)
+                issues.append(f"Found {dup_count} duplicate faces")
+                return True
+        except Exception as e:
+            logger.debug("Could not check for duplicate faces: %s", e)
+        return False
+    
+    @staticmethod
+    def _check_flipped_normals(
+        mesh: trimesh.Trimesh, 
+        is_watertight: bool, 
+        volume: float, 
+        issues: List[str]
+    ) -> bool:
+        """Check for inverted/flipped normals."""
+        if is_watertight and volume < 0:
+            issues.append("Mesh has inverted normals (inside-out)")
+            return True
+        return False
+    
     @property
     def diagnostics(self) -> Optional[MeshDiagnostics]:
         """Get cached diagnostics (call analyze() first)."""
@@ -258,6 +338,9 @@ class MeshAnalyzer:
     def get_mesh_quality_score(self) -> float:
         """
         Compute an overall mesh quality score (0-100).
+        
+        Higher scores indicate better quality meshes suitable for
+        downstream processing.
         
         Returns:
             Quality score from 0 (poor) to 100 (excellent)
@@ -268,36 +351,31 @@ class MeshAnalyzer:
         diag = self._diagnostics
         score = 100.0
         
-        # Penalize for non-manifold
         if not diag.is_manifold:
-            score -= 30
+            score -= QUALITY_PENALTY_NON_MANIFOLD
         
-        # Penalize for not watertight
         if not diag.is_watertight:
-            score -= 20
+            score -= QUALITY_PENALTY_NOT_WATERTIGHT
         
-        # Penalize for degenerate faces
         if diag.has_degenerate_faces:
-            score -= 10
+            score -= QUALITY_PENALTY_DEGENERATE
         
-        # Penalize for duplicate faces
         if diag.has_duplicate_faces:
-            score -= 10
+            score -= QUALITY_PENALTY_DUPLICATE
         
-        # Penalize for flipped normals
         if diag.has_flipped_normals:
-            score -= 10
+            score -= QUALITY_PENALTY_FLIPPED
         
-        # Penalize for high genus (complex topology)
         if diag.genus > 0:
-            score -= min(5 * diag.genus, 20)
+            genus_penalty = min(QUALITY_PENALTY_PER_GENUS * diag.genus, QUALITY_MAX_GENUS_PENALTY)
+            score -= genus_penalty
         
         return max(0.0, score)
 
 
-# ============================================================================
+# =============================================================================
 # HEIGHT FIELD AND ADJACENCY FUNCTIONS
-# ============================================================================
+# =============================================================================
 
 def compute_height_field(
     mesh: trimesh.Trimesh, 
@@ -307,26 +385,33 @@ def compute_height_field(
     Compute height function h(v) = dot(v, direction) for all vertices.
     
     The height function projects each vertex position onto a direction vector,
-    creating a scalar field used for persistence homology analysis.
+    creating a scalar field used for persistence homology analysis in
+    pouring direction optimization (Paper Section 5.2).
     
     Args:
         mesh: Input trimesh mesh
         direction: Unit vector representing the "up" direction (pouring direction)
         
     Returns:
-        vertex_heights: (N,) array of vertex height values
-        face_heights: (M,) array of face height values (average of vertex heights)
+        Tuple containing:
+        - vertex_heights: (N,) array of vertex height values
+        - face_heights: (M,) array of face height values (average of vertex heights)
+        
+    Example:
+        >>> heights, face_heights = compute_height_field(mesh, np.array([0, 0, 1]))
     """
-    # Normalize direction
     direction = np.asarray(direction, dtype=np.float64)
-    direction = direction / np.linalg.norm(direction)
+    norm = np.linalg.norm(direction)
+    if norm < 1e-10:
+        raise ValueError("Direction vector cannot be zero")
+    direction = direction / norm
     
     # Compute vertex heights via dot product
     vertex_heights = mesh.vertices @ direction
     
     # Compute face heights as average of vertex heights
     face_vertex_heights = vertex_heights[mesh.faces]  # (M, 3)
-    face_heights = face_vertex_heights.mean(axis=1)   # (M,)
+    face_heights = np.mean(face_vertex_heights, axis=1)  # (M,)
     
     return vertex_heights, face_heights
 
@@ -342,13 +427,18 @@ def build_vertex_neighbors(mesh: trimesh.Trimesh) -> Dict[int, Set[int]]:
         mesh: Input trimesh mesh
         
     Returns:
-        Dictionary mapping each vertex index to a set of its neighbor vertex indices
+        Dictionary mapping each vertex index to a set of its neighbor vertex indices.
+        Uses Set for O(1) membership testing.
+        
+    Example:
+        >>> neighbors = build_vertex_neighbors(mesh)
+        >>> adjacent_to_0 = neighbors.get(0, set())
     """
     neighbors: Dict[int, Set[int]] = defaultdict(set)
     
-    for edge in mesh.edges:
-        neighbors[edge[0]].add(edge[1])
-        neighbors[edge[1]].add(edge[0])
+    for v0, v1 in mesh.edges:
+        neighbors[v0].add(v1)
+        neighbors[v1].add(v0)
     
     return dict(neighbors)
 
@@ -364,16 +454,18 @@ def build_face_neighbors(mesh: trimesh.Trimesh) -> Dict[int, List[int]]:
         mesh: Input trimesh mesh
         
     Returns:
-        Dictionary mapping each face index to a list of its neighbor face indices
+        Dictionary mapping each face index to a list of its neighbor face indices.
+        Uses List to preserve ordering and allow duplicates if needed.
+        
+    Example:
+        >>> face_neighbors = build_face_neighbors(mesh)
+        >>> adjacent_faces = face_neighbors.get(0, [])
     """
     n_faces = len(mesh.faces)
     neighbors: Dict[int, List[int]] = {i: [] for i in range(n_faces)}
     
     # trimesh.face_adjacency is an (n, 2) array of pairs of adjacent face indices
-    face_adj = mesh.face_adjacency
-    
-    for i in range(len(face_adj)):
-        a, b = face_adj[i]
+    for a, b in mesh.face_adjacency:
         neighbors[a].append(b)
         neighbors[b].append(a)
     

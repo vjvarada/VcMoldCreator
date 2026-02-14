@@ -1,10 +1,16 @@
 """
-Parting Surface Extraction using Marching Tetrahedra
+Parting Surface Extraction using Marching Tetrahedra (Paper Section 4.3)
 
 This module extracts a continuous parting surface mesh from a tetrahedral mesh
 where certain edges have been marked as "cut" (either primary or secondary cuts).
 
-Algorithm: Marching Tetrahedra for Binary Labeling (H1 vs H2)
+Algorithm Overview (Alderighi et al. SIGGRAPH 2019):
+=====================================================
+The triangulated surface C encoding the cut layout is composed using a set of patches
+that are interconnected by chains of non-manifold edges that are bounded by construction
+by the object surface mesh M and the external boundary ∂H.
+
+Marching Tetrahedra for Binary Labeling (H1 vs H2):
 - Each tetrahedron has 6 edges
 - Cut edges connect vertices with different labels (H1 vs H2)
 - In a proper binary system, only 3-edge and 4-edge configurations are valid
@@ -18,13 +24,26 @@ Valid configurations in binary (2-class) system:
 Invalid configurations (indicate labeling issues):
 - 1, 2, 5, 6-edge configs should NOT occur if all vertices are properly labeled
 
+Cut Point Placement (per Nielson & Franke 1997):
+- If vertex_escape_distances available: use WEIGHTED interpolation
+  t = d0 / (d0 + d1), cut_point = (1-t)*v0 + t*v1
+- Otherwise: use geometric midpoint (t=0.5)
+
 Edge numbering within a tetrahedron (vertices 0,1,2,3):
-    Edge 0: (0,1)
-    Edge 1: (0,2)
-    Edge 2: (0,3)
-    Edge 3: (1,2)
-    Edge 4: (1,3)
-    Edge 5: (2,3)
+    Edge 0: (0,1)    Edge 3: (1,2)
+    Edge 1: (0,2)    Edge 4: (1,3)
+    Edge 2: (0,3)    Edge 5: (2,3)
+
+Key Functions:
+- extract_parting_surface(): Main Marching Tetrahedra algorithm
+- extract_parting_surface_from_tet_result(): Convenience wrapper
+- smooth_parting_surface(): Surface nets style smoothing
+- repair_parting_surface(): Gap filling and cleanup
+
+References:
+- Alderighi et al., "Volume-Aware Design of Composite Molds", SIGGRAPH 2019, Section 4.3
+- Nielson & Franke, "Computing the Separating Surface for Segmented Data", 1997
+- Bloomenthal & Ferguson, "Polygonization of Non-Manifold Implicit Surfaces", 1995
 """
 
 import logging
@@ -37,19 +56,42 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# CONSTANTS
+# CONSTANTS - CUT POINT PLACEMENT
+# =============================================================================
+
+# Weighted interpolation clamp bounds (prevents degenerate triangles)
+# When using t = d0/(d0+d1), clamp t to [MIN_T, MAX_T]
+CUT_POINT_INTERPOLATION_MIN_T = 0.1  # Don't place cut point too close to v0
+CUT_POINT_INTERPOLATION_MAX_T = 0.9  # Don't place cut point too close to v1
+
+# Vertex merge epsilon for near-coincident cut points (per Bloomenthal paper)
+VERTEX_MERGE_EPSILON = 1e-8
+
+
+# =============================================================================
+# CONSTANTS - GAP FILLING AND REPAIR
 # =============================================================================
 
 # Gap filling thresholds (as fractions of edge length)
 MIN_PROJECTION_DISTANCE_FRACTION = 0.1   # Minimum distance from boundary to projection point
 PROJECTION_OFFSET_FRACTION = 0.3         # Offset distance when adjusting too-close projections
 
-# Triangle area threshold (as fraction of median area)
-MIN_TRIANGLE_AREA_FRACTION = 0.01        # 1% of median area considered degenerate
-
 # Distance threshold multiplier for auto-computing gap fill threshold
 # Higher value = more aggressive gap filling (catches edges farther from target surfaces)
 DISTANCE_THRESHOLD_EDGE_MULTIPLIER = 3.0  # threshold = median_edge_length * this value
+
+
+# =============================================================================
+# CONSTANTS - TRIANGLE QUALITY THRESHOLDS
+# =============================================================================
+
+# Triangle area threshold (as fraction of median area)
+MIN_TRIANGLE_AREA_FRACTION = 0.01        # 1% of median area considered degenerate
+
+
+# =============================================================================
+# CONSTANTS - ISLAND AND LOOP REMOVAL
+# =============================================================================
 
 # Small polyline removal thresholds
 DEFAULT_MIN_LOOP_PERIMETER = 4.0  # Default minimum perimeter in mm for closed loops to keep
@@ -57,6 +99,11 @@ DEFAULT_MIN_LOOP_PERIMETER = 4.0  # Default minimum perimeter in mm for closed l
 # Island removal for primary surfaces
 PRIMARY_MIN_ISLAND_TRIANGLES = 10  # Minimum triangles to keep an island (primary surface)
 PRIMARY_MIN_ISLAND_AREA_FRACTION = 0.01  # Islands with area < 1% of total are removed
+
+
+# =============================================================================
+# CONSTANTS - FLOATING EDGE DETECTION
+# =============================================================================
 
 # Floating edge detection and filling thresholds
 # After smoothing, boundary vertices are re-projected to the part surface, but
@@ -74,7 +121,21 @@ FLOATING_EDGE_MIN_TOLERANCE = 1e-6        # Minimum tolerance: 1 nanometer (esse
 
 
 # =============================================================================
+# CONSTANTS - BOUNDARY TYPE CODES
+# =============================================================================
+
+# Boundary type codes for vertex classification (used during smoothing)
+BOUNDARY_TYPE_PART = -1       # On part surface M (inner boundary - reproject to part)
+BOUNDARY_TYPE_INTERIOR = 0    # Interior (midpoint - no boundary constraint)
+BOUNDARY_TYPE_H1 = 1          # On hull H1 boundary (outer boundary - reproject to hull)
+BOUNDARY_TYPE_H2 = 2          # On hull H2 boundary (outer boundary - reproject to hull)
+BOUNDARY_TYPE_PRIMARY_JUNCTION = 3  # At primary-secondary junction (reproject to primary surface)
+BOUNDARY_TYPE_PRIMARY_THEN_PART = 4  # Triple junction: reproject to primary, then to part
+
+
+# =============================================================================
 # MARCHING TETRAHEDRA LOOKUP TABLES
+# =============================================================================
 # =============================================================================
 
 # Edge definitions: edge index -> (vertex_i, vertex_j)
@@ -451,6 +512,241 @@ class PartingSurfaceResult:
     extraction_time_ms: float = 0.0
 
 
+# =============================================================================
+# CUT POINT PLACEMENT HELPERS
+# =============================================================================
+
+def _compute_cut_point_position(
+    v0_pos: np.ndarray,
+    v1_pos: np.ndarray,
+    d0: Optional[float] = None,
+    d1: Optional[float] = None
+) -> Tuple[np.ndarray, bool]:
+    """
+    Compute the position of a cut point on an edge.
+    
+    Per Nielson & Franke 1997: "In some applications where there is additional
+    information on which to base any bias or adjustment... weights may be used"
+    
+    If escape distances are available, use weighted interpolation:
+        t = d0 / (d0 + d1)
+        cut_point = (1-t) * v0 + t * v1
+    
+    This places the cut point closer to the vertex with shorter escape path,
+    which better approximates the true parting surface location.
+    
+    Args:
+        v0_pos: Position of first vertex
+        v1_pos: Position of second vertex
+        d0: Escape distance of first vertex (None for midpoint)
+        d1: Escape distance of second vertex (None for midpoint)
+    
+    Returns:
+        Tuple of (cut_point_position, used_weighted) where used_weighted indicates
+        whether weighted interpolation was used (True) or midpoint fallback (False).
+    """
+    # Check if weighted placement is possible
+    if (d0 is not None and d1 is not None and 
+        d0 > 0 and d1 > 0 and 
+        np.isfinite(d0) and np.isfinite(d1)):
+        
+        # t = d0 / (d0 + d1) means cut point is closer to v0 when d0 is small
+        t = d0 / (d0 + d1)
+        # Clamp to avoid degenerate triangles
+        t = np.clip(t, CUT_POINT_INTERPOLATION_MIN_T, CUT_POINT_INTERPOLATION_MAX_T)
+        cut_point = (1.0 - t) * v0_pos + t * v1_pos
+        return cut_point, True
+    else:
+        # Fallback to midpoint
+        return 0.5 * (v0_pos + v1_pos), False
+
+
+def _determine_boundary_type_primary(
+    bl0: int,
+    bl1: int
+) -> int:
+    """
+    Determine boundary type for a PRIMARY surface cut vertex.
+    
+    Priority: Part surface M (-1) > Hull (1,2) > Interior (0)
+    
+    Args:
+        bl0: Boundary label of first edge endpoint (-1=part, 0=interior, 1=H1, 2=H2)
+        bl1: Boundary label of second edge endpoint
+    
+    Returns:
+        Boundary type code for the cut vertex:
+        -1 = part boundary, 1/2 = hull boundary, 0 = interior
+    """
+    # If either endpoint is on part surface, mark for re-projection to part M
+    if bl0 == BOUNDARY_TYPE_PART or bl1 == BOUNDARY_TYPE_PART:
+        return BOUNDARY_TYPE_PART
+    
+    # Else if either endpoint is on hull, use that hull label
+    if bl0 in (BOUNDARY_TYPE_H1, BOUNDARY_TYPE_H2):
+        return bl0
+    if bl1 in (BOUNDARY_TYPE_H1, BOUNDARY_TYPE_H2):
+        return bl1
+    
+    # Both interior
+    return BOUNDARY_TYPE_INTERIOR
+
+
+def _determine_boundary_type_secondary(
+    bl0: int,
+    bl1: int,
+    is_primary_adjacent: bool
+) -> int:
+    """
+    Determine boundary type for a SECONDARY surface cut vertex.
+    
+    For secondary membranes, the boundary condition is the PRIMARY parting
+    surface, not the hull. We use two complementary signals:
+    
+    1. PRIMARY ADJACENCY: If edge is adjacent to primary cut, mark as bt=3
+       (primary junction) so it gets re-projected to the primary surface.
+    
+    2. BOUNDARY LABELS: For non-junction edges:
+       - BOTH on part (-1/-1) → -1 (genuine part boundary)
+       - ONE on part → 0 (interior, free to smooth)
+       - Hull endpoints → hull label (outer boundary)
+       - BOTH interior → 0 (interior, free to smooth)
+    
+    Args:
+        bl0: Boundary label of first edge endpoint
+        bl1: Boundary label of second edge endpoint
+        is_primary_adjacent: True if edge is adjacent to a primary cut edge
+    
+    Returns:
+        Boundary type code for the cut vertex
+    """
+    # Primary adjacency takes precedence
+    if is_primary_adjacent:
+        return BOUNDARY_TYPE_PRIMARY_JUNCTION
+    
+    # Both endpoints on part surface - genuine part boundary
+    if bl0 == BOUNDARY_TYPE_PART and bl1 == BOUNDARY_TYPE_PART:
+        return BOUNDARY_TYPE_PART
+    
+    # ONE endpoint on part - do NOT pin (would fold membrane)
+    if bl0 == BOUNDARY_TYPE_PART or bl1 == BOUNDARY_TYPE_PART:
+        return BOUNDARY_TYPE_INTERIOR
+    
+    # Hull endpoints
+    if bl0 in (BOUNDARY_TYPE_H1, BOUNDARY_TYPE_H2):
+        return bl0
+    if bl1 in (BOUNDARY_TYPE_H1, BOUNDARY_TYPE_H2):
+        return bl1
+    
+    # Both interior
+    return BOUNDARY_TYPE_INTERIOR
+
+
+def _orient_triangle_by_mold_labels(
+    tri_verts: List[int],
+    surface_vertices: np.ndarray,
+    tet_verts: np.ndarray,
+    vertex_mold_labels: np.ndarray,
+    verts: np.ndarray
+) -> List[int]:
+    """
+    Orient triangle so normal points from H1 towards H2 (for PRIMARY surfaces).
+    
+    Uses the H2 vertices in the tetrahedron to determine which side is "H2",
+    then ensures the triangle normal points towards that side.
+    
+    Args:
+        tri_verts: Triangle vertex indices (3 elements)
+        surface_vertices: All surface vertex positions
+        tet_verts: The 4 vertex indices of the tetrahedron
+        vertex_mold_labels: Mold labels for all vertices (1=H1, 2=H2)
+        verts: All vertex positions
+    
+    Returns:
+        Possibly reordered tri_verts with consistent orientation
+    """
+    # Get positions of the 3 cut points
+    p0 = surface_vertices[tri_verts[0]]
+    p1 = surface_vertices[tri_verts[1]]
+    p2 = surface_vertices[tri_verts[2]]
+    
+    # Compute triangle centroid and normal
+    tri_center = (p0 + p1 + p2) / 3.0
+    edge1 = p1 - p0
+    edge2 = p2 - p0
+    normal = np.cross(edge1, edge2)
+    
+    # Find the H2 centroid in this tet (vertices with label 2)
+    h2_positions = []
+    for v_local in range(4):
+        v_global = tet_verts[v_local]
+        if vertex_mold_labels[v_global] == 2:
+            h2_positions.append(verts[v_global])
+    
+    if len(h2_positions) > 0:
+        h2_centroid = np.mean(h2_positions, axis=0)
+        # Vector from triangle center towards H2
+        to_h2 = h2_centroid - tri_center
+        
+        # If normal points away from H2, flip the triangle
+        if np.dot(normal, to_h2) < 0:
+            return [tri_verts[0], tri_verts[2], tri_verts[1]]  # Flip winding
+    
+    return tri_verts
+
+
+def _orient_triangle_by_escape_distance(
+    tri_verts: List[int],
+    surface_vertices: np.ndarray,
+    tet_verts: np.ndarray,
+    vertex_escape_distances: np.ndarray,
+    verts: np.ndarray
+) -> List[int]:
+    """
+    Orient triangle based on escape distances (for SECONDARY surfaces).
+    
+    The side with LONGER escape distance is the "outside" - secondary cuts
+    occur where paths diverge around the part M.
+    
+    Args:
+        tri_verts: Triangle vertex indices (3 elements)
+        surface_vertices: All surface vertex positions
+        tet_verts: The 4 vertex indices of the tetrahedron
+        vertex_escape_distances: Escape distances for all vertices
+        verts: All vertex positions
+    
+    Returns:
+        Possibly reordered tri_verts with consistent orientation
+    """
+    # Get triangle geometry
+    p0 = surface_vertices[tri_verts[0]]
+    p1 = surface_vertices[tri_verts[1]]
+    p2 = surface_vertices[tri_verts[2]]
+    
+    tri_center = (p0 + p1 + p2) / 3.0
+    edge1 = p1 - p0
+    edge2 = p2 - p0
+    normal = np.cross(edge1, edge2)
+    
+    # Find the tet vertex with LONGEST escape distance
+    max_dist = -np.inf
+    max_dist_pos = None
+    for v_local in range(4):
+        v_global = tet_verts[v_local]
+        d = vertex_escape_distances[v_global]
+        if np.isfinite(d) and d > max_dist:
+            max_dist = d
+            max_dist_pos = verts[v_global]
+    
+    if max_dist_pos is not None:
+        to_far = max_dist_pos - tri_center
+        # Normal should point AWAY from the far vertex
+        if np.dot(normal, to_far) > 0:
+            return [tri_verts[0], tri_verts[2], tri_verts[1]]  # Flip winding
+    
+    return tri_verts
+
+
 def extract_parting_surface(
     vertices: np.ndarray,
     tetrahedra: np.ndarray,
@@ -619,104 +915,48 @@ def extract_parting_surface(
     for i, e_idx in enumerate(cut_edge_indices):
         v0, v1 = edges[e_idx]
         
-        # Compute cut point position using weighted interpolation if available
-        # Per Nielson & Franke: t = d0 / (d0 + d1), cut_point = (1-t)*v0 + t*v1
-        # This places the cut point at the estimated classification boundary
+        # Compute cut point position using helper
         if use_weighted:
             d0 = vertex_escape_distances[v0]
             d1 = vertex_escape_distances[v1]
-            
-            # Validate distances - both should be positive and finite
-            if d0 > 0 and d1 > 0 and np.isfinite(d0) and np.isfinite(d1):
-                # t = d0 / (d0 + d1) means cut point is closer to v0 when d0 is small
-                # (v0 has shorter escape path → is closer to its boundary)
-                t = d0 / (d0 + d1)
-                # Clamp t to [0.1, 0.9] to avoid placing cut points too close to vertices
-                # which could create degenerate triangles
-                t = np.clip(t, 0.1, 0.9)
-                surface_vertices[i] = (1.0 - t) * verts[v0] + t * verts[v1]
-                n_weighted += 1
-            else:
-                # Fallback to midpoint if distances are invalid
-                surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
-                n_midpoint += 1
         else:
-            # No distance data - use geometric midpoint (default per Nielson)
-            surface_vertices[i] = 0.5 * (verts[v0] + verts[v1])
+            d0, d1 = None, None
+        
+        cut_point, was_weighted = _compute_cut_point_position(
+            verts[v0], verts[v1], d0, d1
+        )
+        surface_vertices[i] = cut_point
+        if was_weighted:
+            n_weighted += 1
+        else:
             n_midpoint += 1
         
         # Determine boundary type for LATER re-projection (not for placement)
-        # boundary_labels: -1 = on part surface M, 0 = interior, 1 = on H1 hull, 2 = on H2 hull
         if boundary_labels is not None:
             bl0 = boundary_labels[v0]
             bl1 = boundary_labels[v1]
             
             if is_secondary:
-                # SECONDARY SURFACE: Adjacency-aware labeling.
-                #
-                # For secondary membranes, the boundary condition is the PRIMARY parting
-                # surface, not the hull. We use two complementary signals:
-                #
-                # 1. PRIMARY ADJACENCY: If this edge is also a primary cut edge, the
-                #    secondary surface must connect to the primary here. Mark as bt=3
-                #    (primary junction) so it gets re-projected to the primary surface.
-                #
-                # 2. BOUNDARY LABELS: For non-junction edges, use tet vertex labels:
-                #    - BOTH on part (-1/-1) → -1 (genuine part boundary)
-                #    - ONE on part + anything → 0 (interior, free to smooth)
-                #    - Hull endpoints → hull label (outer boundary)
-                #    - BOTH interior → 0 (interior, free to smooth)
-                
-                # Check if this edge is ADJACENT to a primary cut edge.
-                # An edge is adjacent if either tet-mesh endpoint is an
-                # endpoint of any primary cut edge. This detects the junction
-                # where the secondary surface meets the primary surface.
-                if has_primary_vertex_mask and (primary_cut_vertex_mask[v0] or primary_cut_vertex_mask[v1]):
-                    # At least one endpoint touches a primary cut edge.
-                    # The secondary vertex here must lie on the primary surface.
-                    vertex_boundary_type[i] = 3  # Primary junction
-                    n_primary_junction += 1
-                elif bl0 == -1 and bl1 == -1:
-                    # Both endpoints on part surface - genuine part boundary
-                    vertex_boundary_type[i] = -1
-                    n_part_boundary += 1
-                elif bl0 == -1 or bl1 == -1:
-                    # ONE endpoint on part, other is interior or hull.
-                    # Do NOT pin to part mesh — would fold the membrane.
-                    # Label as interior so it can float freely during smoothing.
-                    vertex_boundary_type[i] = 0
-                    n_interior += 1
-                elif bl0 in (1, 2) or bl1 in (1, 2):
-                    if bl0 in (1, 2):
-                        vertex_boundary_type[i] = bl0
-                    else:
-                        vertex_boundary_type[i] = bl1
-                    n_hull_boundary += 1
-                else:
-                    vertex_boundary_type[i] = 0
-                    n_interior += 1
+                # Check if edge is adjacent to a primary cut edge
+                is_primary_adjacent = (has_primary_vertex_mask and 
+                                       (primary_cut_vertex_mask[v0] or primary_cut_vertex_mask[v1]))
+                bt = _determine_boundary_type_secondary(bl0, bl1, is_primary_adjacent)
             else:
-                # PRIMARY SURFACE: Original logic
-                # Priority: Part surface M (-1) > Hull (1,2) > Interior (0)
-                # If either endpoint is on part surface, mark for re-projection to part M
-                if bl0 == -1 or bl1 == -1:
-                    vertex_boundary_type[i] = -1  # Will re-project to part M later
-                    n_part_boundary += 1
-                # Else if either endpoint is on hull boundary, mark for re-projection to hull
-                elif bl0 in (1, 2) or bl1 in (1, 2):
-                    # Use the non-zero hull label (prefer H1 if both are hull vertices)
-                    if bl0 in (1, 2):
-                        vertex_boundary_type[i] = bl0
-                    else:
-                        vertex_boundary_type[i] = bl1
-                    n_hull_boundary += 1
-                else:
-                    # Both interior - no re-projection needed
-                    vertex_boundary_type[i] = 0
-                    n_interior += 1
+                bt = _determine_boundary_type_primary(bl0, bl1)
+            
+            vertex_boundary_type[i] = bt
+            
+            # Track statistics
+            if bt == BOUNDARY_TYPE_PART:
+                n_part_boundary += 1
+            elif bt in (BOUNDARY_TYPE_H1, BOUNDARY_TYPE_H2):
+                n_hull_boundary += 1
+            elif bt == BOUNDARY_TYPE_PRIMARY_JUNCTION:
+                n_primary_junction += 1
+            else:
+                n_interior += 1
         else:
-            # No boundary labels available
-            vertex_boundary_type[i] = 0
+            vertex_boundary_type[i] = BOUNDARY_TYPE_INTERIOR
             n_interior += 1
     
     logger.info(f"Cut point placement: {n_weighted} weighted, {n_midpoint} midpoint")
@@ -875,67 +1115,19 @@ def extract_parting_surface(
                         break
                 
                 if valid and len(tri_verts) == 3:
-                    # Orient triangle normals consistently
-                    # For PRIMARY surfaces: normal points from H1 towards H2
-                    # For SECONDARY surfaces: normal points towards the "secondary side"
-                    #   (we use escape distances as a proxy for "side")
+                    # Orient triangle normals consistently using helper functions
                     if vertex_mold_labels is not None and use_label_derived_cuts:
-                        # PRIMARY: Get positions of the 3 cut points
-                        p0 = surface_vertices[tri_verts[0]]
-                        p1 = surface_vertices[tri_verts[1]]
-                        p2 = surface_vertices[tri_verts[2]]
-                        
-                        # Compute triangle centroid and normal
-                        tri_center = (p0 + p1 + p2) / 3.0
-                        edge1 = p1 - p0
-                        edge2 = p2 - p0
-                        normal = np.cross(edge1, edge2)
-                        
-                        # Find the H2 centroid in this tet (vertices with label 2)
-                        h2_positions = []
-                        for v_local in range(4):
-                            v_global = tet_verts[v_local]
-                            if vertex_mold_labels[v_global] == 2:
-                                h2_positions.append(verts[v_global])
-                        
-                        if len(h2_positions) > 0:
-                            h2_centroid = np.mean(h2_positions, axis=0)
-                            # Vector from triangle center towards H2
-                            to_h2 = h2_centroid - tri_center
-                            
-                            # If normal points away from H2, flip the triangle
-                            if np.dot(normal, to_h2) < 0:
-                                tri_verts = [tri_verts[0], tri_verts[2], tri_verts[1]]  # Flip winding
-                    else:
-                        # SECONDARY: Orient based on escape distances if available
-                        # The side with LONGER escape distance should be the "outside"
-                        # (secondary cuts occur where paths diverge around the part M)
-                        if vertex_escape_distances is not None:
-                            p0 = surface_vertices[tri_verts[0]]
-                            p1 = surface_vertices[tri_verts[1]]
-                            p2 = surface_vertices[tri_verts[2]]
-                            
-                            tri_center = (p0 + p1 + p2) / 3.0
-                            edge1 = p1 - p0
-                            edge2 = p2 - p0
-                            normal = np.cross(edge1, edge2)
-                            
-                            # For secondary cuts, find the tet vertex with LONGEST escape distance
-                            # and orient AWAY from it (it's on the "far side" of the cut)
-                            max_dist = -np.inf
-                            max_dist_pos = None
-                            for v_local in range(4):
-                                v_global = tet_verts[v_local]
-                                d = vertex_escape_distances[v_global]
-                                if np.isfinite(d) and d > max_dist:
-                                    max_dist = d
-                                    max_dist_pos = verts[v_global]
-                            
-                            if max_dist_pos is not None:
-                                to_far = max_dist_pos - tri_center
-                                # Normal should point AWAY from the far vertex
-                                if np.dot(normal, to_far) > 0:
-                                    tri_verts = [tri_verts[0], tri_verts[2], tri_verts[1]]  # Flip winding
+                        # PRIMARY surfaces: normal points from H1 towards H2
+                        tri_verts = _orient_triangle_by_mold_labels(
+                            tri_verts, surface_vertices, tet_verts,
+                            vertex_mold_labels, verts
+                        )
+                    elif vertex_escape_distances is not None:
+                        # SECONDARY surfaces: orient based on escape distances
+                        tri_verts = _orient_triangle_by_escape_distance(
+                            tri_verts, surface_vertices, tet_verts,
+                            vertex_escape_distances, verts
+                        )
                     
                     triangles.append(tri_verts)
     

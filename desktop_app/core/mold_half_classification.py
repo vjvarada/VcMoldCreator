@@ -1,63 +1,101 @@
 """
-Mold Half Classification
+Mold Half Classification - Step 5 of the Mold Design Pipeline
 
 Classifies boundary triangles of a mold cavity into two mold halves (H₁ and H₂)
-based on parting directions.
+based on parting directions d₁ and d₂.
 
-Algorithm:
-1. Identify outer boundary triangles by matching against hull geometry
-2. Initial classification using directional scoring (dot product with parting directions)
-3. Morphological opening (erosion + dilation) to remove thin peninsulas
-4. Laplacian smoothing with 2-ring neighborhood for smooth boundaries
-5. Orphan region removal using connected component analysis
-6. Re-apply directional constraints for strong alignments
+Paper Reference:
+    Alderighi et al., "Volume-Aware Design of Composite Molds", SIGGRAPH 2019
+    Section 4.1: "Given the two parting directions, we partition the boundary ∂H
+    into two parts, ∂H₁ and ∂H₂: we select the two faces F₁ and F₂ of ∂H whose
+    normals best align with d₁ and d₂ and then use a greedy region-growing
+    approach from F₁ and F₂ to assign faces to ∂H₁ and ∂H₂."
 
-Color convention:
-- H₁ (Green): Triangles whose normals align with d1 (dot(n, d1) >= 0)
-- H₂ (Orange): Triangles whose normals align with d2 (dot(n, d2) >= 0)
-- Inner boundary (Dark gray): Triangles from the original part surface
+Algorithm Overview:
+    1. Identify outer boundary triangles (hull surface vs part surface)
+    2. Find seed faces F₁, F₂ with best alignment to d₁, d₂
+    3. Greedy region-growing from seeds based on normal alignment
+    4. Create boundary zone (physical distance threshold from H₁/H₂ interface)
+    5. Optional: Morphological smoothing and orphan removal
 
-Algorithm matches the React frontend implementation exactly.
+Boundary Zone Definition (Paper Section 4.1):
+    "We compute the shortest paths towards all vertices of ∂H, except for those
+    whose distance from the boundary between ∂H₁ and ∂H₂ is less than a fixed
+    threshold... we set the threshold to 15% of the convex hull bounding box diagonal."
+
+Label Encoding:
+    - H₁ (label=1): Faces whose normals align with d₁
+    - H₂ (label=2): Faces whose normals align with d₂
+    - Boundary zone (label=0): Faces near H₁/H₂ interface (excluded from Dijkstra)
+    - Inner boundary (label=-1): Part surface faces (not classified)
+
+Color Convention (Visualization):
+    - H₁: Green
+    - H₂: Orange
+    - Boundary zone: Gray
+    - Inner boundary: Dark gray
 """
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, Set, List, Tuple
+from typing import Dict, Set, List, Tuple, Optional
 
 import numpy as np
 import trimesh
 
-# Check for GPU acceleration
-try:
-    import torch
-    TORCH_AVAILABLE = True
-    CUDA_AVAILABLE = torch.cuda.is_available()
-except ImportError:
-    TORCH_AVAILABLE = False
-    CUDA_AVAILABLE = False
 
-# Check for C++ acceleration
-try:
+# =============================================================================
+# DEPENDENCY DETECTION
+# =============================================================================
+
+def _check_torch() -> Tuple[bool, bool]:
+    """Check PyTorch and CUDA availability."""
+    try:
+        import torch
+        return True, torch.cuda.is_available()
+    except ImportError:
+        return False, False
+
+
+def _check_cpp_fast() -> bool:
+    """Check C++ fast_algorithms availability."""
+    try:
+        from . import fast_algorithms
+        return True
+    except ImportError:
+        return False
+
+
+TORCH_AVAILABLE, CUDA_AVAILABLE = _check_torch()
+CPP_FAST_AVAILABLE = _check_cpp_fast()
+
+# Import PyTorch if available (for type hints)
+if TORCH_AVAILABLE:
+    import torch
+
+# Import C++ module if available
+if CPP_FAST_AVAILABLE:
     from . import fast_algorithms as _cpp
-    CPP_FAST_AVAILABLE = True
-except ImportError:
-    CPP_FAST_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
+# =============================================================================
 # CONSTANTS
-# ============================================================================
+# =============================================================================
 
-# Classification thresholds
+# Classification thresholds (empirically determined)
 STRONG_ALIGNMENT_THRESHOLD = 0.7      # Dot product threshold for strong directional alignment
 STRONG_ALIGNMENT_MARGIN = 0.3         # Required margin over competing direction
-OUTER_BOUNDARY_TOLERANCE_FRACTION = 0.001  # 0.1% of hull size for outer boundary detection
-TET_OUTER_BOUNDARY_TOLERANCE_FRACTION = 0.02  # 2% of hull size for tet-based detection
 
-# Boundary zone parameters
-DEFAULT_BOUNDARY_ZONE_THRESHOLD = 0.05  # Default threshold for boundary zone (5% of bbox diagonal per paper)
+# Outer boundary detection tolerances
+OUTER_BOUNDARY_TOLERANCE_FRACTION = 0.001  # 0.1% of hull size for plane-based detection
+TET_OUTER_BOUNDARY_TOLERANCE_FRACTION = 0.02  # 2% of hull diagonal for tet label-based detection
+
+# Boundary zone parameters (Paper Section 4.1)
+# Note: Paper uses 15% for Dijkstra exclusion, we use 5% for visualization by default
+DEFAULT_BOUNDARY_ZONE_THRESHOLD = 0.05  # 5% of bbox diagonal
+PAPER_BOUNDARY_ZONE_THRESHOLD = 0.15    # 15% as specified in paper
 
 # Area-based filtering
 ORPHAN_REGION_AREA_THRESHOLD = 0.02   # 2% of total area - regions smaller are orphans
@@ -65,16 +103,40 @@ ORPHAN_REGION_AREA_THRESHOLD = 0.02   # 2% of total area - regions smaller are o
 # Minimum outer triangle fraction before warning
 MIN_OUTER_TRIANGLE_FRACTION = 0.1     # Warn if <10% of triangles are outer
 
+# GPU batch sizes
+GPU_VERTEX_BATCH_SIZE = 5000          # Vertices per batch for GPU nearest neighbor
 
-# ============================================================================
+# Morphological smoothing iterations
+DEFAULT_SMOOTHING_ITERATIONS = 5      # Laplacian smoothing iterations
+
+
+# =============================================================================
 # DATA CLASSES
-# ============================================================================
+# =============================================================================
 
 @dataclass
 class MoldHalfClassificationResult:
-    """Result of mold half classification."""
+    """
+    Result of mold half classification (Paper Section 4.1).
+    
+    Contains the partitioning of boundary triangles into:
+    - H₁ (mold half 1): Triangles assigned to first mold piece
+    - H₂ (mold half 2): Triangles assigned to second mold piece
+    - Boundary zone: Triangles near the H₁/H₂ interface (excluded from Dijkstra)
+    - Inner boundary: Part surface triangles (not classified)
+    
+    The boundary zone exists because Dijkstra escape paths should not terminate
+    near the H₁/H₂ interface (per paper Section 4.1).
+    
+    Label Encoding:
+        1 = H₁ (mold half 1)
+        2 = H₂ (mold half 2)
+        0 = Boundary zone (excluded)
+        -1 = Inner boundary (part surface)
+    """
     
     # Map from triangle index to mold half (1 or 2), only for outer boundary triangles
+    # Does NOT include boundary zone or inner boundary triangles
     side_map: Dict[int, int]
     
     # Triangle indices belonging to mold half 1 (H₁)
@@ -83,10 +145,12 @@ class MoldHalfClassificationResult:
     # Triangle indices belonging to mold half 2 (H₂)
     h2_triangles: Set[int]
     
-    # Triangle indices in the boundary zone between H₁ and H₂ (grey, no label)
+    # Triangle indices in the boundary zone between H₁ and H₂
+    # These are excluded from Dijkstra escape destinations
     boundary_zone_triangles: Set[int]
     
-    # Triangle indices belonging to inner boundary (part surface) - not classified
+    # Triangle indices belonging to inner boundary (part surface)
+    # These represent the original part mesh and are not classified
     inner_boundary_triangles: Set[int]
     
     # Total triangles in boundary mesh
@@ -94,6 +158,35 @@ class MoldHalfClassificationResult:
     
     # Total outer boundary triangles (H₁ + H₂ + boundary zone)
     outer_boundary_count: int
+    
+    # =========================================================================
+    # HELPER PROPERTIES
+    # =========================================================================
+    
+    @property
+    def h1_count(self) -> int:
+        """Number of triangles in H₁."""
+        return len(self.h1_triangles)
+    
+    @property
+    def h2_count(self) -> int:
+        """Number of triangles in H₂."""
+        return len(self.h2_triangles)
+    
+    @property
+    def boundary_zone_count(self) -> int:
+        """Number of triangles in boundary zone."""
+        return len(self.boundary_zone_triangles)
+    
+    @property
+    def inner_boundary_count(self) -> int:
+        """Number of triangles in inner boundary (part surface)."""
+        return len(self.inner_boundary_triangles)
+    
+    @property
+    def is_valid(self) -> bool:
+        """Return True if classification produced valid H₁/H₂ regions."""
+        return self.h1_count > 0 and self.h2_count > 0
 
 
 @dataclass
@@ -371,6 +464,10 @@ def classify_hull_faces_fast(
         outer_boundary_count=n_faces,
     )
 
+
+# =============================================================================
+# C++ ACCELERATED CLASSIFICATION
+# =============================================================================
 
 def _classify_mold_halves_cpp(
     boundary_mesh: trimesh.Trimesh,
@@ -1090,6 +1187,10 @@ def classify_mold_halves_fast(
     return side
 
 
+# =============================================================================
+# OUTER BOUNDARY DETECTION
+# =============================================================================
+
 def identify_outer_boundary_by_distance(
     boundary_mesh: trimesh.Trimesh,
     part_mesh: trimesh.Trimesh,
@@ -1552,6 +1653,10 @@ def _point_to_triangles_distance_gpu(
     return min_dist
 
 
+# =============================================================================
+# MORPHOLOGICAL OPERATIONS AND SMOOTHING
+# =============================================================================
+
 def classify_and_smooth(
     triangles: List[TriangleInfo],
     adjacency: Dict[int, List[int]],
@@ -1729,6 +1834,10 @@ def classify_and_smooth(
     # Convert back to dict
     return {int(outer_array[i]): int(side_labels[i]) for i in range(n_outer)}
 
+
+# =============================================================================
+# ORPHAN REGION REMOVAL
+# =============================================================================
 
 def remove_orphans(
     side: Dict[int, int],
