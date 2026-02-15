@@ -3875,28 +3875,53 @@ def _create_collar_vertex(
     collar_dir_hint: Optional[np.ndarray] = None
 ) -> np.ndarray:
     """
-    Create a collar vertex by projecting to part and offsetting inward.
+    Create a collar vertex by offsetting in the membrane plane direction.
+    
+    DESIGN: We prioritize keeping collars COPLANAR with the membrane to avoid
+    visual artifacts (angled collars). The collar's main purpose is to extend
+    the membrane slightly for CSG operations - it doesn't strictly need to be
+    deep inside the part, just needs to create continuous geometry.
     
     Args:
-        vi_pos: Position of the membrane vertex
+        vi_pos: Position of the membrane vertex (should be ON part surface)
         part_mesh: The part mesh
         part_face_normals: Pre-computed part face normals
         collar_depth: How far to offset into the part
-        collar_dir_hint: Optional hint direction for collar (used for isolated tips)
+        collar_dir_hint: Direction for collar (perpendicular to edge in membrane plane)
     
     Returns:
         Position of the collar vertex
     """
-    # If we have a direction hint (for isolated tips), try planar point first
+    # PREFERRED: Use coplanar offset if we have a direction hint
+    # This keeps the collar aligned with the membrane plane
     if collar_dir_hint is not None:
-        planar_pt = vi_pos + collar_depth * collar_dir_hint
+        collar_dir = collar_dir_hint / (np.linalg.norm(collar_dir_hint) + 1e-8)
+        collar_pt = vi_pos + collar_depth * collar_dir
+        
+        # Optionally verify it's inside, but don't require it
+        # If outside, the CSG will still work - we just get less depth
         try:
-            if part_mesh.contains([planar_pt])[0]:
-                return planar_pt
+            if part_mesh.contains([collar_pt])[0]:
+                return collar_pt
+            
+            # If outside, try projecting the coplanar point onto part surface
+            # This keeps us closer to coplanar while ensuring we touch the part
+            closest_pts, _, _ = trimesh.proximity.closest_point(part_mesh, [collar_pt])
+            projected_pt = closest_pts[0]
+            
+            # Blend: move slightly toward the projection to ensure inside
+            # This maintains most of the coplanar alignment
+            blend_pt = 0.7 * collar_pt + 0.3 * projected_pt
+            if part_mesh.contains([blend_pt])[0]:
+                return blend_pt
+            
+            # If still outside, just use the coplanar point anyway
+            # Better to have clean geometry than proper sealing
+            return collar_pt
         except Exception:
-            pass
+            return collar_pt
     
-    # Standard approach: project to part and offset inward
+    # FALLBACK: If no hint, use part surface normal (old behavior)
     try:
         closest_pts, _, closest_faces = trimesh.proximity.closest_point(part_mesh, [vi_pos])
         closest_pt = closest_pts[0]
@@ -3905,24 +3930,15 @@ def _create_collar_vertex(
         if closest_face < len(part_face_normals):
             into_part = -part_face_normals[closest_face]
         else:
-            into_part = collar_dir_hint if collar_dir_hint is not None else np.array([0, 0, -1])
+            into_part = np.array([0, 0, -1])
         
         into_part = into_part / (np.linalg.norm(into_part) + 1e-8)
         collar_pt = closest_pt + collar_depth * into_part
         
-        # Verify inside
-        try:
-            if not part_mesh.contains([collar_pt])[0]:
-                alt_pt = closest_pt - collar_depth * into_part
-                if part_mesh.contains([alt_pt])[0]:
-                    collar_pt = alt_pt
-        except Exception:
-            pass
-        
         return collar_pt
     except Exception:
-        # Fallback to simple offset
-        return vi_pos + collar_depth * (collar_dir_hint if collar_dir_hint is not None else np.array([0, 0, -1]))
+        # Final fallback
+        return vi_pos + collar_depth * np.array([0, 0, -1])
 
 
 def _create_fan_triangles(
@@ -4228,9 +4244,77 @@ def create_robust_collar_extension(
     # Map: (edge_key, vertex) -> collar_idx
     edge_endpoint_collar = {}
     
-    # All fan vertices need edge-aware collar directions
+    # All fan vertices need edge-aware collar directions (separate collar per edge)
     all_fan_verts_set = set(boundary_info.get_all_fan_vertices())
     
+    # PHASE 1: For QUAD vertices, create a SINGLE shared collar vertex
+    # This ensures adjacent edges connect properly at non-corner vertices
+    # We average the collar directions from all adjacent edges
+    quad_vertex_collar = {}  # vi -> collar_idx (shared across all edges at this vertex)
+    
+    # Build vertex -> adjacent boundary edges mapping
+    vertex_to_boundary_edges = {}
+    for v0, v1 in inner_boundary_edges:
+        edge_key = (min(v0, v1), max(v0, v1))
+        for vi in [v0, v1]:
+            if vi not in vertex_to_boundary_edges:
+                vertex_to_boundary_edges[vi] = []
+            vertex_to_boundary_edges[vi].append((edge_key, v0, v1))
+    
+    # Create shared collar vertices for quad (non-fan) vertices
+    for vi, edge_list in vertex_to_boundary_edges.items():
+        if vi in all_fan_verts_set:
+            continue  # Fan vertices get per-edge collars in Phase 2
+        
+        vi_pos = vertices_arr[vi]
+        
+        # Average the collar directions from all adjacent edges
+        collar_dirs = []
+        for edge_key, v0, v1 in edge_list:
+            face_info = edge_to_face.get(edge_key)
+            if face_info is None:
+                continue
+            
+            fi, _ = face_info
+            face_normal = membrane_face_normals[fi] if fi < len(membrane_face_normals) else np.array([0, 0, 1])
+            
+            v0_pos, v1_pos = vertices_arr[v0], vertices_arr[v1]
+            edge_vec = v1_pos - v0_pos
+            edge_len = np.linalg.norm(edge_vec)
+            if edge_len < 1e-8:
+                continue
+            edge_dir = edge_vec / edge_len
+            
+            # Perpendicular to edge in the face plane
+            perp = np.cross(face_normal, edge_dir)
+            perp_len = np.linalg.norm(perp)
+            if perp_len > 1e-8:
+                perp = perp / perp_len
+                # Orient outward
+                face_verts = faces_arr[fi]
+                third_v = [fv for fv in face_verts if fv != v0 and fv != v1]
+                if third_v:
+                    to_third = vertices_arr[third_v[0]] - vi_pos
+                    if np.dot(perp, to_third) > 0:
+                        perp = -perp
+                collar_dirs.append(perp)
+        
+        if collar_dirs:
+            # Average the directions
+            avg_dir = np.mean(collar_dirs, axis=0)
+            avg_len = np.linalg.norm(avg_dir)
+            if avg_len > 1e-8:
+                avg_dir = avg_dir / avg_len
+            else:
+                avg_dir = collar_dirs[0]  # Fallback to first direction
+            
+            collar_pt = _create_collar_vertex(vi_pos, part_mesh, part_face_normals, collar_depth, avg_dir)
+            collar_idx = len(vertices)
+            vertices.append(collar_pt.copy())
+            quad_vertex_collar[vi] = collar_idx
+    
+    # PHASE 2: Create per-edge collar vertices for FAN vertices
+    # (Fan vertices need separate collars per edge for the fan triangle arcs)
     for v0, v1 in inner_boundary_edges:
         edge_key = (min(v0, v1), max(v0, v1))
         
@@ -4255,25 +4339,26 @@ def create_robust_collar_extension(
             if vi in edge_endpoint_collar[edge_key]:
                 continue
             
+            # For QUAD vertices: use the shared collar from Phase 1
+            if vi in quad_vertex_collar:
+                edge_endpoint_collar[edge_key][vi] = quad_vertex_collar[vi]
+                continue
+            
+            # For FAN vertices: create per-edge collar vertex
             vi_pos = vertices_arr[vi]
             
-            # ALWAYS compute edge-aware collar direction for fan vertices
-            # This ensures each edge contributes a distinct collar position at corners
+            perp = np.cross(face_normal, edge_dir)
+            perp_len = np.linalg.norm(perp)
             collar_hint = None
-            if vi in all_fan_verts_set:
-                # Perpendicular to edge in the face plane (outward from mesh)
-                perp = np.cross(face_normal, edge_dir)
-                perp_len = np.linalg.norm(perp)
-                if perp_len > 1e-8:
-                    perp = perp / perp_len
-                    # Flip if pointing toward interior (toward third vertex of face)
-                    face_verts = faces_arr[fi]
-                    third_v = [fv for fv in face_verts if fv != v0 and fv != v1]
-                    if third_v:
-                        to_third = vertices_arr[third_v[0]] - vi_pos
-                        if np.dot(perp, to_third) > 0:
-                            perp = -perp
-                    collar_hint = perp
+            if perp_len > 1e-8:
+                perp = perp / perp_len
+                face_verts = faces_arr[fi]
+                third_v = [fv for fv in face_verts if fv != v0 and fv != v1]
+                if third_v:
+                    to_third = vertices_arr[third_v[0]] - vi_pos
+                    if np.dot(perp, to_third) > 0:
+                        perp = -perp
+                collar_hint = perp
             
             collar_pt = _create_collar_vertex(vi_pos, part_mesh, part_face_normals, collar_depth, collar_hint)
             collar_idx = len(vertices)
