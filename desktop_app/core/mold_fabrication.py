@@ -896,7 +896,7 @@ def _create_half_space_from_membrane(
 def _create_cutting_blade_from_membrane(
     membrane: trimesh.Trimesh,
     direction: np.ndarray,
-    thickness: float = 0.0005
+    thickness: float = 0.0001
 ) -> trimesh.Trimesh:
     """
     Create a thin watertight "blade" volume from the membrane for cutting.
@@ -908,7 +908,7 @@ def _create_cutting_blade_from_membrane(
     Args:
         membrane: The membrane mesh (e.g., outer collar)
         direction: Unit vector perpendicular to the membrane (pouring direction)
-        thickness: Total thickness of the blade (default: 0.0005mm = 0.5 micron)
+        thickness: Total thickness of the blade (default: 0.0001mm = 0.1 micron)
         
     Returns:
         A watertight blade volume mesh
@@ -1328,74 +1328,62 @@ def split_shell_with_membrane(
         blade = _create_cutting_blade_from_membrane(membrane, direction, blade_thickness)
         logger.info(f"Blade: {len(blade.vertices)} verts, {len(blade.faces)} faces")
         
-        # DIAGNOSTIC: Check blade and membrane properties
-        logger.info(f"DIAGNOSTIC - Membrane properties:")
-        logger.info(f"  Membrane: {len(membrane.vertices)} verts, {len(membrane.faces)} faces")
-        logger.info(f"  Membrane is_watertight: {membrane.is_watertight}")
-        # Count membrane boundary edges
-        membrane_edge_count = {}
-        for face in membrane.faces:
-            for i in range(3):
-                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-                edge_key = (min(v0, v1), max(v0, v1))
-                membrane_edge_count[edge_key] = membrane_edge_count.get(edge_key, 0) + 1
-        membrane_boundary_edges = sum(1 for c in membrane_edge_count.values() if c == 1)
-        logger.info(f"  Membrane boundary edges: {membrane_boundary_edges}")
-        
-        logger.info(f"DIAGNOSTIC - Blade properties:")
-        logger.info(f"  Blade is_watertight: {blade.is_watertight}")
-        # Count blade boundary edges
-        blade_edge_count = {}
-        for face in blade.faces:
-            for i in range(3):
-                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-                edge_key = (min(v0, v1), max(v0, v1))
-                blade_edge_count[edge_key] = blade_edge_count.get(edge_key, 0) + 1
-        blade_boundary_edges = sum(1 for c in blade_edge_count.values() if c == 1)
-        logger.info(f"  Blade boundary edges: {blade_boundary_edges}")
-        if blade_boundary_edges > 0:
-            logger.warning(f"  WARNING: Blade has {blade_boundary_edges} open edges - not watertight!")
-        
-        # DIAGNOSTIC: Log bounding box info
-        shell_bounds = shell_with_cavity.bounds  # [[xmin,ymin,zmin], [xmax,ymax,zmax]]
-        blade_bounds = blade.bounds
-        membrane_bounds = membrane.bounds
-        logger.info(f"DIAGNOSTIC - Bounding boxes:")
-        logger.info(f"  Shell:    min={shell_bounds[0]}, max={shell_bounds[1]}")
-        logger.info(f"  Membrane: min={membrane_bounds[0]}, max={membrane_bounds[1]}")
-        logger.info(f"  Blade:    min={blade_bounds[0]}, max={blade_bounds[1]}")
-        
-        # Check overlap along pouring direction
-        # Project all vertices onto pouring direction for accurate range
-        shell_projections = shell_with_cavity.vertices @ direction
-        blade_projections = blade.vertices @ direction
-        shell_proj_min = float(shell_projections.min())
-        shell_proj_max = float(shell_projections.max())
-        blade_proj_min = float(blade_projections.min())
-        blade_proj_max = float(blade_projections.max())
-        
-        logger.info(f"  Shell extent along pouring dir: [{shell_proj_min:.2f}, {shell_proj_max:.2f}]")
-        logger.info(f"  Blade extent along pouring dir: [{blade_proj_min:.2f}, {blade_proj_max:.2f}]")
-        
-        # Check if blade overlaps with shell
-        overlap = not (blade_proj_max < shell_proj_min or blade_proj_min > shell_proj_max)
-        if not overlap:
-            logger.warning("DIAGNOSTIC: Blade does NOT overlap with shell along pouring direction!")
-            logger.warning("  This means the blade is outside the shell's Z range and won't cut it.")
-        else:
-            logger.info("  Blade overlaps with shell along pouring direction - OK")
+        # Diagnostic: blade and membrane properties (debug level to reduce log noise)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Membrane: {len(membrane.vertices)} verts, {len(membrane.faces)} faces, watertight={membrane.is_watertight}")
+            # Count membrane boundary edges
+            membrane_edge_count = {}
+            for face in membrane.faces:
+                for i in range(3):
+                    v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                    edge_key = (min(v0, v1), max(v0, v1))
+                    membrane_edge_count[edge_key] = membrane_edge_count.get(edge_key, 0) + 1
+            membrane_boundary_edges = sum(1 for c in membrane_edge_count.values() if c == 1)
+            logger.debug(f"  Membrane boundary edges: {membrane_boundary_edges}")
+            
+            logger.debug(f"Blade: watertight={blade.is_watertight}")
+            # Count blade boundary edges
+            blade_edge_count = {}
+            for face in blade.faces:
+                for i in range(3):
+                    v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                    edge_key = (min(v0, v1), max(v0, v1))
+                    blade_edge_count[edge_key] = blade_edge_count.get(edge_key, 0) + 1
+            blade_boundary_edges = sum(1 for c in blade_edge_count.values() if c == 1)
+            if blade_boundary_edges > 0:
+                logger.warning(f"Blade has {blade_boundary_edges} open edges - not watertight!")
+            
+            # Bounding box info
+            shell_bounds = shell_with_cavity.bounds
+            blade_bounds = blade.bounds
+            membrane_bounds = membrane.bounds
+            logger.debug(f"Bounds - Shell: {shell_bounds[0]} to {shell_bounds[1]}")
+            logger.debug(f"Bounds - Membrane: {membrane_bounds[0]} to {membrane_bounds[1]}")
+            logger.debug(f"Bounds - Blade: {blade_bounds[0]} to {blade_bounds[1]}")
+            
+            # Check overlap along pouring direction
+            shell_projections = shell_with_cavity.vertices @ direction
+            blade_projections = blade.vertices @ direction
+            shell_proj_min = float(shell_projections.min())
+            shell_proj_max = float(shell_projections.max())
+            blade_proj_min = float(blade_projections.min())
+            blade_proj_max = float(blade_projections.max())
+            logger.debug(f"Shell extent along pouring dir: [{shell_proj_min:.2f}, {shell_proj_max:.2f}]")
+            logger.debug(f"Blade extent along pouring dir: [{blade_proj_min:.2f}, {blade_proj_max:.2f}]")
+            
+            overlap = not (blade_proj_max < shell_proj_min or blade_proj_min > shell_proj_max)
+            if not overlap:
+                logger.warning("Blade does NOT overlap with shell along pouring direction - cut may fail")
+            
+            # Check shell connectivity BEFORE cutting (expensive)
+            shell_components_before = shell_with_cavity.split(only_watertight=False)
+            logger.debug(f"Shell has {len(shell_components_before)} connected components BEFORE cutting")
+            if len(shell_components_before) > 1:
+                for i, comp in enumerate(sorted(shell_components_before, key=lambda m: len(m.faces), reverse=True)[:5]):
+                    logger.debug(f"  Component {i+1}: {len(comp.vertices)} verts, {len(comp.faces)} faces")
         
         # Step 2: Convert to manifold3d
         logger.info("Converting meshes to manifold...")
-        
-        # DIAGNOSTIC: Check shell connectivity BEFORE cutting
-        logger.info("DIAGNOSTIC: Checking shell connectivity BEFORE cutting...")
-        shell_components_before = shell_with_cavity.split(only_watertight=False)
-        logger.info(f"  Shell has {len(shell_components_before)} connected components BEFORE cutting")
-        if len(shell_components_before) > 1:
-            for i, comp in enumerate(sorted(shell_components_before, key=lambda m: len(m.faces), reverse=True)[:5]):
-                logger.info(f"    Component {i+1}: {len(comp.vertices)} verts, {len(comp.faces)} faces")
-        
         shell_manifold = _trimesh_to_manifold(shell_with_cavity)
         blade_manifold = _trimesh_to_manifold(blade)
         
@@ -1762,11 +1750,11 @@ def thicken_surface_symmetric(
         all_vertices = np.vstack([bottom_vertices, top_vertices])
         
         # Create faces:
-        # 1. Bottom faces - original winding (normals point outward = down)
-        bottom_faces = faces.copy()
+        # 1. Bottom faces - reversed winding (normals point away from slab in -normal direction)
+        bottom_faces = faces[:, ::-1].copy()
         
-        # 2. Top faces - reversed winding (normals point outward = up), indices offset by n_verts
-        top_faces = faces[:, ::-1] + n_verts
+        # 2. Top faces - original winding (normals point away from slab in +normal direction), offset by n_verts
+        top_faces = faces + n_verts
         
         # 3. Side faces connecting boundary edges
         # Find boundary edges
@@ -1795,9 +1783,9 @@ def thicken_surface_symmetric(
             t0, t1 = v0_orig + n_verts, v1_orig + n_verts
             
             # Create quad (2 triangles) with outward-facing normals
-            # The winding should create normals pointing away from the surface
-            side_faces.append([b0, t0, t1])
-            side_faces.append([b0, t1, b1])
+            # Winding consistent with reversed bottom (boundary b1->b0) and original top (t0->t1)
+            side_faces.append([b0, b1, t1])
+            side_faces.append([b0, t1, t0])
         
         # Combine all faces
         all_faces = np.vstack([
@@ -2113,8 +2101,9 @@ def trim_metamold_halves(
             
             if gap > 0.01:
                 manifold = _trimesh_to_manifold(upper_half)
-                # trim_by_plane(normal, offset): keeps the side in normal direction
-                # normal = -pouring_dir, offset = -trim_at → keeps below trim_at
+                # trim_by_plane(normal, offset) keeps geometry where dot(v, normal) >= offset.
+                # To keep everything BELOW trim_at (i.e. dot(v, pouring_dir) <= trim_at),
+                # we negate both: normal = -pouring_dir, offset = -trim_at.
                 manifold = manifold.trim_by_plane(
                     (-pouring_dir).tolist(), float(-trim_at)
                 )

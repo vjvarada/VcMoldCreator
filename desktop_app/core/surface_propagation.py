@@ -1265,7 +1265,11 @@ def smooth_membrane_with_boundary_reprojection(
         logger.debug(f"Primary mesh for re-projection: {len(primary_mesh.faces)} faces")
     
     # Find boundary vertices and classify which surface they belong to
-    boundary_edges = find_boundary_edges(trimesh.Trimesh(vertices=vertices, faces=faces))
+    # CRITICAL: Use process=False to prevent merge_vertices() from renumbering
+    # vertex indices. The boundary edge indices must match the original vertices
+    # array — if merge_vertices() removes or reindexes vertices, boundary
+    # classification will index the wrong vertices.
+    boundary_edges = find_boundary_edges(trimesh.Trimesh(vertices=vertices, faces=faces, process=False))
     boundary_verts = set()
     for v0, v1 in boundary_edges:
         boundary_verts.add(v0)
@@ -2115,15 +2119,24 @@ def smooth_membrane_with_boundary_reprojection(
         result.restored_corner_positions = np.array(list(corner_original_positions.values()))
     
     # Create smoothed mesh
-    smoothed_mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+    # CRITICAL: Use process=False to prevent merge_vertices() from renumbering
+    # vertex indices. The caller relies on vertex_boundary_type staying aligned
+    # with the vertex array — if merge_vertices() removes or reindexes vertices,
+    # collar creation will look up wrong boundary types, causing inner/outer
+    # edge misclassification and collar failures.
+    smoothed_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     
     # Clean up any degenerate faces that might have been created
     valid_faces = smoothed_mesh.nondegenerate_faces()
     if np.sum(~valid_faces) > 0:
-        logger.debug(f"Removing {np.sum(~valid_faces)} degenerate faces after smoothing")
+        n_removed = np.sum(~valid_faces)
+        logger.debug(f"Removing {n_removed} degenerate faces after smoothing")
+        # CRITICAL: Use process=False here too — a second process=True would
+        # merge vertices again, further corrupting the index alignment.
         smoothed_mesh = trimesh.Trimesh(
             vertices=smoothed_mesh.vertices,
-            faces=smoothed_mesh.faces[valid_faces]
+            faces=smoothed_mesh.faces[valid_faces],
+            process=False
         )
     
     result.mesh = smoothed_mesh

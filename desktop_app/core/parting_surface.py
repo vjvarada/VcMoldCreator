@@ -3898,26 +3898,42 @@ def _create_collar_vertex(
         collar_dir = collar_dir_hint / (np.linalg.norm(collar_dir_hint) + 1e-8)
         collar_pt = vi_pos + collar_depth * collar_dir
         
-        # Optionally verify it's inside, but don't require it
-        # If outside, the CSG will still work - we just get less depth
+        # Try to ensure the collar point is inside the part or at least
+        # on its surface — an outside-part collar won't seal properly.
         try:
             if part_mesh.contains([collar_pt])[0]:
                 return collar_pt
             
-            # If outside, try projecting the coplanar point onto part surface
-            # This keeps us closer to coplanar while ensuring we touch the part
-            closest_pts, _, _ = trimesh.proximity.closest_point(part_mesh, [collar_pt])
+            # STRATEGY 1: Project the coplanar point onto part surface and
+            # use a blend that stays mostly coplanar
+            closest_pts, _, closest_faces = trimesh.proximity.closest_point(part_mesh, [collar_pt])
             projected_pt = closest_pts[0]
             
             # Blend: move slightly toward the projection to ensure inside
-            # This maintains most of the coplanar alignment
             blend_pt = 0.7 * collar_pt + 0.3 * projected_pt
             if part_mesh.contains([blend_pt])[0]:
                 return blend_pt
             
-            # If still outside, just use the coplanar point anyway
-            # Better to have clean geometry than proper sealing
-            return collar_pt
+            # STRATEGY 2: Try pushing further toward the projection
+            blend_pt2 = 0.5 * collar_pt + 0.5 * projected_pt
+            if part_mesh.contains([blend_pt2])[0]:
+                return blend_pt2
+            
+            # STRATEGY 3: Use part surface normal at the closest point
+            # to push INTO the part from the closest surface point
+            closest_face = closest_faces[0]
+            if closest_face < len(part_face_normals):
+                into_part = -part_face_normals[closest_face]
+                into_part = into_part / (np.linalg.norm(into_part) + 1e-8)
+                push_pt = projected_pt + collar_depth * 0.5 * into_part
+                if part_mesh.contains([push_pt])[0]:
+                    return push_pt
+            
+            # STRATEGY 4: Use the projected surface point directly.
+            # This ensures the collar at least TOUCHES the part surface
+            # even if it doesn't go inside. Much better than a point
+            # floating in space outside the part.
+            return projected_pt
         except Exception:
             return collar_pt
     
@@ -4146,6 +4162,23 @@ def create_robust_collar_extension(
     faces_arr = np.array(faces, dtype=np.int64)
     
     # =========================================================================
+    # DEFENSIVE CHECK: Validate vertex_boundary_type alignment
+    # If smoothing used trimesh with process=True, merge_vertices() may have
+    # renumbered vertex indices, making vertex_boundary_type misaligned.
+    # =========================================================================
+    if vertex_boundary_type is not None:
+        if len(vertex_boundary_type) != n_orig_verts:
+            logger.error(
+                "vertex_boundary_type length (%d) != mesh vertex count (%d). "
+                "This likely means vertex indices were renumbered during smoothing "
+                "(trimesh merge_vertices). Collar classification will be unreliable. "
+                "Falling back to distance-based classification only.",
+                len(vertex_boundary_type), n_orig_verts
+            )
+            # Set to None so downstream code uses distance-based fallback
+            vertex_boundary_type = None
+    
+    # =========================================================================
     # STEP 1: Build edge-to-face mapping and find boundary edges
     # =========================================================================
     
@@ -4198,16 +4231,25 @@ def create_robust_collar_extension(
     inner_boundary_edges = []
     outer_count = 0
     
+    # Compute mesh-scale-relative threshold for the MIXED case in
+    # _classify_boundary_edge.  The default 0.1 is in absolute units and
+    # fails for models that are not in mm.  Use 1% of the mesh diagonal
+    # as a reasonable relative threshold.
+    mesh_scale = np.linalg.norm(np.ptp(vertices_arr, axis=0))
+    relative_proximity_threshold = max(mesh_scale * 0.01, 0.01)
+    
     for v0, v1 in boundary_edges:
         is_inner = _classify_boundary_edge(
-            v0, v1, vertex_boundary_type, vert_to_part_dist, vert_to_hull_dist
+            v0, v1, vertex_boundary_type, vert_to_part_dist, vert_to_hull_dist,
+            part_proximity_threshold=relative_proximity_threshold
         )
         if is_inner:
             inner_boundary_edges.append((v0, v1))
         else:
             outer_count += 1
     
-    logger.info(f"Inner boundary edges: {len(inner_boundary_edges)}, outer (hull): {outer_count}")
+    logger.info(f"Inner boundary edges: {len(inner_boundary_edges)}, outer (hull): {outer_count} "
+               f"(proximity threshold: {relative_proximity_threshold:.4f})")
     
     if len(inner_boundary_edges) == 0:
         logger.info("No inner boundary edges to collar")
@@ -4491,15 +4533,19 @@ def create_robust_collar_extension(
         
         collar_infos.sort(key=collar_angle)
         
-        # Determine if we should wrap around: only wrap if ALL incident edges
-        # connect to other fan vertices (meaning no quads are involved).
-        # If any edge has a quad vertex on the other end, quads handle the
-        # outer edges and we just need the fan to fill the gap (no wrap).
+        # Determine if we should wrap around:
+        # - Always wrap for high-valence vertices (3+ edges) — they were
+        #   specifically classified as needing full fan coverage.  Without
+        #   wrapping, the gap between the last and first collar vertex is
+        #   left unfilled when some neighbors are quads.
+        # - For 2-edge fan vertices: only wrap if ALL incident edges connect
+        #   to other fan vertices (meaning no quads handle the outer arcs).
+        is_high_valence = vi in set(boundary_info.high_valence)
         all_neighbors_are_fans = all(
             other_v in all_fan_vertices_set 
             for _, _, other_v in edges_at_vi
         )
-        wrap_around = all_neighbors_are_fans
+        wrap_around = is_high_valence or all_neighbors_are_fans
         
         # Create fan triangles
         arc_v, fan_t = _create_fan_triangles(

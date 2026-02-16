@@ -2830,13 +2830,17 @@ class CombinedSurfaceSmoothingWorker(QThread):
             
             # Use new robust collar extension
             # Pass hull_mesh for accurate inner/outer boundary classification
+            # Compute scale-relative collar depth (default 0.5mm assumes mm units)
+            mesh_diag = float(np.linalg.norm(np.ptp(current_mesh.vertices, axis=0)))
+            collar_depth = max(mesh_diag * 0.005, 0.05)  # 0.5% of bbox diagonal, min 0.05
             fill_result = create_robust_collar_extension(
                 membrane_mesh=current_mesh,
                 part_mesh=part_mesh,
                 hull_mesh=hull_mesh,
                 vertex_boundary_type=current_boundary_type,
-                collar_depth=0.5,
-                fan_subdivisions=4
+                collar_depth=collar_depth,
+                fan_subdivisions=4,
+                restored_corner_positions=restored_corner_positions
             )
             
             gap_fill_time_ms = (time.time() - gap_fill_start) * 1000
@@ -6840,7 +6844,10 @@ class MainWindow(QMainWindow):
             logger.info("Showing metamold prism in viewer (no cavity or halves)")
         
         self._update_metamold_step_ui()
-        self.step_buttons[Step.METAMOLD].set_status('completed')
+        if csg_success and (has_valid_halves_with_part or has_valid_halves):
+            self.step_buttons[Step.METAMOLD].set_status('completed')
+        else:
+            self.step_buttons[Step.METAMOLD].set_status('needs-recalc')
         
         # Unlock resin channels step if metamold halves with part are available
         if half_1_with_part is not None and half_2_with_part is not None:
