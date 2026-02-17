@@ -139,6 +139,17 @@ biased_dist = δ + max(λ_w, 0)
 
 ## Recent Changes
 
+### January 2026 - Collar Validation & Repair (Session 5)
+- **Problem:** Collar vertices could end up outside the part mesh, causing the downstream CSG blade subtraction in `split_shell_with_membrane()` to fail (shell not split into two halves).
+- **Solution:** Added post-collar validation + iterative repair system in `parting_surface.py`:
+  - **Constants:** `COLLAR_VALIDATION_MAX_REPAIR_ITERATIONS=3`, `COLLAR_VALIDATION_DEPTH_ESCALATION=2.0`, `COLLAR_VALIDATION_MIN_COVERAGE=0.9`, `COLLAR_REPAIR_PENETRATION_MULTIPLIER=3.0`
+  - **`FloatingEdgeFillingResult`:** Added 5 stats fields: `collar_vertices_total`, `collar_vertices_inside_part`, `collar_vertices_repaired`, `collar_coverage_fraction`, `repair_iterations_used`
+  - **`_validate_collar_penetration()`:** Ray-segment intersection test (membrane vertex → collar vertex) to check if segment crosses part surface. Uses parity for signed distance estimation. Does NOT require watertight mesh.
+  - **`_repair_collar_vertices()`:** 3-strategy repair: (1) adaptive placement with escalated depth, (2) 6 axis-aligned rays, (3) guaranteed fallback (nearest point + inward normal push).
+  - **`_quick_segment_crosses_part()`:** Helper for fast segment-part intersection check.
+  - **STEP 7b in `create_robust_collar_extension()`:** Iterative validate-repair loop integrated between STEP 6 (fan triangles) and STEP 7 (create result mesh). Logs coverage warnings/errors. Records statistics in result.
+- **Tests:** All unit tests and edge cases pass (empty map, zero-length, on-surface, deeply-inside, sphere, multi-iteration repair).
+
 ### January 2026 - Static Analysis Refactoring (Session 4)
 - **Bare except removal:** Fixed 11 bare `except:` → `except Exception:` across 4 files (mesh_viewer.py, main_window.py, parting_surface.py, mold_fabrication.py)
 - **Print→logger conversion:** Converted ~100 debug print() calls in mesh_viewer.py to logger.debug() using lines-list pattern. Renamed `_print_tet_edge_info` → `_get_tet_edge_info_lines` (returns List[str])

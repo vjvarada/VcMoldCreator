@@ -4447,6 +4447,159 @@ def create_robust_collar_extension(
     logger.info(f"Created {total_fan_tris} fan triangles ({total_arc_verts} arc vertices)")
     
     # =========================================================================
+    # STEP 6b: Iterative collar extension for boundary edges outside part mesh
+    # =========================================================================
+    # After collar creation, check every boundary edge of the collar region.
+    # If the midpoint of a collar boundary edge is NOT inside the part mesh,
+    # extend that edge with another collar quad.  Repeat up to 5 iterations
+    # or until all collar boundary edges are inside the part mesh.
+    #
+    # To avoid exponential growth we track a *frontier vertex range*:
+    # only boundary edges where BOTH vertices fall in the current frontier
+    # are candidates for extension.  Initially the frontier is all collar
+    # vertices (index >= n_orig_verts).  After each iteration it advances
+    # to the vertices created in that iteration, so only the outermost
+    # edges of the collar are checked/extended.
+    
+    MAX_COLLAR_EXTENSION_ITERATIONS = 5
+    total_extension_quads = 0
+    _frontier_start = n_orig_verts  # first iteration: all collar verts
+    
+    for _ext_iter in range(MAX_COLLAR_EXTENSION_ITERATIONS):
+        _iter_vert_start = len(vertices)  # track new verts created this iter
+        
+        # ----- Build edge-face counts for current mesh state -----
+        _efc: Dict[Tuple[int, int], int] = {}
+        _etf: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        for _fi, _face in enumerate(faces):
+            for _ei in range(3):
+                _va, _vb = int(_face[_ei]), int(_face[(_ei + 1) % 3])
+                _vc = int(_face[(_ei + 2) % 3])
+                _ek = (min(_va, _vb), max(_va, _vb))
+                _efc[_ek] = _efc.get(_ek, 0) + 1
+                _etf[_ek] = (_fi, _vc)
+
+        # Frontier collar boundary edges: boundary (count==1) with BOTH
+        # vertices in the current frontier range (>= _frontier_start).
+        # This selects only the outermost collar edges, not the side
+        # edges connecting collar vertices back to the membrane boundary.
+        _collar_be = [
+            (va, vb) for (va, vb), cnt in _efc.items()
+            if cnt == 1 and va >= _frontier_start and vb >= _frontier_start
+        ]
+
+        if not _collar_be:
+            logger.info(f"Collar extension iter {_ext_iter + 1}: "
+                        "no frontier collar boundary edges found")
+            break
+
+        # ----- Compute midpoints and test containment -----
+        _verts_arr = np.array(vertices, dtype=np.float64)
+        _midpts = np.array([
+            (_verts_arr[va] + _verts_arr[vb]) / 2.0
+            for va, vb in _collar_be
+        ])
+
+        try:
+            _inside = part_mesh.contains(_midpts)
+        except Exception as _ex:
+            logger.warning(f"Collar extension iter {_ext_iter + 1}: "
+                           f"contains() failed ({_ex}), stopping iterations")
+            break
+
+        _outside_edges = [
+            _collar_be[i] for i in range(len(_collar_be)) if not _inside[i]
+        ]
+
+        if not _outside_edges:
+            logger.info(f"Collar extension iter {_ext_iter + 1}: all "
+                        f"{len(_collar_be)} collar boundary edges "
+                        "are inside the part mesh")
+            break
+
+        logger.info(f"Collar extension iter {_ext_iter + 1}: "
+                    f"{len(_outside_edges)}/{len(_collar_be)} collar "
+                    "boundary edges outside part — extending")
+
+        # ----- Extend each outside edge with a new quad -----
+        _extended = 0
+        for _va, _vb in _outside_edges:
+            _va_pos = _verts_arr[_va]
+            _vb_pos = _verts_arr[_vb]
+            _ek = (min(_va, _vb), max(_va, _vb))
+            _finfo = _etf.get(_ek)
+            if _finfo is None:
+                continue
+            _fi, _vc = _finfo
+            _vc_pos = _verts_arr[_vc]
+
+            # Edge direction
+            _edge_vec = _vb_pos - _va_pos
+            _edge_len = np.linalg.norm(_edge_vec)
+            if _edge_len < 1e-10:
+                continue
+            _edge_dir = _edge_vec / _edge_len
+
+            # Face normal from the adjacent face
+            _fverts = faces[_fi]
+            _p0 = _verts_arr[int(_fverts[0])]
+            _p1 = _verts_arr[int(_fverts[1])]
+            _p2 = _verts_arr[int(_fverts[2])]
+            _fn = np.cross(_p1 - _p0, _p2 - _p0)
+            _fn_len = np.linalg.norm(_fn)
+            if _fn_len < 1e-10:
+                continue
+            _fn = _fn / _fn_len
+
+            # Perpendicular to edge in face plane, pointing away from
+            # the face interior (away from third vertex)
+            _perp = np.cross(_fn, _edge_dir)
+            _perp_len = np.linalg.norm(_perp)
+            if _perp_len < 1e-10:
+                continue
+            _perp = _perp / _perp_len
+            _to_third = _vc_pos - (_va_pos + _vb_pos) / 2.0
+            if np.dot(_perp, _to_third) > 0:
+                _perp = -_perp
+
+            # New vertex positions (offset by collar_depth)
+            _new_va_pos = _va_pos + collar_depth * _perp
+            _new_vb_pos = _vb_pos + collar_depth * _perp
+
+            _new_va_idx = len(vertices)
+            vertices.append(_new_va_pos.copy())
+            _new_vb_idx = len(vertices)
+            vertices.append(_new_vb_pos.copy())
+
+            # Build two triangles for the quad [va, vb, new_vb, new_va]
+            # and ensure winding matches the adjacent face normal
+            _tri1 = [_va, _vb, _new_vb_idx]
+            _tri2 = [_va, _new_vb_idx, _new_va_idx]
+            for _tri in (_tri1, _tri2):
+                _tp0 = np.array(vertices[_tri[0]], dtype=np.float64)
+                _tp1 = np.array(vertices[_tri[1]], dtype=np.float64)
+                _tp2 = np.array(vertices[_tri[2]], dtype=np.float64)
+                _tn = np.cross(_tp1 - _tp0, _tp2 - _tp0)
+                if np.dot(_tn, _fn) < 0:
+                    _tri[1], _tri[2] = _tri[2], _tri[1]
+            faces.append(_tri1)
+            faces.append(_tri2)
+            _extended += 1
+
+        total_extension_quads += _extended
+        # Advance frontier to the vertices created in this iteration
+        # so that the next iteration only checks the new outermost edges
+        _frontier_start = _iter_vert_start
+        logger.info(f"Collar extension iter {_ext_iter + 1}: "
+                    f"extended {_extended} edges")
+        if _extended == 0:
+            break
+
+    if total_extension_quads > 0:
+        logger.info(f"Iterative collar extension added {total_extension_quads} "
+                    "extension quads total")
+
+    # =========================================================================
     # STEP 7: Create result mesh
     # =========================================================================
     
