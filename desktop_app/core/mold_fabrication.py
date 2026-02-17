@@ -2247,28 +2247,114 @@ def add_part_to_metamold_halves(
     return half_1_with_part, half_2_with_part, elapsed_ms, True
 
 
+def _cap_manifold_base(
+    half_mesh: trimesh.Trimesh,
+    pouring_dir: np.ndarray,
+    is_upper: bool,
+    cap_thickness: float = 0.5
+) -> trimesh.Trimesh:
+    """
+    Cap the base of a metamold half with a solid floor.
+
+    After ``prism − part`` and trimming, the base of each half may have a
+    hole where the part cavity passes through the trim plane.  This function
+    seals that opening by union-ing a thin slab (shaped like the half's
+    convex hull) at the base height.
+
+    The slab is placed just inside the base so it does not extend the
+    overall dimensions.  If the base is already solid (e.g. the part union
+    succeeded), the union is a no-op.
+
+    Args:
+        half_mesh: The trimmed metamold half.
+        pouring_dir: Unit vector along the pouring direction.
+        is_upper: True for the upper half (base at the top, positive-dir
+            extremum), False for the lower half (base at the bottom).
+        cap_thickness: Thickness of the cap slab (mm).
+
+    Returns:
+        The capped mesh (unchanged if capping was unnecessary or failed).
+    """
+    try:
+        half_m = _trimesh_to_manifold(half_mesh)
+        hull_mesh = half_mesh.convex_hull
+        hull_m = _trimesh_to_manifold(hull_mesh)
+
+        # Find the base height (extremum away from the parting surface)
+        heights = np.asarray(half_mesh.vertices, dtype=np.float64) @ pouring_dir
+
+        pd = pouring_dir.tolist()
+        npd = (-pouring_dir).tolist()
+
+        if is_upper:
+            # Base is at max height — slab from (base − cap) to base
+            base_h = float(np.max(heights))
+            slab = hull_m.trim_by_plane(pd, float(base_h - cap_thickness))
+            slab = slab.trim_by_plane(npd, float(-base_h))
+        else:
+            # Base is at min height — slab from base to (base + cap)
+            base_h = float(np.min(heights))
+            slab = hull_m.trim_by_plane(pd, float(base_h))
+            slab = slab.trim_by_plane(npd, float(-(base_h + cap_thickness)))
+
+        if slab.is_empty():
+            return half_mesh
+
+        capped_m = half_m + slab
+        result = _manifold_to_trimesh(capped_m)
+
+        # Clean up near-degenerate triangles left by manifold3d's
+        # boolean engine (merge close vertices, remove zero-area faces).
+        result = trimesh.Trimesh(
+            vertices=result.vertices, faces=result.faces, process=True)
+        result.merge_vertices(merge_tex=True, merge_norm=True)
+        nondegen = result.nondegenerate_faces()
+        if not nondegen.all():
+            result.update_faces(nondegen)
+            result.remove_unreferenced_vertices()
+
+        logger.debug("Capped %s base at h=%.2f (cap=%.2fmm, %dv→%dv)",
+                     "upper" if is_upper else "lower", base_h,
+                     cap_thickness, len(half_mesh.vertices),
+                     len(result.vertices))
+        return result
+
+    except Exception as e:
+        logger.warning("Failed to cap %s base: %s",
+                       "upper" if is_upper else "lower", e)
+        return half_mesh
+
+
 def trim_metamold_halves(
     upper_half: trimesh.Trimesh,
     lower_half: trimesh.Trimesh,
     parting_surface: trimesh.Trimesh,
     pouring_direction: np.ndarray,
-    trim_threshold: float = 4.0
+    trim_threshold: float = 4.0,
+    cap_base: bool = True,
+    cap_thickness: float = 0.5
 ) -> Tuple[trimesh.Trimesh, trimesh.Trimesh, float, float, float]:
     """
-    Trim each metamold half's BASE to save 3D printing material.
-    
+    Trim each metamold half's BASE to save 3D printing material, then
+    optionally cap any cavity openings on the new base plane.
+
     The upper half (positive pouring direction side) has its TOP trimmed.
     The lower half (negative pouring direction side) has its BOTTOM trimmed.
     Each half is trimmed independently so one never cuts into the other.
-    
+
+    When *cap_base* is True (the default) a thin solid floor is added at
+    each trimmed base to seal any cavity openings.  This ensures the
+    metamold acts as a sealed cup for resin casting, even when the part
+    union step failed or produced an imperfect result.
+
     Must be called AFTER all CSG operations (cavity, split, part union)
     so both prism walls and part geometry are cleanly clipped.
-    
+
     The caller must pass the halves in the correct order as returned by
-    ``split_shell_with_membrane``:
+    ``split_shell_with_half_space_intersection``:
         half_1 → upper_half (positive pouring direction)
         half_2 → lower_half (negative pouring direction)
-    
+
     Args:
         upper_half: The metamold half on the positive pouring-direction side.
         lower_half: The metamold half on the negative pouring-direction side.
@@ -2276,25 +2362,28 @@ def trim_metamold_halves(
         pouring_direction: Unit vector for the resin pouring direction.
         trim_threshold: Keep at least this much material (mm) between the
             parting surface and the trimmed base.  Set ≤ 0 to disable.
-    
+        cap_base: If True, seal any cavity openings at the trimmed base
+            by union-ing a thin convex-hull slab (default True).
+        cap_thickness: Thickness of the base cap slab in mm (default 0.5).
+
     Returns:
         (trimmed_upper, trimmed_lower, upper_saved_mm, lower_saved_mm,
          computation_time_ms).
     """
     start_time = time.time()
-    
+
     if not MANIFOLD_AVAILABLE:
         logger.warning("manifold3d not available – cannot trim metamold halves")
         return upper_half, lower_half, 0.0, 0.0, 0.0
-    
+
     if trim_threshold <= 0:
         logger.info("Metamold trim disabled (threshold=%s)", trim_threshold)
         elapsed_ms = (time.time() - start_time) * 1000
         return upper_half, lower_half, 0.0, 0.0, elapsed_ms
-    
+
     pouring_dir = np.asarray(pouring_direction, dtype=np.float64)
     pouring_dir = pouring_dir / (np.linalg.norm(pouring_dir) + 1e-10)
-    
+
     # ------------------------------------------------------------------
     # Parting surface height extent along the pouring direction
     # ------------------------------------------------------------------
@@ -2302,13 +2391,13 @@ def trim_metamold_halves(
     ps_heights = ps_verts @ pouring_dir
     ps_min_height = float(np.min(ps_heights))
     ps_max_height = float(np.max(ps_heights))
-    
+
     logger.info(f"Trimming metamold halves (threshold={trim_threshold:.1f}mm)")
     logger.info(f"  Parting surface height: {ps_min_height:.2f} to {ps_max_height:.2f}")
-    
+
     upper_saved = 0.0
     lower_saved = 0.0
-    
+
     # ------------------------------------------------------------------
     # Trim the UPPER half's TOP (its base, away from PS)
     # Keep everything BELOW (ps_max + threshold)
@@ -2320,14 +2409,11 @@ def trim_metamold_halves(
             half_max = float(np.max(uh))
             trim_at = ps_max_height + trim_threshold
             gap = half_max - trim_at
-            
+
             logger.info(f"  Upper half extent: {float(np.min(uh)):.2f} to {half_max:.2f}")
-            
+
             if gap > 0.01:
                 manifold = _trimesh_to_manifold(upper_half)
-                # trim_by_plane(normal, offset) keeps geometry where dot(v, normal) >= offset.
-                # To keep everything BELOW trim_at (i.e. dot(v, pouring_dir) <= trim_at),
-                # we negate both: normal = -pouring_dir, offset = -trim_at.
                 manifold = manifold.trim_by_plane(
                     (-pouring_dir).tolist(), float(-trim_at)
                 )
@@ -2338,7 +2424,7 @@ def trim_metamold_halves(
                 logger.info(f"    Upper half: no trim needed (gap={gap:.2f}mm)")
         except Exception as e:
             logger.error(f"Failed to trim upper half: {e}")
-    
+
     # ------------------------------------------------------------------
     # Trim the LOWER half's BOTTOM (its base, away from PS)
     # Keep everything ABOVE (ps_min - threshold)
@@ -2350,12 +2436,11 @@ def trim_metamold_halves(
             half_min = float(np.min(lh))
             trim_at = ps_min_height - trim_threshold
             gap = trim_at - half_min
-            
+
             logger.info(f"  Lower half extent: {half_min:.2f} to {float(np.max(lh)):.2f}")
-            
+
             if gap > 0.01:
                 manifold = _trimesh_to_manifold(lower_half)
-                # normal = pouring_dir, offset = trim_at → keeps above trim_at
                 manifold = manifold.trim_by_plane(
                     pouring_dir.tolist(), float(trim_at)
                 )
@@ -2366,12 +2451,28 @@ def trim_metamold_halves(
                 logger.info(f"    Lower half: no trim needed (gap={gap:.2f}mm)")
         except Exception as e:
             logger.error(f"Failed to trim lower half: {e}")
-    
+
+    # ------------------------------------------------------------------
+    # Cap the bases to seal any remaining cavity openings
+    # ------------------------------------------------------------------
+    if cap_base:
+        if trimmed_upper is not None and len(trimmed_upper.vertices) > 0:
+            trimmed_upper = _cap_manifold_base(
+                trimmed_upper, pouring_dir,
+                is_upper=True, cap_thickness=cap_thickness)
+
+        if trimmed_lower is not None and len(trimmed_lower.vertices) > 0:
+            trimmed_lower = _cap_manifold_base(
+                trimmed_lower, pouring_dir,
+                is_upper=False, cap_thickness=cap_thickness)
+
+        logger.info("  Base capping applied (cap_thickness=%.2fmm)", cap_thickness)
+
     elapsed_ms = (time.time() - start_time) * 1000
-    
+
     logger.info(f"Metamold trim complete in {elapsed_ms:.1f}ms "
                f"(upper saved: {upper_saved:.2f}mm, lower saved: {lower_saved:.2f}mm)")
-    
+
     return trimmed_upper, trimmed_lower, upper_saved, lower_saved, elapsed_ms
 
 

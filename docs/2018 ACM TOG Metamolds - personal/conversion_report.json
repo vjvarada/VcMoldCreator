@@ -1,0 +1,17 @@
+{
+  "source": "2018 ACM TOG Metamolds - personal.pdf",
+  "converted_at": "2026-02-17T12:24:07.776475",
+  "pages": 13,
+  "complexity": "moderate",
+  "backend": "mineru",
+  "mineru_backend": "pipeline",
+  "has_math": true,
+  "has_tables": false,
+  "has_images": true,
+  "output_folder": "output\\2018 ACM TOG Metamolds - personal",
+  "files": {
+    "markdown": "2018 ACM TOG Metamolds - personal.md",
+    "images": "images/",
+    "report": "conversion_report.json"
+  }
+}
