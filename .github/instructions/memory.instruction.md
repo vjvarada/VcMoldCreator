@@ -27,7 +27,7 @@ applyTo: '**'
 - Small hole removal
 - Persistence-based pouring direction optimization
 - Hard shell prism generation (aligned with pouring direction)
-- CSG subtraction (prism - hull) using manifold3d
+- CSG operations via `csg_backend.py` abstraction layer (libigl/CGAL primary, manifold3d fallback)
 - Outer collar extension (parting surface extended outward)
 - Shell splitting into two manifold halves using membrane
 
@@ -94,6 +94,7 @@ The virtual environment is located at:
 ## Important Files to Know
 
 ### Core Algorithm
+- `desktop_app/core/csg_backend.py` - CSG abstraction layer (libigl/CGAL primary, manifold3d fallback)
 - `desktop_app/core/tetrahedral_mesh.py` - Main algorithm implementation
 - `desktop_app/core/parting_surface.py` - Marching tetrahedra
 - `desktop_app/core/surface_propagation.py` - Membrane smoothing
@@ -138,6 +139,49 @@ biased_dist = δ + max(λ_w, 0)
 ---
 
 ## Recent Changes
+
+### January 2026 - mold_fabrication.py Code Quality Refactoring (Session 6)
+- **Extracted 3 shared helpers** to eliminate ~400 lines of duplicated code:
+  - `_build_pouring_basis(direction)` — Gram-Schmidt orthonormal basis (was copy-pasted in 3 functions)
+  - `_extrude_surface_to_volume(surface, direction, offset_pos, offset_neg)` — unified extrusion (was copy-pasted in 4 functions)
+  - `_split_and_classify_halves(mesh, direction)` — split+sort+classify pattern (was copy-pasted in 3 functions)
+  - `_find_boundary_edges_with_winding(faces)` — boundary edge extraction sub-helper
+- **Converted 4 extrusion functions to thin delegators:**
+  - `_create_cutting_volume_from_surface()` → delegates to `_extrude_surface_to_volume()`
+  - `_create_half_space_from_membrane()` → delegates to `_extrude_surface_to_volume()`
+  - `_create_cutting_blade_from_membrane()` → delegates to `_extrude_surface_to_volume()`
+  - `_create_tall_cutting_blade()` → delegates to `_extrude_surface_to_volume()`
+- **Renamed `MANIFOLD_AVAILABLE` → `CSG_AVAILABLE`** across mold_fabrication.py and resin_channels.py (8+4 occurrences)
+- **Replaced 6 `import traceback; traceback.print_exc()`** blocks with `logger.exception(e)`
+- **Removed dead code** after `_create_tall_cutting_blade` return statement
+- **Net result:** 3224 → 2812 lines (−412 lines, or −13%)
+- **All public API signatures unchanged** — no downstream breakage
+
+### January 2026 - CSG Backend Migration & Metamold Pipeline (Session 5)
+- **Metamold execution order change:** Union blade+part first, then single CSG subtract from prism
+  - Added `create_metamold_with_combined_cut()` (~130 lines)
+  - Rewrote `MetamoldWorker.run()` from 6-step to 2-step pipeline
+  - Handles both split and unsplit edge cases
+- **Created `desktop_app/core/csg_backend.py`** — CSG abstraction layer
+  - Primary: `igl.copyleft.cgal.mesh_boolean()` (Zhou et al. 2016, exact arithmetic, 100% robust)
+  - Fallback: `manifold3d` (floating point, may fail on edge cases)
+  - Provides: `csg_difference()`, `csg_union()`, `csg_intersection()`, `csg_trim_by_plane()`
+- **Migrated `mold_fabrication.py`** — Replaced all 9 manifold3d CSG call sites:
+  - `create_shell_with_cavity()` → `csg_backend.csg_difference()`
+  - `split_shell_with_membrane()` → `csg_backend.csg_difference()`
+  - `split_shell_with_tall_blade()` → `csg_backend.csg_difference()`
+  - `split_shell_along_parting_surface()` → `csg_backend.csg_intersection()` × 2
+  - `create_part_with_thickened_secondary()` → `csg_backend.csg_union()`
+  - `add_part_to_metamold_half()` → `csg_backend.csg_union()`
+  - `trim_metamold_halves()` → `csg_backend.csg_trim_by_plane()` × 2
+  - Removed `_trimesh_to_manifold()` and `_manifold_to_trimesh()` helpers
+- **Migrated `resin_channels.py`** — Replaced all 5 manifold3d CSG call sites:
+  - `create_resin_channels()` → loop of `csg_backend.csg_difference()`
+  - `create_hard_shell_inlet()` → `csg_backend.csg_difference()`
+  - `create_hard_shell_air_escapes()` → loop of `csg_backend.csg_difference()`
+  - Removed duplicate `_trimesh_to_manifold()` and `_manifold_to_trimesh()` helpers
+- **Updated `requirements.txt`** — Added `libigl>=2.5.0` as primary, kept `manifold3d>=2.3.0` as fallback
+- **Motivation**: Alderighi 2019 Section 5 explicitly requires Zhou et al. 2016 exact arithmetic booleans; manifold3d used floating point and failed on complex geometries
 
 ### January 2026 - Static Analysis Refactoring (Session 4)
 - **Bare except removal:** Fixed 11 bare `except:` → `except Exception:` across 4 files (mesh_viewer.py, main_window.py, parting_surface.py, mold_fabrication.py)

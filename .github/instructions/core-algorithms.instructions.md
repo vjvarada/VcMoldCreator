@@ -23,6 +23,9 @@ This file provides detailed guidance for working with the core algorithm modules
 | `parting_surface.py` | Marching Tetrahedra | Section 4.3 |
 | `surface_propagation.py` | Membrane smoothing | Section 4.4 |
 | `pouring_direction.py` | Optimal pour directions | Section 5.2 |
+| `csg_backend.py` | CSG operations (libigl/CGAL + manifold3d fallback) | Section 5 |
+| `mold_fabrication.py` | Hard shell & metamold geometry | Section 5 |
+| `resin_channels.py` | Resin inlet & air escape holes | Section 5 |
 
 ---
 

@@ -28,13 +28,9 @@ from scipy.spatial import ConvexHull
 
 logger = logging.getLogger(__name__)
 
-# CSG operations via manifold3d
-try:
-    import manifold3d
-    MANIFOLD_AVAILABLE = True
-except ImportError:
-    MANIFOLD_AVAILABLE = False
-    logger.warning("manifold3d not available - CSG operations will be disabled")
+# CSG operations via abstraction layer (libigl/CGAL preferred, manifold3d fallback)
+from . import csg_backend
+CSG_AVAILABLE = csg_backend.CSG_AVAILABLE
 
 
 # ============================================================================
@@ -43,6 +39,773 @@ except ImportError:
 
 DEFAULT_WALL_THICKNESS_MM = 5.0  # Default hard shell wall thickness
 DEFAULT_COLLAR_SUBDIVISIONS = 4  # Fan subdivisions at corners
+
+
+# ============================================================================
+# SHARED HELPERS (DRY consolidation)
+# ============================================================================
+
+def _build_pouring_basis(
+    pouring_direction: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build an orthonormal basis from a pouring direction via Gram-Schmidt.
+
+    Args:
+        pouring_direction: Raw direction vector (will be normalised).
+
+    Returns:
+        (pouring_dir, u_axis, v_axis, world_to_2d) where
+        - pouring_dir is the normalised input,
+        - u_axis, v_axis span the plane perpendicular to it,
+        - world_to_2d is the (3, 3) rotation matrix that projects
+          world coordinates to (u, v, height) space.
+    """
+    pouring_dir = np.asarray(pouring_direction, dtype=np.float64)
+    pouring_dir = pouring_dir / (np.linalg.norm(pouring_dir) + 1e-10)
+
+    arbitrary = (
+        np.array([1.0, 0.0, 0.0])
+        if abs(pouring_dir[0]) < 0.9
+        else np.array([0.0, 1.0, 0.0])
+    )
+
+    u_axis = arbitrary - np.dot(arbitrary, pouring_dir) * pouring_dir
+    u_axis = u_axis / np.linalg.norm(u_axis)
+
+    v_axis = np.cross(pouring_dir, u_axis)
+    v_axis = v_axis / np.linalg.norm(v_axis)
+
+    world_to_2d = np.column_stack([u_axis, v_axis, pouring_dir]).T  # (3, 3)
+
+    return pouring_dir, u_axis, v_axis, world_to_2d
+
+
+def _find_boundary_edges_with_winding(
+    faces: np.ndarray,
+) -> Tuple[List[Tuple[int, int]], Dict]:
+    """Find boundary edges and their original winding from a face array.
+
+    A boundary edge appears in exactly one face.
+
+    Args:
+        faces: (F, 3) int face array.
+
+    Returns:
+        (boundary_edges, edge_to_face) where
+        - boundary_edges is a list of (v0, v1) edge keys (min, max),
+        - edge_to_face maps edge_key → (face_idx, orig_v0, orig_v1)
+          preserving the oriented half-edge from the parent face.
+    """
+    edge_count: Dict[Tuple[int, int], int] = {}
+    edge_to_face: Dict[Tuple[int, int], Tuple[int, int, int]] = {}
+
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
+            if edge_key not in edge_to_face:
+                edge_to_face[edge_key] = (fi, v0, v1)
+
+    boundary_edges = [e for e, c in edge_count.items() if c == 1]
+    return boundary_edges, edge_to_face
+
+
+def _chain_edges_into_loops(
+    boundary_edges: List[Tuple[int, int]],
+) -> List[List[int]]:
+    """Chain unordered boundary edges into ordered vertex loops.
+
+    Args:
+        boundary_edges: List of (v0, v1) undirected edge tuples.
+
+    Returns:
+        List of loops, where each loop is an ordered list of vertex indices.
+    """
+    if not boundary_edges:
+        return []
+
+    # Build adjacency: vertex -> set of connected vertices
+    adj: Dict[int, List[int]] = {}
+    for v0, v1 in boundary_edges:
+        adj.setdefault(v0, []).append(v1)
+        adj.setdefault(v1, []).append(v0)
+
+    visited_edges: set = set()
+    loops: List[List[int]] = []
+
+    for start_v0, start_v1 in boundary_edges:
+        edge_key = (min(start_v0, start_v1), max(start_v0, start_v1))
+        if edge_key in visited_edges:
+            continue
+
+        # Walk a new loop
+        loop = [start_v0, start_v1]
+        visited_edges.add(edge_key)
+        current = start_v1
+        prev = start_v0
+
+        while True:
+            neighbors = adj.get(current, [])
+            next_v = None
+            for nb in neighbors:
+                ek = (min(current, nb), max(current, nb))
+                if ek not in visited_edges:
+                    next_v = nb
+                    break
+            if next_v is None or next_v == start_v0:
+                break
+            visited_edges.add((min(current, next_v), max(current, next_v)))
+            loop.append(next_v)
+            prev = current
+            current = next_v
+
+        loops.append(loop)
+
+    return loops
+
+
+def _fill_inner_boundary_loops(surface: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Fill inner boundary loops of an open surface mesh.
+
+    The membrane (outer collar) typically has two kinds of boundary:
+    - An **outer** boundary where it meets the prism walls (largest loop).
+    - One or more **inner** boundaries where it meets the part surface.
+
+    This function fills every inner loop with a centroid-fan triangulation so
+    that ``_extrude_surface_to_volume`` only creates side walls along the outer
+    boundary.  The filled region doesn't need to be geometrically perfect —
+    it just needs to seal the opening so the extruded volume is solid.
+
+    Args:
+        surface: Open surface mesh with at least two boundary loops.
+
+    Returns:
+        A new trimesh with inner loops filled.  If the mesh has ≤ 1 boundary
+        loop the original mesh is returned unchanged.
+    """
+    faces = np.asarray(surface.faces, dtype=np.int64)
+    boundary_edges, _ = _find_boundary_edges_with_winding(faces)
+
+    if not boundary_edges:
+        return surface  # Already closed
+
+    loops = _chain_edges_into_loops(boundary_edges)
+
+    if len(loops) <= 1:
+        return surface  # Single boundary — nothing inner to fill
+
+    # Identify the outer loop as the one with the largest perimeter
+    verts = np.asarray(surface.vertices, dtype=np.float64)
+    perimeters = []
+    for loop in loops:
+        loop_verts = verts[loop]
+        diffs = np.diff(np.vstack([loop_verts, loop_verts[:1]]), axis=0)
+        perimeters.append(np.sum(np.linalg.norm(diffs, axis=1)))
+    outer_idx = int(np.argmax(perimeters))
+
+    # Build new vertex/face arrays with centroid-fan fills for inner loops
+    new_verts = list(verts)
+    new_faces = list(faces)
+    n_filled = 0
+
+    for i, loop in enumerate(loops):
+        if i == outer_idx:
+            continue  # Keep outer boundary open
+        if len(loop) < 3:
+            continue
+
+        centroid = verts[loop].mean(axis=0)
+        ci = len(new_verts)
+        new_verts.append(centroid)
+
+        for j in range(len(loop)):
+            v1 = loop[j]
+            v2 = loop[(j + 1) % len(loop)]
+            new_faces.append([ci, v1, v2])
+        n_filled += 1
+
+    if n_filled == 0:
+        return surface
+
+    filled = trimesh.Trimesh(
+        vertices=np.array(new_verts, dtype=np.float64),
+        faces=np.array(new_faces, dtype=np.int64),
+        process=False,
+    )
+    logger.info("  Filled %d inner boundary loop(s) in membrane "
+                "(%d -> %d verts, %d -> %d faces)",
+                n_filled, len(verts), len(filled.vertices),
+                len(faces), len(filled.faces))
+    return filled
+
+
+def _extrude_surface_to_volume(
+    surface: trimesh.Trimesh,
+    direction: np.ndarray,
+    offset_pos: float,
+    offset_neg: float,
+) -> trimesh.Trimesh:
+    """Extrude a surface mesh along *direction* to create a closed volume.
+
+    The resulting volume has:
+    - A **top** cap at ``vertices + direction * offset_pos``
+    - A **bottom** cap at ``vertices - direction * offset_neg``
+    - Side quads stitching the boundary edges.
+
+    Every extrusion variant in the module (cutting blade, tall blade,
+    half-space, thick slab) reduces to choosing ``offset_pos`` and
+    ``offset_neg``.
+
+    Args:
+        surface: The input surface mesh.
+        direction: Unit vector for extrusion axis.
+        offset_pos: Distance to extrude in the *+direction* side.
+        offset_neg: Distance to extrude in the *-direction* side.
+
+    Returns:
+        Watertight extruded volume as a trimesh.Trimesh.
+    """
+    direction = np.asarray(direction, dtype=np.float64)
+    direction = direction / (np.linalg.norm(direction) + 1e-10)
+
+    vertices = np.asarray(surface.vertices, dtype=np.float64)
+    faces = np.asarray(surface.faces, dtype=np.int64)
+    n_verts = len(vertices)
+
+    top_vertices = vertices + direction * offset_pos
+    bottom_vertices = vertices - direction * offset_neg
+
+    all_vertices = np.vstack([bottom_vertices, top_vertices])
+
+    # Bottom faces — reversed winding so normals point outward (downward)
+    bottom_faces = faces[:, ::-1]
+    # Top faces — original winding, offset indices
+    top_faces = faces + n_verts
+
+    # Side faces from boundary edges
+    boundary_edges, edge_to_face = _find_boundary_edges_with_winding(faces)
+
+    side_faces = []
+    for v0, v1 in boundary_edges:
+        _, orig_v0, _orig_v1 = edge_to_face[(v0, v1)]
+        b0, b1 = v0, v1
+        t0, t1 = v0 + n_verts, v1 + n_verts
+
+        if orig_v0 == v0:
+            side_faces.append([b0, b1, t1])
+            side_faces.append([b0, t1, t0])
+        else:
+            side_faces.append([b0, t0, t1])
+            side_faces.append([b0, t1, b1])
+
+    all_faces_list = [bottom_faces, top_faces]
+    if side_faces:
+        all_faces_list.append(np.array(side_faces, dtype=np.int64))
+    all_faces = np.vstack(all_faces_list)
+
+    volume = trimesh.Trimesh(vertices=all_vertices, faces=all_faces, process=True)
+    volume.fix_normals()
+    return volume
+
+
+def _split_and_classify_halves(
+    mesh: trimesh.Trimesh,
+    direction: np.ndarray,
+) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh],
+           List[trimesh.Trimesh], bool]:
+    """Split a mesh into connected components and classify the two largest.
+
+    The two largest components (by face count) are classified as
+    *upper* (higher centroid projection onto *direction*) and *lower*.
+
+    Uses face-adjacency connected components (trimesh.split).  If the
+    default ``process=True`` split finds only 1 component, retries with
+    an unprocessed copy (``process=False``) to rule out vertex-merging
+    artefacts from the CSG backend.
+
+    Args:
+        mesh: The mesh to split.
+        direction: Unit vector defining the "upper" direction.
+
+    Returns:
+        (upper_half, lower_half, all_components, did_split) where
+        - upper_half / lower_half are the two largest components
+          (None if fewer than 2 components),
+        - all_components is the full list,
+        - did_split is True when ≥ 2 components were found.
+    """
+    # ----- diagnostic: mesh stats before split -----
+    logger.info("  Split input: %d verts, %d faces, watertight=%s",
+                len(mesh.vertices), len(mesh.faces), mesh.is_watertight)
+
+    components = mesh.split(only_watertight=False)
+    logger.info("  Found %d connected components (process=True split)",
+                len(components))
+
+    # ----- fallback: retry WITHOUT vertex merging -----
+    if len(components) < 2:
+        logger.warning("  Only 1 component found — retrying split with "
+                       "process=False (no vertex merging)...")
+        raw_mesh = trimesh.Trimesh(
+            vertices=np.array(mesh.vertices),
+            faces=np.array(mesh.faces),
+            process=False,
+        )
+        components = raw_mesh.split(only_watertight=False)
+        logger.info("  Found %d connected components (process=False split)",
+                    len(components))
+
+    # ----- diagnostic: log component sizes -----
+    if len(components) < 2:
+        proj = mesh.vertices @ direction
+        logger.warning("  SPLIT FAILED — mesh remains 1 component")
+        logger.warning("    Vertex extent along direction: %.3f to %.3f",
+                       float(proj.min()), float(proj.max()))
+        logger.warning("    Bounds min: %s", mesh.bounds[0])
+        logger.warning("    Bounds max: %s", mesh.bounds[1])
+        return None, None, components, False
+
+    components = sorted(components, key=lambda m: len(m.faces), reverse=True)
+    for i, c in enumerate(components[:5]):
+        proj_c = float(np.dot(c.centroid, direction))
+        logger.info("    Component %d: %d verts, %d faces, "
+                    "centroid·dir=%.2f, watertight=%s",
+                    i, len(c.vertices), len(c.faces), proj_c, c.is_watertight)
+
+    comp1, comp2 = components[0], components[1]
+
+    proj1 = float(np.dot(comp1.centroid, direction))
+    proj2 = float(np.dot(comp2.centroid, direction))
+
+    if proj1 > proj2:
+        upper, lower = comp1, comp2
+    else:
+        upper, lower = comp2, comp1
+
+    if len(components) > 2:
+        logger.warning("  %d additional fragments discarded", len(components) - 2)
+
+    return upper, lower, components, True
+
+
+def _log_blade_cut_diagnostics(
+    shell: trimesh.Trimesh,
+    membrane: trimesh.Trimesh,
+    blade: trimesh.Trimesh,
+    direction: np.ndarray,
+) -> None:
+    """Log detailed mesh diagnostics before a blade-cut CSG operation.
+
+    Logs membrane/blade watertightness, boundary edge counts, bounding-box
+    overlap along the pouring direction, and pre-cut shell connectivity.
+    Only produces useful output when the logger is at DEBUG level.
+    """
+    logger.debug("Membrane: %d verts, %d faces, watertight=%s",
+                 len(membrane.vertices), len(membrane.faces), membrane.is_watertight)
+    membrane_boundary, _ = _find_boundary_edges_with_winding(np.asarray(membrane.faces))
+    logger.debug("  Membrane boundary edges: %d", len(membrane_boundary))
+
+    logger.debug("Blade: watertight=%s", blade.is_watertight)
+    blade_boundary, _ = _find_boundary_edges_with_winding(np.asarray(blade.faces))
+    if blade_boundary:
+        logger.warning("Blade has %d open edges - not watertight!", len(blade_boundary))
+
+    logger.debug("Bounds - Shell: %s to %s", shell.bounds[0], shell.bounds[1])
+    logger.debug("Bounds - Membrane: %s to %s", membrane.bounds[0], membrane.bounds[1])
+    logger.debug("Bounds - Blade: %s to %s", blade.bounds[0], blade.bounds[1])
+
+    shell_proj = shell.vertices @ direction
+    blade_proj = blade.vertices @ direction
+    s_min, s_max = float(shell_proj.min()), float(shell_proj.max())
+    b_min, b_max = float(blade_proj.min()), float(blade_proj.max())
+    logger.debug("Shell extent along pouring dir: [%.2f, %.2f]", s_min, s_max)
+    logger.debug("Blade extent along pouring dir: [%.2f, %.2f]", b_min, b_max)
+    if b_max < s_min or b_min > s_max:
+        logger.warning("Blade does NOT overlap with shell along pouring direction - cut may fail")
+
+    components = shell.split(only_watertight=False)
+    logger.debug("Shell has %d connected components BEFORE cutting", len(components))
+    if len(components) > 1:
+        for i, comp in enumerate(
+            sorted(components, key=lambda m: len(m.faces), reverse=True)[:5]
+        ):
+            logger.debug("  Component %d: %d verts, %d faces",
+                         i + 1, len(comp.vertices), len(comp.faces))
+
+
+# ============================================================================
+# SPLIT FAILURE DIAGNOSTICS
+# ============================================================================
+
+@dataclass
+class SplitDiagnostics:
+    """Diagnostic information when the metamold prism fails to split into two halves.
+
+    Holds spatial coverage analysis, bridge-face detection results, and
+    optional references to exported debug meshes.  Created by
+    :func:`diagnose_split_failure`.
+    """
+
+    # --- Spatial coverage ---
+    prism_bbox_min: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    prism_bbox_max: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    cutter_bbox_min: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    cutter_bbox_max: np.ndarray = field(default_factory=lambda: np.zeros(3))
+
+    # Coverage in the plane perpendicular to pouring direction (u, v)
+    prism_span_u: float = 0.0  # prism extent along u-axis
+    prism_span_v: float = 0.0  # prism extent along v-axis
+    cutter_span_u: float = 0.0  # cutter extent along u-axis
+    cutter_span_v: float = 0.0  # cutter extent along v-axis
+    coverage_u_pct: float = 0.0  # cutter_span_u / prism_span_u * 100
+    coverage_v_pct: float = 0.0  # cutter_span_v / prism_span_v * 100
+
+    # Whether the cutter fully extends beyond the prism on each lateral side
+    cutter_exceeds_u_neg: bool = False
+    cutter_exceeds_u_pos: bool = False
+    cutter_exceeds_v_neg: bool = False
+    cutter_exceeds_v_pos: bool = False
+    full_lateral_coverage: bool = False  # True if all four are True
+
+    # --- Bridge face detection ---
+    # Faces in the CSG result that lie near the membrane plane and keep
+    # the two halves connected.
+    n_bridge_faces: int = 0
+    bridge_mesh: Optional[trimesh.Trimesh] = None  # submesh of bridge faces
+    bridge_centroid: Optional[np.ndarray] = None  # average position of bridges
+    bridge_bounds_min: Optional[np.ndarray] = None
+    bridge_bounds_max: Optional[np.ndarray] = None
+
+    # --- Gap analysis ---
+    # Regions where the prism extends laterally but the cutter does not
+    n_gap_sample_points: int = 0
+    n_gaps_found: int = 0
+    gap_locations: Optional[np.ndarray] = None  # (N, 3) positions of gaps
+
+    # --- Exported files ---
+    export_dir: Optional[str] = None
+    exported_files: List[str] = field(default_factory=list)
+
+    # Summary message for user display
+    summary: str = ""
+
+
+def diagnose_split_failure(
+    prism_mesh: trimesh.Trimesh,
+    combined_cutter: trimesh.Trimesh,
+    csg_result: trimesh.Trimesh,
+    membrane: trimesh.Trimesh,
+    direction: np.ndarray,
+    blade: Optional[trimesh.Trimesh] = None,
+    export_dir: Optional[str] = None,
+) -> SplitDiagnostics:
+    """Diagnose why a prism failed to split into two halves after CSG subtraction.
+
+    Performs three analyses and returns a :class:`SplitDiagnostics` object:
+
+    1. **Spatial coverage** — checks whether the combined cutter extends beyond
+       the prism on all four lateral sides (perpendicular to the pouring
+       direction).  If the cutter is narrower than the prism anywhere, the
+       blade left a gap.
+
+    2. **Bridge-face detection** — finds faces in the CSG result that sit near
+       the membrane plane.  These are the faces that keep the mesh as a single
+       connected component rather than two halves.  A sub-mesh of just the
+       bridge faces is built so it can be visualised in the viewer.
+
+    3. **Gap ray-casting** — casts a grid of rays through the prism along the
+       pouring direction and checks which rays do NOT intersect the combined
+       cutter.  Gap locations show exactly where the blade fails to cut.
+
+    Optionally exports all diagnostic meshes to *export_dir* as STL files
+    for external inspection.
+
+    Args:
+        prism_mesh: The metamold prism before CSG.
+        combined_cutter: The blade ∪ part mesh used for subtraction.
+        csg_result: The CSG result (prism − combined_cutter).
+        membrane: The parting surface / outer collar mesh.
+        direction: Pouring direction unit vector.
+        blade: Optional separate blade mesh (for export only).
+        export_dir: Directory to write debug STL files.  ``None`` to skip.
+
+    Returns:
+        :class:`SplitDiagnostics` with all analysis results.
+    """
+    import os
+
+    diag = SplitDiagnostics()
+    direction = np.asarray(direction, dtype=np.float64)
+    direction = direction / (np.linalg.norm(direction) + 1e-10)
+
+    # Build a 2D projection basis
+    pouring_dir, u_axis, v_axis, world_to_2d = _build_pouring_basis(direction)
+
+    # ------------------------------------------------------------------
+    # 1. Spatial coverage analysis
+    # ------------------------------------------------------------------
+    logger.info("=== SPLIT FAILURE DIAGNOSTICS ===")
+
+    diag.prism_bbox_min = prism_mesh.bounds[0].copy()
+    diag.prism_bbox_max = prism_mesh.bounds[1].copy()
+    diag.cutter_bbox_min = combined_cutter.bounds[0].copy()
+    diag.cutter_bbox_max = combined_cutter.bounds[1].copy()
+
+    # Project vertices to (u, v, h) space
+    prism_uv = prism_mesh.vertices @ world_to_2d.T   # (N, 3): columns = u, v, h
+    cutter_uv = combined_cutter.vertices @ world_to_2d.T
+
+    p_u_min, p_u_max = float(prism_uv[:, 0].min()), float(prism_uv[:, 0].max())
+    p_v_min, p_v_max = float(prism_uv[:, 1].min()), float(prism_uv[:, 1].max())
+    c_u_min, c_u_max = float(cutter_uv[:, 0].min()), float(cutter_uv[:, 0].max())
+    c_v_min, c_v_max = float(cutter_uv[:, 1].min()), float(cutter_uv[:, 1].max())
+
+    diag.prism_span_u = p_u_max - p_u_min
+    diag.prism_span_v = p_v_max - p_v_min
+    diag.cutter_span_u = c_u_max - c_u_min
+    diag.cutter_span_v = c_v_max - c_v_min
+
+    diag.coverage_u_pct = (diag.cutter_span_u / (diag.prism_span_u + 1e-10)) * 100
+    diag.coverage_v_pct = (diag.cutter_span_v / (diag.prism_span_v + 1e-10)) * 100
+
+    eps = 0.01  # 10 µm tolerance for "exceeds"
+    diag.cutter_exceeds_u_neg = c_u_min <= p_u_min + eps
+    diag.cutter_exceeds_u_pos = c_u_max >= p_u_max - eps
+    diag.cutter_exceeds_v_neg = c_v_min <= p_v_min + eps
+    diag.cutter_exceeds_v_pos = c_v_max >= p_v_max - eps
+    diag.full_lateral_coverage = all([
+        diag.cutter_exceeds_u_neg, diag.cutter_exceeds_u_pos,
+        diag.cutter_exceeds_v_neg, diag.cutter_exceeds_v_pos,
+    ])
+
+    logger.info("Spatial coverage (projected onto plane perp. to pouring dir):")
+    logger.info("  Prism  span: u=[%.2f, %.2f] (%.2fmm)  v=[%.2f, %.2f] (%.2fmm)",
+                p_u_min, p_u_max, diag.prism_span_u,
+                p_v_min, p_v_max, diag.prism_span_v)
+    logger.info("  Cutter span: u=[%.2f, %.2f] (%.2fmm)  v=[%.2f, %.2f] (%.2fmm)",
+                c_u_min, c_u_max, diag.cutter_span_u,
+                c_v_min, c_v_max, diag.cutter_span_v)
+    logger.info("  Coverage: u=%.1f%%  v=%.1f%%", diag.coverage_u_pct, diag.coverage_v_pct)
+    logger.info("  Cutter exceeds prism edges:  u-=[%s]  u+=[%s]  v-=[%s]  v+=[%s]",
+                diag.cutter_exceeds_u_neg, diag.cutter_exceeds_u_pos,
+                diag.cutter_exceeds_v_neg, diag.cutter_exceeds_v_pos)
+
+    if not diag.full_lateral_coverage:
+        gaps = []
+        if not diag.cutter_exceeds_u_neg:
+            gaps.append("u- (cutter u_min=%.2f > prism u_min=%.2f, gap=%.2fmm)" %
+                        (c_u_min, p_u_min, c_u_min - p_u_min))
+        if not diag.cutter_exceeds_u_pos:
+            gaps.append("u+ (cutter u_max=%.2f < prism u_max=%.2f, gap=%.2fmm)" %
+                        (c_u_max, p_u_max, p_u_max - c_u_max))
+        if not diag.cutter_exceeds_v_neg:
+            gaps.append("v- (cutter v_min=%.2f > prism v_min=%.2f, gap=%.2fmm)" %
+                        (c_v_min, p_v_min, c_v_min - p_v_min))
+        if not diag.cutter_exceeds_v_pos:
+            gaps.append("v+ (cutter v_max=%.2f < prism v_max=%.2f, gap=%.2fmm)" %
+                        (c_v_max, p_v_max, p_v_max - c_v_max))
+        logger.warning("  GAPS DETECTED on sides: %s", "; ".join(gaps))
+
+    # ------------------------------------------------------------------
+    # 2. Bridge face detection
+    # ------------------------------------------------------------------
+    # Find faces in the CSG result whose centroids lie close to the membrane
+    # plane.  These faces form the "bridge" keeping the halves connected.
+    membrane_heights = membrane.vertices @ direction
+    membrane_h_min = float(membrane_heights.min())
+    membrane_h_max = float(membrane_heights.max())
+    membrane_h_mid = (membrane_h_min + membrane_h_max) / 2.0
+    membrane_thickness = membrane_h_max - membrane_h_min
+
+    # Tolerance: faces within ±(membrane_thickness + 1mm) of the membrane
+    bridge_tol = max(membrane_thickness * 2.0, 1.0)
+
+    result_verts = np.asarray(csg_result.vertices, dtype=np.float64)
+    result_faces = np.asarray(csg_result.faces, dtype=np.int64)
+
+    face_centroids = result_verts[result_faces].mean(axis=1)  # (F, 3)
+    face_heights = face_centroids @ direction  # (F,)
+
+    near_membrane = np.abs(face_heights - membrane_h_mid) < bridge_tol
+    near_face_indices = np.where(near_membrane)[0]
+
+    logger.info("Bridge face detection:")
+    logger.info("  Membrane height range: [%.2f, %.2f] (mid=%.2f, thickness=%.3f)",
+                membrane_h_min, membrane_h_max, membrane_h_mid, membrane_thickness)
+    logger.info("  Bridge tolerance: ±%.2fmm from membrane mid-plane", bridge_tol)
+    logger.info("  Faces near membrane plane: %d / %d total",
+                len(near_face_indices), len(result_faces))
+
+    if len(near_face_indices) > 0:
+        # Build a sub-mesh of just the bridge faces
+        bridge_faces_raw = result_faces[near_face_indices]
+        # Remap vertex indices to create a compact sub-mesh
+        unique_verts, inverse = np.unique(bridge_faces_raw.ravel(), return_inverse=True)
+        bridge_verts = result_verts[unique_verts]
+        bridge_faces_remapped = inverse.reshape(-1, 3)
+
+        diag.bridge_mesh = trimesh.Trimesh(
+            vertices=bridge_verts, faces=bridge_faces_remapped, process=False)
+        diag.n_bridge_faces = len(near_face_indices)
+        diag.bridge_centroid = bridge_verts.mean(axis=0)
+        diag.bridge_bounds_min = bridge_verts.min(axis=0)
+        diag.bridge_bounds_max = bridge_verts.max(axis=0)
+
+        # Project bridge faces to (u, v) to see WHERE the bridges are
+        bridge_uv = bridge_verts @ world_to_2d.T
+        logger.info("  Bridge faces bounds (world): [%.2f,%.2f,%.2f] to [%.2f,%.2f,%.2f]",
+                    *diag.bridge_bounds_min, *diag.bridge_bounds_max)
+        logger.info("  Bridge faces bounds (u,v):   u=[%.2f, %.2f]  v=[%.2f, %.2f]",
+                    bridge_uv[:, 0].min(), bridge_uv[:, 0].max(),
+                    bridge_uv[:, 1].min(), bridge_uv[:, 1].max())
+
+        # Check if removing bridge faces disconnects the mesh
+        remaining_mask = np.ones(len(result_faces), dtype=bool)
+        remaining_mask[near_face_indices] = False
+        remaining_faces = result_faces[remaining_mask]
+        if len(remaining_faces) > 0:
+            remaining_mesh = trimesh.Trimesh(
+                vertices=result_verts, faces=remaining_faces, process=False)
+            remaining_components = remaining_mesh.split(only_watertight=False)
+            logger.info("  After removing bridge faces: %d components (need ≥2 for split)",
+                        len(remaining_components))
+            if len(remaining_components) >= 2:
+                sizes = sorted([len(c.faces) for c in remaining_components], reverse=True)
+                logger.info("  Component sizes: %s", sizes[:5])
+                logger.info("  → Removing bridge faces WOULD split the mesh!")
+                logger.info("  → The blade/cutter has gaps near these bridge locations")
+            else:
+                logger.info("  → Removing bridge faces still leaves 1 component")
+                logger.info("  → The connection may be further from the membrane plane")
+                # Try increasing tolerance
+                for mult in [4.0, 8.0, 16.0]:
+                    wider_tol = max(membrane_thickness * mult, mult)
+                    wider_mask = np.abs(face_heights - membrane_h_mid) < wider_tol
+                    wider_remaining = result_faces[~wider_mask]
+                    if len(wider_remaining) > 0:
+                        wider_mesh = trimesh.Trimesh(
+                            vertices=result_verts, faces=wider_remaining, process=False)
+                        n_comp = len(wider_mesh.split(only_watertight=False))
+                        logger.info("    tol=±%.1fmm → removing %d faces → %d components",
+                                    wider_tol, int(wider_mask.sum()), n_comp)
+                        if n_comp >= 2:
+                            logger.info("    → Connection found within ±%.1fmm of membrane", wider_tol)
+                            break
+
+    # ------------------------------------------------------------------
+    # 3. Gap ray-casting analysis
+    # ------------------------------------------------------------------
+    # Cast rays parallel to pouring direction through a grid, check which
+    # go through the prism but NOT through the cutter.
+    logger.info("Gap ray-casting analysis:")
+    grid_res = 30  # 30x30 grid
+    u_samples = np.linspace(p_u_min + 0.5, p_u_max - 0.5, grid_res)
+    v_samples = np.linspace(p_v_min + 0.5, p_v_max - 0.5, grid_res)
+    uu, vv = np.meshgrid(u_samples, v_samples)
+    grid_points_uv = np.column_stack([uu.ravel(), vv.ravel()])  # (N, 2)
+
+    # Convert grid points from (u, v) back to 3D world at the membrane mid-height
+    grid_3d = (grid_points_uv[:, 0:1] * u_axis[np.newaxis, :] +
+               grid_points_uv[:, 1:2] * v_axis[np.newaxis, :] +
+               membrane_h_mid * direction[np.newaxis, :])
+
+    # Ray origins: start well above the membrane plane
+    ray_height_offset = max(diag.prism_span_u, diag.prism_span_v) * 2
+    ray_origins = grid_3d + direction * ray_height_offset
+    ray_directions = np.tile(-direction, (len(ray_origins), 1))  # shoot downward
+
+    # Test rays against prism
+    try:
+        prism_hits = prism_mesh.ray.intersects_any(ray_origins, ray_directions)
+    except Exception:
+        prism_hits = np.zeros(len(ray_origins), dtype=bool)
+
+    # Test rays against combined cutter
+    try:
+        cutter_hits = combined_cutter.ray.intersects_any(ray_origins, ray_directions)
+    except Exception:
+        cutter_hits = np.zeros(len(ray_origins), dtype=bool)
+
+    # Gap = hits prism but NOT cutter
+    gap_mask = prism_hits & ~cutter_hits
+    diag.n_gap_sample_points = int(prism_hits.sum())
+    diag.n_gaps_found = int(gap_mask.sum())
+
+    if diag.n_gaps_found > 0:
+        diag.gap_locations = grid_3d[gap_mask]
+        logger.warning("  %d / %d rays through prism do NOT hit the cutter (%.1f%% gap coverage)",
+                       diag.n_gaps_found, diag.n_gap_sample_points,
+                       diag.n_gaps_found / max(diag.n_gap_sample_points, 1) * 100)
+        gap_uv = grid_points_uv[gap_mask]
+        logger.warning("  Gap region (u,v): u=[%.2f, %.2f]  v=[%.2f, %.2f]",
+                       gap_uv[:, 0].min(), gap_uv[:, 0].max(),
+                       gap_uv[:, 1].min(), gap_uv[:, 1].max())
+    else:
+        logger.info("  All %d rays through prism also hit the cutter — no lateral gaps detected",
+                    diag.n_gap_sample_points)
+        if diag.n_bridge_faces > 0:
+            logger.info("  → Bridges exist but no ray gaps — the cutter may be coplanar")
+            logger.info("    with prism faces, causing CSG degeneracy (try thicker blade)")
+
+    # ------------------------------------------------------------------
+    # 4. Summary
+    # ------------------------------------------------------------------
+    parts = []
+    if not diag.full_lateral_coverage:
+        parts.append("Cutter does NOT extend beyond prism on all sides — "
+                     "the blade/collar is too narrow")
+    if diag.n_gaps_found > 0:
+        parts.append("%d gap locations where prism exists but cutter does not" %
+                     diag.n_gaps_found)
+    if diag.n_bridge_faces > 0:
+        parts.append("%d bridge faces near the membrane keep halves connected" %
+                     diag.n_bridge_faces)
+    if not parts:
+        parts.append("No obvious geometric gaps — may be a CSG precision issue "
+                     "(try increasing blade_thickness)")
+    diag.summary = "; ".join(parts)
+    logger.info("DIAGNOSIS: %s", diag.summary)
+
+    # ------------------------------------------------------------------
+    # 5. Export diagnostic meshes
+    # ------------------------------------------------------------------
+    if export_dir is not None:
+        os.makedirs(export_dir, exist_ok=True)
+        diag.export_dir = export_dir
+        _export_diag = [
+            ("debug_prism.stl", prism_mesh),
+            ("debug_combined_cutter.stl", combined_cutter),
+            ("debug_csg_result.stl", csg_result),
+            ("debug_membrane.stl", membrane),
+        ]
+        if blade is not None:
+            _export_diag.append(("debug_blade.stl", blade))
+        if diag.bridge_mesh is not None:
+            _export_diag.append(("debug_bridge_faces.stl", diag.bridge_mesh))
+        if diag.gap_locations is not None and len(diag.gap_locations) > 0:
+            # Create small spheres at each gap location for visualization
+            gap_spheres = []
+            sphere_r = max(diag.prism_span_u, diag.prism_span_v) * 0.01
+            for pt in diag.gap_locations[:200]:  # limit to 200 spheres
+                s = trimesh.creation.icosphere(subdivisions=1, radius=sphere_r)
+                s.apply_translation(pt)
+                gap_spheres.append(s)
+            if gap_spheres:
+                gap_mesh = trimesh.util.concatenate(gap_spheres)
+                _export_diag.append(("debug_gap_locations.stl", gap_mesh))
+
+        for fname, mesh in _export_diag:
+            fpath = os.path.join(export_dir, fname)
+            try:
+                mesh.export(fpath)
+                diag.exported_files.append(fpath)
+                logger.info("  Exported: %s (%d faces)", fpath, len(mesh.faces))
+            except Exception as e:
+                logger.warning("  Failed to export %s: %s", fpath, e)
+
+    logger.info("=== END SPLIT FAILURE DIAGNOSTICS ===")
+    return diag
 
 
 # ============================================================================
@@ -322,25 +1085,7 @@ def create_metamold_prism(
     # =========================================================================
     # Step 1: Build orthonormal basis for the projection plane (same as hard shell)
     # =========================================================================
-    
-    # The plane normal is the pouring direction
-    # Find two orthogonal vectors in the plane
-    
-    # Start with an arbitrary non-parallel vector
-    if abs(pouring_dir[0]) < 0.9:
-        arbitrary = np.array([1.0, 0.0, 0.0])
-    else:
-        arbitrary = np.array([0.0, 1.0, 0.0])
-    
-    # Gram-Schmidt to get orthogonal basis
-    u_axis = arbitrary - np.dot(arbitrary, pouring_dir) * pouring_dir
-    u_axis = u_axis / np.linalg.norm(u_axis)
-    
-    v_axis = np.cross(pouring_dir, u_axis)
-    v_axis = v_axis / np.linalg.norm(v_axis)
-    
-    # Rotation matrix: world_to_2d projects world coordinates to (u, v) plane
-    world_to_2d = np.column_stack([u_axis, v_axis, pouring_dir]).T  # (3, 3)
+    pouring_dir, _u, _v, world_to_2d = _build_pouring_basis(pouring_dir)
     
     # =========================================================================
     # Step 2: Project part mesh vertices to get height extent
@@ -513,25 +1258,7 @@ def create_hard_shell_prism(
     # =========================================================================
     # Step 1: Build orthonormal basis for the projection plane
     # =========================================================================
-    
-    # The plane normal is the pouring direction
-    # Find two orthogonal vectors in the plane
-    
-    # Start with an arbitrary non-parallel vector
-    if abs(pouring_dir[0]) < 0.9:
-        arbitrary = np.array([1.0, 0.0, 0.0])
-    else:
-        arbitrary = np.array([0.0, 1.0, 0.0])
-    
-    # Gram-Schmidt to get orthogonal basis
-    u_axis = arbitrary - np.dot(arbitrary, pouring_dir) * pouring_dir
-    u_axis = u_axis / np.linalg.norm(u_axis)
-    
-    v_axis = np.cross(pouring_dir, u_axis)
-    v_axis = v_axis / np.linalg.norm(v_axis)
-    
-    # Rotation matrix: world_to_2d projects world coordinates to (u, v) plane
-    world_to_2d = np.column_stack([u_axis, v_axis, pouring_dir]).T  # (3, 3)
+    pouring_dir, _u, _v, world_to_2d = _build_pouring_basis(pouring_dir)
     
     # =========================================================================
     # Step 2: Project vertices onto the plane and compute 2D silhouette
@@ -621,26 +1348,8 @@ def create_hard_shell_prism(
 # CSG OPERATIONS FOR HARD SHELL (Cavity + Split)
 # ============================================================================
 
-def _trimesh_to_manifold(mesh: trimesh.Trimesh) -> 'manifold3d.Manifold':
-    """Convert a trimesh to manifold3d Manifold object."""
-    if not MANIFOLD_AVAILABLE:
-        raise RuntimeError("manifold3d is not available")
-    
-    vertices = np.asarray(mesh.vertices, dtype=np.float32)
-    faces = np.asarray(mesh.faces, dtype=np.uint32)
-    
-    # Create Mesh then Manifold (correct API for manifold3d v3.x)
-    m3d_mesh = manifold3d.Mesh(vert_properties=vertices, tri_verts=faces)
-    return manifold3d.Manifold(m3d_mesh)
-
-
-def _manifold_to_trimesh(manifold: 'manifold3d.Manifold') -> trimesh.Trimesh:
-    """Convert a manifold3d Manifold object to trimesh."""
-    mesh_data = manifold.to_mesh()
-    vertices = np.asarray(mesh_data.vert_properties, dtype=np.float64)
-    faces = np.asarray(mesh_data.tri_verts, dtype=np.int64)
-    
-    return trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
+# NOTE: _trimesh_to_manifold / _manifold_to_trimesh removed.
+# All CSG operations now go through csg_backend (libigl/CGAL preferred).
 
 
 def create_shell_with_cavity(
@@ -652,6 +1361,8 @@ def create_shell_with_cavity(
     
     This implements: shell = prism - hull
     
+    Uses robust CSG boolean operations [Zhou et al. 2016] via csg_backend.
+    
     Args:
         prism_mesh: The hard shell prism mesh
         hull_mesh: The inflated hull mesh (defines the cavity)
@@ -661,22 +1372,14 @@ def create_shell_with_cavity(
     """
     start_time = time.time()
     
-    if not MANIFOLD_AVAILABLE:
-        logger.error("manifold3d not available - cannot perform CSG operations")
+    if not CSG_AVAILABLE:
+        logger.error("CSG backend not available - cannot perform CSG operations")
         return None, 0.0, False
     
     try:
         logger.info("Creating shell with cavity (prism - hull)...")
         
-        # Convert to manifold
-        prism_manifold = _trimesh_to_manifold(prism_mesh)
-        hull_manifold = _trimesh_to_manifold(hull_mesh)
-        
-        # Perform subtraction: shell = prism - hull
-        shell_manifold = prism_manifold - hull_manifold
-        
-        # Convert back to trimesh
-        shell_mesh = _manifold_to_trimesh(shell_manifold)
+        shell_mesh = csg_backend.csg_difference(prism_mesh, hull_mesh)
         
         elapsed_ms = (time.time() - start_time) * 1000
         
@@ -696,100 +1399,20 @@ def _create_cutting_volume_from_surface(
     pouring_direction: np.ndarray,
     thickness: float = 100.0
 ) -> trimesh.Trimesh:
-    """
-    Create a thick volume from the parting surface for CSG splitting.
-    
-    The volume is created by extruding the parting surface along the pouring direction
-    in both directions, creating a "slab" that can be used for CSG operations.
-    
+    """Create a thick volume slab from the parting surface for CSG splitting.
+
+    Delegates to :func:`_extrude_surface_to_volume` with symmetric offsets.
+
     Args:
-        parting_surface: The parting surface mesh (with extended collar)
-        pouring_direction: The pouring direction (extrusion axis)
-        thickness: Total thickness of the slab (extends thickness/2 in each direction)
-        
+        parting_surface: The parting surface mesh (with extended collar).
+        pouring_direction: The pouring direction (extrusion axis).
+        thickness: Total slab thickness (extends thickness/2 each side).
+
     Returns:
-        A watertight volume mesh for CSG operations
+        Watertight volume mesh.
     """
-    # Normalize direction
-    direction = np.array(pouring_direction, dtype=np.float64)
-    direction = direction / (np.linalg.norm(direction) + 1e-10)
-    
-    # Get surface vertices and faces
-    vertices = np.asarray(parting_surface.vertices, dtype=np.float64)
-    faces = np.asarray(parting_surface.faces, dtype=np.int64)
-    n_verts = len(vertices)
-    n_faces = len(faces)
-    
-    half_thickness = thickness / 2.0
-    
-    # Create top and bottom surfaces by offsetting along the direction
-    top_vertices = vertices + direction * half_thickness
-    bottom_vertices = vertices - direction * half_thickness
-    
-    # Combined vertices: [bottom, top]
-    all_vertices = np.vstack([bottom_vertices, top_vertices])
-    
-    # Faces for bottom surface (reverse winding for outward normals)
-    bottom_faces = faces[:, ::-1]  # Reverse winding
-    
-    # Faces for top surface (offset indices)
-    top_faces = faces + n_verts
-    
-    # Side faces: find boundary edges and create quads
-    edge_count = {}
-    edge_to_face = {}
-    
-    for fi, face in enumerate(faces):
-        for i in range(3):
-            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-            edge_key = (min(v0, v1), max(v0, v1))
-            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
-            # Store oriented edge info for winding determination
-            if edge_key not in edge_to_face:
-                edge_to_face[edge_key] = (fi, v0, v1)
-    
-    # Boundary edges have count == 1
-    boundary_edges = [e for e, c in edge_count.items() if c == 1]
-    
-    side_faces = []
-    for v0, v1 in boundary_edges:
-        # Get the original edge orientation from the face
-        _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
-        
-        # Bottom vertices
-        b0, b1 = v0, v1
-        # Top vertices (offset by n_verts)
-        t0, t1 = v0 + n_verts, v1 + n_verts
-        
-        # Create quad (2 triangles) with correct winding
-        # The winding depends on the original edge direction in the face
-        if orig_v0 == v0:
-            # Edge goes v0->v1 in original face, so outward normal faces "right"
-            side_faces.append([b0, t0, t1])
-            side_faces.append([b0, t1, b1])
-        else:
-            # Edge goes v1->v0 in original face
-            side_faces.append([b0, b1, t1])
-            side_faces.append([b0, t1, t0])
-    
-    # Combine all faces
-    all_faces = np.vstack([
-        bottom_faces,
-        top_faces,
-        np.array(side_faces, dtype=np.int64) if side_faces else np.zeros((0, 3), dtype=np.int64)
-    ])
-    
-    volume_mesh = trimesh.Trimesh(
-        vertices=all_vertices,
-        faces=all_faces,
-        process=True
-    )
-    volume_mesh.fix_normals()
-    
-    logger.debug(f"Created cutting volume: {len(all_vertices)} verts, {len(all_faces)} faces, "
-                f"from {n_verts} surface verts, {len(boundary_edges)} boundary edges")
-    
-    return volume_mesh
+    half = thickness / 2.0
+    return _extrude_surface_to_volume(parting_surface, pouring_direction, half, half)
 
 
 def _create_half_space_from_membrane(
@@ -797,100 +1420,20 @@ def _create_half_space_from_membrane(
     direction: np.ndarray,
     extrusion_distance: float = 500.0
 ) -> trimesh.Trimesh:
-    """
-    Create a watertight half-space volume bounded by the membrane on one side.
-    
-    This extrudes the membrane along the given direction to create a closed volume
-    representing "everything on one side of the membrane".
-    
-    The resulting volume has:
-    - The membrane as its bottom face (with appropriate winding)
-    - The extruded membrane as its top face
-    - Side faces connecting the membrane boundary to the extruded boundary
-    
+    """Create a one-sided half-space volume bounded by the membrane.
+
+    Delegates to :func:`_extrude_surface_to_volume` with asymmetric offsets
+    (offset_pos = extrusion_distance, offset_neg = 0).
+
     Args:
-        membrane: The membrane mesh (e.g., outer collar)
-        direction: Unit vector for extrusion direction (defines "which side")
-        extrusion_distance: How far to extrude (should be larger than the shell)
-        
+        membrane: The membrane mesh.
+        direction: Extrusion direction (defines "which side").
+        extrusion_distance: How far to extrude.
+
     Returns:
-        A watertight volume mesh representing the half-space
+        Watertight half-space volume mesh.
     """
-    # Normalize direction
-    direction = np.array(direction, dtype=np.float64)
-    direction = direction / (np.linalg.norm(direction) + 1e-10)
-    
-    # Get membrane geometry
-    vertices = np.asarray(membrane.vertices, dtype=np.float64)
-    faces = np.asarray(membrane.faces, dtype=np.int64)
-    n_verts = len(vertices)
-    
-    # Create extruded vertices (far end of the half-space)
-    extruded_vertices = vertices + direction * extrusion_distance
-    
-    # Combined vertices: [membrane, extruded]
-    all_vertices = np.vstack([vertices, extruded_vertices])
-    
-    # Faces:
-    # 1. Membrane faces (bottom) - reverse winding so normals point into the half-space
-    #    (i.e., pointing in the negative direction)
-    bottom_faces = faces[:, ::-1]  # Reversed winding
-    
-    # 2. Extruded faces (top) - keep original winding, offset indices
-    #    These normals point outward (in positive direction)
-    top_faces = faces + n_verts
-    
-    # 3. Side faces connecting boundary edges
-    # Find boundary edges of membrane
-    edge_count = {}
-    edge_to_face = {}
-    
-    for fi, face in enumerate(faces):
-        for i in range(3):
-            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-            edge_key = (min(v0, v1), max(v0, v1))
-            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
-            if edge_key not in edge_to_face:
-                edge_to_face[edge_key] = (fi, v0, v1)
-    
-    # Boundary edges have count == 1
-    boundary_edges = [e for e, c in edge_count.items() if c == 1]
-    
-    side_faces = []
-    for v0, v1 in boundary_edges:
-        _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
-        
-        # Bottom (membrane) vertices
-        b0, b1 = v0, v1
-        # Top (extruded) vertices
-        t0, t1 = v0 + n_verts, v1 + n_verts
-        
-        # Create quad with correct winding for outward-facing normals
-        # Since bottom faces are reversed, side faces should create outward normals
-        if orig_v0 == v0:
-            side_faces.append([b0, b1, t1])
-            side_faces.append([b0, t1, t0])
-        else:
-            side_faces.append([b0, t0, t1])
-            side_faces.append([b0, t1, b1])
-    
-    # Combine all faces
-    all_faces_list = [bottom_faces, top_faces]
-    if side_faces:
-        all_faces_list.append(np.array(side_faces, dtype=np.int64))
-    all_faces = np.vstack(all_faces_list)
-    
-    half_space_mesh = trimesh.Trimesh(
-        vertices=all_vertices,
-        faces=all_faces,
-        process=True
-    )
-    half_space_mesh.fix_normals()
-    
-    logger.debug(f"Created half-space volume: {len(all_vertices)} verts, {len(all_faces)} faces, "
-                f"extruded {extrusion_distance:.1f}mm in direction {direction}")
-    
-    return half_space_mesh
+    return _extrude_surface_to_volume(membrane, direction, extrusion_distance, 0.0)
 
 
 def _create_cutting_blade_from_membrane(
@@ -898,206 +1441,45 @@ def _create_cutting_blade_from_membrane(
     direction: np.ndarray,
     thickness: float = 0.0001
 ) -> trimesh.Trimesh:
-    """
-    Create a thin watertight "blade" volume from the membrane for cutting.
-    
-    The blade is created by extruding the membrane slightly in both directions
-    (+thickness/2 and -thickness/2) to create a thin solid volume that can be
-    subtracted from the shell to create a gap.
-    
+    """Create a thin symmetric blade volume from the membrane for CSG cutting.
+
+    Delegates to :func:`_extrude_surface_to_volume` with symmetric micro-offsets.
+
     Args:
-        membrane: The membrane mesh (e.g., outer collar)
-        direction: Unit vector perpendicular to the membrane (pouring direction)
-        thickness: Total thickness of the blade (default: 0.0001mm = 0.1 micron)
-        
+        membrane: The membrane mesh.
+        direction: Unit vector perpendicular to the membrane.
+        thickness: Total blade thickness (default 0.1 µm).
+
     Returns:
-        A watertight blade volume mesh
+        Watertight blade volume mesh.
     """
-    # Normalize direction
-    direction = np.array(direction, dtype=np.float64)
-    direction = direction / (np.linalg.norm(direction) + 1e-10)
-    
-    # Get membrane geometry
-    vertices = np.asarray(membrane.vertices, dtype=np.float64)
-    faces = np.asarray(membrane.faces, dtype=np.int64)
-    n_verts = len(vertices)
-    
-    half_thickness = thickness / 2.0
-    
-    # Create vertices for both sides of the blade
-    # Bottom side: membrane shifted in -direction
-    bottom_vertices = vertices - direction * half_thickness
-    # Top side: membrane shifted in +direction
-    top_vertices = vertices + direction * half_thickness
-    
-    # Combined vertices: [bottom, top]
-    all_vertices = np.vstack([bottom_vertices, top_vertices])
-    
-    # Faces:
-    # 1. Bottom faces - reverse winding so normals point outward (downward)
-    bottom_faces = faces[:, ::-1]  # Reversed winding
-    
-    # 2. Top faces - keep original winding, offset indices
-    top_faces = faces + n_verts
-    
-    # 3. Side faces connecting boundary edges
-    edge_count = {}
-    edge_to_face = {}
-    
-    for fi, face in enumerate(faces):
-        for i in range(3):
-            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-            edge_key = (min(v0, v1), max(v0, v1))
-            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
-            if edge_key not in edge_to_face:
-                edge_to_face[edge_key] = (fi, v0, v1)
-    
-    # Boundary edges have count == 1
-    boundary_edges = [e for e, c in edge_count.items() if c == 1]
-    
-    side_faces = []
-    for v0, v1 in boundary_edges:
-        _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
-        
-        # Bottom vertices
-        b0, b1 = v0, v1
-        # Top vertices (offset by n_verts)
-        t0, t1 = v0 + n_verts, v1 + n_verts
-        
-        # Create quad with correct winding for outward-facing normals
-        if orig_v0 == v0:
-            side_faces.append([b0, b1, t1])
-            side_faces.append([b0, t1, t0])
-        else:
-            side_faces.append([b0, t0, t1])
-            side_faces.append([b0, t1, b1])
-    
-    # Combine all faces
-    all_faces_list = [bottom_faces, top_faces]
-    if side_faces:
-        all_faces_list.append(np.array(side_faces, dtype=np.int64))
-    all_faces = np.vstack(all_faces_list)
-    
-    blade_mesh = trimesh.Trimesh(
-        vertices=all_vertices,
-        faces=all_faces,
-        process=True
-    )
-    blade_mesh.fix_normals()
-    
-    logger.debug(f"Created cutting blade: {len(all_vertices)} verts, {len(all_faces)} faces, "
-                f"thickness={thickness:.6f}mm")
-    
-    return blade_mesh
+    half = thickness / 2.0
+    return _extrude_surface_to_volume(membrane, direction, half, half)
 
 
 def _create_tall_cutting_blade(
     membrane: trimesh.Trimesh,
     direction: np.ndarray,
     extrusion_distance: float = 100.0,
-    blade_thickness: float = 0.0001
+    blade_thickness: float = 1.0
 ) -> trimesh.Trimesh:
-    """
-    Create a tall cutting blade by extruding the membrane far in both directions.
-    
-    Unlike `_create_cutting_blade_from_membrane` which creates a thin blade at the
-    membrane's position, this creates a blade that extends significantly above and
-    below the membrane to ensure it cuts through any shell regardless of height bounds.
-    
-    The blade is essentially the membrane extruded into a prism shape along the
-    pouring direction, then made slightly thick to create a gap when subtracted.
-    
+    """Create a tall cutting blade extending far above and below the membrane.
+
+    Delegates to :func:`_extrude_surface_to_volume` with large symmetric
+    offsets plus a micro-gap for CSG subtraction.
+
     Args:
-        membrane: The membrane mesh (parting surface + outer collar)
-        direction: Pouring direction (extrusion axis)
-        extrusion_distance: How far to extrude above and below (default: 100mm each way)
-        blade_thickness: Gap thickness for CSG subtraction (default: 0.1 micron)
-        
+        membrane: The membrane mesh (parting surface + outer collar).
+        direction: Pouring direction (extrusion axis).
+        extrusion_distance: How far to extrude each side (default 100 mm).
+        blade_thickness: Gap thickness for CSG subtraction (default 0.1 µm).
+
     Returns:
-        A tall prism-shaped blade mesh
+        Tall prism-shaped blade mesh.
     """
-    # Normalize direction
-    direction = np.array(direction, dtype=np.float64)
-    direction = direction / (np.linalg.norm(direction) + 1e-10)
-    
-    # Get membrane geometry
-    vertices = np.asarray(membrane.vertices, dtype=np.float64)
-    faces = np.asarray(membrane.faces, dtype=np.int64)
-    n_verts = len(vertices)
-    
-    # The blade extends far in both directions along the pouring axis
-    # We add a tiny offset (blade_thickness/2) to create a gap
     half_gap = blade_thickness / 2.0
-    
-    # Bottom vertices: membrane projected far down along pouring direction
-    # We find the membrane's center to project from
-    membrane_heights = np.dot(vertices, direction)
-    membrane_center_height = (membrane_heights.min() + membrane_heights.max()) / 2.0
-    
-    # Create vertices at the bottom plane (membrane height - extrusion_distance - half_gap)
-    bottom_vertices = vertices - direction * (extrusion_distance + half_gap)
-    # Create vertices at the top plane (membrane height + extrusion_distance + half_gap)
-    top_vertices = vertices + direction * (extrusion_distance + half_gap)
-    
-    # Combined vertices: [bottom, top]
-    all_vertices = np.vstack([bottom_vertices, top_vertices])
-    
-    # Faces:
-    # 1. Bottom faces - reverse winding so normals point outward (downward)
-    bottom_faces = faces[:, ::-1]  # Reversed winding
-    
-    # 2. Top faces - keep original winding, offset indices
-    top_faces = faces + n_verts
-    
-    # 3. Side faces connecting boundary edges
-    edge_count = {}
-    edge_to_face = {}
-    
-    for fi, face in enumerate(faces):
-        for i in range(3):
-            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-            edge_key = (min(v0, v1), max(v0, v1))
-            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
-            if edge_key not in edge_to_face:
-                edge_to_face[edge_key] = (fi, v0, v1)
-    
-    # Boundary edges have count == 1
-    boundary_edges = [e for e, c in edge_count.items() if c == 1]
-    
-    side_faces = []
-    for v0, v1 in boundary_edges:
-        _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
-        
-        # Bottom vertices
-        b0, b1 = v0, v1
-        # Top vertices (offset by n_verts)
-        t0, t1 = v0 + n_verts, v1 + n_verts
-        
-        # Create quad with correct winding for outward-facing normals
-        if orig_v0 == v0:
-            side_faces.append([b0, b1, t1])
-            side_faces.append([b0, t1, t0])
-        else:
-            side_faces.append([b0, t0, t1])
-            side_faces.append([b0, t1, b1])
-    
-    # Combine all faces
-    all_faces_list = [bottom_faces, top_faces]
-    if side_faces:
-        all_faces_list.append(np.array(side_faces, dtype=np.int64))
-    all_faces = np.vstack(all_faces_list)
-    
-    blade_mesh = trimesh.Trimesh(
-        vertices=all_vertices,
-        faces=all_faces,
-        process=True
-    )
-    blade_mesh.fix_normals()
-    
-    logger.info(f"Created tall cutting blade: {len(all_vertices)} verts, {len(all_faces)} faces, "
-               f"extrusion={extrusion_distance:.1f}mm each direction")
-    
-    return blade_mesh
+    offset = extrusion_distance + half_gap
+    return _extrude_surface_to_volume(membrane, direction, offset, offset)
 
 
 def extend_membrane_height(
@@ -1159,18 +1541,7 @@ def extend_membrane_height(
         return membrane
     
     # Find boundary edges
-    edge_to_face = {}
-    edge_count = {}
-    for fi, face in enumerate(faces):
-        for i in range(3):
-            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-            third_v = int(face[(i + 2) % 3])
-            edge_key = (min(v0, v1), max(v0, v1))
-            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
-            if edge_key not in edge_to_face:
-                edge_to_face[edge_key] = (fi, v0, v1, third_v)
-    
-    boundary_edges = [(v0, v1) for (v0, v1), c in edge_count.items() if c == 1]
+    boundary_edges, edge_to_face = _find_boundary_edges_with_winding(faces)
     
     if not boundary_edges:
         logger.warning("No boundary edges found - cannot extend membrane height")
@@ -1223,7 +1594,7 @@ def extend_membrane_height(
                 edge_key = (min(v0, v1), max(v0, v1))
                 face_info = edge_to_face.get(edge_key)
                 if face_info is not None:
-                    fi, orig_v0, orig_v1, _ = face_info
+                    fi, orig_v0, orig_v1 = face_info
                     # Create quad connecting original to extended (downward)
                     # Winding should be consistent with face orientation
                     if orig_v0 == v0:
@@ -1256,7 +1627,7 @@ def extend_membrane_height(
                 edge_key = (min(v0, v1), max(v0, v1))
                 face_info = edge_to_face.get(edge_key)
                 if face_info is not None:
-                    fi, orig_v0, orig_v1, _ = face_info
+                    fi, orig_v0, orig_v1 = face_info
                     # Create quad connecting original to extended (upward)
                     if orig_v0 == v0:
                         new_faces.append([v0, v1, ext_v1])
@@ -1283,8 +1654,9 @@ def split_shell_with_membrane(
     shell_with_cavity: trimesh.Trimesh,
     membrane: trimesh.Trimesh,
     pouring_direction: np.ndarray,
-    blade_thickness: float = 0.0001
-) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool]:
+    blade_thickness: float = 1.0
+) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool,
+           Optional[trimesh.Trimesh]]:
     """
     Split the shell into two manifold halves using the membrane as a cutting blade.
     
@@ -1306,15 +1678,16 @@ def split_shell_with_membrane(
                         The blade is centered on the membrane (±thickness/2 each side)
         
     Returns:
-        Tuple of (shell_half_1, shell_half_2, computation_time_ms, success)
+        Tuple of (shell_half_1, shell_half_2, computation_time_ms, success, blade)
         shell_half_1 is the half in the positive pouring direction (upper)
         shell_half_2 is the half in the negative pouring direction (lower)
+        blade is the cutting blade mesh (for reuse in metamold step)
     """
     start_time = time.time()
     
-    if not MANIFOLD_AVAILABLE:
-        logger.error("manifold3d not available - cannot perform CSG operations")
-        return None, None, 0.0, False
+    if not CSG_AVAILABLE:
+        logger.error("CSG backend not available - cannot perform CSG operations")
+        return None, None, 0.0, False, None
     
     try:
         logger.info(f"Splitting shell using thin blade subtraction (thickness={blade_thickness:.6f}mm)...")
@@ -1328,120 +1701,366 @@ def split_shell_with_membrane(
         blade = _create_cutting_blade_from_membrane(membrane, direction, blade_thickness)
         logger.info(f"Blade: {len(blade.vertices)} verts, {len(blade.faces)} faces")
         
-        # Diagnostic: blade and membrane properties (debug level to reduce log noise)
+        # Detailed diagnostics (debug level only)
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"Membrane: {len(membrane.vertices)} verts, {len(membrane.faces)} faces, watertight={membrane.is_watertight}")
-            # Count membrane boundary edges
-            membrane_edge_count = {}
-            for face in membrane.faces:
-                for i in range(3):
-                    v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-                    edge_key = (min(v0, v1), max(v0, v1))
-                    membrane_edge_count[edge_key] = membrane_edge_count.get(edge_key, 0) + 1
-            membrane_boundary_edges = sum(1 for c in membrane_edge_count.values() if c == 1)
-            logger.debug(f"  Membrane boundary edges: {membrane_boundary_edges}")
-            
-            logger.debug(f"Blade: watertight={blade.is_watertight}")
-            # Count blade boundary edges
-            blade_edge_count = {}
-            for face in blade.faces:
-                for i in range(3):
-                    v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-                    edge_key = (min(v0, v1), max(v0, v1))
-                    blade_edge_count[edge_key] = blade_edge_count.get(edge_key, 0) + 1
-            blade_boundary_edges = sum(1 for c in blade_edge_count.values() if c == 1)
-            if blade_boundary_edges > 0:
-                logger.warning(f"Blade has {blade_boundary_edges} open edges - not watertight!")
-            
-            # Bounding box info
-            shell_bounds = shell_with_cavity.bounds
-            blade_bounds = blade.bounds
-            membrane_bounds = membrane.bounds
-            logger.debug(f"Bounds - Shell: {shell_bounds[0]} to {shell_bounds[1]}")
-            logger.debug(f"Bounds - Membrane: {membrane_bounds[0]} to {membrane_bounds[1]}")
-            logger.debug(f"Bounds - Blade: {blade_bounds[0]} to {blade_bounds[1]}")
-            
-            # Check overlap along pouring direction
-            shell_projections = shell_with_cavity.vertices @ direction
-            blade_projections = blade.vertices @ direction
-            shell_proj_min = float(shell_projections.min())
-            shell_proj_max = float(shell_projections.max())
-            blade_proj_min = float(blade_projections.min())
-            blade_proj_max = float(blade_projections.max())
-            logger.debug(f"Shell extent along pouring dir: [{shell_proj_min:.2f}, {shell_proj_max:.2f}]")
-            logger.debug(f"Blade extent along pouring dir: [{blade_proj_min:.2f}, {blade_proj_max:.2f}]")
-            
-            overlap = not (blade_proj_max < shell_proj_min or blade_proj_min > shell_proj_max)
-            if not overlap:
-                logger.warning("Blade does NOT overlap with shell along pouring direction - cut may fail")
-            
-            # Check shell connectivity BEFORE cutting (expensive)
-            shell_components_before = shell_with_cavity.split(only_watertight=False)
-            logger.debug(f"Shell has {len(shell_components_before)} connected components BEFORE cutting")
-            if len(shell_components_before) > 1:
-                for i, comp in enumerate(sorted(shell_components_before, key=lambda m: len(m.faces), reverse=True)[:5]):
-                    logger.debug(f"  Component {i+1}: {len(comp.vertices)} verts, {len(comp.faces)} faces")
+            _log_blade_cut_diagnostics(shell_with_cavity, membrane, blade, direction)
         
-        # Step 2: Convert to manifold3d
-        logger.info("Converting meshes to manifold...")
-        shell_manifold = _trimesh_to_manifold(shell_with_cavity)
-        blade_manifold = _trimesh_to_manifold(blade)
-        
-        # Step 3: CSG subtraction - cut the shell with the blade
+        # Step 2: CSG subtraction - cut the shell with the blade
         logger.info("Performing CSG subtraction: shell - blade...")
-        cut_shell_manifold = shell_manifold - blade_manifold
-        
-        # Step 4: Convert back to trimesh
-        cut_shell = _manifold_to_trimesh(cut_shell_manifold)
+        cut_shell = csg_backend.csg_difference(shell_with_cavity, blade)
         logger.info(f"Cut shell: {len(cut_shell.vertices)} verts, {len(cut_shell.faces)} faces")
         
-        # Step 5: Split into connected components
-        logger.info("Splitting into connected components...")
-        components = cut_shell.split(only_watertight=False)
-        logger.info(f"Found {len(components)} connected components")
+        # Step 3: Split into connected components and classify halves
+        upper, lower, components, did_split = _split_and_classify_halves(cut_shell, direction)
         
-        if len(components) < 2:
+        if not did_split:
             logger.warning("Failed to split shell into two components - blade may not have cut through")
             elapsed_ms = (time.time() - start_time) * 1000
             if len(components) == 1:
-                return components[0], None, elapsed_ms, False
-            return None, None, elapsed_ms, False
+                return components[0], None, elapsed_ms, False, blade
+            return None, None, elapsed_ms, False, blade
         
-        # Step 6: Sort by size and take the two largest
-        components = sorted(components, key=lambda m: len(m.faces), reverse=True)
-        comp1, comp2 = components[0], components[1]
-        
-        # Step 7: Classify which is upper vs lower based on centroid position
-        centroid1 = comp1.centroid
-        centroid2 = comp2.centroid
-        
-        # Project centroids onto pouring direction
-        proj1 = np.dot(centroid1, direction)
-        proj2 = np.dot(centroid2, direction)
-        
-        # Upper half has higher projection value
-        if proj1 > proj2:
-            shell_half_1, shell_half_2 = comp1, comp2
-        else:
-            shell_half_1, shell_half_2 = comp2, comp1
-        
+        shell_half_1, shell_half_2 = upper, lower
         elapsed_ms = (time.time() - start_time) * 1000
         
         logger.info(f"Shell split complete in {elapsed_ms:.1f}ms:")
         logger.info(f"  Half 1 (upper): {len(shell_half_1.vertices)} verts, {len(shell_half_1.faces)} faces")
         logger.info(f"  Half 2 (lower): {len(shell_half_2.vertices)} verts, {len(shell_half_2.faces)} faces")
         
-        if len(components) > 2:
-            logger.warning(f"  Note: {len(components) - 2} additional small fragments were discarded")
-        
-        return shell_half_1, shell_half_2, elapsed_ms, True
+        return shell_half_1, shell_half_2, elapsed_ms, True, blade
         
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000
-        logger.error(f"Failed to split shell with membrane: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, None, elapsed_ms, False
+        logger.error("Failed to split shell with membrane: %s", e)
+        logger.exception(e)
+        return None, None, elapsed_ms, False, None
+
+
+# ============================================================================
+# COMBINED CUTTER VALIDATION & REPAIR
+# ============================================================================
+
+def _count_non_manifold_edges(mesh: trimesh.Trimesh) -> int:
+    """Count edges shared by != 2 faces (boundary or non-manifold junctions).
+
+    An edge shared by 1 face is an open boundary.
+    An edge shared by 3+ faces is a non-manifold junction.
+    Both are counted.
+
+    Args:
+        mesh: Triangle mesh to inspect.
+
+    Returns:
+        Number of edges with face-count != 2.
+    """
+    from collections import Counter
+    edge_counts: Counter = Counter()
+    for f in mesh.faces:
+        for i in range(3):
+            a, b = int(f[i]), int(f[(i + 1) % 3])
+            if a != b:  # skip degenerate edges
+                edge_counts[tuple(sorted((a, b)))] += 1
+    return sum(1 for c in edge_counts.values() if c != 2)
+
+
+def _validate_and_repair_cutter(
+    mesh: trimesh.Trimesh,
+    label: str = "combined_cutter",
+) -> Tuple[trimesh.Trimesh, bool, List[str]]:
+    """Validate a CSG-produced mesh and attempt comprehensive repair if needed.
+
+    The repair pipeline is structured to avoid one step undoing another:
+
+    **Pass 1 — MeshLib deep repair** (if available):
+        Handles degenerate faces, self-intersections, holes, and normals
+        in a single coordinated pass.
+
+    **Pass 2 — Trimesh cleanup** (catches anything MeshLib missed):
+        1. Remove degenerate (zero-area) faces.
+        2. Remove duplicate faces.
+        3. Merge close vertices.
+        4. Fix normals (consistent winding).
+        5. Fill holes (second pass, in case Pass 1 opened new ones).
+
+    **Validation**:
+        * Watertight check (no open boundaries).
+        * Manifold edge check (every edge shared by exactly 2 faces).
+
+    Args:
+        mesh: The mesh to validate / repair.
+        label: Human-readable label for log messages.
+
+    Returns:
+        (repaired_mesh, is_valid, repair_log)
+        - repaired_mesh: The (possibly repaired) mesh.
+        - is_valid: True if the mesh passes all manifold / watertight checks.
+        - repair_log: List of human-readable strings describing each step.
+    """
+    log: List[str] = []
+    m = mesh.copy()
+
+    v0, f0 = len(m.vertices), len(m.faces)
+    log.append(f"{label}: input {v0} verts, {f0} faces, "
+               f"watertight={m.is_watertight}")
+
+    # ================================================================== #
+    # PASS 1 — MeshLib deep repair (degenerates, self-ix, holes, normals)
+    # ================================================================== #
+    try:
+        from core.mesh_repair import MeshRepairer
+        repairer = MeshRepairer(m)
+        repair_result = repairer.repair(
+            merge_vertices=True,
+            remove_degenerate=True,
+            remove_duplicates=True,
+            fix_normals=True,
+            fill_holes=True,
+            fix_self_intersections=True,
+            use_convex_hull_fallback=False,
+        )
+        if repair_result.was_repaired:
+            m = repair_result.mesh
+            for step in repair_result.repair_steps:
+                log.append(f"  [MeshRepairer] {step}")
+        else:
+            log.append("  [MeshRepairer] No repairs needed")
+    except Exception as e:
+        log.append(f"  [MeshRepairer] Skipped: {e}")
+
+    # ================================================================== #
+    # PASS 2 — Trimesh cleanup (catches anything MeshLib missed / opened)
+    # ================================================================== #
+
+    # 2a. Remove degenerate (zero-area) faces
+    if hasattr(m, 'area_faces') and len(m.faces) > 0:
+        degen_mask = m.area_faces < 1e-12
+        n_degen = int(degen_mask.sum())
+        if n_degen > 0:
+            m.update_faces(~degen_mask)
+            m.remove_unreferenced_vertices()
+            log.append(f"  Removed {n_degen} degenerate (zero-area) faces")
+
+    # 2b. Remove duplicate faces
+    if len(m.faces) > 0:
+        sorted_faces = np.sort(m.faces, axis=1)
+        _, unique_idx = np.unique(sorted_faces, axis=0, return_index=True)
+        n_dup = len(m.faces) - len(unique_idx)
+        if n_dup > 0:
+            m = trimesh.Trimesh(
+                vertices=m.vertices.copy(),
+                faces=m.faces[unique_idx],
+                process=False,
+            )
+            log.append(f"  Removed {n_dup} duplicate faces")
+
+    # 2c. Merge close vertices
+    pre_merge = len(m.vertices)
+    m.merge_vertices(merge_tex=True, merge_norm=True)
+    n_merged = pre_merge - len(m.vertices)
+    if n_merged > 0:
+        log.append(f"  Merged {n_merged} duplicate/close vertices")
+
+    # 2d. Fix normals (consistent winding)
+    m.fix_normals()
+
+    # 2e. Fill holes — second pass to seal any boundaries opened by
+    #     MeshLib's degenerate-face removal.
+    if hasattr(m, 'fill_holes'):
+        try:
+            m.fill_holes()
+            log.append("  Filled holes (post-repair pass)")
+        except Exception as e:
+            log.append(f"  Hole filling skipped: {e}")
+
+    # ================================================================== #
+    # VALIDATION
+    # ================================================================== #
+    is_watertight = bool(m.is_watertight)
+    is_volume = bool(m.is_volume) if hasattr(m, 'is_volume') else is_watertight
+    non_manifold_edges = _count_non_manifold_edges(m)
+    is_manifold = is_watertight and (non_manifold_edges == 0)
+
+    log.append(f"  Final: {len(m.vertices)} verts, {len(m.faces)} faces")
+    log.append(f"  Watertight: {is_watertight}, Volume: {is_volume}, "
+               f"Non-manifold edges: {non_manifold_edges}, "
+               f"Manifold: {is_manifold}")
+
+    for line in log:
+        logger.info(line)
+
+    return m, is_manifold, log
+
+
+def create_metamold_with_combined_cut(
+    prism_mesh: trimesh.Trimesh,
+    part_mesh: trimesh.Trimesh,
+    membrane: trimesh.Trimesh,
+    pouring_direction: np.ndarray,
+    blade_thickness: float = 1.0,
+    secondary_mesh: Optional[trimesh.Trimesh] = None,
+    secondary_thickness: float = 0.2,
+    cutting_blade: Optional[trimesh.Trimesh] = None,
+) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh],
+           Optional[trimesh.Trimesh], float, bool, Optional['SplitDiagnostics']]:
+    """Create metamold halves using CSG cavity + half-space intersection.
+
+    Uses a robust two-step approach:
+        1. Create cavity:  cavity = prism − part
+        2. Create upper half-space volume from membrane (extruded in +direction)
+        3. Create lower half-space volume from membrane (extruded in −direction)
+        4. half_1 = cavity ∩ upper_halfspace
+        5. half_2 = cavity ∩ lower_halfspace
+
+    This eliminates the unreliable blade-subtraction + connected-component
+    splitting approach.  Each half is directly computed via CSG intersection,
+    so no component detection or vertex-merging issues arise.
+
+    A small gap (``blade_thickness``) is introduced at the parting line by
+    shifting each half-space inward by half the thickness.
+
+    Uses robust exact arithmetic CSG operations (Zhou et al. 2016 via CGAL).
+
+    Args:
+        prism_mesh: The metamold prism mesh.
+        part_mesh: The original part mesh to cast.
+        membrane: The parting surface mesh (including outer collar extension).
+        pouring_direction: Unit vector for the resin pouring direction.
+        blade_thickness: Gap at the parting line (mm).  Each half-space is
+            shifted inward by ``blade_thickness / 2``.
+        secondary_mesh: Optional secondary membrane (unused for now).
+        secondary_thickness: Thickness for secondary membrane (unused for now).
+        cutting_blade: Ignored — kept for API compatibility.
+
+    Returns:
+        (half_1, half_2, shell_with_cavity, computation_time_ms,
+         split_success, diagnostics)
+
+        - half_1: Upper half (positive pouring direction), or None on failure.
+        - half_2: Lower half (negative pouring direction), or None on failure.
+        - shell_with_cavity: The cavity result (prism − part), always returned
+          when the first boolean succeeds.
+        - computation_time_ms: Total computation time.
+        - split_success: True if both intersections produced valid geometry.
+        - diagnostics: ``None`` (reserved for future use).
+    """
+    start_time = time.time()
+
+    if not CSG_AVAILABLE:
+        logger.error("CSG backend not available — cannot perform CSG operations")
+        return None, None, None, 0.0, False, None
+
+    try:
+        # Normalize direction
+        direction = np.array(pouring_direction, dtype=np.float64)
+        direction = direction / (np.linalg.norm(direction) + 1e-10)
+
+        # ------------------------------------------------------------------
+        # Step 1: Create cavity — cavity = prism − part
+        # ------------------------------------------------------------------
+        logger.info("Creating metamold cavity (prism − part)...")
+        shell_with_cavity = csg_backend.csg_difference(prism_mesh, part_mesh)
+        logger.info("  Cavity: %d verts, %d faces",
+                     len(shell_with_cavity.vertices),
+                     len(shell_with_cavity.faces))
+
+        # ------------------------------------------------------------------
+        # Step 2: Build upper and lower half-space volumes from membrane
+        # ------------------------------------------------------------------
+        half_gap = blade_thickness / 2.0
+        hs_distance = 500.0  # large enough to contain any prism
+
+        logger.info("Building half-space volumes from membrane "
+                     "(gap=%.3fmm, hs_distance=%.0fmm)...", blade_thickness,
+                     hs_distance)
+
+        # Shift membrane vertices inward by half_gap for each side
+        membrane_verts = np.asarray(membrane.vertices, dtype=np.float64)
+        membrane_faces = np.asarray(membrane.faces, dtype=np.int64)
+
+        # Upper half-space: membrane shifted UP by half_gap, extruded in +dir
+        upper_membrane = trimesh.Trimesh(
+            vertices=membrane_verts + direction * half_gap,
+            faces=membrane_faces,
+            process=False,
+        )
+        # Fill inner boundary loops so the half-space is a true solid slab,
+        # not an annular ring with part-shaped holes punched through it.
+        upper_membrane = _fill_inner_boundary_loops(upper_membrane)
+        upper_hs = _extrude_surface_to_volume(
+            upper_membrane, direction,
+            offset_pos=hs_distance, offset_neg=0.0)
+
+        # Lower half-space: membrane shifted DOWN by half_gap, extruded in −dir
+        lower_membrane = trimesh.Trimesh(
+            vertices=membrane_verts - direction * half_gap,
+            faces=membrane_faces,
+            process=False,
+        )
+        lower_membrane = _fill_inner_boundary_loops(lower_membrane)
+        lower_hs = _extrude_surface_to_volume(
+            lower_membrane, direction,
+            offset_pos=0.0, offset_neg=hs_distance)
+
+        logger.info("  Upper HS: %d verts, %d faces, watertight=%s",
+                     len(upper_hs.vertices), len(upper_hs.faces),
+                     upper_hs.is_watertight)
+        logger.info("  Lower HS: %d verts, %d faces, watertight=%s",
+                     len(lower_hs.vertices), len(lower_hs.faces),
+                     lower_hs.is_watertight)
+
+        # --- Diagnostic: bounds comparison ---
+        c_bounds = shell_with_cavity.bounds
+        u_bounds = upper_hs.bounds
+        l_bounds = lower_hs.bounds
+        logger.info("  Cavity bounds: min=%s  max=%s",
+                     c_bounds[0], c_bounds[1])
+        logger.info("  Upper HS bounds: min=%s  max=%s",
+                     u_bounds[0], u_bounds[1])
+        logger.info("  Lower HS bounds: min=%s  max=%s",
+                     l_bounds[0], l_bounds[1])
+
+        # ------------------------------------------------------------------
+        # Step 3: Intersect cavity with each half-space
+        # ------------------------------------------------------------------
+        logger.info("Computing upper half: cavity ∩ upper_HS...")
+        half_1 = csg_backend.csg_intersection(shell_with_cavity, upper_hs)
+        logger.info("  Upper half: %d verts, %d faces",
+                     len(half_1.vertices), len(half_1.faces))
+
+        logger.info("Computing lower half: cavity ∩ lower_HS...")
+        half_2 = csg_backend.csg_intersection(shell_with_cavity, lower_hs)
+        logger.info("  Lower half: %d verts, %d faces",
+                     len(half_2.vertices), len(half_2.faces))
+
+        # ------------------------------------------------------------------
+        # Step 4: Validate results
+        # ------------------------------------------------------------------
+        h1_valid = half_1 is not None and len(half_1.vertices) > 4
+        h2_valid = half_2 is not None and len(half_2.vertices) > 4
+        did_split = h1_valid and h2_valid
+
+        if not did_split:
+            logger.warning("Half-space intersection failed to produce "
+                           "two valid halves (h1=%s, h2=%s)",
+                           h1_valid, h2_valid)
+            elapsed_ms = (time.time() - start_time) * 1000
+            return None, None, shell_with_cavity, elapsed_ms, False, None
+
+        elapsed_ms = (time.time() - start_time) * 1000
+
+        logger.info("Metamold half-space split complete in %.1fms:", elapsed_ms)
+        logger.info("  Half 1 (upper): %d verts, %d faces",
+                     len(half_1.vertices), len(half_1.faces))
+        logger.info("  Half 2 (lower): %d verts, %d faces",
+                     len(half_2.vertices), len(half_2.faces))
+
+        return half_1, half_2, shell_with_cavity, elapsed_ms, True, None
+
+    except Exception as e:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error("Failed to create metamold with half-space split: %s", e)
+        logger.exception(e)
+        return None, None, None, elapsed_ms, False, None
 
 
 def split_shell_with_tall_blade(
@@ -1478,8 +2097,8 @@ def split_shell_with_tall_blade(
     """
     start_time = time.time()
     
-    if not MANIFOLD_AVAILABLE:
-        logger.error("manifold3d not available - cannot perform CSG operations")
+    if not CSG_AVAILABLE:
+        logger.error("CSG backend not available - cannot perform CSG operations")
         return None, None, 0.0, False
     
     try:
@@ -1494,65 +2113,34 @@ def split_shell_with_tall_blade(
         blade = _create_tall_cutting_blade(membrane, direction, extrusion_distance, blade_gap)
         logger.info(f"Tall blade: {len(blade.vertices)} verts, {len(blade.faces)} faces")
         
-        # Step 2: Convert to manifold3d
-        logger.info("Converting meshes to manifold...")
-        shell_manifold = _trimesh_to_manifold(shell)
-        blade_manifold = _trimesh_to_manifold(blade)
-        
-        # Step 3: CSG subtraction - cut the shell with the blade
+        # Step 2: CSG subtraction - cut the shell with the blade
         logger.info("Performing CSG subtraction: shell - tall_blade...")
-        cut_shell_manifold = shell_manifold - blade_manifold
-        
-        # Step 4: Convert back to trimesh
-        cut_shell = _manifold_to_trimesh(cut_shell_manifold)
+        cut_shell = csg_backend.csg_difference(shell, blade)
         logger.info(f"Cut shell: {len(cut_shell.vertices)} verts, {len(cut_shell.faces)} faces")
         
-        # Step 5: Split into connected components
-        logger.info("Splitting into connected components...")
-        components = cut_shell.split(only_watertight=False)
-        logger.info(f"Found {len(components)} connected components")
+        # Step 3: Split into connected components and classify halves
+        upper, lower, components, did_split = _split_and_classify_halves(cut_shell, direction)
         
-        if len(components) < 2:
+        if not did_split:
             logger.warning("Failed to split shell into two components - blade may not have cut through")
             elapsed_ms = (time.time() - start_time) * 1000
             if len(components) == 1:
                 return components[0], None, elapsed_ms, False
             return None, None, elapsed_ms, False
         
-        # Step 6: Sort by size and take the two largest
-        components = sorted(components, key=lambda m: len(m.faces), reverse=True)
-        comp1, comp2 = components[0], components[1]
-        
-        # Step 7: Classify which is upper vs lower based on centroid position
-        centroid1 = comp1.centroid
-        centroid2 = comp2.centroid
-        
-        # Project centroids onto pouring direction
-        proj1 = np.dot(centroid1, direction)
-        proj2 = np.dot(centroid2, direction)
-        
-        # Upper half has higher projection value
-        if proj1 > proj2:
-            shell_half_1, shell_half_2 = comp1, comp2
-        else:
-            shell_half_1, shell_half_2 = comp2, comp1
-        
+        shell_half_1, shell_half_2 = upper, lower
         elapsed_ms = (time.time() - start_time) * 1000
         
         logger.info(f"Shell split complete in {elapsed_ms:.1f}ms:")
         logger.info(f"  Half 1 (upper): {len(shell_half_1.vertices)} verts, {len(shell_half_1.faces)} faces")
         logger.info(f"  Half 2 (lower): {len(shell_half_2.vertices)} verts, {len(shell_half_2.faces)} faces")
         
-        if len(components) > 2:
-            logger.warning(f"  Note: {len(components) - 2} additional small fragments were discarded")
-        
         return shell_half_1, shell_half_2, elapsed_ms, True
         
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000
-        logger.error(f"Failed to split shell with tall blade: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error("Failed to split shell with tall blade: %s", e)
+        logger.exception(e)
         return None, None, elapsed_ms, False
 
 
@@ -1578,8 +2166,8 @@ def split_shell_along_parting_surface(
     """
     start_time = time.time()
     
-    if not MANIFOLD_AVAILABLE:
-        logger.error("manifold3d not available - cannot perform CSG operations")
+    if not CSG_AVAILABLE:
+        logger.error("CSG backend not available - cannot perform CSG operations")
         return None, None, 0.0, False
     
     try:
@@ -1593,56 +2181,16 @@ def split_shell_along_parting_surface(
             thickness=1000.0  # Large enough to extend beyond the shell
         )
         
-        # Convert to manifold
-        shell_manifold = _trimesh_to_manifold(shell_with_cavity)
-        cutting_manifold = _trimesh_to_manifold(cutting_volume)
-        
-        # Split using intersection and subtraction:
-        # half_1 = shell - cutting_volume (part above the parting surface)
-        # half_2 = shell ∩ cutting_volume... no wait, that's not right
-        
-        # Actually, we need to split using the cutting volume as a divider
-        # The cutting volume represents the parting surface "thickened"
-        # We want: the shell on the positive side of parting surface, 
-        # and the shell on the negative side
-        
-        # Better approach: 
-        # 1. Create two half-spaces by offsetting the cutting slab
-        # 2. Intersect shell with each half-space
-        
-        # Simplest approach: 
-        # Create a large box on each side of the parting surface
-        # and intersect with shell
-        
-        # Get shell bounds to create large enough cutting boxes
+        # Create large half-space boxes on each side of the parting surface
+        # and intersect with the shell to produce two halves.
         shell_bounds = shell_with_cavity.bounds
-        shell_center = (shell_bounds[0] + shell_bounds[1]) / 2.0
         shell_size = np.linalg.norm(shell_bounds[1] - shell_bounds[0])
         box_size = shell_size * 3  # Make box much larger than shell
         
         direction = np.array(pouring_direction, dtype=np.float64)
         direction = direction / (np.linalg.norm(direction) + 1e-10)
         
-        # Create half-space boxes using the cutting volume
-        # Half 1: above the parting surface (positive direction)
-        # Half 2: below the parting surface (negative direction)
-        
-        # Use the cutting volume to split:
-        # half_1 = shell - (shell ∩ cutting_volume)  -- remove the "inside" part
-        # This gives us: shell parts NOT inside the cutting volume
-        
-        # Better: subtract cutting_volume from shell, then we have two disconnected pieces
-        # But that doesn't always work if cutting volume is thin
-        
-        # Most reliable: use intersection with half-space volumes
-        
-        # Create a large box for each half
-        # Box center offset by box_size/2 in the direction
         half_box_size = box_size
-        
-        # Create half-space box for positive direction (half 1)
-        # Center is offset by box_size/2 + small epsilon in positive direction from shell center
-        # But we need to use the parting surface centroid, not shell center
         parting_center = parting_surface.centroid
         
         box_center_1 = parting_center + direction * (half_box_size / 2.0 + 0.1)
@@ -1657,17 +2205,9 @@ def split_shell_along_parting_surface(
             transform=trimesh.transformations.translation_matrix(box_center_2)
         )
         
-        # Convert boxes to manifold
-        box_manifold_1 = _trimesh_to_manifold(box_1)
-        box_manifold_2 = _trimesh_to_manifold(box_2)
-        
         # Intersect shell with each half-space box
-        half_1_manifold = shell_manifold ^ box_manifold_1  # Intersection
-        half_2_manifold = shell_manifold ^ box_manifold_2  # Intersection
-        
-        # Convert back to trimesh
-        shell_half_1 = _manifold_to_trimesh(half_1_manifold)
-        shell_half_2 = _manifold_to_trimesh(half_2_manifold)
+        shell_half_1 = csg_backend.csg_intersection(shell_with_cavity, box_1)
+        shell_half_2 = csg_backend.csg_intersection(shell_with_cavity, box_2)
         
         elapsed_ms = (time.time() - start_time) * 1000
         
@@ -1679,9 +2219,8 @@ def split_shell_along_parting_surface(
         
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000
-        logger.error(f"Failed to split shell: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error("Failed to split shell: %s", e)
+        logger.exception(e)
         return None, None, elapsed_ms, False
 
 
@@ -1757,25 +2296,11 @@ def thicken_surface_symmetric(
         top_faces = faces + n_verts
         
         # 3. Side faces connecting boundary edges
-        # Find boundary edges
-        edge_count = {}
-        edge_to_winding = {}  # Track original winding for consistent side face orientation
-        
-        for fi, face in enumerate(faces):
-            for i in range(3):
-                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-                edge_key = (min(v0, v1), max(v0, v1))
-                edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
-                if edge_key not in edge_to_winding:
-                    # Store the original edge direction based on face winding
-                    edge_to_winding[edge_key] = (v0, v1)
-        
-        # Boundary edges appear only once
-        boundary_edges = [e for e, c in edge_count.items() if c == 1]
+        boundary_edges, edge_to_face = _find_boundary_edges_with_winding(faces)
         
         side_faces = []
         for edge_key in boundary_edges:
-            v0_orig, v1_orig = edge_to_winding[edge_key]
+            _, v0_orig, v1_orig = edge_to_face[edge_key]
             
             # Bottom vertices
             b0, b1 = v0_orig, v1_orig
@@ -1817,9 +2342,8 @@ def thicken_surface_symmetric(
         
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000
-        logger.error(f"Failed to thicken surface: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error("Failed to thicken surface: %s", e)
+        logger.exception(e)
         return None, elapsed_ms, False
 
 
@@ -1844,8 +2368,8 @@ def create_part_with_thickened_secondary(
     """
     start_time = time.time()
     
-    if not MANIFOLD_AVAILABLE:
-        logger.error("manifold3d not available - cannot perform CSG operations")
+    if not CSG_AVAILABLE:
+        logger.error("CSG backend not available - cannot perform CSG operations")
         return None, 0.0, False
     
     if part_mesh is None or len(part_mesh.vertices) == 0:
@@ -1876,12 +2400,7 @@ def create_part_with_thickened_secondary(
         
         # Step 2: Boolean union part + thickened secondary
         logger.info("Performing boolean union: part + thickened_secondary...")
-        
-        part_manifold = _trimesh_to_manifold(part_mesh)
-        secondary_manifold = _trimesh_to_manifold(thickened_secondary)
-        
-        combined_manifold = part_manifold + secondary_manifold
-        combined_mesh = _manifold_to_trimesh(combined_manifold)
+        combined_mesh = csg_backend.csg_union(part_mesh, thickened_secondary)
         
         elapsed_ms = (time.time() - start_time) * 1000
         
@@ -1896,9 +2415,8 @@ def create_part_with_thickened_secondary(
         
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000
-        logger.error(f"Failed to create part with thickened secondary: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error("Failed to create part with thickened secondary: %s", e)
+        logger.exception(e)
         return None, elapsed_ms, False
 
 
@@ -1917,7 +2435,7 @@ def add_part_to_metamold_half(
     a solid where the part would be placed. This is useful for creating
     metamold halves that can be used to cast silicone around an actual part.
     
-    The result is a manifold mesh thanks to manifold3d's robust CSG operations.
+    The result is a manifold mesh thanks to the robust CSG backend (libigl/CGAL or manifold3d).
     
     Args:
         metamold_half: One half of the split metamold (with cavity)
@@ -1929,8 +2447,8 @@ def add_part_to_metamold_half(
     """
     start_time = time.time()
     
-    if not MANIFOLD_AVAILABLE:
-        logger.error("manifold3d not available - cannot perform CSG operations")
+    if not CSG_AVAILABLE:
+        logger.error("CSG backend not available - cannot perform CSG operations")
         return None, 0.0, False
     
     if metamold_half is None or len(metamold_half.vertices) == 0:
@@ -1946,15 +2464,8 @@ def add_part_to_metamold_half(
         logger.info(f"  Metamold half: {len(metamold_half.vertices)} verts, {len(metamold_half.faces)} faces")
         logger.info(f"  Part mesh: {len(part_mesh.vertices)} verts, {len(part_mesh.faces)} faces")
         
-        # Convert to manifold
-        half_manifold = _trimesh_to_manifold(metamold_half)
-        part_manifold = _trimesh_to_manifold(part_mesh)
-        
         # Perform union: result = half + part
-        result_manifold = half_manifold + part_manifold
-        
-        # Convert back to trimesh
-        result_mesh = _manifold_to_trimesh(result_manifold)
+        result_mesh = csg_backend.csg_union(metamold_half, part_mesh)
         
         elapsed_ms = (time.time() - start_time) * 1000
         
@@ -1970,9 +2481,8 @@ def add_part_to_metamold_half(
         
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000
-        logger.error(f"Failed to add part to metamold half: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error("Failed to add part to metamold half: %s", e)
+        logger.exception(e)
         return None, elapsed_ms, False
 
 
@@ -2059,8 +2569,8 @@ def trim_metamold_halves(
     """
     start_time = time.time()
     
-    if not MANIFOLD_AVAILABLE:
-        logger.warning("manifold3d not available – cannot trim metamold halves")
+    if not CSG_AVAILABLE:
+        logger.warning("CSG backend not available – cannot trim metamold halves")
         return upper_half, lower_half, 0.0, 0.0, 0.0
     
     if trim_threshold <= 0:
@@ -2100,14 +2610,12 @@ def trim_metamold_halves(
             logger.info(f"  Upper half extent: {float(np.min(uh)):.2f} to {half_max:.2f}")
             
             if gap > 0.01:
-                manifold = _trimesh_to_manifold(upper_half)
-                # trim_by_plane(normal, offset) keeps geometry where dot(v, normal) >= offset.
-                # To keep everything BELOW trim_at (i.e. dot(v, pouring_dir) <= trim_at),
-                # we negate both: normal = -pouring_dir, offset = -trim_at.
-                manifold = manifold.trim_by_plane(
-                    (-pouring_dir).tolist(), float(-trim_at)
+                # Keep everything BELOW trim_at (i.e. dot(v, pouring_dir) <= trim_at)
+                # csg_trim_by_plane uses manifold3d convention: keeps dot(v, normal) >= offset
+                # So we negate: normal = -pouring_dir, offset = -trim_at
+                trimmed_upper = csg_backend.csg_trim_by_plane(
+                    upper_half, (-pouring_dir).tolist(), float(-trim_at)
                 )
-                trimmed_upper = _manifold_to_trimesh(manifold)
                 upper_saved = gap
                 logger.info(f"    Trimmed upper top by {gap:.2f}mm (cut at h={trim_at:.2f})")
             else:
@@ -2130,12 +2638,11 @@ def trim_metamold_halves(
             logger.info(f"  Lower half extent: {half_min:.2f} to {float(np.max(lh)):.2f}")
             
             if gap > 0.01:
-                manifold = _trimesh_to_manifold(lower_half)
-                # normal = pouring_dir, offset = trim_at → keeps above trim_at
-                manifold = manifold.trim_by_plane(
-                    pouring_dir.tolist(), float(trim_at)
+                # Keep everything ABOVE trim_at (i.e. dot(v, pouring_dir) >= trim_at)
+                # csg_trim_by_plane: normal = pouring_dir, offset = trim_at
+                trimmed_lower = csg_backend.csg_trim_by_plane(
+                    lower_half, pouring_dir.tolist(), float(trim_at)
                 )
-                trimmed_lower = _manifold_to_trimesh(manifold)
                 lower_saved = gap
                 logger.info(f"    Trimmed lower bottom by {gap:.2f}mm (cut at h={trim_at:.2f})")
             else:
@@ -2558,6 +3065,121 @@ def _compute_smooth_vertex_normals(
 # OUTER COLLAR EXTENSION
 # ============================================================================
 
+
+def _classify_boundary_edges_by_type(
+    boundary_edges: List[Tuple[int, int]],
+    vertex_boundary_type: Optional[np.ndarray],
+    n_orig_verts: int,
+    vertices_arr: np.ndarray,
+    inner_hull: trimesh.Trimesh,
+) -> Tuple[
+    List[Tuple[int, int]],  # outer_boundary_edges
+    List[Tuple[int, int]],  # inner_boundary_edges
+    Dict[int, List],        # vertex_to_boundary_edges
+    List[int],              # corner_vertices
+    List[int],              # endpoint_vertices
+]:
+    """Classify mesh boundary edges as inner (part) or outer (hull).
+
+    Outer edges have at least one vertex with ``boundary_type`` in {1, 2}
+    (hull boundary).  Inner edges have at least one vertex with
+    ``boundary_type == -1`` (part surface).  When *vertex_boundary_type* is
+    unavailable, falls back to proximity testing against *inner_hull*
+    (< 1 mm threshold).
+
+    Also builds per-vertex adjacency for the outer boundary and identifies
+    corner vertices (2+ incident outer boundary edges) and endpoints (1 edge).
+
+    Returns:
+        (outer_edges, inner_edges, vertex_to_boundary_edges,
+         corner_vertices, endpoint_vertices)
+    """
+    has_bt = (vertex_boundary_type is not None
+              and len(vertex_boundary_type) >= n_orig_verts)
+
+    outer_boundary_edges: List[Tuple[int, int]] = []
+    inner_boundary_edges: List[Tuple[int, int]] = []
+
+    for v0, v1 in boundary_edges:
+        is_outer = False
+
+        if has_bt:
+            bt0 = vertex_boundary_type[v0] if v0 < len(vertex_boundary_type) else 0
+            bt1 = vertex_boundary_type[v1] if v1 < len(vertex_boundary_type) else 0
+
+            if bt0 in (1, 2) or bt1 in (1, 2):
+                is_outer = True
+            elif bt0 == -1 or bt1 == -1:
+                is_outer = False
+            else:
+                is_outer = True  # Both interior — default to outer
+        else:
+            try:
+                _, dists, _ = trimesh.proximity.closest_point(
+                    inner_hull, vertices_arr[[v0, v1]])
+                is_outer = float(np.min(dists)) < 1.0
+            except Exception:
+                is_outer = True
+
+        (outer_boundary_edges if is_outer else inner_boundary_edges).append((v0, v1))
+
+    # Build vertex adjacency for outer boundary
+    vertex_to_boundary_edges: Dict[int, List] = {}
+    for v0, v1 in outer_boundary_edges:
+        vertex_to_boundary_edges.setdefault(v0, []).append(((v0, v1), v0, v1))
+        vertex_to_boundary_edges.setdefault(v1, []).append(((v0, v1), v1, v0))
+
+    corner_vertices = [
+        vi for vi, edges in vertex_to_boundary_edges.items() if len(edges) >= 2
+    ]
+    endpoint_vertices = [
+        vi for vi, edges in vertex_to_boundary_edges.items() if len(edges) == 1
+    ]
+
+    return (outer_boundary_edges, inner_boundary_edges,
+            vertex_to_boundary_edges, corner_vertices, endpoint_vertices)
+
+
+def _compute_collar_extension_dir(
+    vi_pos: np.ndarray,
+    inner_hull: trimesh.Trimesh,
+    face_normal: np.ndarray,
+    pouring_dir: np.ndarray,
+) -> np.ndarray:
+    """Compute the outward extension direction for a collar vertex.
+
+    The direction is the hull surface normal at the closest point,
+    projected onto the plane perpendicular to *pouring_dir*.  Falls
+    back to *face_normal* and then an arbitrary perpendicular when
+    the projection degenerates.
+
+    Returns:
+        Unit vector in the plane perpendicular to *pouring_dir*.
+    """
+    try:
+        _, _, closest_faces = trimesh.proximity.closest_point(
+            inner_hull, [vi_pos])
+        hull_normal = inner_hull.face_normals[closest_faces[0]]
+    except Exception:
+        hull_normal = face_normal
+
+    # Try hull normal projection
+    perp = hull_normal - np.dot(hull_normal, pouring_dir) * pouring_dir
+    if np.linalg.norm(perp) > 1e-6:
+        return perp / np.linalg.norm(perp)
+
+    # Try face normal projection
+    perp = face_normal - np.dot(face_normal, pouring_dir) * pouring_dir
+    if np.linalg.norm(perp) > 1e-6:
+        return perp / np.linalg.norm(perp)
+
+    # Absolute fallback: arbitrary perpendicular
+    d = np.cross(pouring_dir, [1, 0, 0])
+    if np.linalg.norm(d) < 1e-6:
+        d = np.cross(pouring_dir, [0, 1, 0])
+    return d / np.linalg.norm(d)
+
+
 def create_outer_collar_extension(
     parting_surface: trimesh.Trimesh,
     inner_hull: trimesh.Trimesh,
@@ -2649,17 +3271,7 @@ def create_outer_collar_extension(
     
     if wall_thickness is not None:
         # Build orthonormal basis for the projection plane (same as create_hard_shell_prism)
-        if abs(pouring_dir[0]) < 0.9:
-            arbitrary = np.array([1.0, 0.0, 0.0])
-        else:
-            arbitrary = np.array([0.0, 1.0, 0.0])
-        
-        _collar_u_axis = arbitrary - np.dot(arbitrary, pouring_dir) * pouring_dir
-        _collar_u_axis = _collar_u_axis / np.linalg.norm(_collar_u_axis)
-        _collar_v_axis = np.cross(pouring_dir, _collar_u_axis)
-        _collar_v_axis = _collar_v_axis / np.linalg.norm(_collar_v_axis)
-        
-        _collar_world_to_2d = np.column_stack([_collar_u_axis, _collar_v_axis, pouring_dir]).T
+        _, _collar_u_axis, _collar_v_axis, _collar_world_to_2d = _build_pouring_basis(pouring_dir)
         
         # Project hull vertices to 2D and compute silhouette (same algorithm as prism)
         hull_vertices_3d = np.array(inner_hull.vertices, dtype=np.float64)
@@ -2687,19 +3299,7 @@ def create_outer_collar_extension(
     # STEP 1: Find all mesh boundary edges and classify as inner/outer
     # =========================================================================
     
-    edge_to_face = {}  # edge_key -> (face_idx, third_vertex)
-    edge_face_count = {}  # edge_key -> count
-    
-    for fi, face in enumerate(faces_arr):
-        for i in range(3):
-            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-            v2 = int(face[(i + 2) % 3])
-            edge_key = (min(v0, v1), max(v0, v1))
-            edge_face_count[edge_key] = edge_face_count.get(edge_key, 0) + 1
-            edge_to_face[edge_key] = (fi, v2)
-    
-    # Boundary edges = edges with only 1 adjacent face
-    boundary_edges = [(v0, v1) for (v0, v1), count in edge_face_count.items() if count == 1]
+    boundary_edges, edge_to_face = _find_boundary_edges_with_winding(faces_arr)
     
     if len(boundary_edges) == 0:
         logger.info("No boundary edges found in parting surface")
@@ -2709,45 +3309,15 @@ def create_outer_collar_extension(
     logger.info(f"Found {len(boundary_edges)} mesh boundary edges")
     
     # =========================================================================
-    # STEP 2: Classify boundary edges as inner (part) or outer (hull)
+    # STEP 2: Classify boundary edges as inner/outer and build adjacency
     # =========================================================================
     
-    has_boundary_type = vertex_boundary_type is not None and len(vertex_boundary_type) >= n_orig_verts
-    
-    outer_boundary_edges = []
-    inner_boundary_edges = []
-    
-    for v0, v1 in boundary_edges:
-        is_outer = False
-        
-        if has_boundary_type:
-            bt0 = vertex_boundary_type[v0] if v0 < len(vertex_boundary_type) else 0
-            bt1 = vertex_boundary_type[v1] if v1 < len(vertex_boundary_type) else 0
-            
-            # Outer edge: at least one vertex is on hull boundary (type 1 or 2)
-            if bt0 in (1, 2) or bt1 in (1, 2):
-                is_outer = True
-            # Inner edge: at least one vertex is on part (type -1)
-            elif bt0 == -1 or bt1 == -1:
-                is_outer = False
-            else:
-                # Both interior - check distance to inner hull vs part
-                # Default to outer for now
-                is_outer = True
-        else:
-            # No boundary type - use proximity to hull
-            boundary_vert_positions = vertices_arr[[v0, v1]]
-            try:
-                _, dists_to_hull, _ = trimesh.proximity.closest_point(inner_hull, boundary_vert_positions)
-                # If close to hull, it's outer
-                is_outer = np.min(dists_to_hull) < 1.0  # 1mm threshold
-            except Exception:
-                is_outer = True
-        
-        if is_outer:
-            outer_boundary_edges.append((v0, v1))
-        else:
-            inner_boundary_edges.append((v0, v1))
+    (outer_boundary_edges, inner_boundary_edges,
+     vertex_to_boundary_edges, corner_vertices, endpoint_vertices
+    ) = _classify_boundary_edges_by_type(
+        boundary_edges, vertex_boundary_type, n_orig_verts,
+        vertices_arr, inner_hull,
+    )
     
     logger.info(f"Outer boundary edges: {len(outer_boundary_edges)}, inner: {len(inner_boundary_edges)}")
     
@@ -2756,33 +3326,10 @@ def create_outer_collar_extension(
         result.computation_time_ms = (time.time() - start_time) * 1000
         return result
     
-    # =========================================================================
-    # STEP 3: Build vertex adjacency for outer boundary
-    # =========================================================================
-    
-    vertex_to_boundary_edges: Dict[int, List] = {}
-    for v0, v1 in outer_boundary_edges:
-        if v0 not in vertex_to_boundary_edges:
-            vertex_to_boundary_edges[v0] = []
-        if v1 not in vertex_to_boundary_edges:
-            vertex_to_boundary_edges[v1] = []
-        vertex_to_boundary_edges[v0].append(((v0, v1), v0, v1))  # (edge_tuple, this_vert, other_vert)
-        vertex_to_boundary_edges[v1].append(((v0, v1), v1, v0))
-    
-    # Identify corners (2+ boundary edges) and endpoints
-    corner_vertices = []
-    endpoint_vertices = []
-    
-    for vi, edges in vertex_to_boundary_edges.items():
-        if len(edges) == 1:
-            endpoint_vertices.append(vi)
-        elif len(edges) >= 2:
-            corner_vertices.append(vi)
-    
     logger.info(f"Corner vertices: {len(corner_vertices)}, endpoints: {len(endpoint_vertices)}")
     
     # =========================================================================
-    # STEP 4: Create collar vertices for outer boundary
+    # STEP 3: Create collar vertices for outer boundary
     # =========================================================================
     
     # For each outer boundary vertex, create a collar vertex on the outer shell hull
@@ -2811,7 +3358,7 @@ def create_outer_collar_extension(
         if face_info is None:
             continue
         
-        fi, _ = face_info
+        fi = face_info[0]
         if fi < len(membrane_face_normals):
             face_normal = membrane_face_normals[fi]
         else:
@@ -2823,45 +3370,9 @@ def create_outer_collar_extension(
             
             vi_pos = vertices_arr[vi]
             
-            # ==================================================================
-            # Compute extension direction: perpendicular to pouring, outward from hull
-            # ==================================================================
-            
-            # Get the closest point on inner hull to find hull normal
-            try:
-                closest_pts, _, closest_faces = trimesh.proximity.closest_point(inner_hull, [vi_pos])
-                closest_pt = closest_pts[0]
-                closest_face = closest_faces[0]
-                hull_normal = inner_hull.face_normals[closest_face]
-            except Exception:
-                hull_normal = face_normal
-            
-            # The extension direction should be:
-            # 1. In the plane perpendicular to pouring direction
-            # 2. Pointing outward (along hull normal projection)
-            
-            # Project hull normal onto plane perpendicular to pouring direction
-            # perp_component = hull_normal - (hull_normal · pouring_dir) * pouring_dir
-            dot_product = np.dot(hull_normal, pouring_dir)
-            perp_component = hull_normal - dot_product * pouring_dir
-            perp_len = np.linalg.norm(perp_component)
-            
-            if perp_len > 1e-6:
-                extension_dir = perp_component / perp_len
-            else:
-                # Hull normal is parallel to pouring direction
-                # Use face normal instead
-                dot_product = np.dot(face_normal, pouring_dir)
-                perp_component = face_normal - dot_product * pouring_dir
-                perp_len = np.linalg.norm(perp_component)
-                if perp_len > 1e-6:
-                    extension_dir = perp_component / perp_len
-                else:
-                    # Fallback: use any perpendicular direction
-                    extension_dir = np.cross(pouring_dir, [1, 0, 0])
-                    if np.linalg.norm(extension_dir) < 1e-6:
-                        extension_dir = np.cross(pouring_dir, [0, 1, 0])
-                    extension_dir = extension_dir / np.linalg.norm(extension_dir)
+            # Compute extension direction (perpendicular to pouring, outward from hull)
+            extension_dir = _compute_collar_extension_dir(
+                vi_pos, inner_hull, face_normal, pouring_dir)
             
             # ==================================================================
             # Compute extension distance (adaptive or fixed)
@@ -2940,15 +3451,10 @@ def create_outer_collar_extension(
         if face_info is None:
             continue
         
-        fi, third_v = face_info
+        fi, orig_v0, _orig_v1 = face_info
         
         # Determine edge direction in the original face
-        face = faces_arr[fi]
-        edge_forward = False
-        for i in range(3):
-            if face[i] == v0 and face[(i + 1) % 3] == v1:
-                edge_forward = True
-                break
+        edge_forward = (orig_v0 == v0)
         
         # Create quad (2 triangles) connecting edge to collar
         # Winding: if edge is v0->v1 in face, collar should be c1->c0 for consistent normal

@@ -1,0 +1,17 @@
+{
+  "source": "zhou2016mas.pdf",
+  "converted_at": "2026-02-17T13:15:41.677737",
+  "pages": 15,
+  "complexity": "complex",
+  "backend": "mineru",
+  "mineru_backend": "pipeline",
+  "has_math": true,
+  "has_tables": true,
+  "has_images": true,
+  "output_folder": "output\\zhou2016mas",
+  "files": {
+    "markdown": "zhou2016mas.md",
+    "images": "images/",
+    "report": "conversion_report.json"
+  }
+}

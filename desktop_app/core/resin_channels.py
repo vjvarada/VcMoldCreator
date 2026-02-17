@@ -24,12 +24,9 @@ from typing import Optional, List, Tuple
 import numpy as np
 import trimesh
 
-# CSG operations via manifold3d
-try:
-    import manifold3d
-    MANIFOLD_AVAILABLE = True
-except ImportError:
-    MANIFOLD_AVAILABLE = False
+# CSG operations via abstraction layer (libigl/CGAL preferred, manifold3d fallback)
+from . import csg_backend
+CSG_AVAILABLE = csg_backend.CSG_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
@@ -188,28 +185,11 @@ def _create_cylinder(
 
 
 # ============================================================================
-# MANIFOLD CSG HELPERS
+# CSG HELPERS (now handled by csg_backend)
 # ============================================================================
 
-def _trimesh_to_manifold(mesh: trimesh.Trimesh) -> 'manifold3d.Manifold':
-    """Convert a trimesh to manifold3d Manifold object."""
-    if not MANIFOLD_AVAILABLE:
-        raise RuntimeError("manifold3d is not available")
-    
-    vertices = np.asarray(mesh.vertices, dtype=np.float32)
-    faces = np.asarray(mesh.faces, dtype=np.uint32)
-    
-    m3d_mesh = manifold3d.Mesh(vert_properties=vertices, tri_verts=faces)
-    return manifold3d.Manifold(m3d_mesh)
-
-
-def _manifold_to_trimesh(manifold: 'manifold3d.Manifold') -> trimesh.Trimesh:
-    """Convert a manifold3d Manifold object to trimesh."""
-    mesh_data = manifold.to_mesh()
-    vertices = np.asarray(mesh_data.vert_properties, dtype=np.float64)
-    faces = np.asarray(mesh_data.tri_verts, dtype=np.int64)
-    
-    return trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
+# NOTE: _trimesh_to_manifold / _manifold_to_trimesh removed.
+# All CSG ops go through csg_backend.csg_difference(), etc.
 
 
 # ============================================================================
@@ -517,8 +497,8 @@ def create_resin_channels(
         global_diameter_mm=global_diameter_mm
     )
     
-    if not MANIFOLD_AVAILABLE:
-        logger.error("manifold3d not available - cannot create resin channels")
+    if not CSG_AVAILABLE:
+        logger.error("CSG backend not available - cannot create resin channels")
         result.computation_time_ms = (time.time() - start_time) * 1000
         return result
     
@@ -637,21 +617,17 @@ def create_resin_channels(
     try:
         logger.info(f"Performing CSG subtraction: metamold half - {len(cylinders)} cylinder(s)...")
         
-        # Convert metamold half to manifold
-        half_manifold = _trimesh_to_manifold(metamold_half)
-        
-        # Subtract each cylinder sequentially
+        # Subtract each cylinder sequentially via csg_backend
+        current_mesh = metamold_half
         for i, cyl in enumerate(cylinders):
             try:
-                cyl_manifold = _trimesh_to_manifold(cyl)
-                half_manifold = half_manifold - cyl_manifold
+                current_mesh = csg_backend.csg_difference(current_mesh, cyl)
                 logger.debug(f"  Subtracted cylinder {i+1}/{len(cylinders)}")
             except Exception as e:
                 logger.warning(f"  Failed to subtract cylinder {i+1}: {e}")
                 # Continue with remaining cylinders
         
-        # Convert back to trimesh
-        result_mesh = _manifold_to_trimesh(half_manifold)
+        result_mesh = current_mesh
         
         result.mesh = result_mesh
         result.success = True
@@ -818,8 +794,8 @@ def create_hard_shell_inlet(
     Returns:
         Modified shell half with through-hole, or None on failure
     """
-    if not MANIFOLD_AVAILABLE:
-        logger.error("manifold3d not available — cannot create shell inlet")
+    if not CSG_AVAILABLE:
+        logger.error("CSG backend not available — cannot create shell inlet")
         return None
     
     if shell_half is None or len(shell_half.vertices) == 0:
@@ -852,10 +828,7 @@ def create_hard_shell_inlet(
     )
     
     try:
-        shell_manifold = _trimesh_to_manifold(shell_half)
-        cyl_manifold = _trimesh_to_manifold(cyl)
-        result_manifold = shell_manifold - cyl_manifold
-        result_mesh = _manifold_to_trimesh(result_manifold)
+        result_mesh = csg_backend.csg_difference(shell_half, cyl)
         
         logger.info(f"Hard shell inlet created: {len(result_mesh.vertices)} verts, "
                     f"{len(result_mesh.faces)} faces")
@@ -890,8 +863,8 @@ def create_hard_shell_air_escapes(
     Returns:
         Modified shell half with air escape through-holes, or None on failure
     """
-    if not MANIFOLD_AVAILABLE:
-        logger.error("manifold3d not available — cannot create shell air escapes")
+    if not CSG_AVAILABLE:
+        logger.error("CSG backend not available — cannot create shell air escapes")
         return None
     
     if shell_half is None or len(shell_half.vertices) == 0:
@@ -927,10 +900,7 @@ def create_hard_shell_air_escapes(
         )
         
         try:
-            shell_manifold = _trimesh_to_manifold(current_mesh)
-            cyl_manifold = _trimesh_to_manifold(cyl)
-            result_manifold = shell_manifold - cyl_manifold
-            current_mesh = _manifold_to_trimesh(result_manifold)
+            current_mesh = csg_backend.csg_difference(current_mesh, cyl)
             logger.debug(f"  Air escape hole {i}: pos={pos}")
         except Exception as e:
             logger.warning(f"Failed to drill air escape hole {i}: {e}")

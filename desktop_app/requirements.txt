@@ -19,7 +19,11 @@ meshlib>=3.0.0
 pyvista>=0.42.0
 pyvistaqt>=0.11.0
 
-# CSG Operations (manifold3d is HIGHLY recommended for mold cavity creation)
+# CSG Operations (libigl with CGAL preferred — exact arithmetic, 100% robust)
+# Uses Zhou et al. 2016 "Mesh Arrangements for Solid Geometry" via igl.copyleft.cgal
+libigl>=2.5.0
+
+# CSG Fallback (manifold3d used if libigl/CGAL unavailable — floating point, may fail on edge cases)
 manifold3d>=2.3.0
 
 # Tetrahedral meshing (required for parting surface computation)

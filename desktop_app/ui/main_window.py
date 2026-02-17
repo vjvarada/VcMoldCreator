@@ -884,8 +884,8 @@ class HardShellWorker(QThread):
     """Background worker for generating hard shell geometry (prism + CSG cavity + collar + split into halves)."""
     
     progress = pyqtSignal(str)
-    # (HardShellPrismResult, shell_with_cavity, OuterCollarResult, shell_half_1, shell_half_2, success)
-    complete = pyqtSignal(object, object, object, object, object, bool)
+    # (HardShellPrismResult, shell_with_cavity, OuterCollarResult, shell_half_1, shell_half_2, success, cutting_blade)
+    complete = pyqtSignal(object, object, object, object, object, bool, object)
     error = pyqtSignal(str)
     
     def __init__(
@@ -961,7 +961,7 @@ class HardShellWorker(QThread):
                 
                 # Step 4: Split shell into two halves using the outer collar membrane
                 self.progress.emit("Splitting shell into two halves using membrane...")
-                shell_half_1, shell_half_2, split_time_ms, split_success = split_shell_with_membrane(
+                shell_half_1, shell_half_2, split_time_ms, split_success, cutting_blade = split_shell_with_membrane(
                     shell_with_cavity,
                     collar_result.mesh,
                     self.pouring_direction
@@ -977,7 +977,9 @@ class HardShellWorker(QThread):
                 logger.warning("CSG cavity subtraction failed - cannot split shell")
             
             self.progress.emit(f"Hard shell generation complete")
-            self.complete.emit(prism_result, shell_with_cavity, collar_result, shell_half_1, shell_half_2, csg_success)
+            self.complete.emit(prism_result, shell_with_cavity, collar_result,
+                              shell_half_1, shell_half_2, csg_success,
+                              cutting_blade if 'cutting_blade' in dir() else None)
             
         except Exception as e:
             logger.exception("Error generating hard shell: %s", e)
@@ -989,8 +991,8 @@ class MetamoldWorker(QThread):
     
     progress = pyqtSignal(str)
     # (MetamoldPrismResult, metamold_with_cavity, metamold_half_1, metamold_half_2, 
-    #  half_1_with_part, half_2_with_part, success)
-    complete = pyqtSignal(object, object, object, object, object, object, bool)
+    #  half_1_with_part, half_2_with_part, success, split_diagnostics)
+    complete = pyqtSignal(object, object, object, object, object, object, bool, object)
     error = pyqtSignal(str)
     
     def __init__(
@@ -1004,7 +1006,8 @@ class MetamoldWorker(QThread):
         height_above=2.0,
         height_below=2.0,
         secondary_surface=None,  # Smoothed secondary parting surface
-        secondary_thickness=0.2  # Thickness for secondary surface (mm)
+        secondary_thickness=0.2,  # Thickness for secondary surface (mm)
+        cutting_blade=None  # Pre-built blade from hard shell step
     ):
         super().__init__()
         self.hull_mesh = hull_mesh
@@ -1017,27 +1020,30 @@ class MetamoldWorker(QThread):
         self.height_below = height_below
         self.secondary_surface = secondary_surface
         self.secondary_thickness = secondary_thickness
+        self.cutting_blade = cutting_blade  # Reused from hard shell step
     
     def run(self):
         try:
             from core.mold_fabrication import (
                 create_metamold_prism,
-                create_shell_with_cavity,
-                split_shell_with_membrane,
+                create_metamold_with_combined_cut,
                 add_part_to_metamold_halves,
-                create_part_with_thickened_secondary,
                 trim_metamold_halves
             )
             
-            logger.info(f"Generating metamold with wall_thickness={self.wall_thickness}mm, "
-                       f"margin={self.margin}mm, height_above={self.height_above}mm, height_below={self.height_below}mm")
+            logger.info("Generating metamold with wall_thickness=%.1fmm, "
+                        "margin=%.1fmm, height_above=%.1fmm, height_below=%.1fmm",
+                        self.wall_thickness, self.margin,
+                        self.height_above, self.height_below)
             
             if self.secondary_surface is not None:
-                logger.info(f"  Secondary surface: {len(self.secondary_surface.vertices)} verts, "
-                           f"thickness={self.secondary_thickness}mm")
+                logger.info("  Secondary surface: %d verts, thickness=%.2fmm",
+                            len(self.secondary_surface.vertices),
+                            self.secondary_thickness)
             
-            # Step 1: Create the prism (same silhouette as hard shell, height from part mesh)
-            # Pass the outer collar (parting surface) so the prism extends to include it
+            # ------------------------------------------------------------------
+            # Step 1: Create the prism (same silhouette as hard shell)
+            # ------------------------------------------------------------------
             self.progress.emit("Creating metamold prism (same silhouette as hard shell)...")
             prism_result = create_metamold_prism(
                 self.hull_mesh,
@@ -1047,96 +1053,87 @@ class MetamoldWorker(QThread):
                 margin=self.margin,
                 height_above=self.height_above,
                 height_below=self.height_below,
-                parting_surface=self.outer_collar_mesh  # Ensures prism includes parting surface level
+                parting_surface=self.outer_collar_mesh
             )
-            logger.info(f"Metamold prism: {prism_result.vertex_count} vertices, {prism_result.face_count} faces")
+            logger.info("Metamold prism: %d vertices, %d faces",
+                        prism_result.vertex_count, prism_result.face_count)
             
-            # Step 2: CSG subtraction - metamold = prism - part_mesh
-            # The metamold cavity is shaped like the part (different from hard shell which uses hull)
-            self.progress.emit("Performing CSG: subtracting part from prism...")
-            metamold_with_cavity, csg_time_ms, csg_success = create_shell_with_cavity(
-                prism_result.prism_mesh,
-                self.part_mesh  # Use part mesh for metamold cavity
-            )
+            # ------------------------------------------------------------------
+            # Step 2: Sequential cuts — cavity (prism − part), repair, blade split
+            # Mirrors the hard-shell pipeline.
+            # Uses robust exact arithmetic CSG (Zhou et al. 2016 via CGAL).
+            # ------------------------------------------------------------------
+            self.progress.emit("Creating cavity (prism − part)...")
+            metamold_half_1, metamold_half_2, shell_with_cavity, csg_time_ms, did_split, split_diag = \
+                create_metamold_with_combined_cut(
+                    prism_result.prism_mesh,
+                    self.part_mesh,
+                    self.outer_collar_mesh,
+                    self.resin_pouring_direction,
+                    secondary_mesh=self.secondary_surface,
+                    secondary_thickness=self.secondary_thickness,
+                    cutting_blade=self.cutting_blade
+                )
             
-            metamold_half_1 = None
-            metamold_half_2 = None
+            # shell_with_cavity is prism − part (before blade split)
+            metamold_with_cavity = shell_with_cavity
+            csg_success = shell_with_cavity is not None
+            
             half_1_with_part = None
             half_2_with_part = None
             
-            if csg_success and metamold_with_cavity is not None:
-                logger.info(f"CSG cavity complete: metamold has {len(metamold_with_cavity.vertices)} vertices, "
-                           f"{len(metamold_with_cavity.faces)} faces in {csg_time_ms:.1f}ms")
+            if did_split and metamold_half_1 is not None and metamold_half_2 is not None:
+                logger.info("Metamold split into two halves in %.1fms", csg_time_ms)
                 
-                # Step 3: Split metamold using the same blade from hard shell
-                # Simple CSG: metamold_halves = metamold - blade
-                self.progress.emit("Splitting metamold into two halves...")
-                metamold_half_1, metamold_half_2, split_time_ms, split_success = split_shell_with_membrane(
-                    metamold_with_cavity,
-                    self.outer_collar_mesh,  # Same parting surface + collar used in hard shell
-                    self.resin_pouring_direction
-                )
-                
-                if split_success:
-                    logger.info(f"Metamold split complete in {split_time_ms:.1f}ms")
-                    logger.info(f"  Half 1: {len(metamold_half_1.vertices)} verts, {len(metamold_half_1.faces)} faces")
-                    logger.info(f"  Half 2: {len(metamold_half_2.vertices)} verts, {len(metamold_half_2.faces)} faces")
-                    
-                    # Step 4: Create combined mesh (part + thickened secondary surface)
-                    # This ensures secondary membrane features are included in the mold
-                    combined_part_mesh = self.part_mesh
-                    if self.secondary_surface is not None and len(self.secondary_surface.vertices) > 0:
-                        self.progress.emit(f"Thickening secondary surface ({self.secondary_thickness}mm)...")
-                        combined_part_mesh, combine_time_ms, combine_success = create_part_with_thickened_secondary(
-                            self.part_mesh,
-                            self.secondary_surface,
-                            self.secondary_thickness
-                        )
-                        if not combine_success or combined_part_mesh is None:
-                            logger.warning("Failed to create part with thickened secondary - using part mesh only")
-                            combined_part_mesh = self.part_mesh
-                        else:
-                            logger.info(f"Combined part mesh: {len(combined_part_mesh.vertices)} verts, "
-                                       f"{len(combined_part_mesh.faces)} faces in {combine_time_ms:.1f}ms")
-                    
-                    # Step 5: Add combined part mesh back to each metamold half (boolean union)
-                    # This creates halves where the part is solid geometry inside the mold
-                    self.progress.emit("Adding part mesh to metamold halves (boolean union)...")
-                    half_1_with_part, half_2_with_part, add_time_ms, add_success = add_part_to_metamold_halves(
+                # Add the part mesh back to each half (union) so the
+                # part-shaped cavity holes are sealed.
+                self.progress.emit("Adding part mesh to metamold halves...")
+                metamold_half_1, metamold_half_2, add_ms, add_ok = \
+                    add_part_to_metamold_halves(
                         metamold_half_1,
                         metamold_half_2,
-                        combined_part_mesh
+                        self.part_mesh
                     )
-                    
-                    if add_success:
-                        logger.info(f"Part added to metamold halves in {add_time_ms:.1f}ms")
-                        logger.info(f"  Half 1 with part: {len(half_1_with_part.vertices)} verts, {len(half_1_with_part.faces)} faces")
-                        logger.info(f"  Half 2 with part: {len(half_2_with_part.vertices)} verts, {len(half_2_with_part.faces)} faces")
-                        
-                        # Step 6: Trim both halves to save 3D printing material
-                        # This is done AFTER part union so the planar cut clips
-                        # both prism walls and part geometry cleanly.
-                        self.progress.emit("Trimming metamold halves to save material...")
-                        half_1_with_part, half_2_with_part, bot_saved, top_saved, trim_ms = trim_metamold_halves(
-                            half_1_with_part,
-                            half_2_with_part,
-                            self.outer_collar_mesh,
-                            self.resin_pouring_direction,
-                            trim_threshold=4.0
-                        )
-                        if bot_saved > 0 or top_saved > 0:
-                            logger.info(f"Metamold trim: bottom saved {bot_saved:.1f}mm, "
-                                       f"top saved {top_saved:.1f}mm in {trim_ms:.1f}ms")
-                    else:
-                        logger.warning("Adding part to metamold halves failed")
+                if add_ok:
+                    logger.info("Part added to both halves in %.1fms", add_ms)
                 else:
-                    logger.warning("Metamold splitting failed - halves may be incomplete")
+                    logger.warning("Failed to add part to metamold halves — "
+                                   "continuing with raw halves")
+                
+                # Trim halves to save 3D printing material.
+                # csg_trim_by_plane caps the cut with a flat face, closing
+                # the base of each prism half.
+                self.progress.emit("Trimming metamold halves to save material...")
+                metamold_half_1, metamold_half_2, bot_saved, top_saved, trim_ms = \
+                    trim_metamold_halves(
+                        metamold_half_1,
+                        metamold_half_2,
+                        self.outer_collar_mesh,
+                        self.resin_pouring_direction,
+                        trim_threshold=4.0
+                    )
+                if bot_saved > 0 or top_saved > 0:
+                    logger.info("Metamold trim: bottom saved %.1fmm, "
+                                "top saved %.1fmm in %.1fms",
+                                bot_saved, top_saved, trim_ms)
+                
+                half_1_with_part = metamold_half_1
+                half_2_with_part = metamold_half_2
+            elif csg_success:
+                logger.info("Prism did not separate into two halves – "
+                            "showing CSG result as-is in visualization")
+                if split_diag is not None:
+                    logger.warning("Split diagnostics: %s", split_diag.summary)
+                    if split_diag.export_dir:
+                        logger.info("Diagnostic meshes exported to: %s", split_diag.export_dir)
             else:
-                logger.warning("CSG cavity subtraction failed - cannot split metamold")
+                logger.warning("CSG combined cut failed – cannot create metamold")
             
             self.progress.emit("Metamold generation complete")
-            self.complete.emit(prism_result, metamold_with_cavity, metamold_half_1, metamold_half_2, 
-                             half_1_with_part, half_2_with_part, csg_success)
+            self.complete.emit(prism_result, metamold_with_cavity,
+                             metamold_half_1, metamold_half_2,
+                             half_1_with_part, half_2_with_part, csg_success,
+                             split_diag)
             
         except Exception as e:
             logger.exception("Error generating metamold: %s", e)
@@ -4917,6 +4914,7 @@ class MainWindow(QMainWindow):
         self._outer_collar_result = None  # OuterCollarResult (extended parting surface)
         self._shell_half_1 = None  # Upper half of split shell (manifold)
         self._shell_half_2 = None  # Lower half of split shell (manifold)
+        self._cutting_blade = None  # Blade mesh from hard shell split (reused in metamold)
         self._csg_success = False
         
         # Metamold state
@@ -6391,13 +6389,14 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'shell_progress_label'):
             self.shell_progress_label.setText(message)
 
-    def _on_hard_shell_complete(self, prism_result, shell_with_cavity, collar_result, shell_half_1, shell_half_2, csg_success):
+    def _on_hard_shell_complete(self, prism_result, shell_with_cavity, collar_result, shell_half_1, shell_half_2, csg_success, cutting_blade=None):
         self._hard_shell_prism_result = prism_result
         self._shell_with_cavity = shell_with_cavity
         self._outer_collar_result = collar_result
         self._shell_half_1 = shell_half_1
         self._shell_half_2 = shell_half_2
         self._csg_success = csg_success
+        self._cutting_blade = cutting_blade  # Reused in metamold step
         
         # Show the outer collar extension (extended parting surface)
         if collar_result is not None and collar_result.mesh is not None:
@@ -6775,7 +6774,8 @@ class MainWindow(QMainWindow):
             height_above=height_above,
             height_below=height_below,
             secondary_surface=secondary_surface,  # Smoothed secondary surface
-            secondary_thickness=secondary_thickness  # Thickness for secondary surface
+            secondary_thickness=secondary_thickness,  # Thickness for secondary surface
+            cutting_blade=self._cutting_blade  # Reuse blade from hard shell step
         )
         self._metamold_worker.progress.connect(self._on_metamold_progress)
         self._metamold_worker.complete.connect(self._on_metamold_complete)
@@ -6788,7 +6788,7 @@ class MainWindow(QMainWindow):
             self.metamold_progress_label.setText(message)
 
     def _on_metamold_complete(self, prism_result, metamold_with_cavity, metamold_half_1, metamold_half_2, 
-                               half_1_with_part, half_2_with_part, csg_success):
+                               half_1_with_part, half_2_with_part, csg_success, split_diagnostics):
         self._metamold_prism_result = prism_result
         self._metamold_with_cavity = metamold_with_cavity
         self._metamold_half_1 = metamold_half_1
@@ -6796,6 +6796,7 @@ class MainWindow(QMainWindow):
         self._metamold_half_1_with_part = half_1_with_part
         self._metamold_half_2_with_part = half_2_with_part
         self._metamold_csg_success = csg_success
+        self._split_diagnostics = split_diagnostics
         
         # Clear any previous metamold displays
         self.mesh_viewer.remove_metamold_prism()
@@ -6804,6 +6805,7 @@ class MainWindow(QMainWindow):
         self.mesh_viewer.remove_metamold_half_2()
         self.mesh_viewer.remove_metamold_half_1_with_part()
         self.mesh_viewer.remove_metamold_half_2_with_part()
+        self.mesh_viewer.remove_split_diagnostic_overlays()
         
         # Determine what to show based on results
         has_prism = prism_result is not None and prism_result.prism_mesh is not None
@@ -6840,6 +6842,23 @@ class MainWindow(QMainWindow):
             # Fall back to prism
             self.mesh_viewer.show_metamold_prism(prism_result.prism_mesh)
             logger.info("Showing metamold prism in viewer (no cavity or halves)")
+        
+        # --- Show split diagnostics overlays when split failed ---
+        if split_diagnostics is not None:
+            self.mesh_viewer.show_split_diagnostic_overlays(split_diagnostics)
+            # Inform the user about the diagnostic export
+            diag_msg = f"Split failed. Diagnostics:\n{split_diagnostics.summary}"
+            if split_diagnostics.export_dir:
+                diag_msg += f"\n\nDiagnostic STL files exported to:\n{split_diagnostics.export_dir}"
+            if hasattr(self, 'metamold_progress_label'):
+                self.metamold_progress_label.setText(
+                    f"⚠ Split failed — {split_diagnostics.n_bridge_faces} bridge faces, "
+                    f"{split_diagnostics.n_gaps_found} gap locations detected")
+                self.metamold_progress_label.setStyleSheet(
+                    f'color: {Colors.WARNING}; font-size: 12px;')
+            QMessageBox.warning(
+                self, "Metamold Split Failed",
+                diag_msg)
         
         self._update_metamold_step_ui()
         if csg_success and (has_valid_halves_with_part or has_valid_halves):
@@ -7823,6 +7842,7 @@ class MainWindow(QMainWindow):
         self._outer_collar_result = None
         self._shell_half_1 = None
         self._shell_half_2 = None
+        self._cutting_blade = None
         self._csg_success = False
         
         # Clear metamold results

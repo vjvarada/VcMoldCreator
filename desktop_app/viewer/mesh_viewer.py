@@ -5995,7 +5995,7 @@ class MeshViewer(QWidget):
         self._metamold_half_1_actor = self.plotter.add_mesh(
             pv_mesh,
             color='#66BB6A',  # Green 400
-            opacity=0.75,
+            opacity=0.5,
             show_edges=True,
             edge_color='#43A047',  # Green 600
             line_width=0.5,
@@ -6069,7 +6069,7 @@ class MeshViewer(QWidget):
         self._metamold_half_2_actor = self.plotter.add_mesh(
             pv_mesh,
             color='#AB47BC',  # Purple 400
-            opacity=0.75,
+            opacity=0.5,
             show_edges=True,
             edge_color='#8E24AA',  # Purple 600
             line_width=0.5,
@@ -6148,7 +6148,7 @@ class MeshViewer(QWidget):
         self._metamold_half_1_with_part_actor = self.plotter.add_mesh(
             pv_mesh,
             color='#00BCD4',  # Cyan 500
-            opacity=0.85,
+            opacity=0.5,
             show_edges=True,
             edge_color='#0097A7',  # Cyan 700
             line_width=0.5,
@@ -6223,7 +6223,7 @@ class MeshViewer(QWidget):
         self._metamold_half_2_with_part_actor = self.plotter.add_mesh(
             pv_mesh,
             color='#FF9800',  # Orange 500
-            opacity=0.85,
+            opacity=0.5,
             show_edges=True,
             edge_color='#F57C00',  # Orange 700
             line_width=0.5,
@@ -6332,3 +6332,100 @@ class MeshViewer(QWidget):
             self._resin_plug_actor.SetVisibility(visible)
             self.plotter.update()
             logger.debug(f"Resin plug visibility set to {visible}")
+
+    # =========================================================================
+    # SPLIT DIAGNOSTIC OVERLAYS
+    # =========================================================================
+
+    def show_split_diagnostic_overlays(self, diagnostics):
+        """Display diagnostic overlays when a metamold split fails.
+
+        Shows bridge faces (red) and gap location spheres (yellow) so the
+        user can see exactly WHERE the cutting blade failed to fully sever
+        the prism.
+
+        Args:
+            diagnostics: A :class:`SplitDiagnostics` instance from
+                :func:`core.mold_fabrication.diagnose_split_failure`.
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+
+        import pyvista as pv
+
+        self.remove_split_diagnostic_overlays()
+
+        if diagnostics is None:
+            return
+
+        # --- Bridge faces (bright red, semi-transparent) ---
+        bridge_mesh = getattr(diagnostics, 'bridge_mesh', None)
+        if bridge_mesh is not None and len(bridge_mesh.vertices) > 0:
+            try:
+                verts = np.asarray(bridge_mesh.vertices)
+                faces = np.asarray(bridge_mesh.faces)
+                faces_pv = np.hstack(
+                    [np.full((len(faces), 1), 3), faces]).astype(np.int64)
+                pv_mesh = pv.PolyData(verts, faces_pv.flatten())
+                self._diag_bridge_actor = self.plotter.add_mesh(
+                    pv_mesh,
+                    color='#FF2222',
+                    opacity=0.85,
+                    show_edges=True,
+                    edge_color='#CC0000',
+                    line_width=1.5,
+                )
+                logger.info("Split diagnostic: showing %d bridge faces in red",
+                            len(faces))
+            except Exception as e:
+                logger.warning("Failed to display bridge faces: %s", e)
+
+        # --- Gap location spheres (yellow) ---
+        gap_locs = getattr(diagnostics, 'gap_locations', None)
+        if gap_locs is not None and len(gap_locs) > 0:
+            try:
+                # Determine sphere radius from prism extents
+                p_span_u = getattr(diagnostics, 'prism_span_u', 1.0)
+                p_span_v = getattr(diagnostics, 'prism_span_v', 1.0)
+                sphere_r = max(p_span_u, p_span_v) * 0.012
+
+                # Limit number of spheres for performance
+                pts = gap_locs[:300]
+                cloud = pv.PolyData(pts)
+                glyphs = cloud.glyph(
+                    geom=pv.Sphere(radius=sphere_r), orient=False, scale=False)
+                self._diag_gap_actor = self.plotter.add_mesh(
+                    glyphs,
+                    color='#FFD700',
+                    opacity=0.9,
+                )
+                logger.info("Split diagnostic: showing %d gap spheres in yellow",
+                            len(pts))
+            except Exception as e:
+                logger.warning("Failed to display gap locations: %s", e)
+
+        self.plotter.update()
+
+    def remove_split_diagnostic_overlays(self):
+        """Remove all split-diagnostic overlay actors from the display."""
+        for attr in ('_diag_bridge_actor', '_diag_gap_actor'):
+            actor = getattr(self, attr, None)
+            if actor is not None:
+                try:
+                    self.plotter.remove_actor(actor)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self.plotter.update()
+
+    def set_split_diagnostic_visible(self, visible: bool):
+        """Toggle visibility of split-diagnostic overlays.
+
+        Args:
+            visible: True to show, False to hide.
+        """
+        for attr in ('_diag_bridge_actor', '_diag_gap_actor'):
+            actor = getattr(self, attr, None)
+            if actor is not None:
+                actor.SetVisibility(visible)
+        self.plotter.update()
