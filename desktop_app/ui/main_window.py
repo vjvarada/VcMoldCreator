@@ -2830,16 +2830,14 @@ class CombinedSurfaceSmoothingWorker(QThread):
             
             # Use new robust collar extension
             # Pass hull_mesh for accurate inner/outer boundary classification
-            # Compute scale-relative collar depth (default 0.5mm assumes mm units)
-            mesh_diag = float(np.linalg.norm(np.ptp(current_mesh.vertices, axis=0)))
-            collar_depth = max(mesh_diag * 0.005, 0.05)  # 0.5% of bbox diagonal, min 0.05
+            # Use fixed inner collar extension depth (mm)
+            collar_depth = 0.2
             fill_result = create_robust_collar_extension(
                 membrane_mesh=current_mesh,
                 part_mesh=part_mesh,
                 hull_mesh=hull_mesh,
                 vertex_boundary_type=current_boundary_type,
                 collar_depth=collar_depth,
-                fan_subdivisions=4,
                 restored_corner_positions=restored_corner_positions
             )
             
