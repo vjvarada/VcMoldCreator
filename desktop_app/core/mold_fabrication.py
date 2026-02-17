@@ -792,6 +792,64 @@ def _create_cutting_volume_from_surface(
     return volume_mesh
 
 
+def _find_boundary_loops(faces: np.ndarray) -> list:
+    """Find ordered boundary loops in a triangle mesh.
+
+    A boundary edge has exactly one adjacent face.  Boundary edges form
+    closed loops for manifold (or open) meshes with boundary.
+
+    Args:
+        faces: (F, 3) array of triangle vertex indices.
+
+    Returns:
+        List of loops, where each loop is a list of vertex indices
+        ordered around the boundary.  Empty list if no boundary exists.
+    """
+    # Count edge occurrences
+    edge_count: dict = {}
+    for face in faces:
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            ek = (min(v0, v1), max(v0, v1))
+            edge_count[ek] = edge_count.get(ek, 0) + 1
+
+    # Boundary edges appear exactly once
+    boundary_edges = [(v0, v1) for (v0, v1), c in edge_count.items() if c == 1]
+    if not boundary_edges:
+        return []
+
+    # Build adjacency for boundary vertices
+    adj: Dict[int, List[int]] = {}
+    for v0, v1 in boundary_edges:
+        adj.setdefault(v0, []).append(v1)
+        adj.setdefault(v1, []).append(v0)
+
+    # Walk loops
+    visited: set = set()
+    loops: list = []
+
+    for start in sorted(adj.keys()):
+        if start in visited:
+            continue
+        loop: list = []
+        current = start
+        prev = -1
+        while True:
+            if current in visited:
+                break
+            visited.add(current)
+            loop.append(current)
+            neighbors = [n for n in adj.get(current, []) if n != prev]
+            if not neighbors:
+                break
+            prev = current
+            current = neighbors[0]
+        if len(loop) >= 3:
+            loops.append(loop)
+
+    return loops
+
+
 def _create_half_space_from_membrane(
     membrane: trimesh.Trimesh,
     direction: np.ndarray,
@@ -799,52 +857,119 @@ def _create_half_space_from_membrane(
 ) -> trimesh.Trimesh:
     """
     Create a watertight half-space volume bounded by the membrane on one side.
-    
-    This extrudes the membrane along the given direction to create a closed volume
-    representing "everything on one side of the membrane".
-    
+
+    This extrudes the membrane along the given direction to create a closed
+    volume representing "everything on one side of the membrane".
+
+    If the membrane has inner boundary holes (e.g. where the parting surface
+    meets the part), those holes are capped first so that the half-space
+    fully covers the interior region.  Only the **outermost** boundary loop
+    (largest perimeter) gets side-wall extrusion; all smaller (inner) loops
+    are filled with fan triangulation.
+
     The resulting volume has:
-    - The membrane as its bottom face (with appropriate winding)
-    - The extruded membrane as its top face
-    - Side faces connecting the membrane boundary to the extruded boundary
-    
+    - The membrane (with inner holes filled) as its bottom face
+    - The extruded copy as its top face
+    - Side faces connecting the outer boundary to the extruded outer boundary
+
     Args:
-        membrane: The membrane mesh (e.g., outer collar)
-        direction: Unit vector for extrusion direction (defines "which side")
-        extrusion_distance: How far to extrude (should be larger than the shell)
-        
+        membrane: The membrane mesh (e.g., outer collar).
+        direction: Unit vector for extrusion direction (defines "which side").
+        extrusion_distance: How far to extrude (should be larger than the shell).
+
     Returns:
-        A watertight volume mesh representing the half-space
+        A watertight volume mesh representing the half-space.
     """
     # Normalize direction
     direction = np.array(direction, dtype=np.float64)
     direction = direction / (np.linalg.norm(direction) + 1e-10)
-    
-    # Get membrane geometry
-    vertices = np.asarray(membrane.vertices, dtype=np.float64)
-    faces = np.asarray(membrane.faces, dtype=np.int64)
+
+    # Get membrane geometry (mutable copies)
+    vertices = np.asarray(membrane.vertices, dtype=np.float64).copy()
+    faces = np.asarray(membrane.faces, dtype=np.int64).copy()
+
+    # ------------------------------------------------------------------
+    # Cap inner boundary holes so the half-space has no internal walls
+    # ------------------------------------------------------------------
+    loops = _find_boundary_loops(faces)
+
+    if len(loops) > 1:
+        # Identify the outermost loop (largest perimeter)
+        perimeters = []
+        for loop in loops:
+            perim = sum(
+                np.linalg.norm(vertices[loop[(i + 1) % len(loop)]] - vertices[loop[i]])
+                for i in range(len(loop))
+            )
+            perimeters.append(perim)
+        outer_idx = int(np.argmax(perimeters))
+
+        # Compute the average membrane face normal for winding determination
+        membrane_normal = np.zeros(3, dtype=np.float64)
+        for face in faces:
+            v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
+            membrane_normal += np.cross(v1 - v0, v2 - v0)
+        norm_len = np.linalg.norm(membrane_normal)
+        if norm_len > 1e-10:
+            membrane_normal /= norm_len
+
+        # Cap each inner loop with fan triangulation from its centroid
+        new_verts = list(vertices)
+        new_faces = list(map(list, faces))
+        n_capped = 0
+
+        for li, loop in enumerate(loops):
+            if li == outer_idx:
+                continue  # keep outer boundary open for side walls
+
+            centroid = np.mean(vertices[loop], axis=0)
+            centroid_idx = len(new_verts)
+            new_verts.append(centroid)
+
+            # Pick winding that aligns with the membrane normal
+            v0 = vertices[loop[0]]
+            v1 = vertices[loop[1 % len(loop)]]
+            test_normal = np.cross(v0 - centroid, v1 - centroid)
+
+            if np.dot(test_normal, membrane_normal) >= 0:
+                for i in range(len(loop)):
+                    j = (i + 1) % len(loop)
+                    new_faces.append([centroid_idx, loop[i], loop[j]])
+            else:
+                for i in range(len(loop)):
+                    j = (i + 1) % len(loop)
+                    new_faces.append([centroid_idx, loop[j], loop[i]])
+            n_capped += 1
+
+        vertices = np.array(new_verts, dtype=np.float64)
+        faces = np.array(new_faces, dtype=np.int64)
+
+        logger.debug(
+            "Capped %d inner boundary loop(s): membrane now %d verts, %d faces",
+            n_capped, len(vertices), len(faces),
+        )
+
     n_verts = len(vertices)
-    
+
     # Create extruded vertices (far end of the half-space)
     extruded_vertices = vertices + direction * extrusion_distance
-    
+
     # Combined vertices: [membrane, extruded]
     all_vertices = np.vstack([vertices, extruded_vertices])
-    
+
     # Faces:
     # 1. Membrane faces (bottom) - reverse winding so normals point into the half-space
     #    (i.e., pointing in the negative direction)
     bottom_faces = faces[:, ::-1]  # Reversed winding
-    
+
     # 2. Extruded faces (top) - keep original winding, offset indices
     #    These normals point outward (in positive direction)
     top_faces = faces + n_verts
-    
-    # 3. Side faces connecting boundary edges
-    # Find boundary edges of membrane
+
+    # 3. Side faces connecting OUTER boundary edges only
     edge_count = {}
     edge_to_face = {}
-    
+
     for fi, face in enumerate(faces):
         for i in range(3):
             v0, v1 = int(face[i]), int(face[(i + 1) % 3])
@@ -852,19 +977,19 @@ def _create_half_space_from_membrane(
             edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
             if edge_key not in edge_to_face:
                 edge_to_face[edge_key] = (fi, v0, v1)
-    
-    # Boundary edges have count == 1
+
+    # Boundary edges have count == 1 (only the outer loop remains after capping)
     boundary_edges = [e for e, c in edge_count.items() if c == 1]
-    
+
     side_faces = []
     for v0, v1 in boundary_edges:
         _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
-        
+
         # Bottom (membrane) vertices
         b0, b1 = v0, v1
         # Top (extruded) vertices
         t0, t1 = v0 + n_verts, v1 + n_verts
-        
+
         # Create quad with correct winding for outward-facing normals
         # Since bottom faces are reversed, side faces should create outward normals
         if orig_v0 == v0:
@@ -873,23 +998,23 @@ def _create_half_space_from_membrane(
         else:
             side_faces.append([b0, t0, t1])
             side_faces.append([b0, t1, b1])
-    
+
     # Combine all faces
     all_faces_list = [bottom_faces, top_faces]
     if side_faces:
         all_faces_list.append(np.array(side_faces, dtype=np.int64))
     all_faces = np.vstack(all_faces_list)
-    
+
     half_space_mesh = trimesh.Trimesh(
         vertices=all_vertices,
         faces=all_faces,
         process=True
     )
     half_space_mesh.fix_normals()
-    
+
     logger.debug(f"Created half-space volume: {len(all_vertices)} verts, {len(all_faces)} faces, "
                 f"extruded {extrusion_distance:.1f}mm in direction {direction}")
-    
+
     return half_space_mesh
 
 
@@ -1439,6 +1564,105 @@ def split_shell_with_membrane(
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000
         logger.error(f"Failed to split shell with membrane: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None, elapsed_ms, False
+
+
+def split_shell_with_half_space_intersection(
+    shell: trimesh.Trimesh,
+    membrane: trimesh.Trimesh,
+    pouring_direction: np.ndarray,
+    extrusion_distance: float = 500.0
+) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool]:
+    """
+    Split a shell into two halves by intersecting with half-space volumes.
+
+    Unlike blade subtraction, this approach does NOT require the membrane to
+    form a continuous seal with the cavity wall.  Each half is computed
+    independently via ``shell ∩ half_space``, so small gaps between the
+    membrane inner boundary and the part/hull surface are irrelevant.
+
+    Algorithm:
+        1. Create *upper* half-space: membrane extruded along +direction.
+        2. Create *lower* half-space: membrane extruded along −direction.
+        3. ``half_1 = shell ∩ upper_half_space``
+        4. ``half_2 = shell ∩ lower_half_space``
+
+    The membrane's outer boundary must extend past the prism walls (the outer
+    collar ensures this) so each half-space fully encloses one side.
+
+    Args:
+        shell: The shell mesh to split (e.g. prism − hull, or prism − part).
+        membrane: The cutting membrane (parting surface + outer collar).
+        pouring_direction: Unit vector defining "upper" (+) vs "lower" (−).
+        extrusion_distance: How far to extrude each half-space.  Must be
+            larger than the shell extent along the pouring direction.
+
+    Returns:
+        ``(half_1, half_2, computation_time_ms, success)``
+        *half_1* is on the positive-direction side (upper).
+    """
+    start_time = time.time()
+
+    if not MANIFOLD_AVAILABLE:
+        logger.error("manifold3d not available – cannot perform CSG operations")
+        return None, None, 0.0, False
+
+    try:
+        direction = np.array(pouring_direction, dtype=np.float64)
+        direction = direction / (np.linalg.norm(direction) + 1e-10)
+
+        # Auto-size extrusion if caller left the default
+        shell_heights = np.asarray(shell.vertices, dtype=np.float64) @ direction
+        shell_span = float(np.max(shell_heights) - np.min(shell_heights))
+        extrusion = max(extrusion_distance, shell_span * 2.0)
+
+        logger.info("Splitting shell via half-space intersection "
+                     f"(extrusion={extrusion:.1f}mm)...")
+
+        # Build two half-space volumes from the membrane
+        logger.info("  Creating upper half-space (+direction)...")
+        upper_hs = _create_half_space_from_membrane(membrane, direction, extrusion)
+        logger.info("  Creating lower half-space (−direction)...")
+        lower_hs = _create_half_space_from_membrane(membrane, -direction, extrusion)
+
+        # Convert to manifold3d
+        shell_m = _trimesh_to_manifold(shell)
+        upper_m = _trimesh_to_manifold(upper_hs)
+        lower_m = _trimesh_to_manifold(lower_hs)
+
+        # Intersect
+        logger.info("  Computing shell ∩ upper_half_space...")
+        half_1_m = shell_m ^ upper_m
+        logger.info("  Computing shell ∩ lower_half_space...")
+        half_2_m = shell_m ^ lower_m
+
+        half_1 = _manifold_to_trimesh(half_1_m)
+        half_2 = _manifold_to_trimesh(half_2_m)
+
+        # Validate – both halves must be non-empty
+        h1_ok = half_1 is not None and len(half_1.faces) > 0
+        h2_ok = half_2 is not None and len(half_2.faces) > 0
+
+        elapsed_ms = (time.time() - start_time) * 1000
+
+        if h1_ok and h2_ok:
+            logger.info(f"Half-space split complete in {elapsed_ms:.1f}ms:")
+            logger.info(f"  Half 1 (upper): {len(half_1.vertices)} verts, "
+                         f"{len(half_1.faces)} faces")
+            logger.info(f"  Half 2 (lower): {len(half_2.vertices)} verts, "
+                         f"{len(half_2.faces)} faces")
+            return half_1, half_2, elapsed_ms, True
+        else:
+            logger.warning("Half-space intersection produced an empty half – "
+                           "membrane may not extend past the shell boundary")
+            return half_1 if h1_ok else None, \
+                   half_2 if h2_ok else None, elapsed_ms, False
+
+    except Exception as e:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error(f"Failed to split shell with half-space intersection: {e}")
         import traceback
         traceback.print_exc()
         return None, None, elapsed_ms, False

@@ -909,7 +909,7 @@ class HardShellWorker(QThread):
                 create_hard_shell_prism,
                 create_shell_with_cavity,
                 create_outer_collar_extension,
-                split_shell_with_membrane
+                split_shell_with_half_space_intersection
             )
             
             logger.info(f"Generating hard shell with wall_thickness={self.wall_thickness}mm")
@@ -959,9 +959,9 @@ class HardShellWorker(QThread):
                 logger.info(f"CSG cavity complete: shell has {len(shell_with_cavity.vertices)} vertices, "
                            f"{len(shell_with_cavity.faces)} faces in {csg_time_ms:.1f}ms")
                 
-                # Step 4: Split shell into two halves using the outer collar membrane
-                self.progress.emit("Splitting shell into two halves using membrane...")
-                shell_half_1, shell_half_2, split_time_ms, split_success = split_shell_with_membrane(
+                # Step 4: Split shell into two halves using half-space intersection
+                self.progress.emit("Splitting shell into two halves (half-space intersection)...")
+                shell_half_1, shell_half_2, split_time_ms, split_success = split_shell_with_half_space_intersection(
                     shell_with_cavity,
                     collar_result.mesh,
                     self.pouring_direction
@@ -1023,7 +1023,7 @@ class MetamoldWorker(QThread):
             from core.mold_fabrication import (
                 create_metamold_prism,
                 create_shell_with_cavity,
-                split_shell_with_membrane,
+                split_shell_with_half_space_intersection,
                 add_part_to_metamold_halves,
                 create_part_with_thickened_secondary,
                 trim_metamold_halves
@@ -1068,10 +1068,10 @@ class MetamoldWorker(QThread):
                 logger.info(f"CSG cavity complete: metamold has {len(metamold_with_cavity.vertices)} vertices, "
                            f"{len(metamold_with_cavity.faces)} faces in {csg_time_ms:.1f}ms")
                 
-                # Step 3: Split metamold using the same blade from hard shell
-                # Simple CSG: metamold_halves = metamold - blade
-                self.progress.emit("Splitting metamold into two halves...")
-                metamold_half_1, metamold_half_2, split_time_ms, split_success = split_shell_with_membrane(
+                # Step 3: Split metamold using half-space intersection
+                # Each half = metamold ∩ half_space (robust even with gaps)
+                self.progress.emit("Splitting metamold into two halves (half-space intersection)...")
+                metamold_half_1, metamold_half_2, split_time_ms, split_success = split_shell_with_half_space_intersection(
                     metamold_with_cavity,
                     self.outer_collar_mesh,  # Same parting surface + collar used in hard shell
                     self.resin_pouring_direction
