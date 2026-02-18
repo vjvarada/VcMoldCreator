@@ -41,10 +41,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_AIR_ESCAPE_DEPTH_MM = 1.5     # Default depth of air escape holes
 DEFAULT_INLET_MIN_DEPTH_MM = 1.5     # Minimum depth of resin inlet hole
 DEFAULT_LOCAL_DIAMETER_MM = 1.2       # Diameter for air escape holes (local maxima)
-DEFAULT_GLOBAL_DIAMETER_MM = 5.2      # Diameter for resin inlet hole (global maximum)
+DEFAULT_GLOBAL_DIAMETER_MM = 5.2      # Top diameter for resin inlet hole (global maximum)
+DEFAULT_GLOBAL_BOTTOM_DIAMETER_MM = 1.2  # Bottom diameter of tapered resin inlet hole
 DEFAULT_SHELL_INLET_DIAMETER_MM = 12.2  # Diameter for hard shell through-hole
 PLUG_TOLERANCE_MM = 0.2                   # Tolerance clearance for plug dimensions
-PLUG_TAPER_ANGLE_DEG = 20.0               # Taper half-angle in degrees
+PLUG_TAPER_ANGLE_DEG = 20.0               # Taper half-angle in degrees (plug-to-shell transition)
 CYLINDER_SEGMENTS = 32                # Number of segments for cylinder approximation
 INLET_DEPTH_SAMPLE_POINTS = 24        # Points around circumference for depth ray-casting
 
@@ -73,6 +74,7 @@ class ResinChannelResult:
     inlet_depth_auto: float = 0.0  # Auto-computed inlet depth (before clamping to min)
     local_diameter_mm: float = DEFAULT_LOCAL_DIAMETER_MM
     global_diameter_mm: float = DEFAULT_GLOBAL_DIAMETER_MM
+    global_bottom_diameter_mm: float = DEFAULT_GLOBAL_BOTTOM_DIAMETER_MM
     
     # Number of channels created
     n_local_channels: int = 0
@@ -185,6 +187,98 @@ def _create_cylinder(
     cylinder.apply_transform(transform)
     
     return cylinder
+
+
+def _create_frustum(
+    center: np.ndarray,
+    direction: np.ndarray,
+    top_radius: float,
+    bottom_radius: float,
+    height: float,
+    segments: int = CYLINDER_SEGMENTS
+) -> trimesh.Trimesh:
+    """
+    Create a frustum (truncated cone) mesh starting at center, extending along direction.
+
+    The frustum starts at ``center`` with ``top_radius`` and tapers to
+    ``bottom_radius`` at ``center + direction * height``.
+
+    Args:
+        center: (3,) starting point (top of frustum)
+        direction: (3,) unit vector for frustum axis
+        top_radius: Radius at the start (center)
+        bottom_radius: Radius at the end (center + direction*height)
+        height: Height (length) of the frustum along direction
+        segments: Number of segments for circular cross-section
+
+    Returns:
+        trimesh.Trimesh representing the frustum
+    """
+    direction = np.asarray(direction, dtype=np.float64)
+    direction = direction / (np.linalg.norm(direction) + 1e-10)
+
+    angles = np.linspace(0, 2 * np.pi, segments, endpoint=False)
+    cos_a = np.cos(angles)
+    sin_a = np.sin(angles)
+
+    # Build in local space: Z-axis = frustum axis, z=0 = top, z=height = bottom
+    vertices = []
+    # Top ring (at z=0, radius = top_radius)
+    for j in range(segments):
+        vertices.append([top_radius * cos_a[j], top_radius * sin_a[j], 0.0])
+    # Bottom ring (at z=height, radius = bottom_radius)
+    for j in range(segments):
+        vertices.append([bottom_radius * cos_a[j], bottom_radius * sin_a[j], height])
+    # Cap centers
+    top_center_idx = len(vertices)
+    vertices.append([0.0, 0.0, 0.0])
+    bottom_center_idx = len(vertices)
+    vertices.append([0.0, 0.0, height])
+
+    vertices = np.array(vertices, dtype=np.float64)
+
+    faces = []
+    # Side quads (as triangle pairs) connecting top ring to bottom ring
+    for j in range(segments):
+        j_next = (j + 1) % segments
+        t0 = j                    # top ring
+        t1 = j_next               # top ring
+        b0 = segments + j         # bottom ring
+        b1 = segments + j_next    # bottom ring
+        faces.append([t0, b0, t1])
+        faces.append([t1, b0, b1])
+    # Top cap
+    for j in range(segments):
+        j_next = (j + 1) % segments
+        faces.append([top_center_idx, j_next, j])
+    # Bottom cap
+    for j in range(segments):
+        j_next = (j + 1) % segments
+        faces.append([bottom_center_idx, segments + j, segments + j_next])
+
+    faces = np.array(faces, dtype=np.int64)
+
+    # Transform from local Z-axis to target direction, positioned at center
+    z_axis = np.array([0.0, 0.0, 1.0])
+    dot = np.dot(z_axis, direction)
+    if abs(dot - 1.0) < 1e-8:
+        R = np.eye(3)
+    elif abs(dot + 1.0) < 1e-8:
+        R = np.diag([1.0, -1.0, -1.0])
+    else:
+        axis = np.cross(z_axis, direction)
+        axis = axis / (np.linalg.norm(axis) + 1e-10)
+        angle = np.arccos(np.clip(dot, -1.0, 1.0))
+        K = np.array([[0, -axis[2], axis[1]],
+                      [axis[2], 0, -axis[0]],
+                      [-axis[1], axis[0], 0]])
+        R = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+
+    vertices = (R @ vertices.T).T + center
+
+    frustum = trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
+    frustum.fix_normals()
+    return frustum
 
 
 # ============================================================================
@@ -367,19 +461,24 @@ def _compute_inlet_depth(
 ) -> float:
     """
     Compute the required drilling depth for the resin inlet so that a full
-    circular cross-section is cut into the part, even on inclined surfaces.
+    circular cross-section of the given radius is cut into the part, even
+    on inclined surfaces.
 
-    Samples points around the cylinder circumference and ray-casts each one
-    along the drill direction onto the part surface. The depth variation
-    across the circumference (max - min intersection depth) tells us how
-    much extra depth is needed to clear the incline.
+    For tapered inlets, pass the BOTTOM (smaller) radius so that the depth
+    ensures the narrow end is fully cut into the part.
+
+    Samples points around the circumference and ray-casts each one along
+    the drill direction onto the part surface. The depth variation across
+    the circumference (max - min intersection depth) tells us how much
+    extra depth is needed to clear the incline.
 
     Final depth = depth_variation + min_depth_mm
 
     Args:
-        cylinder_center: (3,) the cylinder center position  
+        cylinder_center: (3,) the cylinder center position
         drill_direction: (3,) unit vector for drilling axis
-        radius: Radius of the inlet cylinder
+        radius: Radius of the cross-section to ensure is fully cut
+            (for tapered inlets, use the bottom/smaller radius)
         part_mesh: Part mesh to ray-cast against
         min_depth_mm: Minimum base depth to drill beyond the incline
         n_samples: Number of sample points around the circumference
@@ -474,21 +573,22 @@ def create_resin_channels(
     inlet_min_depth_mm: float = DEFAULT_INLET_MIN_DEPTH_MM,
     local_diameter_mm: float = DEFAULT_LOCAL_DIAMETER_MM,
     global_diameter_mm: float = DEFAULT_GLOBAL_DIAMETER_MM,
+    global_bottom_diameter_mm: float = DEFAULT_GLOBAL_BOTTOM_DIAMETER_MM,
     mold_half: int = 1
 ) -> ResinChannelResult:
     """
     Create resin pouring and air escape channels in a metamold half.
     
-    Subtracts cylinders from the metamold half at the positions of local and
-    global maxima identified during pouring direction optimization. The cylinders
-    are drilled in the OPPOSITE direction to the resin pouring direction
-    (from outside surface into the cavity).
+    Subtracts shapes from the metamold half at the positions of local and
+    global maxima identified during pouring direction optimization.
     
-    - Global maximum: large cylinder for resin pouring inlet, with center
-      offset toward the part's 2D convex hull centroid so the original
-      maximum position lies on the cylinder's circumference. Depth is
-      auto-computed via ray-casting to ensure a full circular cutout
-      even on inclined surfaces.
+    - Global maximum: tapered frustum (truncated cone) for resin pouring
+      inlet, tapering from global_diameter_mm at the metamold surface down
+      to global_bottom_diameter_mm at the drilling depth. Center is offset
+      toward the part's 2D convex hull centroid so the original maximum
+      position lies on the top circumference. Depth is auto-computed via
+      ray-casting using the bottom (smaller) radius to ensure the narrow
+      end is fully cut into the part.
     - Local maxima: small cylinders for air bubble escape (centered on maxima)
     
     Args:
@@ -501,7 +601,8 @@ def create_resin_channels(
         air_escape_depth_mm: Depth of air escape holes in mm
         inlet_min_depth_mm: Minimum depth of resin inlet hole in mm
         local_diameter_mm: Diameter of air escape holes at local maxima
-        global_diameter_mm: Diameter of resin inlet hole at global maximum
+        global_diameter_mm: Top diameter of tapered resin inlet hole
+        global_bottom_diameter_mm: Bottom diameter of tapered resin inlet hole
         mold_half: Which mold half this is (1=upper, 2=lower)
         
     Returns:
@@ -514,7 +615,8 @@ def create_resin_channels(
         air_escape_depth_mm=air_escape_depth_mm,
         inlet_depth_mm=inlet_min_depth_mm,  # Will be updated after auto-compute
         local_diameter_mm=local_diameter_mm,
-        global_diameter_mm=global_diameter_mm
+        global_diameter_mm=global_diameter_mm,
+        global_bottom_diameter_mm=global_bottom_diameter_mm
     )
     
     if not MANIFOLD_AVAILABLE:
@@ -553,9 +655,9 @@ def create_resin_channels(
     logger.info(f"  Local maxima: {len(local_maxima_positions) if has_local else 0} "
                 f"(diameter: {local_diameter_mm:.2f} mm)")
     logger.info(f"  Global maximum: {'yes' if has_global else 'no'} "
-                f"(diameter: {global_diameter_mm:.2f} mm)")
+                f"(top ⌀: {global_diameter_mm:.2f} mm → bottom ⌀: {global_bottom_diameter_mm:.2f} mm)")
     
-    # Collect all cylinders to subtract
+    # Collect all shapes to subtract (cylinders for local, frustum for global)
     cylinders = []
     
     # Create cylinders at local maxima (air escape holes)
@@ -576,33 +678,39 @@ def create_resin_channels(
         result.n_local_channels = len(local_maxima_positions)
         result.local_channel_positions = np.array(local_maxima_positions, dtype=np.float64)
     
-    # Create cylinder at global maximum (resin inlet)
-    # The cylinder center is offset toward the part's 2D convex hull centroid
-    # so that the original global max position sits on the circumference.
-    # Depth is auto-computed via ray-casting to ensure full circular cutout.
+    # Create tapered frustum at global maximum (resin inlet)
+    # The frustum center is offset toward the part's 2D convex hull centroid
+    # so that the original global max position sits on the top circumference.
+    # The frustum tapers from global_diameter_mm at the top (metamold surface)
+    # to global_bottom_diameter_mm at the drilling depth.
+    # Depth is auto-computed via ray-casting using the bottom (smaller) radius
+    # to ensure the narrow end is fully cut into the part.
     if has_global:
         global_pos = np.asarray(global_maximum_position, dtype=np.float64)
-        global_radius = global_diameter_mm / 2.0
+        global_top_radius = global_diameter_mm / 2.0
+        global_bottom_radius = global_bottom_diameter_mm / 2.0
 
-        # Compute offset center: shift toward part's 2D hull centroid by radius
+        # Compute offset center: shift toward part's 2D hull centroid by
+        # the TOP radius (the wide end sits at the surface)
         if part_mesh is not None:
             cylinder_center = _compute_inlet_offset(
                 inlet_position=global_pos,
                 part_mesh=part_mesh,
                 drill_direction=drill_direction,
-                radius=global_radius
+                radius=global_top_radius
             )
         else:
             logger.warning("No part mesh provided — placing global inlet centered on maximum")
             cylinder_center = global_pos.copy()
 
-        # Auto-compute inlet depth: ray-cast from circumference to find
-        # the surface depth variation due to incline, then add min_depth
+        # Auto-compute inlet depth using the BOTTOM (smaller) radius.
+        # This ensures the narrow end circle is fully cut into the part
+        # even on inclined surfaces.
         if part_mesh is not None:
             inlet_depth = _compute_inlet_depth(
                 cylinder_center=cylinder_center,
                 drill_direction=drill_direction,
-                radius=global_radius,
+                radius=global_bottom_radius,
                 part_mesh=part_mesh,
                 min_depth_mm=inlet_min_depth_mm
             )
@@ -612,18 +720,20 @@ def create_resin_channels(
         result.inlet_depth_mm = inlet_depth
         result.inlet_depth_auto = inlet_depth
 
-        cyl = _create_cylinder(
+        frustum = _create_frustum(
             center=cylinder_center,
             direction=drill_direction,
-            radius=global_radius,
+            top_radius=global_top_radius,
+            bottom_radius=global_bottom_radius,
             height=inlet_depth
         )
-        cylinders.append(cyl)
+        cylinders.append(frustum)
         result.n_global_channels = 1
         result.global_channel_position = global_pos.copy()
         result.inlet_cylinder_center = cylinder_center.copy()
-        logger.info(f"  Global channel: original_pos={global_pos}, "
-                    f"cylinder_center={cylinder_center}, radius={global_radius:.2f}, "
+        logger.info(f"  Global channel (tapered): original_pos={global_pos}, "
+                    f"cylinder_center={cylinder_center}, "
+                    f"top_r={global_top_radius:.2f}, bottom_r={global_bottom_radius:.2f}, "
                     f"depth={inlet_depth:.2f}mm (min={inlet_min_depth_mm:.2f}mm)")
     
     if not cylinders:
@@ -684,7 +794,8 @@ def create_resin_channels_on_both_halves(
     air_escape_depth_mm: float = DEFAULT_AIR_ESCAPE_DEPTH_MM,
     inlet_min_depth_mm: float = DEFAULT_INLET_MIN_DEPTH_MM,
     local_diameter_mm: float = DEFAULT_LOCAL_DIAMETER_MM,
-    global_diameter_mm: float = DEFAULT_GLOBAL_DIAMETER_MM
+    global_diameter_mm: float = DEFAULT_GLOBAL_DIAMETER_MM,
+    global_bottom_diameter_mm: float = DEFAULT_GLOBAL_BOTTOM_DIAMETER_MM
 ) -> Tuple[ResinChannelResult, Optional[trimesh.Trimesh]]:
     """
     Create resin channels on the correct metamold half.
@@ -702,7 +813,8 @@ def create_resin_channels_on_both_halves(
         air_escape_depth_mm: Depth for air escape holes
         inlet_min_depth_mm: Minimum depth for resin inlet hole
         local_diameter_mm: Diameter for local maxima holes
-        global_diameter_mm: Diameter for global maximum hole
+        global_diameter_mm: Top diameter for tapered global maximum hole
+        global_bottom_diameter_mm: Bottom diameter for tapered global maximum hole
         
     Returns:
         Tuple of (ResinChannelResult for modified half, unmodified other half mesh)
@@ -747,6 +859,7 @@ def create_resin_channels_on_both_halves(
         inlet_min_depth_mm=inlet_min_depth_mm,
         local_diameter_mm=local_diameter_mm,
         global_diameter_mm=global_diameter_mm,
+        global_bottom_diameter_mm=global_bottom_diameter_mm,
         mold_half=target_half
     )
     
@@ -949,34 +1062,41 @@ def create_resin_plug(
     inlet_diameter_mm: float,
     shell_inlet_diameter_mm: float,
     inlet_depth_mm: float,
+    inlet_bottom_diameter_mm: Optional[float] = None,
     tolerance_mm: float = PLUG_TOLERANCE_MM,
     taper_angle_deg: float = PLUG_TAPER_ANGLE_DEG,
     segments: int = CYLINDER_SEGMENTS
 ) -> Optional[trimesh.Trimesh]:
     """
-    Create a resin pouring plug that fits into the inlet + shell through-holes.
+    Create a resin pouring plug that fits into the tapered inlet + shell holes.
     
-    The plug is a 3-section solid of revolution:
-      1. Narrow cylinder (bottom): ⌀ = inlet_diameter - tolerance.
-         Starts at the BASE of the inlet hole (where it touches the part,
-         i.e. inlet_cylinder_center offset downward by inlet_depth) and
-         extends upward to the part's max height along resin direction.
-      2. Taper (middle): expands from narrow ⌀ to shell ⌀ - tolerance
-         at the specified taper half-angle.
-      3. Wide cylinder (top): ⌀ = shell_inlet_diameter - tolerance,
-         extends from the taper top to the top of the hard shell.
+    The plug is a 4-section solid of revolution:
+      1. Tapered section (bottom): tapers from ⌀(inlet_diameter - tolerance)
+         at the part surface down to ⌀(inlet_bottom_diameter - tolerance) at
+         the base of the inlet hole. Matches the tapered frustum hole shape.
+      2. Narrow top cylinder: ⌀ = inlet_diameter - tolerance, from the part
+         surface up to the start of the plug-to-shell taper.
+      3. Plug-to-shell taper (middle): expands from inlet ⌀ to shell ⌀ at
+         the specified taper half-angle.
+      4. Wide cylinder (top): ⌀ = shell_inlet_diameter - tolerance, extends
+         from the taper top to the top of the hard shell.
+    
+    When inlet_bottom_diameter_mm is None, falls back to the constant-diameter
+    plug (no taper in the inlet section), matching legacy behaviour.
     
     Args:
-        inlet_cylinder_center: (3,) center of the resin inlet cylinder
+        inlet_cylinder_center: (3,) center of the resin inlet hole
             (at the metamold surface, the TOP of the hole)
         resin_direction: (3,) resin pouring direction unit vector
         part_mesh: The original part mesh (for computing max height)
         shell_half: The hard shell half (for computing shell top)
-        inlet_diameter_mm: Resin inlet hole diameter
+        inlet_diameter_mm: Top diameter of the tapered resin inlet hole
         shell_inlet_diameter_mm: Hard shell through-hole diameter
         inlet_depth_mm: Depth of the inlet hole drilled into the metamold
+        inlet_bottom_diameter_mm: Bottom diameter of the tapered resin inlet
+            hole.  If None, defaults to DEFAULT_GLOBAL_BOTTOM_DIAMETER_MM.
         tolerance_mm: Clearance tolerance subtracted from diameters
-        taper_angle_deg: Taper half-angle in degrees (from the vertical axis)
+        taper_angle_deg: Taper half-angle for plug-to-shell transition (degrees)
         segments: Number of segments for circular cross-section
         
     Returns:
@@ -986,16 +1106,28 @@ def create_resin_plug(
         logger.error("Missing data for resin plug creation")
         return None
     
+    if inlet_bottom_diameter_mm is None:
+        inlet_bottom_diameter_mm = DEFAULT_GLOBAL_BOTTOM_DIAMETER_MM
+    
     resin_dir = np.asarray(resin_direction, dtype=np.float64)
     resin_dir = resin_dir / (np.linalg.norm(resin_dir) + 1e-10)
     center = np.asarray(inlet_cylinder_center, dtype=np.float64)
     
     # Radii with tolerance
-    narrow_radius = (inlet_diameter_mm - tolerance_mm) / 2.0
+    # Top of tapered inlet section (at metamold surface / part surface)
+    inlet_top_radius = (inlet_diameter_mm - tolerance_mm) / 2.0
+    # Bottom of tapered inlet section (deep in the part)
+    inlet_bottom_radius = (inlet_bottom_diameter_mm - tolerance_mm) / 2.0
+    # Wide shell section
     wide_radius = (shell_inlet_diameter_mm - tolerance_mm) / 2.0
     
-    if narrow_radius <= 0 or wide_radius <= 0 or wide_radius <= narrow_radius:
-        logger.error(f"Invalid plug radii: narrow={narrow_radius:.2f}, wide={wide_radius:.2f}")
+    if inlet_top_radius <= 0 or inlet_bottom_radius <= 0 or wide_radius <= 0:
+        logger.error(f"Invalid plug radii: top={inlet_top_radius:.2f}, "
+                     f"bottom={inlet_bottom_radius:.2f}, wide={wide_radius:.2f}")
+        return None
+    if wide_radius <= inlet_top_radius:
+        logger.error(f"Wide radius ({wide_radius:.2f}) must be > inlet top radius "
+                     f"({inlet_top_radius:.2f})")
         return None
     
     # The plug base is at the BOTTOM of the inlet hole.
@@ -1012,40 +1144,45 @@ def create_resin_plug(
     part_max_proj = np.max(part_projs)
     shell_top_proj = np.max(shell_projs)
     
-    # Section 1: narrow cylinder from hole bottom up to part max height
-    narrow_height = part_max_proj - base_proj
-    if narrow_height < 0.5:
-        logger.warning(f"Narrow section height too small ({narrow_height:.2f}mm), clamping to 0.5mm")
-        narrow_height = 0.5
+    # Section 1: tapered section from hole bottom up to part max height.
+    # At the bottom: inlet_bottom_radius.  At the top: inlet_top_radius.
+    # This matches the tapered frustum hole in the metamold (minus tolerance).
+    tapered_height = part_max_proj - base_proj
+    if tapered_height < 0.5:
+        logger.warning(f"Tapered section height too small ({tapered_height:.2f}mm), "
+                       "clamping to 0.5mm")
+        tapered_height = 0.5
     
-    # Section 2: taper from narrow_radius to wide_radius at specified angle
-    # half-angle from axis: tan(angle) = (wide_r - narrow_r) / taper_height
-    # taper_height = (wide_r - narrow_r) / tan(angle)
+    # Section 2: plug-to-shell taper from inlet_top_radius to wide_radius
+    # half-angle from axis: tan(angle) = (wide_r - inlet_top_r) / taper_height
     taper_angle_rad = np.radians(taper_angle_deg)
-    radius_diff = wide_radius - narrow_radius
-    taper_height = radius_diff / np.tan(taper_angle_rad)
+    radius_diff = wide_radius - inlet_top_radius
+    plug_shell_taper_height = radius_diff / np.tan(taper_angle_rad)
     
-    # Section 3: wide cylinder from taper top to shell top
-    taper_top_proj = base_proj + narrow_height + taper_height
+    # Section 3: wide cylinder from plug-shell taper top to shell top
+    taper_top_proj = base_proj + tapered_height + plug_shell_taper_height
     wide_height = shell_top_proj - taper_top_proj
     if wide_height < 0.5:
-        logger.warning(f"Wide section height too small ({wide_height:.2f}mm), clamping to 0.5mm")
+        logger.warning(f"Wide section height too small ({wide_height:.2f}mm), "
+                       "clamping to 0.5mm")
         wide_height = 0.5
     
-    total_height = narrow_height + taper_height + wide_height
+    total_height = tapered_height + plug_shell_taper_height + wide_height
     
-    logger.info(f"Creating resin plug (base at hole bottom):")
-    logger.info(f"  Narrow: ⌀{narrow_radius*2:.1f}mm × {narrow_height:.1f}mm")
-    logger.info(f"  Taper:  {taper_angle_deg:.0f}° × {taper_height:.1f}mm")
+    logger.info("Creating resin plug (tapered, base at hole bottom):")
+    logger.info(f"  Tapered: ⌀{inlet_bottom_radius*2:.1f}mm → "
+                f"⌀{inlet_top_radius*2:.1f}mm × {tapered_height:.1f}mm")
+    logger.info(f"  Shell taper: {taper_angle_deg:.0f}° × "
+                f"{plug_shell_taper_height:.1f}mm")
     logger.info(f"  Wide:   ⌀{wide_radius*2:.1f}mm × {wide_height:.1f}mm")
     logger.info(f"  Total height: {total_height:.1f}mm")
     
     # Build as solid of revolution: profile = [(height_from_base, radius), ...]
     profile = [
-        (0.0, narrow_radius),
-        (narrow_height, narrow_radius),
-        (narrow_height + taper_height, wide_radius),
-        (narrow_height + taper_height + wide_height, wide_radius),
+        (0.0, inlet_bottom_radius),                              # bottom of hole
+        (tapered_height, inlet_top_radius),                      # part surface
+        (tapered_height + plug_shell_taper_height, wide_radius), # shell transition
+        (tapered_height + plug_shell_taper_height + wide_height, wide_radius),  # shell top
     ]
     
     n_rings = len(profile)
