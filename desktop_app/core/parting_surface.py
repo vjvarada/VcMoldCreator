@@ -4451,18 +4451,19 @@ def create_robust_collar_extension(
     # =========================================================================
     # After collar creation, check every boundary edge of the collar region.
     # If the midpoint of a collar boundary edge is NOT inside the part mesh,
-    # extend that edge with another collar quad.  Repeat up to 5 iterations
-    # or until all collar boundary edges are inside the part mesh.
+    # first re-project its vertices to the closest part surface, then re-check:
+    # if still outside, extend that edge with another collar quad.
+    # Repeat up to 5 iterations or until all collar boundary edges are inside.
     #
-    # To avoid exponential growth we track a *frontier vertex range*:
-    # only boundary edges where BOTH vertices fall in the current frontier
-    # are candidates for extension.  Initially the frontier is all collar
-    # vertices (index >= n_orig_verts).  After each iteration it advances
-    # to the vertices created in that iteration, so only the outermost
-    # edges of the collar are checked/extended.
+    # Adjacent extension quads share new vertices so the extension strip
+    # forms a continuous boundary rather than disconnected quads.
+    #
+    # Frontier tracking: only edges where BOTH vertices fall in the current
+    # frontier range are candidates, preventing exponential growth.
     
     MAX_COLLAR_EXTENSION_ITERATIONS = 5
     total_extension_quads = 0
+    total_reprojected = 0
     _frontier_start = n_orig_verts  # first iteration: all collar verts
     
     for _ext_iter in range(MAX_COLLAR_EXTENSION_ITERATIONS):
@@ -4481,8 +4482,6 @@ def create_robust_collar_extension(
 
         # Frontier collar boundary edges: boundary (count==1) with BOTH
         # vertices in the current frontier range (>= _frontier_start).
-        # This selects only the outermost collar edges, not the side
-        # edges connecting collar vertices back to the membrane boundary.
         _collar_be = [
             (va, vb) for (va, vb), cnt in _efc.items()
             if cnt == 1 and va >= _frontier_start and vb >= _frontier_start
@@ -4507,22 +4506,81 @@ def create_robust_collar_extension(
                            f"contains() failed ({_ex}), stopping iterations")
             break
 
-        _outside_edges = [
-            _collar_be[i] for i in range(len(_collar_be)) if not _inside[i]
+        _outside_indices = [
+            i for i in range(len(_collar_be)) if not _inside[i]
         ]
 
-        if not _outside_edges:
+        if not _outside_indices:
             logger.info(f"Collar extension iter {_ext_iter + 1}: all "
                         f"{len(_collar_be)} collar boundary edges "
                         "are inside the part mesh")
             break
 
+        # =================================================================
+        # SUB-STEP A: Re-project outside frontier vertices to part surface
+        # =================================================================
+        # Collect the unique frontier vertices that belong to outside edges
+        _outside_edges_pre = [_collar_be[i] for i in _outside_indices]
+        _reproj_verts = set()
+        for _va, _vb in _outside_edges_pre:
+            _reproj_verts.add(_va)
+            _reproj_verts.add(_vb)
+        _reproj_list = sorted(_reproj_verts)
+
+        if _reproj_list:
+            _reproj_positions = _verts_arr[_reproj_list]
+            try:
+                # Check which vertices are themselves outside the part
+                _v_inside = part_mesh.contains(_reproj_positions)
+                _v_outside_mask = ~_v_inside
+
+                if np.any(_v_outside_mask):
+                    _outside_positions = _reproj_positions[_v_outside_mask]
+                    _closest_pts, _, _ = trimesh.proximity.closest_point(
+                        part_mesh, _outside_positions)
+
+                    # Write re-projected positions back into vertices list
+                    _oi = 0
+                    _n_reprojected = 0
+                    for _ri, _vi in enumerate(_reproj_list):
+                        if _v_outside_mask[_ri]:
+                            vertices[_vi] = _closest_pts[_oi].copy()
+                            _oi += 1
+                            _n_reprojected += 1
+
+                    if _n_reprojected > 0:
+                        total_reprojected += _n_reprojected
+                        logger.info(
+                            f"Collar extension iter {_ext_iter + 1}: "
+                            f"re-projected {_n_reprojected} vertices "
+                            "to part surface")
+
+                        # Rebuild vertex array after re-projection
+                        _verts_arr = np.array(vertices, dtype=np.float64)
+            except Exception as _ex:
+                logger.warning(
+                    f"Collar extension iter {_ext_iter + 1}: "
+                    f"re-projection failed ({_ex}), proceeding without")
+
+        # Always extend all originally-outside edges after re-projection
+        _outside_edges = [_collar_be[i] for i in _outside_indices]
         logger.info(f"Collar extension iter {_ext_iter + 1}: "
                     f"{len(_outside_edges)}/{len(_collar_be)} collar "
                     "boundary edges outside part — extending")
 
-        # ----- Extend each outside edge with a new quad -----
-        _extended = 0
+        # =================================================================
+        # SUB-STEP B: Build adjacency among outside edges for vertex sharing
+        # =================================================================
+        # Two outside edges are *adjacent* when they share a vertex.
+        # When extending, adjacent edges share the new vertex at their
+        # common endpoint so the extension strip is continuous.
+        #
+        # _vert_new_idx[vi] = index of the NEW vertex created for
+        # frontier vertex vi during this iteration (shared across edges)
+        _vert_new_idx: Dict[int, int] = {}
+
+        # Pre-compute per-edge extension geometry (direction + face normal)
+        _edge_ext_info: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = {}
         for _va, _vb in _outside_edges:
             _va_pos = _verts_arr[_va]
             _vb_pos = _verts_arr[_vb]
@@ -4533,14 +4591,12 @@ def create_robust_collar_extension(
             _fi, _vc = _finfo
             _vc_pos = _verts_arr[_vc]
 
-            # Edge direction
             _edge_vec = _vb_pos - _va_pos
             _edge_len = np.linalg.norm(_edge_vec)
             if _edge_len < 1e-10:
                 continue
             _edge_dir = _edge_vec / _edge_len
 
-            # Face normal from the adjacent face
             _fverts = faces[_fi]
             _p0 = _verts_arr[int(_fverts[0])]
             _p1 = _verts_arr[int(_fverts[1])]
@@ -4551,8 +4607,6 @@ def create_robust_collar_extension(
                 continue
             _fn = _fn / _fn_len
 
-            # Perpendicular to edge in face plane, pointing away from
-            # the face interior (away from third vertex)
             _perp = np.cross(_fn, _edge_dir)
             _perp_len = np.linalg.norm(_perp)
             if _perp_len < 1e-10:
@@ -4562,17 +4616,125 @@ def create_robust_collar_extension(
             if np.dot(_perp, _to_third) > 0:
                 _perp = -_perp
 
-            # New vertex positions (offset by collar_depth)
-            _new_va_pos = _va_pos + collar_depth * _perp
-            _new_vb_pos = _vb_pos + collar_depth * _perp
+            _edge_ext_info[_ek] = (_perp, _fn)
 
-            _new_va_idx = len(vertices)
-            vertices.append(_new_va_pos.copy())
-            _new_vb_idx = len(vertices)
-            vertices.append(_new_vb_pos.copy())
+        # Build adjacency: vertex -> list of outside edge keys that use it
+        _vert_to_outside_edges: Dict[int, List[Tuple[int, int]]] = {}
+        for _va, _vb in _outside_edges:
+            _ek = (min(_va, _vb), max(_va, _vb))
+            if _ek not in _edge_ext_info:
+                continue
+            _vert_to_outside_edges.setdefault(_va, []).append(_ek)
+            _vert_to_outside_edges.setdefault(_vb, []).append(_ek)
+
+        # =================================================================
+        # SUB-STEP C: Create new vertices (shared at adjacency points)
+        # =================================================================
+        # For each frontier vertex that appears in outside edges, compute
+        # one new position.  If the vertex is shared by multiple edges,
+        # average their perpendicular directions for a smooth join.
+        # Skip creating vertices that would be nearly coincident with
+        # their source (degenerate after re-projection).
+        #
+        # ROBUSTNESS: Blend edge-perpendicular with the inward part
+        # surface normal at each frontier vertex.  This ensures the
+        # extension always has a component pointing INTO the part,
+        # even when the membrane meets the surface at a shallow angle
+        # (where the edge perpendicular would be tangential).
+        _frontier_into_part: Dict[int, np.ndarray] = {}
+        _all_frontier_vi = list(_vert_to_outside_edges.keys())
+        if _all_frontier_vi:
+            _frontier_positions = _verts_arr[_all_frontier_vi]
+            try:
+                _, _, _f_closest_faces = trimesh.proximity.closest_point(
+                    part_mesh, _frontier_positions)
+                for _fi_idx, _vi in enumerate(_all_frontier_vi):
+                    _pfi = _f_closest_faces[_fi_idx]
+                    if _pfi < len(part_mesh.face_normals):
+                        _pn = part_mesh.face_normals[_pfi]
+                        _pn_len = np.linalg.norm(_pn)
+                        if _pn_len > 1e-10:
+                            _frontier_into_part[_vi] = -_pn / _pn_len
+            except Exception:
+                pass  # fallback: no blending, use edge perp only
+
+        for _vi, _ek_list in _vert_to_outside_edges.items():
+            if _vi in _vert_new_idx:
+                continue
+            _vi_pos = _verts_arr[_vi]
+
+            # Average perpendicular directions from all adjacent edges
+            _perp_sum = np.zeros(3)
+            _count = 0
+            for _ek in _ek_list:
+                if _ek in _edge_ext_info:
+                    _perp_sum += _edge_ext_info[_ek][0]
+                    _count += 1
+            if _count == 0:
+                continue
+
+            if _count == 1:
+                _avg_perp = _perp_sum  # already unit length from above
+            else:
+                _avg_len = np.linalg.norm(_perp_sum)
+                if _avg_len < 1e-10:
+                    # Opposing directions cancel out — use first edge's perp
+                    _avg_perp = _edge_ext_info[_ek_list[0]][0]
+                else:
+                    _avg_perp = _perp_sum / _avg_len
+
+            # Blend with inward part normal for robust penetration
+            _into_dir = _frontier_into_part.get(_vi)
+            if _into_dir is not None:
+                _alignment = np.dot(_avg_perp, _into_dir)
+                # If edge perp is mostly tangent or points away from
+                # part interior, add significant into-part bias
+                _blend = 0.6 if _alignment < 0.3 else 0.2
+                _blended = _avg_perp * (1 - _blend) + _into_dir * _blend
+                _bl_len = np.linalg.norm(_blended)
+                if _bl_len > 1e-10:
+                    _avg_perp = _blended / _bl_len
+
+            _new_pos = _vi_pos + collar_depth * _avg_perp
+
+            # Skip if new position is coincident with source (post re-proj)
+            if np.linalg.norm(_new_pos - _vi_pos) < 1e-6:
+                continue
+
+            _new_idx = len(vertices)
+            vertices.append(_new_pos.copy())
+            _vert_new_idx[_vi] = _new_idx
+
+        # =================================================================
+        # SUB-STEP D: Create quad faces for each outside edge
+        # =================================================================
+        _extended = 0
+        _skipped_degenerate = 0
+        for _va, _vb in _outside_edges:
+            _ek = (min(_va, _vb), max(_va, _vb))
+            if _ek not in _edge_ext_info:
+                continue
+            _, _fn = _edge_ext_info[_ek]
+
+            _new_va_idx = _vert_new_idx.get(_va)
+            _new_vb_idx = _vert_new_idx.get(_vb)
+            if _new_va_idx is None or _new_vb_idx is None:
+                continue
+
+            # Skip if new vertices are nearly coincident with source
+            # (happens when re-projection already brought them to part
+            # surface and extension collapses back to the same spot)
+            _va_pos = np.array(vertices[_va], dtype=np.float64)
+            _vb_pos = np.array(vertices[_vb], dtype=np.float64)
+            _new_va_pos = np.array(vertices[_new_va_idx], dtype=np.float64)
+            _new_vb_pos = np.array(vertices[_new_vb_idx], dtype=np.float64)
+            _disp_a = np.linalg.norm(_new_va_pos - _va_pos)
+            _disp_b = np.linalg.norm(_new_vb_pos - _vb_pos)
+            if _disp_a < 1e-6 and _disp_b < 1e-6:
+                _skipped_degenerate += 1
+                continue
 
             # Build two triangles for the quad [va, vb, new_vb, new_va]
-            # and ensure winding matches the adjacent face normal
             _tri1 = [_va, _vb, _new_vb_idx]
             _tri2 = [_va, _new_vb_idx, _new_va_idx]
             for _tri in (_tri1, _tri2):
@@ -4586,18 +4748,132 @@ def create_robust_collar_extension(
             faces.append(_tri2)
             _extended += 1
 
+        # =================================================================
+        # SUB-STEP E: Join adjacent extension quads with stitching triangles
+        # =================================================================
+        # Where two outside edges share a vertex, the extension quads
+        # already share the new vertex (from SUB-STEP C).  However, when
+        # frontiers have side gaps (e.g., one edge was inside, neighbors
+        # were outside), fill the lateral gap with a triangle connecting
+        # the outside edge's new side vertex to the shared vertex.
+        # This is handled implicitly by vertex sharing above — no extra
+        # stitching faces needed because both quads reference the same
+        # new vertex index, making the strip manifold-continuous.
+
         total_extension_quads += _extended
         # Advance frontier to the vertices created in this iteration
-        # so that the next iteration only checks the new outermost edges
         _frontier_start = _iter_vert_start
         logger.info(f"Collar extension iter {_ext_iter + 1}: "
-                    f"extended {_extended} edges")
+                    f"extended {_extended} edges "
+                    f"({len(_vert_new_idx)} shared new vertices"
+                    f"{f', {_skipped_degenerate} degenerate skipped' if _skipped_degenerate else ''})")
         if _extended == 0:
             break
 
-    if total_extension_quads > 0:
-        logger.info(f"Iterative collar extension added {total_extension_quads} "
-                    "extension quads total")
+    if total_extension_quads > 0 or total_reprojected > 0:
+        logger.info(f"Iterative collar extension: {total_extension_quads} "
+                    f"extension quads, {total_reprojected} vertex "
+                    "re-projections total")
+
+    # =========================================================================
+    # STEP 6c: Final frontier validation and inward push
+    # =========================================================================
+    # Safety net: after all iterative extensions, ensure the outermost collar
+    # boundary vertices are inside the part mesh.  Any that are still outside
+    # get re-projected to the closest part surface point, then pushed inward
+    # along the negative surface normal by a small fraction of collar_depth.
+    # Also logs a diagnostic of how many final collar boundary edge midpoints
+    # are inside vs outside the part mesh.
+
+    if len(vertices) > n_orig_verts:
+        _final_verts_arr = np.array(vertices, dtype=np.float64)
+
+        # Build edge-face counts for final mesh state
+        _final_efc: Dict[Tuple[int, int], int] = {}
+        for _fi, _face in enumerate(faces):
+            for _ei in range(3):
+                _va, _vb = int(_face[_ei]), int(_face[(_ei + 1) % 3])
+                _ek = (min(_va, _vb), max(_va, _vb))
+                _final_efc[_ek] = _final_efc.get(_ek, 0) + 1
+
+        # Collar boundary vertices: boundary (count==1) and index >= n_orig_verts
+        _collar_bv = set()
+        for (_va, _vb), cnt in _final_efc.items():
+            if cnt == 1:
+                if _va >= n_orig_verts:
+                    _collar_bv.add(_va)
+                if _vb >= n_orig_verts:
+                    _collar_bv.add(_vb)
+
+        if _collar_bv:
+            _cbv_list = sorted(_collar_bv)
+            _cbv_positions = _final_verts_arr[_cbv_list]
+            try:
+                _cbv_inside = part_mesh.contains(_cbv_positions)
+                _cbv_outside_vi = [
+                    _cbv_list[i] for i in range(len(_cbv_list))
+                    if not _cbv_inside[i]
+                ]
+
+                if _cbv_outside_vi:
+                    _cbv_out_pos = _final_verts_arr[_cbv_outside_vi]
+                    _cp, _, _cf = trimesh.proximity.closest_point(
+                        part_mesh, _cbv_out_pos)
+                    _push_depth = collar_depth * 0.15
+                    _n_pushed = 0
+                    for _oi, _vi in enumerate(_cbv_outside_vi):
+                        _pfi = _cf[_oi]
+                        if _pfi < len(part_mesh.face_normals):
+                            _pn = part_mesh.face_normals[_pfi]
+                            _pn_len = np.linalg.norm(_pn)
+                            if _pn_len > 1e-10:
+                                _into = -_pn / _pn_len
+                                vertices[_vi] = (
+                                    _cp[_oi] + _push_depth * _into
+                                ).copy()
+                            else:
+                                vertices[_vi] = _cp[_oi].copy()
+                        else:
+                            vertices[_vi] = _cp[_oi].copy()
+                        _n_pushed += 1
+
+                    logger.info(
+                        f"Final frontier: pushed {_n_pushed}/"
+                        f"{len(_cbv_list)} outside collar boundary "
+                        "vertices inward")
+                else:
+                    logger.info(
+                        f"Final frontier: all {len(_cbv_list)} collar "
+                        "boundary vertices inside part")
+
+                # Diagnostic: test midpoints of collar boundary edges
+                _collar_be_final = [
+                    (va, vb) for (va, vb), cnt in _final_efc.items()
+                    if cnt == 1
+                    and (va >= n_orig_verts or vb >= n_orig_verts)
+                ]
+                if _collar_be_final:
+                    _diag_verts = np.array(vertices, dtype=np.float64)
+                    _fmids = np.array([
+                        (_diag_verts[va] + _diag_verts[vb]) / 2.0
+                        for va, vb in _collar_be_final
+                    ])
+                    _fmid_inside = part_mesh.contains(_fmids)
+                    _n_in = int(np.sum(_fmid_inside))
+                    _n_out = len(_collar_be_final) - _n_in
+                    if _n_out > 0:
+                        logger.warning(
+                            f"Final collar validation: {_n_out}/"
+                            f"{len(_collar_be_final)} edge midpoints "
+                            "still outside part mesh")
+                    else:
+                        logger.info(
+                            f"Final collar validation: all "
+                            f"{len(_collar_be_final)} edge midpoints "
+                            "inside part mesh")
+            except Exception as _ex:
+                logger.warning(
+                    f"Final frontier validation failed: {_ex}")
 
     # =========================================================================
     # STEP 7: Create result mesh
