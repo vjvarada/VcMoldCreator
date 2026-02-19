@@ -42,12 +42,15 @@ DEFAULT_AIR_ESCAPE_DEPTH_MM = 1.5     # Default depth of air escape holes
 DEFAULT_INLET_MIN_DEPTH_MM = 1.5     # Minimum depth of resin inlet hole
 DEFAULT_LOCAL_DIAMETER_MM = 1.2       # Diameter for air escape holes (local maxima)
 DEFAULT_GLOBAL_DIAMETER_MM = 5.2      # Top diameter for resin inlet hole (global maximum)
-DEFAULT_GLOBAL_BOTTOM_DIAMETER_MM = 1.2  # Bottom diameter of tapered resin inlet hole
+DEFAULT_GLOBAL_BOTTOM_DIAMETER_MM = 2.2  # Bottom diameter of tapered resin inlet hole
 DEFAULT_SHELL_INLET_DIAMETER_MM = 12.2  # Diameter for hard shell through-hole
 PLUG_TOLERANCE_MM = 0.2                   # Tolerance clearance for plug dimensions
 PLUG_TAPER_ANGLE_DEG = 20.0               # Taper half-angle in degrees (plug-to-shell transition)
 CYLINDER_SEGMENTS = 32                # Number of segments for cylinder approximation
 INLET_DEPTH_SAMPLE_POINTS = 24        # Points around circumference for depth ray-casting
+MAX_INTO_PART_ANGLE_DEG = 25.0        # Max angle for adaptive into-part direction
+CSG_OVERLAP_MM = 0.5                  # Overlap distance for clean CSG union at junctions
+INLET_CONTAINMENT_MARGIN_MM = 0.5     # Extra depth beyond first-contained point
 
 
 # ============================================================================
@@ -75,6 +78,11 @@ class ResinChannelResult:
     local_diameter_mm: float = DEFAULT_LOCAL_DIAMETER_MM
     global_diameter_mm: float = DEFAULT_GLOBAL_DIAMETER_MM
     global_bottom_diameter_mm: float = DEFAULT_GLOBAL_BOTTOM_DIAMETER_MM
+    
+    # Adaptive angled inlet geometry
+    into_part_direction: Optional[np.ndarray] = None   # (3,) angled direction for lower section
+    inlet_entry_point: Optional[np.ndarray] = None     # (3,) where inlet meets part surface
+    inlet_angled_depth_mm: float = 0.0                  # Depth of angled lower section
     
     # Number of channels created
     n_local_channels: int = 0
@@ -560,6 +568,729 @@ def _compute_inlet_depth(
 
 
 # ============================================================================
+# ADAPTIVE ANGLED INLET HELPERS
+# ============================================================================
+
+def _find_part_entry_point(
+    cylinder_center: np.ndarray,
+    drill_direction: np.ndarray,
+    part_mesh: trimesh.Trimesh,
+    max_search_angle_deg: float = MAX_INTO_PART_ANGLE_DEG,
+) -> Tuple[Optional[np.ndarray], float, np.ndarray]:
+    """
+    Find the **shallowest** (nearest to *cylinder_center*) entry point on
+    the part surface by casting rays in a cone around *drill_direction*.
+
+    For convex parts the straight-down ray already gives the closest
+    entry.  For concave / hollow parts (cups, bowls, tubes) an angled
+    ray may hit a wall near the top at a much shorter distance than the
+    straight-down ray which would hit the distant bottom.
+
+    Algorithm:
+      1. Generate candidate ray directions: the primary drill ray plus
+         rings of tilted rays (5°–45° from drill, 12 azimuth samples
+         per ring).
+      2. Batch ray-cast all candidates at once.
+      3. For each ray keep only the nearest forward hit.
+      4. Across all rays pick the one whose first hit is closest to
+         *cylinder_center* (Euclidean distance).
+
+    Args:
+        cylinder_center: (3,) starting point above metamold surface
+        drill_direction: (3,) primary drill direction unit vector
+        part_mesh: The original part mesh
+        max_search_angle_deg: Maximum cone half-angle to search
+
+    Returns:
+        Tuple of ``(entry_point, distance, approach_direction)``.
+        *entry_point* is ``None`` if no intersection is found.
+        *approach_direction* is the ray direction that found the best hit
+        (normalised).  Falls back to *drill_direction* on failure.
+    """
+    center = np.asarray(cylinder_center, dtype=np.float64)
+    drill_dir = np.asarray(drill_direction, dtype=np.float64)
+    drill_dir = drill_dir / (np.linalg.norm(drill_dir) + 1e-10)
+
+    # --- build orthonormal basis perpendicular to drill_dir ---------------
+    if abs(drill_dir[0]) < 0.9:
+        arb = np.array([1.0, 0.0, 0.0])
+    else:
+        arb = np.array([0.0, 1.0, 0.0])
+    u = np.cross(drill_dir, arb)
+    u = u / (np.linalg.norm(u) + 1e-10)
+    v = np.cross(drill_dir, u)
+    v = v / (np.linalg.norm(v) + 1e-10)
+
+    # --- generate candidate ray directions --------------------------------
+    candidate_dirs = [drill_dir.copy()]                              # always include primary
+
+    tilt_angles_deg = [5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0]
+    tilt_angles_deg = [t for t in tilt_angles_deg if t <= max_search_angle_deg]
+    n_azimuth = 12
+
+    for tilt_deg in tilt_angles_deg:
+        tilt_rad = np.radians(tilt_deg)
+        for az in np.linspace(0, 2 * np.pi, n_azimuth, endpoint=False):
+            perp = np.cos(az) * u + np.sin(az) * v
+            d = np.cos(tilt_rad) * drill_dir + np.sin(tilt_rad) * perp
+            d = d / (np.linalg.norm(d) + 1e-10)
+            candidate_dirs.append(d)
+
+    n_rays = len(candidate_dirs)
+    origins = np.tile(center, (n_rays, 1))
+    directions = np.array(candidate_dirs)
+
+    # --- batch ray-cast ---------------------------------------------------
+    try:
+        locations, ray_indices, _ = part_mesh.ray.intersects_location(
+            ray_origins=origins,
+            ray_directions=directions
+        )
+    except Exception as e:
+        logger.warning("  Multi-ray cast to part failed: %s", e)
+        return None, 0.0, drill_dir.copy()
+
+    if len(locations) == 0:
+        logger.warning("  No part intersection from any ray direction")
+        return None, 0.0, drill_dir.copy()
+
+    # --- per-ray nearest forward hit --------------------------------------
+    best_per_ray: dict = {}                # ray_idx → (fwd_dist, location)
+    for i in range(len(locations)):
+        ray_idx = int(ray_indices[i])
+        fwd = float(np.dot(locations[i] - center, candidate_dirs[ray_idx]))
+        if fwd <= 0.01:
+            continue
+        if ray_idx not in best_per_ray or fwd < best_per_ray[ray_idx][0]:
+            best_per_ray[ray_idx] = (fwd, locations[i].copy())
+
+    if not best_per_ray:
+        logger.warning("  No forward intersections with part surface")
+        return None, 0.0, drill_dir.copy()
+
+    # --- across all rays, find the shortest distance ----------------------
+    best_dist = float("inf")
+    best_entry = None
+    best_ray_idx = 0
+    for ray_idx, (fwd, loc) in best_per_ray.items():
+        if fwd < best_dist:
+            best_dist = fwd
+            best_entry = loc
+            best_ray_idx = ray_idx
+
+    approach_dir = candidate_dirs[best_ray_idx].copy()
+    tilt = np.degrees(np.arccos(np.clip(np.dot(approach_dir, drill_dir), -1, 1)))
+
+    # Also report the straight-down distance for comparison
+    straight_dist = best_per_ray.get(0, (float("inf"), None))[0]
+    if straight_dist < float("inf") and best_dist < straight_dist - 0.5:
+        logger.info("  Part entry: %.1fmm via %.1f° ray (straight-down was "
+                     "%.1fmm — saved %.1fmm by angling)",
+                     best_dist, tilt, straight_dist,
+                     straight_dist - best_dist)
+    else:
+        logger.info("  Part entry point found at distance %.2fmm from surface"
+                     " (approach %.1f° from drill, searched %d rays)",
+                     best_dist, tilt, n_rays)
+
+    return best_entry, best_dist, approach_dir
+
+
+def _compute_into_part_direction(
+    entry_point: np.ndarray,
+    drill_direction: np.ndarray,
+    part_mesh: trimesh.Trimesh,
+    max_angle_deg: float = MAX_INTO_PART_ANGLE_DEG,
+    bottom_radius: float = DEFAULT_GLOBAL_BOTTOM_DIAMETER_MM / 2.0,
+    n_cone_samples: int = 32,
+    n_depth_probes: int = 20,
+    max_probe_depth_mm: float = 15.0,
+    n_circle_samples: int = 8
+) -> np.ndarray:
+    """
+    Compute the direction from the entry point that lets the frustum tip
+    (a circle of *bottom_radius*) fit inside the part at the **shallowest**
+    possible depth.
+
+    Instead of maximising how many single-point probes are inside solid
+    (which biases toward long paths along thin walls), this checks at
+    each probe depth whether a full **circle** of ``bottom_radius`` is
+    contained.  The scoring prefers directions where circle containment
+    is achieved earliest (shallowest fitted depth).
+
+    Algorithm:
+      1. Build orthonormal basis perpendicular to drill_direction.
+      2. Sample candidate directions at multiple tilt angles (0° to
+         max_angle_deg) × azimuth angles (0° to 360°).
+      3. For each candidate direction, build probe **circles** (not
+         single points) at increasing depths from entry_point.
+      4. Score = negative of the shallowest depth where ALL circle
+         sample points are inside the part (lower depth = better).
+      5. Among directions with the same shallowest fitted depth,
+         prefer the smallest tilt angle (straightest path).
+      6. If no direction achieves circle containment at any probed
+         depth, fall back to single-point containment scoring.
+
+    Args:
+        entry_point: (3,) where the inlet meets the part surface
+        drill_direction: (3,) original drill direction (straight into part)
+        part_mesh: The original part mesh (should be watertight)
+        max_angle_deg: Maximum deviation angle from drill_direction
+        bottom_radius: Radius of the frustum bottom circle to check
+        n_cone_samples: Number of azimuth samples per tilt ring
+        n_depth_probes: Number of probe depths along each direction
+        max_probe_depth_mm: Max depth to probe into the part
+        n_circle_samples: Points around the circle perimeter to check
+
+    Returns:
+        (3,) unit vector for the best into-part direction
+    """
+    drill_dir = np.asarray(drill_direction, dtype=np.float64)
+    drill_dir = drill_dir / (np.linalg.norm(drill_dir) + 1e-10)
+    entry = np.asarray(entry_point, dtype=np.float64)
+
+    # Build orthonormal basis perpendicular to drill_dir
+    if abs(drill_dir[0]) < 0.9:
+        arb = np.array([1.0, 0.0, 0.0])
+    else:
+        arb = np.array([0.0, 1.0, 0.0])
+    u = np.cross(drill_dir, arb)
+    u = u / (np.linalg.norm(u) + 1e-10)
+    v = np.cross(drill_dir, u)
+    v = v / (np.linalg.norm(v) + 1e-10)
+
+    # --- generate candidate directions -----------------------------------
+    tilt_angles_deg = [0.0, 5.0, 10.0, 15.0, 25.0, 35.0, 45.0]
+    tilt_angles_deg = [t for t in tilt_angles_deg if t <= max_angle_deg]
+    if not tilt_angles_deg or tilt_angles_deg[0] != 0.0:
+        tilt_angles_deg.insert(0, 0.0)
+
+    candidates = []                    # (direction, tilt_deg)
+    for tilt_deg in tilt_angles_deg:
+        tilt_rad = np.radians(tilt_deg)
+        if tilt_deg < 0.1:
+            candidates.append((drill_dir.copy(), 0.0))
+            continue
+        n_az = max(6, n_cone_samples // len(tilt_angles_deg))
+        for az in np.linspace(0, 2 * np.pi, n_az, endpoint=False):
+            perp = np.cos(az) * u + np.sin(az) * v
+            d = np.cos(tilt_rad) * drill_dir + np.sin(tilt_rad) * perp
+            d = d / (np.linalg.norm(d) + 1e-10)
+            candidates.append((d, tilt_deg))
+
+    n_cand = len(candidates)
+    probe_ts = np.linspace(0.3, max_probe_depth_mm, n_depth_probes)
+    n_probes = len(probe_ts)
+
+    # --- build per-direction orthonormal bases for circle points ----------
+    circle_angles = np.linspace(0, 2 * np.pi, n_circle_samples, endpoint=False)
+    cos_ca = np.cos(circle_angles)          # (n_circle,)
+    sin_ca = np.sin(circle_angles)
+
+    bases = []                               # (u_d, v_d) per candidate
+    for d, _ in candidates:
+        if abs(d[0]) < 0.9:
+            a = np.array([1.0, 0.0, 0.0])
+        else:
+            a = np.array([0.0, 1.0, 0.0])
+        u_d = np.cross(d, a);  u_d /= (np.linalg.norm(u_d) + 1e-10)
+        v_d = np.cross(d, u_d); v_d /= (np.linalg.norm(v_d) + 1e-10)
+        bases.append((u_d, v_d))
+
+    # --- build ALL probe points (circle + center per depth per cand) ------
+    pts_per_depth = n_circle_samples + 1     # perimeter + centre
+    total_pts = n_cand * n_probes * pts_per_depth
+    all_points = np.empty((total_pts, 3), dtype=np.float64)
+
+    idx = 0
+    for i, (d, _) in enumerate(candidates):
+        u_d, v_d = bases[i]
+        for j, t in enumerate(probe_ts):
+            c = entry + d * t
+            for k in range(n_circle_samples):
+                all_points[idx + k] = (c
+                    + bottom_radius * (cos_ca[k] * u_d + sin_ca[k] * v_d))
+            all_points[idx + n_circle_samples] = c      # centre point
+            idx += pts_per_depth
+
+    # --- batch containment check ------------------------------------------
+    try:
+        inside = part_mesh.contains(all_points)
+    except Exception as e:
+        logger.warning("  Containment check failed: %s — falling back to "
+                       "drill dir", e)
+        return drill_dir.copy()
+
+    inside = inside.reshape(n_cand, n_probes, pts_per_depth)
+
+    # A depth is "circle-contained" if ALL pts (perimeter + centre) inside
+    circle_ok = np.all(inside, axis=2)          # (n_cand, n_probes)
+
+    # --- PRIMARY score: shallowest depth where circle is contained --------
+    # For each candidate, find the index of the first True along probes
+    INF_DEPTH = max_probe_depth_mm + 100.0
+    fitted_depth = np.full(n_cand, INF_DEPTH)
+    for i in range(n_cand):
+        first_ok = np.argmax(circle_ok[i])       # first True index
+        if circle_ok[i, first_ok]:                # there IS a True
+            fitted_depth[i] = probe_ts[first_ok]
+
+    best_fitted = float(np.min(fitted_depth))
+
+    if best_fitted >= INF_DEPTH:
+        # --- FALLBACK: no direction achieves circle containment -----------
+        # Use single-point (centre-only) containment count instead.
+        centre_inside = inside[:, :, -1]          # (n_cand, n_probes)
+        scores = np.sum(centre_inside, axis=1)
+        best_score = int(np.max(scores))
+
+        if best_score == 0:
+            logger.warning("  Into-part direction: no solid material in any "
+                           "direction — using drill dir")
+            return drill_dir.copy()
+
+        best_mask = scores == best_score
+        tilts = np.array([candidates[i][1] for i in range(n_cand)])
+        best_indices = np.where(best_mask)[0]
+        winner_idx = best_indices[np.argmin(tilts[best_mask])]
+        winner_dir, winner_tilt = candidates[winner_idx]
+
+        logger.info("  Into-part direction (point-fallback): %.1f° from drill, "
+                     "score=%d/%d (sampled %d dirs, circle never contained)",
+                     winner_tilt, best_score, n_probes, n_cand)
+        return winner_dir
+
+    # --- among candidates with smallest fitted depth, pick min tilt -------
+    DEPTH_TOL = 0.05                             # mm tolerance for ties
+    best_mask = fitted_depth <= best_fitted + DEPTH_TOL
+    tilts = np.array([candidates[i][1] for i in range(n_cand)])
+    best_indices = np.where(best_mask)[0]
+    winner_idx = best_indices[np.argmin(tilts[best_mask])]
+    winner_dir, winner_tilt = candidates[winner_idx]
+
+    # How many circle-contained depths does the winner have?
+    n_ok = int(np.sum(circle_ok[winner_idx]))
+
+    logger.info("  Into-part direction: %.1f° from drill, circle fits at "
+                "%.1fmm depth (%d/%d depths OK, sampled %d dirs)",
+                winner_tilt, best_fitted, n_ok, n_probes, n_cand)
+
+    return winner_dir
+
+
+def _compute_angled_inlet_depth(
+    entry_point: np.ndarray,
+    into_part_dir: np.ndarray,
+    bottom_radius: float,
+    part_mesh: trimesh.Trimesh,
+    min_depth_mm: float = DEFAULT_INLET_MIN_DEPTH_MM,
+    n_circle_samples: int = INLET_DEPTH_SAMPLE_POINTS,
+    containment_margin_mm: float = INLET_CONTAINMENT_MARGIN_MM
+) -> float:
+    """
+    Compute the MINIMUM depth along *into_part_dir* from *entry_point*
+    such that the bottom circle of *bottom_radius* is fully contained in
+    the part, plus a small safety margin.
+
+    This ensures the taper is as SHORT and STEEP as possible — the tip
+    dives into the part just enough to be fully embedded.
+
+    Uses a linear scan followed by binary-search refinement to find the
+    shallowest depth at which the entire bottom circle is inside the part.
+
+    Args:
+        entry_point: (3,) starting point on part surface
+        into_part_dir: (3,) direction going into the part interior
+        bottom_radius: Radius of the bottom circle (e.g. 0.6 mm)
+        part_mesh: The original part mesh (should be watertight)
+        min_depth_mm: Minimum depth to return
+        n_circle_samples: Number of sample points on the bottom circle
+        containment_margin_mm: Extra depth beyond first contained point
+
+    Returns:
+        Computed depth in mm (>= *min_depth_mm*)
+    """
+    into_dir = np.asarray(into_part_dir, dtype=np.float64)
+    into_dir = into_dir / (np.linalg.norm(into_dir) + 1e-10)
+    entry = np.asarray(entry_point, dtype=np.float64)
+
+    # Orthonormal basis perpendicular to into_part_dir
+    if abs(into_dir[0]) < 0.9:
+        arb = np.array([1.0, 0.0, 0.0])
+    else:
+        arb = np.array([0.0, 1.0, 0.0])
+    u = np.cross(into_dir, arb)
+    u = u / (np.linalg.norm(u) + 1e-10)
+    v = np.cross(into_dir, u)
+    v = v / (np.linalg.norm(v) + 1e-10)
+
+    # Max possible depth: ray from entry → find exit from part
+    try:
+        locations, _, _ = part_mesh.ray.intersects_location(
+            ray_origins=entry.reshape(1, 3),
+            ray_directions=into_dir.reshape(1, 3)
+        )
+    except Exception:
+        logger.warning("  Ray-cast failed for angled depth — using min depth")
+        return min_depth_mm
+
+    if len(locations) == 0:
+        logger.warning("  No exit intersection from entry — using min depth")
+        return min_depth_mm
+
+    dists = np.dot(locations - entry, into_dir)
+    pos_mask = dists > 0.1
+    if not np.any(pos_mask):
+        logger.warning("  No positive-distance exit — using min depth")
+        return min_depth_mm
+
+    max_ray_depth = float(np.min(dists[pos_mask]))
+    conservative_max = max_ray_depth - bottom_radius - 0.3
+
+    if conservative_max < min_depth_mm:
+        logger.info("  Part too thin along angled dir (exit %.2fmm) — min depth",
+                     max_ray_depth)
+        return min_depth_mm
+
+    # Prepare circle sample offsets
+    angles = np.linspace(0, 2 * np.pi, n_circle_samples, endpoint=False)
+    circle_u = bottom_radius * np.cos(angles)
+    circle_v = bottom_radius * np.sin(angles)
+
+    def _check_depth(depth: float) -> bool:
+        """Check if all sample points at this depth are inside the part."""
+        c = entry + into_dir * depth
+        pts = np.zeros((n_circle_samples + 1, 3))
+        pts[-1] = c
+        for i in range(n_circle_samples):
+            pts[i] = c + circle_u[i] * u + circle_v[i] * v
+        try:
+            return bool(np.all(part_mesh.contains(pts)))
+        except Exception:
+            return depth <= conservative_max
+
+    # Linear scan from a small starting depth to find the FIRST depth
+    # where the entire bottom circle is inside the part.
+    scan_step = 0.25   # mm
+    first_contained = None
+    test_depth = 0.2   # start just inside, not right on the surface
+
+    while test_depth <= conservative_max:
+        if _check_depth(test_depth):
+            first_contained = test_depth
+            break
+        test_depth += scan_step
+
+    if first_contained is None:
+        logger.warning("  Circle never contained along angled dir — using min depth")
+        return min_depth_mm
+
+    # Binary-search refinement between (first_contained - scan_step) and
+    # first_contained to find the exact transition.
+    lo = max(0.1, first_contained - scan_step)
+    hi = first_contained
+    for _ in range(12):
+        mid = (lo + hi) / 2.0
+        if _check_depth(mid):
+            hi = mid   # circle is inside — try shallower
+        else:
+            lo = mid   # circle is outside — need deeper
+    first_contained = hi
+
+    result_depth = first_contained + containment_margin_mm
+    result_depth = min(result_depth, conservative_max)
+
+    logger.info("  Angled inlet depth: %.2fmm (first contained: %.2fmm, "
+                "exit: %.2fmm)", result_depth, first_contained, max_ray_depth)
+    return max(result_depth, min_depth_mm)
+
+
+def _build_compound_inlet(
+    cylinder_center: np.ndarray,
+    drill_direction: np.ndarray,
+    entry_point: np.ndarray,
+    into_part_dir: np.ndarray,
+    top_radius: float,
+    bottom_radius: float,
+    upper_height: float,
+    angled_depth: float,
+    segments: int = CYLINDER_SEGMENTS
+) -> trimesh.Trimesh:
+    """
+    Build a single-piece compound inlet hole for CSG subtraction.
+
+    Three vertex rings form one continuous, watertight mesh:
+
+      - **Ring 0** at *cylinder_center*  (⌀ ``top_radius*2``)  — top
+      - **Ring 1** at *axial junction*   (⌀ ``top_radius*2``)  — on drill axis
+      - **Ring 2** at *tip*              (⌀ ``bottom_radius*2``) — bottom
+
+    Rings 0–1 form a straight cylinder along ``drill_direction``
+    (stays coaxial — no lateral drift even when entry is offset).
+    Rings 1–2 form an angled frustum toward the tip inside the part.
+    The axial junction is the projection of entry_point onto the
+    drill axis, so the 5 mm section never tilts.
+
+    Args:
+        cylinder_center: (3,) hole start above metamold surface
+        drill_direction: (3,) straight drill direction (vertical)
+        entry_point: (3,) where the drill ray intersects the part surface
+        into_part_dir: (3,) adaptive direction into the part (angled)
+        top_radius: Radius of upper cylinder / top of lower frustum
+        bottom_radius: Radius at the frustum tip
+        upper_height: Distance from cylinder_center to entry_point
+        angled_depth: Depth of angled section into the part
+        segments: Circle resolution
+
+    Returns:
+        Single watertight trimesh (no CSG union needed).
+    """
+    drill_dir = np.asarray(drill_direction, dtype=np.float64)
+    drill_dir = drill_dir / (np.linalg.norm(drill_dir) + 1e-10)
+    into_dir = np.asarray(into_part_dir, dtype=np.float64)
+    into_dir = into_dir / (np.linalg.norm(into_dir) + 1e-10)
+    center = np.asarray(cylinder_center, dtype=np.float64)
+    entry = np.asarray(entry_point, dtype=np.float64)
+    tip = entry + into_dir * angled_depth
+
+    # Axial junction: project entry_point onto the drill axis through
+    # cylinder_center.  The upper 5 mm cylinder stays coaxial with
+    # drill_direction; only the frustum below angles toward the tip.
+    axial_height = float(np.dot(entry - center, drill_dir))
+    axial_junction = center + drill_dir * axial_height
+
+    angle_deg = np.degrees(np.arccos(np.clip(
+        abs(np.dot(into_dir, drill_dir)), 0, 1)))
+
+    # Orthonormal basis perpendicular to drill_direction.
+    # All rings share this basis so vertices line up azimuthally
+    # and the junction ring is geometrically seamless.
+    ref = np.array([1.0, 0.0, 0.0])
+    if abs(np.dot(drill_dir, ref)) > 0.9:
+        ref = np.array([0.0, 1.0, 0.0])
+    u = np.cross(drill_dir, ref)
+    u = u / (np.linalg.norm(u) + 1e-10)
+    v = np.cross(drill_dir, u)
+    v = v / (np.linalg.norm(v) + 1e-10)
+
+    # Three rings — ring 1 on the drill axis ⇒ 5 mm section stays axial
+    ring_specs = [
+        (center,          top_radius),    # Ring 0: top of straight cylinder
+        (axial_junction,  top_radius),    # Ring 1: axial junction (on drill axis)
+        (tip,             bottom_radius), # Ring 2: angled frustum tip
+    ]
+
+    angles = np.linspace(0, 2 * np.pi, segments, endpoint=False)
+    cos_a, sin_a = np.cos(angles), np.sin(angles)
+
+    vertices = []
+    for rc, rr in ring_specs:
+        for j in range(segments):
+            vertices.append(rc + rr * (cos_a[j] * u + sin_a[j] * v))
+
+    top_cap_idx = len(vertices)
+    vertices.append(center.copy())
+    bot_cap_idx = len(vertices)
+    vertices.append(tip.copy())
+    vertices = np.array(vertices, dtype=np.float64)
+
+    n_rings = len(ring_specs)
+    faces = []
+
+    # Side quads between adjacent rings
+    for i in range(n_rings - 1):
+        for j in range(segments):
+            j_next = (j + 1) % segments
+            t0 = i * segments + j
+            t1 = i * segments + j_next
+            b0 = (i + 1) * segments + j
+            b1 = (i + 1) * segments + j_next
+            faces.append([t0, b0, t1])
+            faces.append([t1, b0, b1])
+
+    # Top cap (ring 0)
+    for j in range(segments):
+        j_next = (j + 1) % segments
+        faces.append([top_cap_idx, j_next, j])
+
+    # Bottom cap (ring 2 = tip)
+    last_ring = (n_rings - 1) * segments
+    for j in range(segments):
+        j_next = (j + 1) % segments
+        faces.append([bot_cap_idx, last_ring + j, last_ring + j_next])
+
+    faces = np.array(faces, dtype=np.int64)
+
+    frustum_length = float(np.linalg.norm(tip - axial_junction))
+    logger.info("  Compound inlet (single mesh): upper ⌀%.1fmm × %.1fmm "
+                "(axial) + lower ⌀%.1f→⌀%.1fmm × %.1fmm (%.1f° tilt)",
+                top_radius * 2, abs(axial_height),
+                top_radius * 2, bottom_radius * 2,
+                frustum_length, angle_deg)
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
+    mesh.fix_normals()
+    return mesh
+
+
+def _build_angled_plug(
+    inlet_cylinder_center: np.ndarray,
+    inlet_entry_point: np.ndarray,
+    into_part_direction: np.ndarray,
+    resin_direction: np.ndarray,
+    shell_half: trimesh.Trimesh,
+    inlet_top_radius: float,
+    inlet_bottom_radius: float,
+    wide_radius: float,
+    angled_depth: float,
+    taper_angle_deg: float = PLUG_TAPER_ANGLE_DEG,
+    segments: int = CYLINDER_SEGMENTS
+) -> Optional[trimesh.Trimesh]:
+    """
+    Build a single-piece resin plug matching the compound inlet hole.
+
+    Five vertex rings form one continuous, watertight mesh:
+
+      - **Ring 0**: *tip*             (⌀ ``inlet_bottom_radius*2``) — angled
+      - **Ring 1**: *axial junction*  (⌀ ``inlet_top_radius*2``)   — on axis
+      - **Ring 2**: *center level*    (⌀ ``inlet_top_radius*2``)   — axial
+      - **Ring 3**: *taper end*       (⌀ ``wide_radius*2``)        — axial
+      - **Ring 4**: *shell top*       (⌀ ``wide_radius*2``)        — axial
+
+    Ring 0–1 is the angled frustum (only section that tilts).
+    Rings 1–4 are the axial section along ``resin_direction``
+    (coaxial with the hard-shell hole at cylinder_center).
+
+    Args:
+        inlet_cylinder_center: (3,) frustum start above metamold surface
+        inlet_entry_point: (3,) where the inlet meets the part surface
+        into_part_direction: (3,) adaptive direction into the part
+        resin_direction: (3,) resin pouring direction (upward)
+        shell_half: Hard shell mesh (for computing shell top)
+        inlet_top_radius: Plug radius at metamold surface (with tolerance)
+        inlet_bottom_radius: Plug radius at tip (with tolerance)
+        wide_radius: Plug radius in shell section (with tolerance)
+        angled_depth: Depth of angled section into the part
+        taper_angle_deg: Shell-to-inlet taper half-angle
+        segments: Circle resolution
+
+    Returns:
+        Plug mesh, or None on failure
+    """
+    resin_dir = np.asarray(resin_direction, dtype=np.float64)
+    resin_dir = resin_dir / (np.linalg.norm(resin_dir) + 1e-10)
+    into_dir = np.asarray(into_part_direction, dtype=np.float64)
+    into_dir = into_dir / (np.linalg.norm(into_dir) + 1e-10)
+    center = np.asarray(inlet_cylinder_center, dtype=np.float64)
+    entry = np.asarray(inlet_entry_point, dtype=np.float64)
+    tip = entry + into_dir * angled_depth
+
+    # Axial junction: project entry_point onto the resin axis through
+    # cylinder_center.  The 5 mm section stays coaxial with resin_dir;
+    # only the frustum below angles toward the tip.
+    axial_drop = float(np.dot(entry - center, resin_dir))
+    axial_junction = center + resin_dir * axial_drop
+
+    angle_deg = np.degrees(np.arccos(np.clip(
+        abs(np.dot(into_dir, resin_dir)), 0, 1)))
+
+    # Heights along resin_dir measured from cylinder_center.
+    # Rings 2–4 MUST be centred on cylinder_center’s XY position so
+    # the plug aligns with the hard-shell through-hole (which is
+    # drilled at cylinder_center).
+    taper_angle_rad = np.radians(taper_angle_deg)
+    taper_height = (wide_radius - inlet_top_radius) / np.tan(taper_angle_rad)
+
+    shell_projs = np.dot(np.asarray(shell_half.vertices), resin_dir)
+    shell_top_proj = float(np.max(shell_projs))
+    center_proj = float(np.dot(center, resin_dir))
+    h_above_center = shell_top_proj - center_proj
+    if h_above_center < taper_height + 0.5:
+        h_above_center = taper_height + 0.5
+
+    # Orthonormal basis perpendicular to resin_direction.
+    # All rings share this basis so vertex correspondence is consistent
+    # and the junction ring is geometrically seamless.
+    ref = np.array([1.0, 0.0, 0.0])
+    if abs(np.dot(resin_dir, ref)) > 0.9:
+        ref = np.array([0.0, 1.0, 0.0])
+    u = np.cross(resin_dir, ref)
+    u = u / (np.linalg.norm(u) + 1e-10)
+    v = np.cross(resin_dir, u)
+    v = v / (np.linalg.norm(v) + 1e-10)
+
+    # Five rings — ring 1 is the axial junction (on drill axis).
+    # Rings 1–4 share the cylinder_center XY so the plug is
+    # coaxial with the hard-shell hole.  Only ring 0→1 tilts.
+    ring_specs = [
+        (tip,                                           inlet_bottom_radius),  # Ring 0: tip (angled)
+        (axial_junction,                                inlet_top_radius),     # Ring 1: axial junction
+        (center,                                        inlet_top_radius),     # Ring 2: cylinder_center
+        (center + resin_dir * taper_height,             wide_radius),          # Ring 3: taper end
+        (center + resin_dir * h_above_center,           wide_radius),          # Ring 4: shell top
+    ]
+
+    angles = np.linspace(0, 2 * np.pi, segments, endpoint=False)
+    cos_a, sin_a = np.cos(angles), np.sin(angles)
+
+    vertices = []
+    for rc, rr in ring_specs:
+        for j in range(segments):
+            vertices.append(rc + rr * (cos_a[j] * u + sin_a[j] * v))
+
+    bot_cap_idx = len(vertices)
+    vertices.append(tip.copy())
+    top_cap_idx = len(vertices)
+    vertices.append(ring_specs[-1][0].copy())  # shell top center
+    vertices = np.array(vertices, dtype=np.float64)
+
+    n_rings = len(ring_specs)
+    faces = []
+
+    # Side quads between adjacent rings
+    for i in range(n_rings - 1):
+        for j in range(segments):
+            j_next = (j + 1) % segments
+            t0 = i * segments + j
+            t1 = i * segments + j_next
+            b0 = (i + 1) * segments + j
+            b1 = (i + 1) * segments + j_next
+            faces.append([t0, b0, t1])
+            faces.append([t1, b0, b1])
+
+    # Bottom cap (ring 0 = tip)
+    for j in range(segments):
+        j_next = (j + 1) % segments
+        faces.append([bot_cap_idx, j_next, j])
+
+    # Top cap (ring 4 = shell top)
+    last_ring = (n_rings - 1) * segments
+    for j in range(segments):
+        j_next = (j + 1) % segments
+        faces.append([top_cap_idx, last_ring + j, last_ring + j_next])
+
+    faces = np.array(faces, dtype=np.int64)
+
+    frustum_length = float(np.linalg.norm(tip - axial_junction))
+    h_axial = float(np.linalg.norm(center - axial_junction))
+    logger.info("Creating resin plug (single mesh, lower tilt=%.1f°):", angle_deg)
+    logger.info("  Lower frustum: ⌀%.1f→⌀%.1fmm × %.1fmm (angled)",
+                inlet_bottom_radius * 2, inlet_top_radius * 2, frustum_length)
+    logger.info("  Axial section: ⌀%.1fmm × %.1fmm",
+                inlet_top_radius * 2, h_axial)
+    logger.info("  Shell taper: %.0f° × %.1fmm", taper_angle_deg, taper_height)
+    logger.info("  Wide section: ⌀%.1fmm × %.1fmm",
+                wide_radius * 2, h_above_center - taper_height)
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
+    mesh.fix_normals()
+
+    logger.info("  Plug: %dv, %df, watertight=%s",
+                len(mesh.vertices), len(mesh.faces), mesh.is_watertight)
+    return mesh
+
+
+# ============================================================================
 # MAIN FUNCTION: CREATE RESIN CHANNELS
 # ============================================================================
 
@@ -678,13 +1409,12 @@ def create_resin_channels(
         result.n_local_channels = len(local_maxima_positions)
         result.local_channel_positions = np.array(local_maxima_positions, dtype=np.float64)
     
-    # Create tapered frustum at global maximum (resin inlet)
-    # The frustum center is offset toward the part's 2D convex hull centroid
-    # so that the original global max position sits on the top circumference.
-    # The frustum tapers from global_diameter_mm at the top (metamold surface)
-    # to global_bottom_diameter_mm at the drilling depth.
-    # Depth is auto-computed via ray-casting using the bottom (smaller) radius
-    # to ensure the narrow end is fully cut into the part.
+    # Create compound inlet at global maximum (resin inlet):
+    #   Upper: constant cylinder (⌀ global_diameter_mm) from metamold surface
+    #          to part surface, along the original drill direction.
+    #   Lower: tapered frustum (global_diameter_mm → global_bottom_diameter_mm)
+    #          from part surface into the part interior, along an adaptive
+    #          direction that angles toward the part centroid.
     if has_global:
         global_pos = np.asarray(global_maximum_position, dtype=np.float64)
         global_top_radius = global_diameter_mm / 2.0
@@ -703,38 +1433,110 @@ def create_resin_channels(
             logger.warning("No part mesh provided — placing global inlet centered on maximum")
             cylinder_center = global_pos.copy()
 
-        # Auto-compute inlet depth using the BOTTOM (smaller) radius.
-        # This ensures the narrow end circle is fully cut into the part
-        # even on inclined surfaces.
+        # Move cylinder_center ABOVE the metamold outer surface.
+        # _compute_inlet_offset only shifts laterally, leaving it at the
+        # part surface level.  The frustum must start above the metamold
+        # so the CSG subtraction creates a proper through-hole.
+        resin_dir_up = -drill_direction  # points out of the mold
+        metamold_projs = np.dot(
+            np.asarray(metamold_half.vertices, dtype=np.float64),
+            resin_dir_up)
+        metamold_top_proj = float(np.max(metamold_projs))
+        center_proj = float(np.dot(cylinder_center, resin_dir_up))
+        if metamold_top_proj > center_proj:
+            overshoot = 2.0  # mm above metamold surface for clean CSG
+            lift = metamold_top_proj - center_proj + overshoot
+            cylinder_center = cylinder_center + resin_dir_up * lift
+            logger.info("  Lifted inlet start %.1fmm to above metamold surface",
+                        lift)
+
+        # Try adaptive angled inlet
+        entry_point = None
+        into_part_dir = None
+        angled_depth = 0.0
+        upper_height = 0.0
+        approach_dir = drill_direction.copy()
+
         if part_mesh is not None:
-            inlet_depth = _compute_inlet_depth(
+            entry_point, upper_height, approach_dir = _find_part_entry_point(
                 cylinder_center=cylinder_center,
                 drill_direction=drill_direction,
-                radius=global_bottom_radius,
+                part_mesh=part_mesh
+            )
+
+        if entry_point is not None and part_mesh is not None:
+            # Compute adaptive into-part direction
+            into_part_dir = _compute_into_part_direction(
+                entry_point=entry_point,
+                drill_direction=drill_direction,
+                part_mesh=part_mesh,
+                bottom_radius=global_bottom_radius
+            )
+
+            # Compute angled depth ensuring bottom circle is inside part
+            angled_depth = _compute_angled_inlet_depth(
+                entry_point=entry_point,
+                into_part_dir=into_part_dir,
+                bottom_radius=global_bottom_radius,
                 part_mesh=part_mesh,
                 min_depth_mm=inlet_min_depth_mm
             )
+
+            # Build compound inlet (upper cylinder + lower angled frustum)
+            compound = _build_compound_inlet(
+                cylinder_center=cylinder_center,
+                drill_direction=drill_direction,
+                entry_point=entry_point,
+                into_part_dir=into_part_dir,
+                top_radius=global_top_radius,
+                bottom_radius=global_bottom_radius,
+                upper_height=upper_height,
+                angled_depth=angled_depth
+            )
+            cylinders.append(compound)
+
+            result.inlet_depth_mm = upper_height + angled_depth
+            result.inlet_depth_auto = upper_height + angled_depth
+            result.into_part_direction = into_part_dir.copy()
+            result.inlet_entry_point = entry_point.copy()
+            result.inlet_angled_depth_mm = angled_depth
+
+            angle_deg = np.degrees(np.arccos(
+                np.clip(np.dot(into_part_dir, drill_direction), -1, 1)))
+            logger.info("  Adaptive inlet: upper=%.2fmm, angled=%.2fmm, "
+                        "deviation=%.1f°",
+                         upper_height, angled_depth, angle_deg)
         else:
-            inlet_depth = inlet_min_depth_mm
+            # Fallback: straight frustum (no part entry found)
+            logger.info("  Using straight frustum (no adaptive angle)")
+            if part_mesh is not None:
+                inlet_depth = _compute_inlet_depth(
+                    cylinder_center=cylinder_center,
+                    drill_direction=drill_direction,
+                    radius=global_bottom_radius,
+                    part_mesh=part_mesh,
+                    min_depth_mm=inlet_min_depth_mm
+                )
+            else:
+                inlet_depth = inlet_min_depth_mm
 
-        result.inlet_depth_mm = inlet_depth
-        result.inlet_depth_auto = inlet_depth
+            result.inlet_depth_mm = inlet_depth
+            result.inlet_depth_auto = inlet_depth
 
-        frustum = _create_frustum(
-            center=cylinder_center,
-            direction=drill_direction,
-            top_radius=global_top_radius,
-            bottom_radius=global_bottom_radius,
-            height=inlet_depth
-        )
-        cylinders.append(frustum)
+            frustum = _create_frustum(
+                center=cylinder_center,
+                direction=drill_direction,
+                top_radius=global_top_radius,
+                bottom_radius=global_bottom_radius,
+                height=inlet_depth
+            )
+            cylinders.append(frustum)
+
         result.n_global_channels = 1
         result.global_channel_position = global_pos.copy()
         result.inlet_cylinder_center = cylinder_center.copy()
-        logger.info(f"  Global channel (tapered): original_pos={global_pos}, "
-                    f"cylinder_center={cylinder_center}, "
-                    f"top_r={global_top_radius:.2f}, bottom_r={global_bottom_radius:.2f}, "
-                    f"depth={inlet_depth:.2f}mm (min={inlet_min_depth_mm:.2f}mm)")
+        logger.info("  Global channel: center=%s, top_r=%.2f, bottom_r=%.2f",
+                     cylinder_center, global_top_radius, global_bottom_radius)
     
     if not cylinders:
         logger.warning("No cylinders created - returning original mesh")
@@ -1063,26 +1865,25 @@ def create_resin_plug(
     shell_inlet_diameter_mm: float,
     inlet_depth_mm: float,
     inlet_bottom_diameter_mm: Optional[float] = None,
+    into_part_direction: Optional[np.ndarray] = None,
+    inlet_entry_point: Optional[np.ndarray] = None,
+    inlet_angled_depth_mm: float = 0.0,
     tolerance_mm: float = PLUG_TOLERANCE_MM,
     taper_angle_deg: float = PLUG_TAPER_ANGLE_DEG,
     segments: int = CYLINDER_SEGMENTS
 ) -> Optional[trimesh.Trimesh]:
     """
-    Create a resin pouring plug that fits into the tapered inlet + shell holes.
+    Create a resin pouring plug that fits into the inlet + shell holes.
     
-    The plug is a 4-section solid of revolution:
-      1. Tapered section (bottom): tapers from ⌀(inlet_diameter - tolerance)
-         at the part surface down to ⌀(inlet_bottom_diameter - tolerance) at
-         the base of the inlet hole. Matches the tapered frustum hole shape.
-      2. Narrow top cylinder: ⌀ = inlet_diameter - tolerance, from the part
-         surface up to the start of the plug-to-shell taper.
-      3. Plug-to-shell taper (middle): expands from inlet ⌀ to shell ⌀ at
-         the specified taper half-angle.
-      4. Wide cylinder (top): ⌀ = shell_inlet_diameter - tolerance, extends
-         from the taper top to the top of the hard shell.
+    When adaptive angled geometry is provided (into_part_direction,
+    inlet_entry_point, inlet_angled_depth_mm), builds a compound plug:
+      1. Lower frustum (along into_part_dir): inlet_bottom_radius tip
+         tapering up to inlet_top_radius at the part surface.
+      2. Upper solid of revolution (along resin_dir): constant
+         inlet_top_radius through the metamold, expanding to wide_radius
+         through the hard shell.
     
-    When inlet_bottom_diameter_mm is None, falls back to the constant-diameter
-    plug (no taper in the inlet section), matching legacy behaviour.
+    Otherwise falls back to a straight 4-section solid of revolution.
     
     Args:
         inlet_cylinder_center: (3,) center of the resin inlet hole
@@ -1095,6 +1896,10 @@ def create_resin_plug(
         inlet_depth_mm: Depth of the inlet hole drilled into the metamold
         inlet_bottom_diameter_mm: Bottom diameter of the tapered resin inlet
             hole.  If None, defaults to DEFAULT_GLOBAL_BOTTOM_DIAMETER_MM.
+        into_part_direction: (3,) adaptive angled direction for the lower
+            section.  If None, uses straight plug.
+        inlet_entry_point: (3,) where the inlet meets the part surface.
+        inlet_angled_depth_mm: Depth of the angled lower section.
         tolerance_mm: Clearance tolerance subtracted from diameters
         taper_angle_deg: Taper half-angle for plug-to-shell transition (degrees)
         segments: Number of segments for circular cross-section
@@ -1130,6 +1935,31 @@ def create_resin_plug(
                      f"({inlet_top_radius:.2f})")
         return None
     
+    # ---- Adaptive angled plug (compound geometry) ----
+    has_angled = (into_part_direction is not None and
+                  inlet_entry_point is not None and
+                  inlet_angled_depth_mm > 0.01 and
+                  MANIFOLD_AVAILABLE)
+
+    if has_angled:
+        plug = _build_angled_plug(
+            inlet_cylinder_center=center,
+            inlet_entry_point=np.asarray(inlet_entry_point, dtype=np.float64),
+            into_part_direction=np.asarray(into_part_direction, dtype=np.float64),
+            resin_direction=resin_dir,
+            shell_half=shell_half,
+            inlet_top_radius=inlet_top_radius,
+            inlet_bottom_radius=inlet_bottom_radius,
+            wide_radius=wide_radius,
+            angled_depth=inlet_angled_depth_mm,
+            taper_angle_deg=taper_angle_deg,
+            segments=segments
+        )
+        if plug is not None:
+            return plug
+        logger.warning("Angled plug failed — falling back to straight plug")
+
+    # ---- Straight plug fallback ----
     # The plug base is at the BOTTOM of the inlet hole.
     # inlet_cylinder_center is at the metamold surface (top of hole).
     # The hole drills downward (opposite resin_dir) by inlet_depth_mm.

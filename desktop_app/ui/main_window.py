@@ -1277,7 +1277,10 @@ class ResinChannelsWorker(QThread):
                     shell_half=channel_result.modified_shell_mesh,
                     inlet_diameter_mm=self.global_diameter_mm,
                     shell_inlet_diameter_mm=self.shell_inlet_diameter_mm,
-                    inlet_depth_mm=channel_result.inlet_depth_mm
+                    inlet_depth_mm=channel_result.inlet_depth_mm,
+                    into_part_direction=channel_result.into_part_direction,
+                    inlet_entry_point=channel_result.inlet_entry_point,
+                    inlet_angled_depth_mm=channel_result.inlet_angled_depth_mm,
                 )
                 
                 if plug is not None:
