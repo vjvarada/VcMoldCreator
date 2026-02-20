@@ -666,7 +666,17 @@ def extract_secondary_surfaces_per_component(
             logger.info(f"Found {len(unused_edges)} orphan primary edges to distribute")
             _distribute_orphan_edges_to_components(all_membranes, unused_edges, tet_result)
     
-    # Step 3: Extract surface per component
+    # Step 3: Pre-compute per-component edge sets for cross-component junction handling
+    # When two components share a tet, each component's extraction must see the
+    # OTHER component's edges in that tet.  Otherwise each component only produces
+    # a partial mesh (e.g. 3-edge triangle) instead of the full junction mesh
+    # (e.g. 6-edge INNER_VERTEX with 12 triangles).
+    comp_edge_sets: List[Set[Tuple[int, int]]] = []
+    for membrane in all_membranes:
+        edge_set = {(min(vi, vj), max(vi, vj)) for vi, vj in membrane.cut_edges}
+        comp_edge_sets.append(edge_set)
+    
+    # Step 4: Extract surface per component
     results: List[Tuple[SecondaryMembraneInfo, 'PartingSurfaceResult']] = []
     
     for comp_idx, membrane in enumerate(all_membranes):
@@ -674,21 +684,27 @@ def extract_secondary_surfaces_per_component(
                     f"{len(membrane.cut_edges)} edges, "
                     f"{len(membrane.junction_tets)} junction tets")
         
-        # Build cut flags for just this component's edges
+        # Collect OTHER component's edge sets for cross-component junction filling
+        other_comp_edge_sets = [
+            comp_edge_sets[i] for i in range(len(all_membranes)) if i != comp_idx
+        ]
+        
+        # Build cut flags for this component + primary junctions + cross-component junctions
         if extend_to_primary:
-            cut_flags = compute_extended_secondary_cut_flags_improved(
+            cut_flags = compute_extended_secondary_cut_flags_with_cross_component(
                 tet_result,
                 membrane.cut_edges,
+                other_comp_edge_sets,
                 include_junction_primary_edges=True
             )
         else:
-            n_edges = len(tet_result.edges)
-            edge_to_index = tet_result.edge_to_index or {}
-            cut_flags = np.zeros(n_edges, dtype=np.int8)
-            for vi, vj in membrane.cut_edges:
-                key = (min(vi, vj), max(vi, vj))
-                if key in edge_to_index:
-                    cut_flags[edge_to_index[key]] = 1
+            # Even without primary extension, still include cross-component edges
+            cut_flags = compute_extended_secondary_cut_flags_with_cross_component(
+                tet_result,
+                membrane.cut_edges,
+                other_comp_edge_sets,
+                include_junction_primary_edges=False
+            )
         
         n_cut = np.sum(cut_flags)
         if n_cut == 0:
@@ -887,6 +903,118 @@ def compute_extended_secondary_cut_flags_improved(
                         n_junction_edges_added += 1
     
     logger.info(f"Extended secondary flags: {len(secondary_edges)} secondary + {n_junction_edges_added} junction primary")
+    
+    return cut_flags
+
+
+def compute_extended_secondary_cut_flags_with_cross_component(
+    tet_result,
+    secondary_edges: List[Tuple[int, int]],
+    other_component_edge_sets: List[Set[Tuple[int, int]]],
+    include_junction_primary_edges: bool = True
+) -> np.ndarray:
+    """
+    Compute cut flags for one component, including edges from OTHER components
+    at cross-component junction tets.
+    
+    When two secondary components share a tetrahedron, each component only has a
+    subset of the tet's cut edges. This produces partial meshes (e.g. each sees a
+    3-edge config producing 1 triangle) instead of a proper junction mesh. By
+    including the other component's edges at shared tets, the extraction sees the
+    FULL configuration (e.g. 6-edge config → 12 triangles via INNER_VERTEX).
+    
+    This fills the holes at junctions where multiple secondary surfaces meet.
+    
+    Args:
+        tet_result: TetrahedralMeshResult
+        secondary_edges: Cut edges for THIS component
+        other_component_edge_sets: List of edge sets from OTHER components
+        include_junction_primary_edges: If True, also include primary edges at junctions
+        
+    Returns:
+        (E,) int8 array of extended cut flags
+    """
+    n_edges = len(tet_result.edges)
+    
+    # Build edge-to-index map
+    edge_to_index = tet_result.edge_to_index
+    if edge_to_index is None:
+        from . import tetrahedral_mesh as tm
+        edge_to_index = tm.build_edge_to_index_map(tet_result.edges)
+    
+    # Start with this component's secondary flags
+    cut_flags = np.zeros(n_edges, dtype=np.int8)
+    own_edge_set = set()
+    
+    for vi, vj in secondary_edges:
+        key = (min(vi, vj), max(vi, vj))
+        own_edge_set.add(key)
+        if key in edge_to_index:
+            cut_flags[edge_to_index[key]] = 1
+    
+    # Merge all other-component edge sets for efficient lookup
+    all_other_edges: Set[Tuple[int, int]] = set()
+    for eset in other_component_edge_sets:
+        all_other_edges.update(eset)
+    
+    # Build primary edge set
+    primary_edge_set: Set[Tuple[int, int]] = set()
+    if tet_result.primary_cut_edges is not None:
+        for vi, vj in tet_result.primary_cut_edges:
+            primary_edge_set.add((min(vi, vj), max(vi, vj)))
+    
+    # Scan all tets to find cross-component junctions and primary junctions
+    edge_pairs = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+    
+    n_cross_component_added = 0
+    n_primary_junction_added = 0
+    
+    for t_idx, tet in enumerate(tet_result.tetrahedra):
+        # Classify all 6 edges of this tet
+        tet_own = []        # This component's edges in tet
+        tet_other = []      # Other components' edges in tet
+        tet_primary = []    # Primary edges in tet
+        
+        for i, j in edge_pairs:
+            vi, vj = int(tet[i]), int(tet[j])
+            key = (min(vi, vj), max(vi, vj))
+            
+            if key in own_edge_set:
+                tet_own.append(key)
+            if key in all_other_edges:
+                tet_other.append(key)
+            if key in primary_edge_set:
+                tet_primary.append(key)
+        
+        if not tet_own:
+            continue  # This tet has none of our edges — skip
+        
+        # CROSS-COMPONENT JUNCTION: Include other component's edges at shared tets
+        # This ensures the marching tet sees the full configuration
+        if tet_other:
+            for other_key in tet_other:
+                if other_key in edge_to_index and cut_flags[edge_to_index[other_key]] == 0:
+                    cut_flags[edge_to_index[other_key]] = 1
+                    n_cross_component_added += 1
+        
+        # PRIMARY JUNCTION: Include primary edges adjacent to our secondary edges
+        if include_junction_primary_edges and tet_primary:
+            own_vertices = set()
+            for vi, vj in tet_own:
+                own_vertices.add(vi)
+                own_vertices.add(vj)
+            
+            for p_key in tet_primary:
+                p_verts = set(p_key)
+                if p_verts & own_vertices:
+                    if p_key in edge_to_index and cut_flags[edge_to_index[p_key]] == 0:
+                        cut_flags[edge_to_index[p_key]] = 1
+                        n_primary_junction_added += 1
+    
+    logger.info(f"Extended secondary flags (with cross-component): "
+                f"{len(secondary_edges)} own + "
+                f"{n_cross_component_added} cross-component + "
+                f"{n_primary_junction_added} primary junction")
     
     return cut_flags
 
@@ -1585,3 +1713,92 @@ def mark_secondary_junction_boundary_types(
             marked_count += 1
     
     logger.info(f"Marked {marked_count} vertices as secondary junction (bt=5)")
+
+# =============================================================================
+# SECONDARY-TO-PRIMARY PROXIMITY JUNCTION DETECTION
+# =============================================================================
+
+def detect_primary_proximity_junctions(
+    component_surfaces: List[Tuple['SecondaryMembraneInfo', 'PartingSurfaceResult']],
+    primary_mesh: 'trimesh.Trimesh',
+    proximity_threshold: float
+) -> int:
+    """
+    Detect secondary surface vertices that are geometrically close to the primary
+    surface and upgrade their boundary type to PRIMARY_JUNCTION (bt=3).
+    
+    During extraction, ``is_primary_adjacent`` only flags edges that are literally
+    primary cut edges reused in the secondary extraction.  Boundary vertices that
+    sit near the primary membrane but were NOT on a primary cut edge remain
+    classified as interior (bt=0) or hull (bt=1/2).  This function performs a
+    distance-based reclassification so those vertices are properly constrained
+    during smoothing.
+    
+    Only interior (bt=0) vertices are upgraded.  Higher-priority types (part,
+    hull, existing primary junction, secondary junction) are left untouched.
+    
+    Args:
+        component_surfaces: List of (SecondaryMembraneInfo, PartingSurfaceResult)
+                           from ``extract_secondary_surfaces_per_component()``.
+        primary_mesh: The primary parting surface mesh (already extracted /
+                     repaired / smoothed).  Used as the proximity target.
+        proximity_threshold: Maximum distance (in scene units) from a vertex to
+                            the primary surface for it to be considered a
+                            junction vertex.  Recommended: ``2 × avg_tet_edge_length``.
+    
+    Returns:
+        Number of vertices upgraded to bt=3.
+    """
+    import trimesh
+    from trimesh.proximity import ProximityQuery
+    from .parting_surface import (
+        BOUNDARY_TYPE_PRIMARY_JUNCTION,
+        BOUNDARY_TYPE_INTERIOR,
+    )
+    
+    if primary_mesh is None or len(primary_mesh.faces) == 0:
+        return 0
+    
+    proximity = ProximityQuery(primary_mesh)
+    
+    total_upgraded = 0
+    
+    for comp_idx, (_, surface) in enumerate(component_surfaces):
+        if surface.vertices is None or len(surface.vertices) == 0:
+            continue
+        if surface.vertex_boundary_type is None:
+            continue
+        
+        # Find interior vertices (bt=0) — candidates for upgrade
+        interior_mask = surface.vertex_boundary_type == BOUNDARY_TYPE_INTERIOR
+        interior_indices = np.where(interior_mask)[0]
+        
+        if len(interior_indices) == 0:
+            continue
+        
+        # Query distance to primary surface for all interior vertices
+        interior_positions = surface.vertices[interior_indices]
+        _, distances, _ = proximity.on_surface(interior_positions)
+        
+        # Upgrade vertices within threshold
+        close_mask = distances < proximity_threshold
+        close_indices = interior_indices[close_mask]
+        
+        for idx in close_indices:
+            surface.vertex_boundary_type[idx] = BOUNDARY_TYPE_PRIMARY_JUNCTION
+        
+        comp_upgraded = len(close_indices)
+        total_upgraded += comp_upgraded
+        
+        if comp_upgraded > 0:
+            logger.debug(f"Component {comp_idx}: {comp_upgraded} interior verts "
+                        f"within {proximity_threshold:.4f} of primary → bt=3")
+    
+    if total_upgraded > 0:
+        logger.info(f"Primary proximity detection: {total_upgraded} vertices "
+                    f"upgraded to bt=3 (threshold={proximity_threshold:.4f})")
+    else:
+        logger.info(f"Primary proximity detection: no interior vertices within "
+                    f"{proximity_threshold:.4f} of primary surface")
+    
+    return total_upgraded

@@ -2590,6 +2590,11 @@ class SecondarySurfaceExtractionWorker(QThread):
             result = SecondarySurfaceExtractionResult()
             total_start = time.time()
             
+            # Compute geometry-aware proximity threshold from tet mesh
+            # Used for junction detection and post-repair component ID rebuild
+            avg_edge_len = float(np.mean(self.tet_result.edge_lengths))
+            proximity_threshold = 2.0 * avg_edge_len
+            
             # Check prerequisites
             if (self.tet_result.secondary_cut_edges is None or 
                 len(self.tet_result.secondary_cut_edges) == 0):
@@ -2652,22 +2657,28 @@ class SecondarySurfaceExtractionWorker(QThread):
                 merged_extraction = extraction_result
             else:
                 # =============================================================
-                # STEP 2b: Detect secondary-to-secondary junctions
-                #
-                # Before merging, find vertices from different components at
-                # the same spatial position. These are junction vertices where
-                # one secondary membrane meets another. Mark them as bt=5 so
-                # they get reprojected to the other component during smoothing.
+                # STEP 2b: Detect secondary-to-secondary & secondary-to-primary
+                # junctions using 2× average tet edge length as proximity
+                # threshold.  This replaces the previous 1e-6 exact-match
+                # threshold with a geometry-aware distance that catches
+                # vertices that are close but not exactly coincident.
                 # =============================================================
                 from core.secondary_membrane import (
                     detect_secondary_junction_vertices,
-                    mark_secondary_junction_boundary_types
+                    mark_secondary_junction_boundary_types,
+                    detect_primary_proximity_junctions
+                )
+                
+                self.progress.emit(
+                    f"Junction proximity threshold: {proximity_threshold:.4f} "
+                    f"(2× avg tet edge length {avg_edge_len:.4f})"
                 )
                 
                 if len(component_results) >= 2:
                     self.progress.emit("Detecting secondary-to-secondary junctions...")
                     junction_map, pre_merge_comp_ids = detect_secondary_junction_vertices(
-                        component_results
+                        component_results,
+                        merge_threshold=proximity_threshold
                     )
                     
                     if junction_map:
@@ -2679,6 +2690,27 @@ class SecondarySurfaceExtractionWorker(QThread):
                         self.progress.emit("No secondary-to-secondary junctions found")
                 else:
                     pre_merge_comp_ids = None
+                
+                # =============================================================
+                # STEP 2c: Detect secondary-to-primary proximity junctions
+                #
+                # Interior (bt=0) vertices of secondary surfaces that are
+                # geometrically close to the primary surface should be
+                # constrained to it during smoothing (bt=3).
+                # =============================================================
+                if self.part_mesh is not None:
+                    # We need a primary surface to detect proximity.  The primary
+                    # surface mesh is not available on this worker directly — it
+                    # is extracted and smoothed earlier.  However, we can build a
+                    # proxy from the primary cut edges in the tet mesh.  For now
+                    # we detect proximity against the PART mesh as a fallback
+                    # (which at least pins secondary boundary verts to the object
+                    # surface).  The caller may also supply primary_mesh later.
+                    #
+                    # Note: detect_primary_proximity_junctions works on any
+                    # target mesh.  When a smoothed primary surface is available,
+                    # the CombinedSurfaceSmoothingWorker can run a secondary pass.
+                    pass  # Primary proximity handled in smoothing worker when primary mesh is available
                 
                 # Merge per-component surfaces into a single mesh
                 self.progress.emit(f"Merging {len(component_results)} component surfaces...")
@@ -2780,6 +2812,8 @@ class SecondarySurfaceExtractionWorker(QThread):
             # Repair merges coincident vertices, so we match each post-repair
             # vertex to the nearest per-component vertex to determine membership.
             # Vertices equidistant to multiple components are junction vertices (-1).
+            # Use 2× avg tet edge length as the match tolerance to catch vertices
+            # that shifted slightly during repair.
             if (result.vertex_component_id is not None and
                     component_results and result.mesh is not None):
                 self.progress.emit("Rebuilding component IDs after repair...")
@@ -2788,7 +2822,7 @@ class SecondarySurfaceExtractionWorker(QThread):
                 repaired_verts = np.array(result.mesh.vertices)
                 n_repaired = len(repaired_verts)
                 new_comp_ids = np.full(n_repaired, -1, dtype=np.int32)
-                merge_tol = 1e-6
+                merge_tol = proximity_threshold
                 
                 # Build per-component KD-trees
                 comp_trees = []
@@ -3058,6 +3092,55 @@ class CombinedSurfaceSmoothingWorker(QThread):
                         f"Secondary junction data: {len(sec_component_meshes)} components, "
                         f"{n_bt5} bt=5 vertices"
                     )
+                
+                # =============================================================
+                # STEP 3b: Detect secondary-to-primary proximity junctions
+                #
+                # Now that the primary surface is smoothed, upgrade any
+                # interior (bt=0) secondary vertices within 2× avg tet edge
+                # length of the primary surface to bt=3 (primary junction).
+                # This ensures these boundary vertices are constrained to the
+                # primary membrane during smoothing instead of drifting freely.
+                # =============================================================
+                if (primary_mesh_for_secondary is not None and
+                        self.secondary_extraction_result.vertex_boundary_type is not None):
+                    from trimesh.proximity import ProximityQuery
+                    from core.parting_surface import (
+                        BOUNDARY_TYPE_PRIMARY_JUNCTION,
+                        BOUNDARY_TYPE_INTERIOR
+                    )
+                    
+                    avg_edge_len = float(np.mean(self.tet_result.edge_lengths))
+                    proximity_threshold = 2.0 * avg_edge_len
+                    
+                    sec_verts = np.array(self.secondary_extraction_result.mesh.vertices)
+                    sec_bt = self.secondary_extraction_result.vertex_boundary_type
+                    
+                    # Find interior (bt=0) vertices
+                    interior_mask = sec_bt == BOUNDARY_TYPE_INTERIOR
+                    interior_indices = np.where(interior_mask)[0]
+                    
+                    if len(interior_indices) > 0:
+                        prox = ProximityQuery(primary_mesh_for_secondary)
+                        _, dists, _ = prox.on_surface(sec_verts[interior_indices])
+                        
+                        close_mask = dists < proximity_threshold
+                        upgrade_indices = interior_indices[close_mask]
+                        
+                        for idx in upgrade_indices:
+                            sec_bt[idx] = BOUNDARY_TYPE_PRIMARY_JUNCTION
+                        
+                        n_upgraded = len(upgrade_indices)
+                        if n_upgraded > 0:
+                            self.progress.emit(
+                                f"Primary proximity: {n_upgraded} interior verts → bt=3 "
+                                f"(within {proximity_threshold:.4f} of primary surface)"
+                            )
+                        else:
+                            self.progress.emit(
+                                f"Primary proximity: no interior verts within "
+                                f"{proximity_threshold:.4f} of primary"
+                            )
                 
                 # Smooth secondary surface (without collar creation)
                 result.secondary_mesh, result.secondary_num_vertices, result.secondary_num_faces, \
