@@ -43,15 +43,18 @@ DEFAULT_INLET_MIN_DEPTH_MM = 1.5     # Minimum depth of resin inlet hole
 DEFAULT_LOCAL_DIAMETER_MM = 1.2       # Diameter for air escape holes (local maxima)
 DEFAULT_GLOBAL_DIAMETER_MM = 5.2      # Top diameter for resin inlet hole (global maximum)
 DEFAULT_GLOBAL_BOTTOM_DIAMETER_MM = 2.2  # Bottom diameter of tapered resin inlet hole
-DEFAULT_SHELL_INLET_DIAMETER_MM = 12.2  # Diameter for hard shell through-hole
+DEFAULT_SHELL_INLET_DIAMETER_MM = 17.0  # Diameter of hard-shell through-hole for resin inlet
+PLUG_WIDE_DIAMETER_MM = 12.2            # Wide/flange section diameter of resin plug (through the shell hole)
 PLUG_TOLERANCE_MM = 0.2                   # Tolerance clearance for plug dimensions
+PLUG_SHELL_OVERHANG_MM = 5.0           # Extra height the wide section extends above the hard-shell top
 PLUG_TAPER_ANGLE_DEG = 20.0               # Taper half-angle in degrees (plug-to-shell transition)
 CYLINDER_SEGMENTS = 32                # Number of segments for cylinder approximation
 INLET_DEPTH_SAMPLE_POINTS = 24        # Points around circumference for depth ray-casting
 MAX_INTO_PART_ANGLE_DEG = 25.0        # Max angle for adaptive into-part direction
 CSG_OVERLAP_MM = 0.5                  # Overlap distance for clean CSG union at junctions
 INLET_CONTAINMENT_MARGIN_MM = 0.5     # Extra depth beyond first-contained point
-SILICONE_POUR_HOLE_DIAMETER_MM = 12.0  # Through-hole diameter for silicone mold pouring
+SILICONE_POUR_HOLE_DIAMETER_MM = 12.0        # Locating-pin / plug diameter
+SILICONE_POUR_SHELL_HOLE_DIAMETER_MM = 17.0  # Shell through-hole diameter (pin + 5 mm diametric tolerance)
 SILICONE_POUR_CLEARANCE_MM = 5.0       # Min clearance from any other shell hole
 SILICONE_POUR_GRID_STEP_MM = 1.5       # Grid resolution for candidate sampling
 
@@ -1275,7 +1278,9 @@ def _build_angled_plug(
     shell_projs = np.dot(np.asarray(shell_half.vertices), resin_dir)
     shell_top_proj = float(np.max(shell_projs))
     center_proj = float(np.dot(center, resin_dir))
-    h_above_center = shell_top_proj - center_proj
+    # Extend the wide section PLUG_SHELL_OVERHANG_MM above the hard-shell top
+    # so the plug protrudes and is easy to grip/push out.
+    h_above_center = shell_top_proj - center_proj + PLUG_SHELL_OVERHANG_MM
     if h_above_center < taper_height + 0.5:
         h_above_center = taper_height + 0.5
 
@@ -1979,6 +1984,7 @@ def create_silicone_pour_holes(
     clearance_mm: float = SILICONE_POUR_CLEARANCE_MM,
     part_mesh: Optional[trimesh.Trimesh] = None,
     part_hull_inset_mm: float = 5.0,
+    shell_hole_diameter_mm: float = SILICONE_POUR_SHELL_HOLE_DIAMETER_MM,
 ) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], Optional[np.ndarray]]:
     """
     Drill a silicone mold pouring / locating-pin hole through both hard shell halves.
@@ -2002,11 +2008,16 @@ def create_silicone_pour_holes(
         inlet_shell_diameter_mm: Diameter of the resin inlet through-hole.
         air_escape_positions:    (N, 3) positions of air-escape holes (or None).
         air_escape_diameter_mm:  Diameter of each air-escape hole.
-        hole_diameter_mm:        Diameter of the silicone pour hole.
+        hole_diameter_mm:        Diameter of the locating-pin / silicone pour pin
+                                 (used for clearance spacing from other holes).
         clearance_mm:            Minimum edge-to-edge gap from any other hole.
         part_mesh:               Original part mesh — constrains placement inside
                                  the part footprint.
         part_hull_inset_mm:      Extra inset inside part hull boundary (default 5 mm).
+        shell_hole_diameter_mm:  Diameter of the through-hole actually drilled into
+                                 the hard shells.  Larger than *hole_diameter_mm* to
+                                 provide assembly clearance (default 17 mm = 12 mm pin
+                                 + 5 mm diametric tolerance).
 
     Returns:
         Tuple of ``(shell_half_1_modified, shell_half_2_modified, hole_position_3d)``.
@@ -2016,8 +2027,9 @@ def create_silicone_pour_holes(
         return shell_half_1, shell_half_2, None
 
     hole_radius = hole_diameter_mm / 2.0
-
-    # ── Find placement position ──────────────────────────────────────────────
+    shell_hole_radius = shell_hole_diameter_mm / 2.0
+    # Clearance / inset are based on the *pin* diameter (12 mm), not the
+    # larger shell hole, so the silicone pin fits snugly without stress.
     pos_3d = _find_silicone_pour_hole_position(
         shell_half_1           = shell_half_1,
         shell_half_2           = shell_half_2,
@@ -2054,7 +2066,7 @@ def create_silicone_pour_holes(
         cyl = _create_cylinder(
             center    = cyl_start,
             direction = drill_dir,
-            radius    = hole_radius,
+            radius    = shell_hole_radius,
             height    = cyl_height,
         )
         try:
@@ -2289,8 +2301,8 @@ def create_resin_plug(
     inlet_top_radius = (inlet_diameter_mm - tolerance_mm) / 2.0
     # Bottom of tapered inlet section (deep in the part)
     inlet_bottom_radius = (inlet_bottom_diameter_mm - tolerance_mm) / 2.0
-    # Wide shell section
-    wide_radius = (shell_inlet_diameter_mm - tolerance_mm) / 2.0
+    # Wide shell section — always 12 mm nominal (independent of shell hole size)
+    wide_radius = (PLUG_WIDE_DIAMETER_MM - tolerance_mm) / 2.0
     
     if inlet_top_radius <= 0 or inlet_bottom_radius <= 0 or wide_radius <= 0:
         logger.error(f"Invalid plug radii: top={inlet_top_radius:.2f}, "
@@ -2355,9 +2367,10 @@ def create_resin_plug(
     radius_diff = wide_radius - inlet_top_radius
     plug_shell_taper_height = radius_diff / np.tan(taper_angle_rad)
     
-    # Section 3: wide cylinder from plug-shell taper top to shell top
+    # Section 3: wide cylinder from plug-shell taper top to shell top + overhang
+    # The extra PLUG_SHELL_OVERHANG_MM lets the plug protrude above the shell.
     taper_top_proj = base_proj + tapered_height + plug_shell_taper_height
-    wide_height = shell_top_proj - taper_top_proj
+    wide_height = shell_top_proj - taper_top_proj + PLUG_SHELL_OVERHANG_MM
     if wide_height < 0.5:
         logger.warning(f"Wide section height too small ({wide_height:.2f}mm), "
                        "clamping to 0.5mm")

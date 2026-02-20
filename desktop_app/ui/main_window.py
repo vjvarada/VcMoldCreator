@@ -1347,7 +1347,7 @@ class ResinChannelsWorker(QThread):
                     channel_result.shell_half_1_final          = sh1_final
                     channel_result.shell_half_2_final          = sh2_final
                     channel_result.silicone_pour_hole_position = sil_pos
-                    channel_result.silicone_pour_hole_diameter_mm = 12.0
+                    channel_result.silicone_pour_hole_diameter_mm = 17.0  # shell hole (pin ⌀12 + 5mm tolerance)
 
                     # Keep modified_shell_mesh in sync (the half that already had
                     # the resin inlet now also has the silicone hole)
@@ -7149,13 +7149,15 @@ class MainWindow(QMainWindow):
         # Hard shell through-hole diameter
         self.resin_shell_diameter_spin = QDoubleSpinBox()
         self.resin_shell_diameter_spin.setRange(2.0, 30.0)
-        self.resin_shell_diameter_spin.setValue(12.2)
+        self.resin_shell_diameter_spin.setValue(17.0)
         self.resin_shell_diameter_spin.setSuffix(" mm")
         self.resin_shell_diameter_spin.setSingleStep(1.0)
         self.resin_shell_diameter_spin.setDecimals(1)
         self.resin_shell_diameter_spin.setToolTip(
             "Diameter of the through-hole drilled into the hard shell\n"
-            "for resin pouring access. Drilled from the inlet center."
+            "for resin pouring access (default 17 mm).\n"
+            "The resin plug wide section is always \u224812 mm regardless\n"
+            "of this setting, giving a 5 mm diametric clearance."
         )
         self.resin_shell_diameter_spin.setStyleSheet(spin_style)
         params_layout.addRow("Shell hole ⌀:", self.resin_shell_diameter_spin)
@@ -7334,8 +7336,10 @@ class MainWindow(QMainWindow):
                 self.resin_channels_stats.add_row(f'Inlet depth: {result.inlet_depth_mm:.1f}mm')
             
             if result.shell_half_modified > 0 and result.modified_shell_mesh is not None:
+                _gap_mm = result.shell_inlet_diameter_mm - 12.0
                 self.resin_channels_stats.add_row(
-                    f'Shell inlet: ⌀{result.shell_inlet_diameter_mm:.0f}mm '
+                    f'Shell inlet: hole ⌀{result.shell_inlet_diameter_mm:.0f}mm, '
+                    f'plug ⌀12mm ({_gap_mm:+.0f}mm gap) '
                     f'in shell half {result.shell_half_modified}'
                 )
                 if result.n_shell_air_escapes > 0:
@@ -7359,7 +7363,7 @@ class MainWindow(QMainWindow):
             if result.silicone_pour_hole_position is not None:
                 p = result.silicone_pour_hole_position
                 self.resin_channels_stats.add_row(
-                    f'Silicone pour hole: ⌀{result.silicone_pour_hole_diameter_mm:.0f}mm '
+                    f'Silicone pour hole: pin ⌀12mm, shell hole ⌀{result.silicone_pour_hole_diameter_mm:.0f}mm '
                     f'on both shells — ({p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f})'
                 )
             else:
