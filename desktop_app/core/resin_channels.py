@@ -105,6 +105,15 @@ class ResinChannelResult:
     # Resin plug
     plug_mesh: Optional[trimesh.Trimesh] = None  # The resin pouring plug
     
+    # Alignment notches (applied after resin channels and shell drilling)
+    alignment_notches_applied: bool = False
+    notched_shell_half_1:    Optional[trimesh.Trimesh] = None
+    notched_shell_half_2:    Optional[trimesh.Trimesh] = None
+    notched_metamold_half_1: Optional[trimesh.Trimesh] = None
+    notched_metamold_half_2: Optional[trimesh.Trimesh] = None
+    notch_width_mm: float = 4.0
+    notch_depth_mm: float = 0.5
+
     # Success flag
     success: bool = False
     

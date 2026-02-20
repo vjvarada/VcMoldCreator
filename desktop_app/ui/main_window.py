@@ -1166,7 +1166,10 @@ class ResinChannelsWorker(QThread):
         inlet_min_depth_mm=1.5,
         local_diameter_mm=1.0,
         global_diameter_mm=5.0,
-        shell_inlet_diameter_mm=12.0
+        shell_inlet_diameter_mm=12.0,
+        add_alignment_notches=True,
+        notch_width_mm=4.0,
+        notch_depth_mm=0.5
     ):
         super().__init__()
         self.metamold_half_1_with_part = metamold_half_1_with_part
@@ -1182,6 +1185,9 @@ class ResinChannelsWorker(QThread):
         self.local_diameter_mm = local_diameter_mm
         self.global_diameter_mm = global_diameter_mm
         self.shell_inlet_diameter_mm = shell_inlet_diameter_mm
+        self.add_alignment_notches_flag = add_alignment_notches
+        self.notch_width_mm = notch_width_mm
+        self.notch_depth_mm = notch_depth_mm
     
     def run(self):
         try:
@@ -1289,6 +1295,59 @@ class ResinChannelsWorker(QThread):
                 else:
                     logger.warning("Failed to create resin plug")
             
+            # ── Alignment notches ─────────────────────────────────────────────────
+            if self.add_alignment_notches_flag:
+                self.progress.emit("Cutting alignment notches into all mold pieces...")
+                try:
+                    from core.alignment_notches import add_alignment_notches as _add_notches
+
+                    # Determine current processed state of each metamold half
+                    if channel_result.mold_half == 1:
+                        mm1 = channel_result.mesh
+                        mm2 = other_half
+                    else:
+                        mm1 = other_half
+                        mm2 = channel_result.mesh
+
+                    # Determine current processed state of each shell half
+                    sh1 = (channel_result.modified_shell_mesh
+                           if channel_result.shell_half_modified == 1
+                           else self.shell_half_1)
+                    sh2 = (channel_result.modified_shell_mesh
+                           if channel_result.shell_half_modified == 2
+                           else self.shell_half_2)
+
+                    notch_result = _add_notches(
+                        shell_half_1    = sh1,
+                        shell_half_2    = sh2,
+                        metamold_half_1 = mm1,
+                        metamold_half_2 = mm2,
+                        resin_direction = self.resin_direction,
+                        n_notches       = 1,
+                        notch_width_mm  = self.notch_width_mm,
+                        notch_depth_mm  = self.notch_depth_mm,
+                    )
+
+                    if notch_result.success:
+                        channel_result.alignment_notches_applied = True
+                        channel_result.notched_metamold_half_1   = notch_result.metamold_half_1
+                        channel_result.notched_metamold_half_2   = notch_result.metamold_half_2
+                        channel_result.notched_shell_half_1      = notch_result.shell_half_1
+                        channel_result.notched_shell_half_2      = notch_result.shell_half_2
+                        channel_result.notch_width_mm            = self.notch_width_mm
+                        channel_result.notch_depth_mm            = self.notch_depth_mm
+                        logger.info(
+                            "Alignment notches applied to %d pieces in %.0f ms",
+                            notch_result.n_pieces_notched,
+                            notch_result.computation_time_ms,
+                        )
+                    else:
+                        logger.warning(
+                            "Alignment notches failed: %s", notch_result.error_message
+                        )
+                except Exception as notch_err:
+                    logger.error("Error applying alignment notches: %s", notch_err)
+
             self.progress.emit("Resin channels complete")
             self.complete.emit(channel_result, other_half)
             
@@ -7041,7 +7100,57 @@ class MainWindow(QMainWindow):
         params_layout.addRow("Detected:", maxima_info)
         
         self.context_layout.addWidget(params_group)
-        
+
+        # ── Alignment notch group ─────────────────────────────────────────
+        notch_group = QGroupBox("Alignment Notches")
+        notch_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 12px;
+                font-weight: bold;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+            QLabel {{ color: {Colors.DARK}; font-size: 12px; }}
+        """)
+        notch_layout = QFormLayout(notch_group)
+        notch_layout.setContentsMargins(8, 16, 8, 8)
+        notch_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        self.alignment_notch_checkbox = QCheckBox("Cut alignment notches")
+        self.alignment_notch_checkbox.setChecked(True)
+        self.alignment_notch_checkbox.setStyleSheet(
+            f"color: {Colors.DARK}; font-size: 12px;"
+        )
+        self.alignment_notch_checkbox.setToolTip(
+            "Add two triangular V-notches on the outer perimeter of every\n"
+            "hard-shell and metamold half so mating pairs self-align."
+        )
+        notch_layout.addRow("", self.alignment_notch_checkbox)
+
+        self.notch_width_spin = QDoubleSpinBox()
+        self.notch_width_spin.setRange(1.0, 20.0)
+        self.notch_width_spin.setValue(5.0)
+        self.notch_width_spin.setSuffix(" mm")
+        self.notch_width_spin.setSingleStep(0.5)
+        self.notch_width_spin.setDecimals(1)
+        self.notch_width_spin.setStyleSheet(spin_style)
+        self.notch_width_spin.setToolTip("Base width of each triangular notch.")
+        notch_layout.addRow("Notch width:", self.notch_width_spin)
+
+        notch_depth_label = QLabel("0.5 mm  (fixed)")
+        notch_depth_label.setStyleSheet(f"color: {Colors.GRAY}; font-size: 12px;")
+        notch_layout.addRow("Notch depth:", notch_depth_label)
+
+        self.context_layout.addWidget(notch_group)
+
         # Generate button
         self.resin_channels_btn = QPushButton("Create Resin Channels")
         self.resin_channels_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -7116,10 +7225,18 @@ class MainWindow(QMainWindow):
                 self.resin_channels_stats.add_row(
                     f'Plug: {len(result.plug_mesh.vertices):,} verts'
                 )
-            
+
+            if result.alignment_notches_applied:
+                self.resin_channels_stats.add_row(
+                    f'Alignment notches: 1 ▽ {result.notch_width_mm:.1f}×0.5 mm '
+                    f'on all 4 pieces'
+                )
+            else:
+                self.resin_channels_stats.add_row('Alignment notches: not applied')
+
             if result.mesh is not None:
                 self.resin_channels_stats.add_row(f'Result mesh: {len(result.mesh.vertices):,} verts, {len(result.mesh.faces):,} faces')
-            
+
             self.resin_channels_stats.add_row(f'Time: {result.computation_time_ms:.0f}ms')
     
     def _on_create_resin_channels(self):
@@ -7147,7 +7264,9 @@ class MainWindow(QMainWindow):
         local_diameter = self.resin_local_diameter_spin.value()
         global_diameter = self.resin_global_diameter_spin.value()
         shell_inlet_diameter = self.resin_shell_diameter_spin.value()
-        
+        do_notches   = self.alignment_notch_checkbox.isChecked()
+        notch_width  = self.notch_width_spin.value()
+
         self._resin_channels_worker = ResinChannelsWorker(
             self._metamold_half_1_with_part,
             self._metamold_half_2_with_part,
@@ -7161,7 +7280,10 @@ class MainWindow(QMainWindow):
             inlet_min_depth_mm=inlet_min_depth,
             local_diameter_mm=local_diameter,
             global_diameter_mm=global_diameter,
-            shell_inlet_diameter_mm=shell_inlet_diameter
+            shell_inlet_diameter_mm=shell_inlet_diameter,
+            add_alignment_notches=do_notches,
+            notch_width_mm=notch_width,
+            notch_depth_mm=0.5,
         )
         self._resin_channels_worker.progress.connect(self._on_resin_channels_progress)
         self._resin_channels_worker.complete.connect(self._on_resin_channels_complete)
@@ -7184,22 +7306,41 @@ class MainWindow(QMainWindow):
             self.mesh_viewer.remove_metamold_half_1_with_part()
             self.mesh_viewer.remove_metamold_half_2_with_part()
             
-            # Show the updated halves (modified one and unmodified one)
+            # Show the updated halves (modified one and unmodified one).
             # NOTE: Do NOT overwrite _metamold_half_X_with_part — those are the
             # ORIGINALS from the metamold step. We keep them pristine so that
             # re-running resin channels with different parameters always starts
-            # from the un-channeled originals. The channeled mesh is stored in
-            # _resin_channel_result.mesh and _resin_channel_other_half.
-            if channel_result.mold_half == 1:
-                self.mesh_viewer.show_metamold_half_1_with_part(channel_result.mesh)
-                self.mesh_viewer.show_metamold_half_2_with_part(other_half)
+            # from the un-channeled originals.
+            #
+            # Prefer the notched versions when alignment notches were applied.
+            if channel_result.alignment_notches_applied:
+                mm1_show = channel_result.notched_metamold_half_1
+                mm2_show = channel_result.notched_metamold_half_2
             else:
-                self.mesh_viewer.show_metamold_half_1_with_part(other_half)
-                self.mesh_viewer.show_metamold_half_2_with_part(channel_result.mesh)
-            
-            # Update hard shell viewer if shell was modified
-            if (channel_result.modified_shell_mesh is not None and
-                channel_result.shell_half_modified > 0):
+                if channel_result.mold_half == 1:
+                    mm1_show, mm2_show = channel_result.mesh, other_half
+                else:
+                    mm1_show, mm2_show = other_half, channel_result.mesh
+
+            if mm1_show is not None:
+                self.mesh_viewer.show_metamold_half_1_with_part(mm1_show)
+            if mm2_show is not None:
+                self.mesh_viewer.show_metamold_half_2_with_part(mm2_show)
+
+            # Update hard-shell viewer
+            # If notches were applied, prefer the notched shells; otherwise
+            # fall back to showing only the drilled shell half as before.
+            if channel_result.alignment_notches_applied:
+                try:
+                    if channel_result.notched_shell_half_1 is not None:
+                        self.mesh_viewer.show_shell_half_1(channel_result.notched_shell_half_1)
+                    if channel_result.notched_shell_half_2 is not None:
+                        self.mesh_viewer.show_shell_half_2(channel_result.notched_shell_half_2)
+                    logger.info("Updated both shell halves with alignment notches")
+                except Exception as e:
+                    logger.warning(f"Could not update shell viewer with notches: {e}")
+            elif (channel_result.modified_shell_mesh is not None and
+                  channel_result.shell_half_modified > 0):
                 shell_half = channel_result.shell_half_modified
                 try:
                     if shell_half == 1:
