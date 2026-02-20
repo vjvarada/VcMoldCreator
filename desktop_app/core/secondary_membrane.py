@@ -128,68 +128,130 @@ def _build_membrane_info(
     secondary_edges: List[Tuple[int, int]],
     mold_half: int
 ) -> List[SecondaryMembraneInfo]:
-    """Build SecondaryMembraneInfo for edges in a mold half."""
+    """
+    Build SecondaryMembraneInfo for edges in a mold half.
     
+    IMPORTANT: This function now separates secondary edges into CONNECTED COMPONENTS
+    before building membrane info. Each connected component becomes its own
+    SecondaryMembraneInfo, preventing label conflicts between geometrically
+    separate secondary membranes (per Bloomenthal 1995, Section 4: multiple
+    regions within a single propagation cell).
+    
+    Args:
+        tet_result: TetrahedralMeshResult with edge data
+        secondary_edges: List of (vi, vj) secondary cut edges for this mold half
+        mold_half: Which mold half (1=H1, 2=H2)
+        
+    Returns:
+        List of SecondaryMembraneInfo, one per connected component
+    """
     if len(secondary_edges) == 0:
         return []
     
-    # Build edge sets
-    secondary_edge_set = {(min(vi, vj), max(vi, vj)) for vi, vj in secondary_edges}
+    # =========================================================================
+    # Step 1: Separate secondary edges into connected components
+    # Two edges are connected if they share a vertex.
+    # =========================================================================
+    edge_set_canonical = {(min(vi, vj), max(vi, vj)) for vi, vj in secondary_edges}
+    
+    # Build vertex-to-edges adjacency
+    vertex_to_edges: Dict[int, Set[Tuple[int, int]]] = {}
+    for vi, vj in secondary_edges:
+        key = (min(vi, vj), max(vi, vj))
+        vertex_to_edges.setdefault(vi, set()).add(key)
+        vertex_to_edges.setdefault(vj, set()).add(key)
+    
+    # BFS to find connected components
+    visited_edges: Set[Tuple[int, int]] = set()
+    components: List[List[Tuple[int, int]]] = []
+    
+    for start_edge in edge_set_canonical:
+        if start_edge in visited_edges:
+            continue
+        
+        component = []
+        queue = [start_edge]
+        while queue:
+            edge = queue.pop(0)
+            if edge in visited_edges:
+                continue
+            visited_edges.add(edge)
+            component.append(edge)
+            
+            # Find adjacent edges (share a vertex)
+            vi, vj = edge
+            for neighbor_edge in vertex_to_edges.get(vi, set()):
+                if neighbor_edge not in visited_edges:
+                    queue.append(neighbor_edge)
+            for neighbor_edge in vertex_to_edges.get(vj, set()):
+                if neighbor_edge not in visited_edges:
+                    queue.append(neighbor_edge)
+        
+        if component:
+            components.append(component)
+    
+    logger.info(f"Mold half {mold_half}: {len(secondary_edges)} secondary edges "
+                f"form {len(components)} connected components")
+    
+    # =========================================================================
+    # Step 2: Build a SecondaryMembraneInfo for EACH connected component
+    # =========================================================================
     primary_edge_set = set()
     if tet_result.primary_cut_edges is not None:
         primary_edge_set = {(min(vi, vj), max(vi, vj)) for vi, vj in tet_result.primary_cut_edges}
-    
-    # Classify tetrahedra
-    interior_tets = set()
-    junction_tets = set()
-    junction_edges = set()
     
     edge_to_index = tet_result.edge_to_index if tet_result.edge_to_index is not None else {}
     if not edge_to_index:
         from . import tetrahedral_mesh as tm
         edge_to_index = tm.build_edge_to_index_map(tet_result.edges)
     
-    # Edge pairs within a tetrahedron (local vertex indices)
     edge_pairs = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
     
-    for t_idx, tet in enumerate(tet_result.tetrahedra):
-        has_secondary = False
-        has_primary = False
-        tet_secondary_edges = []
-        tet_primary_edges = []
+    membranes = []
+    for comp_idx, comp_edges in enumerate(components):
+        comp_edge_set = set(comp_edges)
         
-        for i, j in edge_pairs:
-            vi, vj = int(tet[i]), int(tet[j])
-            key = (min(vi, vj), max(vi, vj))
+        interior_tets = set()
+        junction_tets = set()
+        junction_edges = set()
+        
+        for t_idx, tet in enumerate(tet_result.tetrahedra):
+            has_secondary = False
+            has_primary = False
+            tet_secondary_edges = []
+            tet_primary_edges = []
             
-            if key in secondary_edge_set:
-                has_secondary = True
-                tet_secondary_edges.append(key)
-            if key in primary_edge_set:
-                has_primary = True
-                tet_primary_edges.append(key)
+            for i, j in edge_pairs:
+                vi, vj = int(tet[i]), int(tet[j])
+                key = (min(vi, vj), max(vi, vj))
+                
+                if key in comp_edge_set:
+                    has_secondary = True
+                    tet_secondary_edges.append(key)
+                if key in primary_edge_set:
+                    has_primary = True
+                    tet_primary_edges.append(key)
+            
+            if has_secondary:
+                if has_primary:
+                    junction_tets.add(t_idx)
+                    junction_edges.update(tet_primary_edges)
+                else:
+                    interior_tets.add(t_idx)
         
-        if has_secondary:
-            if has_primary:
-                junction_tets.add(t_idx)
-                junction_edges.update(tet_primary_edges)
-            else:
-                interior_tets.add(t_idx)
+        membrane = SecondaryMembraneInfo(
+            mold_half=mold_half,
+            cut_edges=list(comp_edges),
+            interior_tets=interior_tets,
+            junction_tets=junction_tets,
+            junction_edges=junction_edges
+        )
+        membranes.append(membrane)
+        
+        logger.info(f"  Component {comp_idx}: {len(comp_edges)} edges, "
+                    f"{len(interior_tets)} interior tets, {len(junction_tets)} junction tets")
     
-    logger.info(f"Mold half {mold_half}: {len(secondary_edges)} secondary edges, "
-                f"{len(interior_tets)} interior tets, {len(junction_tets)} junction tets, "
-                f"{len(junction_edges)} junction edges")
-    
-    # Create membrane info
-    membrane = SecondaryMembraneInfo(
-        mold_half=mold_half,
-        cut_edges=secondary_edges,
-        interior_tets=interior_tets,
-        junction_tets=junction_tets,
-        junction_edges=junction_edges
-    )
-    
-    return [membrane]
+    return membranes
 
 
 def compute_secondary_vertex_labels_with_primary_awareness(
@@ -335,6 +397,405 @@ def compute_secondary_vertex_labels_with_primary_awareness(
     logger.info(f"Secondary labels computed: {n_side_a} SideA, {n_side_b} SideB, {component_count} components")
     
     return labels
+
+
+def compute_multi_region_secondary_labels(
+    tet_result,
+    membrane_components: List['SecondaryMembraneInfo'],
+    mold_half: int,
+    primary_region_offset: int = 2
+) -> np.ndarray:
+    """
+    Compute multi-region vertex labels for multiple secondary membrane components.
+    
+    Per Bloomenthal & Ferguson 1995 Section 4: When multiple surfaces meet,
+    we need a multiple regionalization of space rather than binary. Each connected
+    secondary membrane component gets its own pair of region labels, ensuring that
+    the BFS labeling for one component doesn't conflict with another.
+    
+    Region assignment scheme:
+    - Regions 1, 2: Reserved for the primary membrane (H1, H2)
+    - Component 0: regions (3, 4) → SideA=3, SideB=4
+    - Component 1: regions (5, 6) → SideA=5, SideB=6
+    - Component N: regions (3+2N, 4+2N)
+    
+    At JUNCTION TETRAHEDRA where secondary meets primary, the primary edge labels
+    (H1=1, H2=2) are treated as boundary conditions. Primary edges act as barriers
+    that stop the BFS propagation, making the secondary surface terminate at the
+    primary membrane.
+    
+    At CROSS-COMPONENT JUNCTIONS where two secondary components share a tetrahedron,
+    each component's edges get their own region pair, and the resulting 5-edge or
+    6-edge tet configurations are resolved using face/inner vertices per Bloomenthal.
+    
+    Args:
+        tet_result: TetrahedralMeshResult with computed data
+        membrane_components: List of SecondaryMembraneInfo, one per connected component
+        mold_half: Which mold half (1=H1, 2=H2)
+        primary_region_offset: First region label to use for secondary (default 2 → starts at 3)
+        
+    Returns:
+        (N,) int16 array of vertex region labels:
+        0 = not involved in any secondary membrane
+        1 = primary H1, 2 = primary H2 (for vertices on primary boundary)
+        3, 4 = component 0 SideA/SideB
+        5, 6 = component 1 SideA/SideB
+        etc.
+    """
+    from collections import deque
+    
+    n_vertices = len(tet_result.vertices)
+    edges = tet_result.edges
+    n_edges = len(edges)
+    
+    if not membrane_components:
+        return np.zeros(n_vertices, dtype=np.int16)
+    
+    # Build primary cut edge set for barrier detection
+    primary_cut_set = set()
+    if tet_result.primary_cut_edges is not None:
+        primary_cut_set = {(min(vi, vj), max(vi, vj)) for vi, vj in tet_result.primary_cut_edges}
+    
+    # Initialize region labels
+    region_labels = np.zeros(n_vertices, dtype=np.int16)
+    
+    # Process each component independently with its own region pair
+    edge_pairs_local = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+    
+    for comp_idx, membrane in enumerate(membrane_components):
+        region_a = primary_region_offset + 1 + (2 * comp_idx)      # 3, 5, 7, ...
+        region_b = primary_region_offset + 1 + (2 * comp_idx) + 1  # 4, 6, 8, ...
+        
+        # Build cut edge set for this component
+        comp_cut_set = {(min(vi, vj), max(vi, vj)) for vi, vj in membrane.cut_edges}
+        
+        # Build adjacency for this component
+        # same_side: edges that are NOT this component's cuts AND not primary cuts
+        # cross_cut: edges that ARE this component's cuts
+        same_side_adj: Dict[int, List[int]] = {}
+        cross_cut_adj: Dict[int, List[int]] = {}
+        
+        for e_idx in range(n_edges):
+            v0, v1 = int(edges[e_idx, 0]), int(edges[e_idx, 1])
+            key = (min(v0, v1), max(v0, v1))
+            
+            if key in comp_cut_set:
+                cross_cut_adj.setdefault(v0, []).append(v1)
+                cross_cut_adj.setdefault(v1, []).append(v0)
+            elif key not in primary_cut_set:
+                same_side_adj.setdefault(v0, []).append(v1)
+                same_side_adj.setdefault(v1, []).append(v0)
+            # Primary edges are barriers — not added to either adjacency
+        
+        # Identify all vertices involved in tetrahedra with this component's edges
+        involved_vertices = set()
+        for vi, vj in membrane.cut_edges:
+            involved_vertices.add(vi)
+            involved_vertices.add(vj)
+        
+        for tet in tet_result.tetrahedra:
+            tet_verts = set(int(v) for v in tet)
+            for i, j in edge_pairs_local:
+                vi, vj = int(tet[i]), int(tet[j])
+                key = (min(vi, vj), max(vi, vj))
+                if key in comp_cut_set:
+                    involved_vertices.update(tet_verts)
+                    break
+        
+        # BFS to assign region labels for this component
+        labeled_count = 0
+        for start_v in involved_vertices:
+            if region_labels[start_v] != 0:
+                # Already labeled by this or another component — skip
+                continue
+            
+            queue = deque()
+            queue.append((start_v, region_a))
+            
+            while queue:
+                v, lbl = queue.popleft()
+                
+                if region_labels[v] != 0:
+                    continue
+                
+                region_labels[v] = lbl
+                labeled_count += 1
+                
+                # Propagate same label via non-cut edges
+                for neighbor in same_side_adj.get(v, []):
+                    if neighbor in involved_vertices and region_labels[neighbor] == 0:
+                        queue.append((neighbor, lbl))
+                
+                # Propagate opposite label via component's cut edges
+                opposite_lbl = region_b if lbl == region_a else region_a
+                for neighbor in cross_cut_adj.get(v, []):
+                    if neighbor in involved_vertices and region_labels[neighbor] == 0:
+                        queue.append((neighbor, opposite_lbl))
+        
+        n_a = np.sum(region_labels == region_a)
+        n_b = np.sum(region_labels == region_b)
+        logger.info(f"  Component {comp_idx} (regions {region_a}/{region_b}): "
+                    f"{n_a} SideA, {n_b} SideB, {labeled_count} total labeled")
+    
+    # Assign primary boundary labels (1, 2) for vertices on the primary boundary
+    # that are also involved in secondary tets (junction vertices)
+    if tet_result.vertex_mold_labels is not None:
+        primary_boundary_verts = np.where(
+            (tet_result.boundary_labels == 1) | (tet_result.boundary_labels == 2)
+        )[0]
+        for v in primary_boundary_verts:
+            if region_labels[v] == 0:
+                region_labels[v] = tet_result.boundary_labels[v]
+    
+    n_components = len(membrane_components)
+    n_labeled = np.sum(region_labels != 0)
+    logger.info(f"Multi-region labeling complete: {n_components} components, "
+                f"{n_labeled}/{n_vertices} vertices labeled, "
+                f"max region = {np.max(region_labels)}")
+    
+    return region_labels
+
+
+def build_region_pairs_of_interest(
+    membrane_components: List['SecondaryMembraneInfo'],
+    include_primary: bool = True,
+    primary_region_offset: int = 2
+) -> List[Tuple[int, int]]:
+    """
+    Build the set of region-pairs whose separating surfaces should be polygonized.
+    
+    Per Bloomenthal 1995 Section 3: "Our surface definition consists of two parts:
+    an integer-valued region function and a set of region-pairs of interest."
+    
+    For secondary membranes, the region-pairs of interest are:
+    - Each secondary component's (region_a, region_b) pair → the membrane surface
+    - Optionally (1, 2) → the primary parting surface (handled separately)
+    
+    Cross-component pairs (e.g. (3, 5)) are NOT surfaces of interest — they would
+    create spurious surfaces between unrelated secondary membranes. The Bloomenthal
+    polygonizer uses this set to decide which faces to generate.
+    
+    Args:
+        membrane_components: List of SecondaryMembraneInfo for one mold half
+        include_primary: If True, include (1, 2) for primary surface
+        primary_region_offset: Offset for secondary region labels (default 2)
+        
+    Returns:
+        List of (region_a, region_b) pairs, canonically ordered (a < b)
+    """
+    pairs = []
+    
+    if include_primary:
+        pairs.append((1, 2))
+    
+    for comp_idx in range(len(membrane_components)):
+        region_a = primary_region_offset + 1 + (2 * comp_idx)
+        region_b = primary_region_offset + 1 + (2 * comp_idx) + 1
+        pairs.append((min(region_a, region_b), max(region_a, region_b)))
+    
+    return pairs
+
+
+def extract_secondary_surfaces_per_component(
+    tet_result,
+    part_mesh: 'trimesh.Trimesh',
+    include_orphan_primary: bool = True,
+    extend_to_primary: bool = True
+) -> List[Tuple['SecondaryMembraneInfo', 'PartingSurfaceResult']]:
+    """
+    Extract secondary surfaces PER CONNECTED COMPONENT.
+    
+    This is the main entry point for multi-component secondary surface extraction.
+    Instead of extracting all secondary membranes as a single merged surface, this
+    function:
+    
+    1. Classifies secondary edges by mold half (H1/H2)
+    2. Separates edges into connected components within each half
+    3. Extracts a separate PartingSurfaceResult for each component
+    4. At junction tets (where components meet primary or each other),
+       5/6-edge configs are resolved using face/inner vertices (Bloomenthal)
+    
+    The per-component extraction allows:
+    - Independent smoothing per membrane (different boundary conditions)
+    - Proper junction handling between multiple secondary membranes
+    - Better tracking of which membrane belongs to which geometric feature
+    
+    Per Paper Section 4.2: "Once the silicone mold volume has been partitioned
+    into two pieces, for each piece we define additional membranes."
+    
+    Args:
+        tet_result: TetrahedralMeshResult with secondary_cut_edges computed
+        part_mesh: Original part mesh for classification
+        include_orphan_primary: If True, enhance secondary edges with orphan primary edges
+        extend_to_primary: If True, include junction primary edges for connectivity
+        
+    Returns:
+        List of (SecondaryMembraneInfo, PartingSurfaceResult) tuples.
+        Each tuple contains the membrane metadata and its extracted surface.
+        Empty list if no secondary cut edges exist.
+    """
+    from .parting_surface import extract_parting_surface_from_tet_result
+    from . import tetrahedral_mesh as tm
+    
+    if tet_result.secondary_cut_edges is None or len(tet_result.secondary_cut_edges) == 0:
+        logger.info("No secondary cut edges — nothing to extract")
+        return []
+    
+    # Ensure data structures are ready
+    if tet_result.tet_edge_indices is None:
+        tet_result = tm.prepare_parting_surface_data(tet_result)
+    
+    # Step 1: Classify into mold halves and connected components
+    h1_membranes, h2_membranes = classify_secondary_membranes_by_mold_half(
+        tet_result, part_mesh
+    )
+    
+    all_membranes = h1_membranes + h2_membranes
+    
+    if not all_membranes:
+        logger.warning("No secondary membrane components found after classification")
+        return []
+    
+    logger.info(f"Processing {len(all_membranes)} secondary membrane components "
+                f"({len(h1_membranes)} in H1, {len(h2_membranes)} in H2)")
+    
+    # Step 2: Optionally enhance with orphan primary edges
+    if include_orphan_primary:
+        _used, unused_edges, _cfg = find_all_unused_primary_edges(tet_result)
+        if unused_edges:
+            logger.info(f"Found {len(unused_edges)} orphan primary edges to distribute")
+            _distribute_orphan_edges_to_components(all_membranes, unused_edges, tet_result)
+    
+    # Step 3: Extract surface per component
+    results: List[Tuple[SecondaryMembraneInfo, 'PartingSurfaceResult']] = []
+    
+    for comp_idx, membrane in enumerate(all_membranes):
+        logger.info(f"Extracting component {comp_idx} (H{membrane.mold_half}): "
+                    f"{len(membrane.cut_edges)} edges, "
+                    f"{len(membrane.junction_tets)} junction tets")
+        
+        # Build cut flags for just this component's edges
+        if extend_to_primary:
+            cut_flags = compute_extended_secondary_cut_flags_improved(
+                tet_result,
+                membrane.cut_edges,
+                include_junction_primary_edges=True
+            )
+        else:
+            n_edges = len(tet_result.edges)
+            edge_to_index = tet_result.edge_to_index or {}
+            cut_flags = np.zeros(n_edges, dtype=np.int8)
+            for vi, vj in membrane.cut_edges:
+                key = (min(vi, vj), max(vi, vj))
+                if key in edge_to_index:
+                    cut_flags[edge_to_index[key]] = 1
+        
+        n_cut = np.sum(cut_flags)
+        if n_cut == 0:
+            logger.warning(f"  Component {comp_idx}: no cut edges after flag computation — skipping")
+            continue
+        
+        # Build escape distance array for orientation
+        vertex_escape_distances = None
+        if (tet_result.seed_distances is not None and
+            tet_result.seed_vertex_indices is not None and
+            len(tet_result.seed_distances) == len(tet_result.seed_vertex_indices)):
+            n_verts = len(tet_result.vertices)
+            vertex_escape_distances = np.full(n_verts, np.inf, dtype=np.float64)
+            for idx, v_global in enumerate(tet_result.seed_vertex_indices):
+                vertex_escape_distances[v_global] = tet_result.seed_distances[idx]
+            if tet_result.boundary_labels is not None:
+                boundary_mask = (tet_result.boundary_labels == 1) | (tet_result.boundary_labels == 2)
+                vertex_escape_distances[boundary_mask] = 0.0
+        
+        # Build primary vertex mask for junction detection
+        primary_vertex_mask = None
+        if tet_result.primary_cut_edges is not None:
+            n_verts = len(tet_result.vertices)
+            primary_vertex_mask = np.zeros(n_verts, dtype=bool)
+            for vi, vj in tet_result.primary_cut_edges:
+                primary_vertex_mask[vi] = True
+                primary_vertex_mask[vj] = True
+        
+        # Import and call the core extraction function
+        from .parting_surface import extract_parting_surface
+        
+        surface_result = extract_parting_surface(
+            vertices=tet_result.vertices,
+            tetrahedra=tet_result.tetrahedra,
+            edges=tet_result.edges,
+            cut_edge_flags=cut_flags,
+            tet_edge_indices=tet_result.tet_edge_indices,
+            use_original_vertices=True,
+            vertices_original=tet_result.vertices_original,
+            boundary_labels=tet_result.boundary_labels,
+            vertex_mold_labels=None,  # Secondary: no label-derived cuts
+            vertex_escape_distances=vertex_escape_distances,
+            use_label_derived_cuts=False,
+            is_secondary=True,
+            primary_cut_vertex_mask=primary_vertex_mask
+        )
+        
+        if surface_result.mesh is not None and surface_result.num_faces > 0:
+            results.append((membrane, surface_result))
+            logger.info(f"  Component {comp_idx}: extracted {surface_result.num_vertices} verts, "
+                        f"{surface_result.num_faces} faces")
+        else:
+            logger.warning(f"  Component {comp_idx}: empty surface — skipped")
+    
+    logger.info(f"Extracted {len(results)} non-empty secondary surfaces "
+                f"from {len(all_membranes)} components")
+    return results
+
+
+def _distribute_orphan_edges_to_components(
+    membranes: List[SecondaryMembraneInfo],
+    orphan_edges: List[Tuple[int, int]],
+    tet_result
+) -> None:
+    """
+    Distribute orphan primary edges to the nearest secondary membrane component.
+    
+    Orphan primary edges (primary cut edges not used by the primary surface due to
+    invalid tet configs) are assigned to the secondary component that shares the
+    most vertices with them. This modifies the membrane objects in-place.
+    
+    Args:
+        membranes: List of SecondaryMembraneInfo to augment (modified in-place)
+        orphan_edges: List of orphan primary cut edges
+        tet_result: TetrahedralMeshResult for context
+    """
+    if not membranes or not orphan_edges:
+        return
+    
+    # Build vertex sets for each component
+    comp_vertex_sets = []
+    for membrane in membranes:
+        verts = set()
+        for vi, vj in membrane.cut_edges:
+            verts.add(vi)
+            verts.add(vj)
+        comp_vertex_sets.append(verts)
+    
+    assigned_count = 0
+    for vi, vj in orphan_edges:
+        # Find component with most vertex overlap
+        best_comp = -1
+        best_overlap = 0
+        for c_idx, vset in enumerate(comp_vertex_sets):
+            overlap = (vi in vset) + (vj in vset)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_comp = c_idx
+        
+        if best_comp >= 0 and best_overlap > 0:
+            key = (min(vi, vj), max(vi, vj))
+            membranes[best_comp].cut_edges.append(key)
+            comp_vertex_sets[best_comp].add(vi)
+            comp_vertex_sets[best_comp].add(vj)
+            assigned_count += 1
+    
+    logger.info(f"Distributed {assigned_count}/{len(orphan_edges)} orphan edges to components")
 
 
 def compute_extended_secondary_cut_flags_improved(
@@ -939,3 +1400,188 @@ def create_enhanced_secondary_cut_edges(
                f"{added_count} unused primary = {len(secondary_edges)} total")
     
     return secondary_edges
+
+
+# =============================================================================
+# SECONDARY-TO-SECONDARY JUNCTION DETECTION
+# =============================================================================
+
+def detect_secondary_junction_vertices(
+    component_surfaces: List[Tuple['SecondaryMembraneInfo', 'PartingSurfaceResult']],
+    merge_threshold: float = 1e-6
+) -> Tuple[Dict[int, List[Tuple[int, int]]], np.ndarray]:
+    """
+    Detect vertices at junctions between different secondary membrane components.
+    
+    When multiple secondary components are extracted independently, some of their
+    boundary vertices may occupy the same spatial position (from shared cut points
+    on shared tet edges). These junction vertices need special treatment during
+    smoothing: they should be reprojected to the OTHER component's surface to
+    maintain the inter-membrane connection.
+    
+    The detection works by building a spatial index of all per-component vertices
+    and finding coincident vertices across different components.
+    
+    Args:
+        component_surfaces: List of (SecondaryMembraneInfo, PartingSurfaceResult) tuples
+                           from extract_secondary_surfaces_per_component()
+        merge_threshold: Distance threshold for considering two vertices coincident
+    
+    Returns:
+        Tuple of:
+        - junction_map: Dict mapping (component_idx, local_vertex_idx) →
+          list of (other_component_idx, other_local_vertex_idx) pairs.
+          Each entry identifies a vertex that is at a junction with vertices
+          from other components.
+        - vertex_component_id: Array of shape (total_merged_vertices,) where
+          vertex_component_id[i] = component index for vertex i in the
+          merged (concatenated) vertex array. Vertices at junctions between
+          multiple components get component_id = -1.
+    """
+    from scipy.spatial import cKDTree
+    
+    if len(component_surfaces) < 2:
+        # Need at least 2 components for junctions
+        total_verts = 0
+        for _, surface in component_surfaces:
+            if surface.vertices is not None:
+                total_verts += len(surface.vertices)
+        comp_ids = np.zeros(total_verts, dtype=np.int32)
+        if component_surfaces:
+            # Single component — all vertices belong to component 0
+            pass
+        return {}, comp_ids
+    
+    # Build global vertex array with component tracking
+    all_positions = []
+    comp_ids_list = []
+    local_ids_list = []
+    offsets = []  # Start index of each component in the concatenated array
+    
+    offset = 0
+    for comp_idx, (_, surface) in enumerate(component_surfaces):
+        if surface.vertices is None or len(surface.vertices) == 0:
+            offsets.append(offset)
+            continue
+        n_verts = len(surface.vertices)
+        all_positions.append(surface.vertices)
+        comp_ids_list.append(np.full(n_verts, comp_idx, dtype=np.int32))
+        local_ids_list.append(np.arange(n_verts, dtype=np.int32))
+        offsets.append(offset)
+        offset += n_verts
+    
+    if not all_positions:
+        return {}, np.array([], dtype=np.int32)
+    
+    all_positions = np.concatenate(all_positions, axis=0)
+    comp_ids = np.concatenate(comp_ids_list, axis=0)
+    local_ids = np.concatenate(local_ids_list, axis=0)
+    
+    n_total = len(all_positions)
+    
+    # Build KD-tree for spatial queries
+    tree = cKDTree(all_positions)
+    
+    # Find all pairs of vertices within merge_threshold
+    # query_ball_tree is efficient for finding all neighbors
+    junction_map: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+    junction_global_indices: Set[int] = set()
+    
+    # For each vertex, find nearby vertices from OTHER components
+    # Use batch query for efficiency
+    neighbor_lists = tree.query_ball_tree(tree, merge_threshold)
+    
+    for global_i in range(n_total):
+        comp_i = comp_ids[global_i]
+        local_i = local_ids[global_i]
+        
+        for global_j in neighbor_lists[global_i]:
+            if global_j <= global_i:
+                continue  # Skip self and already-processed pairs
+            
+            comp_j = comp_ids[global_j]
+            if comp_j == comp_i:
+                continue  # Same component — not a junction
+            
+            local_j = local_ids[global_j]
+            
+            # Found a cross-component junction
+            key_i = (comp_i, local_i)
+            key_j = (comp_j, local_j)
+            
+            if key_i not in junction_map:
+                junction_map[key_i] = []
+            junction_map[key_i].append(key_j)
+            
+            if key_j not in junction_map:
+                junction_map[key_j] = []
+            junction_map[key_j].append(key_i)
+            
+            junction_global_indices.add(global_i)
+            junction_global_indices.add(global_j)
+    
+    # Build vertex_component_id array
+    # -1 for vertices at multi-component junctions, else component index
+    vertex_component_id = comp_ids.copy()
+    for gi in junction_global_indices:
+        vertex_component_id[gi] = -1
+    
+    n_junction_verts = len(junction_global_indices)
+    n_junction_pairs = sum(len(v) for v in junction_map.values()) // 2  # Each pair counted twice
+    
+    logger.info(f"Secondary junction detection: "
+                f"{n_junction_verts} junction vertices, "
+                f"{n_junction_pairs} cross-component pairs "
+                f"across {len(component_surfaces)} components")
+    
+    return junction_map, vertex_component_id
+
+
+def mark_secondary_junction_boundary_types(
+    component_surfaces: List[Tuple['SecondaryMembraneInfo', 'PartingSurfaceResult']],
+    junction_map: Dict[Tuple[int, int], List[Tuple[int, int]]]
+) -> None:
+    """
+    Mark vertices at secondary-secondary junctions with BOUNDARY_TYPE_SECONDARY_JUNCTION (5).
+    
+    This modifies the vertex_boundary_type arrays of component surfaces IN-PLACE.
+    Only vertices that are currently classified as interior (bt=0) get upgraded
+    to bt=5. Vertices already classified as part (-1), hull (1/2), or primary
+    junction (3/4) keep their existing classification since those constraints
+    take precedence.
+    
+    Args:
+        component_surfaces: List of (SecondaryMembraneInfo, PartingSurfaceResult) tuples
+        junction_map: Dict from detect_secondary_junction_vertices() mapping
+                     (comp_idx, local_vertex_idx) → list of (other_comp, other_local_idx)
+    """
+    from .parting_surface import (
+        BOUNDARY_TYPE_SECONDARY_JUNCTION,
+        BOUNDARY_TYPE_INTERIOR,
+    )
+    
+    if not junction_map:
+        return
+    
+    marked_count = 0
+    
+    for (comp_idx, local_idx), partners in junction_map.items():
+        if comp_idx >= len(component_surfaces):
+            continue
+        
+        _, surface = component_surfaces[comp_idx]
+        
+        if surface.vertex_boundary_type is None:
+            continue
+        if local_idx >= len(surface.vertex_boundary_type):
+            continue
+        
+        current_bt = surface.vertex_boundary_type[local_idx]
+        
+        # Only upgrade interior vertices to secondary junction.
+        # Part, hull, primary junction types take precedence.
+        if current_bt == BOUNDARY_TYPE_INTERIOR:
+            surface.vertex_boundary_type[local_idx] = BOUNDARY_TYPE_SECONDARY_JUNCTION
+            marked_count += 1
+    
+    logger.info(f"Marked {marked_count} vertices as secondary junction (bt=5)")

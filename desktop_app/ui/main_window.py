@@ -2510,8 +2510,15 @@ class SecondarySurfaceExtractionResult:
     Similar to primary surface extraction, this uses Marching Tetrahedra
     to extract secondary parting surfaces from secondary cut edges.
     Smoothing is deferred to a combined smoothing step.
+    
+    The result can contain either:
+    - A single merged mesh (backwards-compatible) in .mesh
+    - Per-component meshes in .component_surfaces for independent processing
+    
+    When per-component extraction is used, .mesh contains the merged result
+    and .component_surfaces contains individual surfaces with their membrane info.
     """
-    # Extracted mesh
+    # Extracted mesh (merged from all components)
     mesh: Optional[trimesh.Trimesh] = None
     num_vertices: int = 0
     num_faces: int = 0
@@ -2519,11 +2526,24 @@ class SecondarySurfaceExtractionResult:
     num_tets_processed: int = 0
     
     # Boundary type tracking for smoothing step
-    # -1 = on part mesh M, 0 = interior, 1/2 = on hull ∂H
+    # -1 = on part mesh M, 0 = interior, 1/2 = on hull ∂H, 3 = primary junction, 5 = secondary junction
     vertex_boundary_type: Optional[np.ndarray] = None
     
     # Mapping from surface vertex index to tet mesh edge index (for debugging)
     vertex_to_edge: Optional[np.ndarray] = None
+    
+    # Per-component surfaces: list of (SecondaryMembraneInfo, PartingSurfaceResult)
+    # Available when per_component_extraction is used
+    component_surfaces: Optional[list] = None
+    
+    # Component membership for each vertex in the merged mesh.
+    # vertex_component_id[i] = component index for vertex i.
+    # -1 indicates a junction vertex shared by multiple components.
+    # Used during smoothing to determine reprojection targets for bt=5 vertices.
+    vertex_component_id: Optional[np.ndarray] = None
+    
+    # Number of connected components found
+    num_components: int = 0
     
     # Timing
     extraction_time_ms: float = 0.0
@@ -2564,6 +2584,7 @@ class SecondarySurfaceExtractionWorker(QThread):
                 repair_parting_surface_with_part
             )
             from core.tetrahedral_mesh import prepare_parting_surface_data
+            from core.secondary_membrane import extract_secondary_surfaces_per_component
             import time
             
             result = SecondarySurfaceExtractionResult()
@@ -2585,37 +2606,140 @@ class SecondarySurfaceExtractionWorker(QThread):
                 self.tet_result = prepare_parting_surface_data(self.tet_result)
             
             # =====================================================================
-            # STEP 2: Extract secondary surface using Marching Tetrahedra
+            # STEP 2: Extract secondary surfaces per connected component
+            # 
+            # Per Bloomenthal 1995 and Paper Section 4.2:
+            # Each connected component of secondary edges forms an independent
+            # membrane. 5/6-edge configs at junctions (where components meet
+            # primary or each other) are resolved with face/inner vertices.
             # =====================================================================
-            self.progress.emit("Extracting secondary surface with Marching Tetrahedra...")
+            self.progress.emit("Extracting secondary surfaces per component...")
             extraction_start = time.time()
             
-            # Per paper Section 4.2-4.3:
-            # Secondary membranes connect to the PRIMARY parting surface (not hull)
-            # extend_to_primary=True includes primary edges in shared tetrahedra
-            # so the secondary surface can connect to the primary surface
-            extraction_result = extract_parting_surface_from_tet_result(
+            component_results = extract_secondary_surfaces_per_component(
                 self.tet_result,
-                use_original_vertices=True,
-                prepare_data=False,
-                cut_type='secondary',  # Use secondary cut edges
-                extend_to_primary=True  # Include primary edges in shared tets for connectivity
+                part_mesh=self.part_mesh,
+                include_orphan_primary=True,
+                extend_to_primary=True
             )
             
             result.extraction_time_ms = (time.time() - extraction_start) * 1000
-            result.num_tets_processed = extraction_result.num_tets_processed
-            result.num_tets_contributing = extraction_result.num_tets_contributing
-            result.vertex_to_edge = extraction_result.vertex_to_edge
+            result.component_surfaces = component_results
+            result.num_components = len(component_results)
             
-            if extraction_result.mesh is None or extraction_result.num_faces == 0:
-                self.progress.emit("No secondary surface generated")
-                result.total_time_ms = (time.time() - total_start) * 1000
-                self.complete.emit(result)
-                return
-            
-            self.progress.emit(f"Extracted: {extraction_result.num_vertices:,} verts, "
-                             f"{extraction_result.num_faces:,} faces "
-                             f"from {extraction_result.num_tets_contributing} tets")
+            if not component_results:
+                self.progress.emit("No secondary surfaces from components — falling back to merged extraction...")
+                
+                # Fallback: try the original merged extraction
+                extraction_result = extract_parting_surface_from_tet_result(
+                    self.tet_result,
+                    use_original_vertices=True,
+                    prepare_data=False,
+                    cut_type='secondary',
+                    extend_to_primary=True
+                )
+                
+                if extraction_result.mesh is None or extraction_result.num_faces == 0:
+                    self.progress.emit("No secondary surface generated")
+                    result.total_time_ms = (time.time() - total_start) * 1000
+                    self.complete.emit(result)
+                    return
+                
+                result.num_tets_processed = extraction_result.num_tets_processed
+                result.num_tets_contributing = extraction_result.num_tets_contributing
+                result.vertex_to_edge = extraction_result.vertex_to_edge
+                
+                merged_extraction = extraction_result
+            else:
+                # =============================================================
+                # STEP 2b: Detect secondary-to-secondary junctions
+                #
+                # Before merging, find vertices from different components at
+                # the same spatial position. These are junction vertices where
+                # one secondary membrane meets another. Mark them as bt=5 so
+                # they get reprojected to the other component during smoothing.
+                # =============================================================
+                from core.secondary_membrane import (
+                    detect_secondary_junction_vertices,
+                    mark_secondary_junction_boundary_types
+                )
+                
+                if len(component_results) >= 2:
+                    self.progress.emit("Detecting secondary-to-secondary junctions...")
+                    junction_map, pre_merge_comp_ids = detect_secondary_junction_vertices(
+                        component_results
+                    )
+                    
+                    if junction_map:
+                        mark_secondary_junction_boundary_types(component_results, junction_map)
+                        self.progress.emit(
+                            f"Found {len(junction_map)} junction vertices across components"
+                        )
+                    else:
+                        self.progress.emit("No secondary-to-secondary junctions found")
+                else:
+                    pre_merge_comp_ids = None
+                
+                # Merge per-component surfaces into a single mesh
+                self.progress.emit(f"Merging {len(component_results)} component surfaces...")
+                all_verts = []
+                all_faces = []
+                all_bts = []
+                all_comp_ids = []
+                vertex_offset = 0
+                total_tets_contributing = 0
+                
+                for comp_idx, (membrane_info, surface) in enumerate(component_results):
+                    if surface.mesh is not None and surface.num_faces > 0:
+                        n_comp_verts = len(surface.vertices)
+                        all_verts.append(surface.vertices)
+                        all_faces.append(surface.faces + vertex_offset)
+                        if surface.vertex_boundary_type is not None:
+                            all_bts.append(surface.vertex_boundary_type)
+                        else:
+                            all_bts.append(np.zeros(n_comp_verts, dtype=np.int8))
+                        all_comp_ids.append(np.full(n_comp_verts, comp_idx, dtype=np.int32))
+                        vertex_offset += n_comp_verts
+                        total_tets_contributing += surface.num_tets_contributing
+                
+                if not all_verts:
+                    self.progress.emit("All component surfaces were empty")
+                    result.total_time_ms = (time.time() - total_start) * 1000
+                    self.complete.emit(result)
+                    return
+                
+                merged_verts = np.concatenate(all_verts, axis=0)
+                merged_faces = np.concatenate(all_faces, axis=0)
+                merged_bts = np.concatenate(all_bts, axis=0)
+                merged_comp_ids = np.concatenate(all_comp_ids, axis=0)
+                
+                # Override component IDs for junction vertices (from pre-merge detection)
+                if pre_merge_comp_ids is not None and len(pre_merge_comp_ids) == len(merged_comp_ids):
+                    junction_mask = pre_merge_comp_ids == -1
+                    merged_comp_ids[junction_mask] = -1
+                
+                from core.parting_surface import PartingSurfaceResult
+                merged_extraction = PartingSurfaceResult()
+                merged_extraction.vertices = merged_verts
+                merged_extraction.faces = merged_faces
+                merged_extraction.vertex_boundary_type = merged_bts
+                merged_extraction.mesh = trimesh.Trimesh(
+                    vertices=merged_verts,
+                    faces=merged_faces,
+                    process=False
+                )
+                merged_extraction.num_vertices = len(merged_verts)
+                merged_extraction.num_faces = len(merged_faces)
+                merged_extraction.num_tets_contributing = total_tets_contributing
+                
+                result.num_tets_contributing = total_tets_contributing
+                result.vertex_component_id = merged_comp_ids
+                
+                self.progress.emit(
+                    f"Merged: {merged_extraction.num_vertices:,} verts, "
+                    f"{merged_extraction.num_faces:,} faces from "
+                    f"{len(component_results)} components"
+                )
             
             # =====================================================================
             # STEP 3: Clean surface (merge vertices, remove degenerates)
@@ -2625,13 +2749,13 @@ class SecondarySurfaceExtractionWorker(QThread):
             
             if self.part_mesh is not None:
                 repaired_result = repair_parting_surface_with_part(
-                    extraction_result,
+                    merged_extraction,
                     self.part_mesh,
                     is_secondary=True  # Use part-priority merge for secondary
                 )
             else:
                 repaired_result = repair_parting_surface(
-                    extraction_result,
+                    merged_extraction,
                     merge_vertices=True,
                     merge_threshold=1e-8,
                     is_secondary=True  # Use part-priority merge for secondary
@@ -2651,6 +2775,52 @@ class SecondarySurfaceExtractionWorker(QThread):
                 result.num_faces = repaired_result.num_faces
                 result.vertex_boundary_type = repaired_result.vertex_boundary_type
                 self.progress.emit(f"Cleaned: {result.num_vertices:,} verts, {result.num_faces:,} faces")
+            
+            # Rebuild vertex_component_id after repair via spatial matching.
+            # Repair merges coincident vertices, so we match each post-repair
+            # vertex to the nearest per-component vertex to determine membership.
+            # Vertices equidistant to multiple components are junction vertices (-1).
+            if (result.vertex_component_id is not None and
+                    component_results and result.mesh is not None):
+                self.progress.emit("Rebuilding component IDs after repair...")
+                from scipy.spatial import cKDTree
+                
+                repaired_verts = np.array(result.mesh.vertices)
+                n_repaired = len(repaired_verts)
+                new_comp_ids = np.full(n_repaired, -1, dtype=np.int32)
+                merge_tol = 1e-6
+                
+                # Build per-component KD-trees
+                comp_trees = []
+                for comp_idx, (_, surface) in enumerate(component_results):
+                    if surface.vertices is not None and len(surface.vertices) > 0:
+                        comp_trees.append((comp_idx, cKDTree(surface.vertices)))
+                    else:
+                        comp_trees.append((comp_idx, None))
+                
+                # For each repaired vertex, find nearest in each component
+                for comp_idx, tree in comp_trees:
+                    if tree is None:
+                        continue
+                    dists, _ = tree.query(repaired_verts, k=1)
+                    on_comp = dists < merge_tol
+                    
+                    for vi in np.where(on_comp)[0]:
+                        if new_comp_ids[vi] == -1:
+                            # First component claim
+                            new_comp_ids[vi] = comp_idx
+                        elif new_comp_ids[vi] != comp_idx:
+                            # Multiple components claim this vertex → junction
+                            new_comp_ids[vi] = -1
+                
+                # Vertices not claimed by any component keep -1 (junction/unknown)
+                result.vertex_component_id = new_comp_ids
+                
+                n_junction = np.sum(new_comp_ids == -1)
+                n_assigned = np.sum(new_comp_ids >= 0)
+                self.progress.emit(
+                    f"Component IDs: {n_assigned} assigned, {n_junction} junction/unmatched"
+                )
             
             # =====================================================================
             # STEP 4: Remove small disconnected islands (noise fragments)
@@ -2681,7 +2851,8 @@ class SecondarySurfaceExtractionWorker(QThread):
             result.total_time_ms = (time.time() - total_start) * 1000
             
             self.progress.emit(
-                f"Secondary extraction complete: {result.num_vertices:,} verts, {result.num_faces:,} faces "
+                f"Secondary extraction complete: {result.num_vertices:,} verts, "
+                f"{result.num_faces:,} faces from {result.num_components} components "
                 f"({result.extraction_time_ms:.0f}ms extract, {result.repair_time_ms:.0f}ms clean)"
             )
             
@@ -2866,6 +3037,28 @@ class CombinedSurfaceSmoothingWorker(QThread):
                 # Secondary membrane boundaries should connect to primary membrane
                 primary_mesh_for_secondary = result.primary_mesh
                 
+                # Build per-component meshes and component IDs for bt=5 reprojection
+                sec_component_meshes = None
+                sec_component_ids = None
+                
+                if (self.secondary_extraction_result.component_surfaces and
+                        self.secondary_extraction_result.vertex_component_id is not None):
+                    sec_component_meshes = []
+                    for membrane_info, surface in self.secondary_extraction_result.component_surfaces:
+                        if surface.mesh is not None and len(surface.mesh.faces) > 0:
+                            sec_component_meshes.append(surface.mesh)
+                        else:
+                            sec_component_meshes.append(None)
+                    sec_component_ids = self.secondary_extraction_result.vertex_component_id
+                    
+                    n_bt5 = 0
+                    if self.secondary_extraction_result.vertex_boundary_type is not None:
+                        n_bt5 = int(np.sum(self.secondary_extraction_result.vertex_boundary_type == 5))
+                    self.progress.emit(
+                        f"Secondary junction data: {len(sec_component_meshes)} components, "
+                        f"{n_bt5} bt=5 vertices"
+                    )
+                
                 # Smooth secondary surface (without collar creation)
                 result.secondary_mesh, result.secondary_num_vertices, result.secondary_num_faces, \
                     result.secondary_boundary_vertices, result.secondary_interior_vertices, \
@@ -2878,7 +3071,9 @@ class CombinedSurfaceSmoothingWorker(QThread):
                         part_mesh_for_reprojection,
                         hull_mesh_for_reprojection,
                         primary_mesh_for_secondary,
-                        "SECONDARY"
+                        "SECONDARY",
+                        secondary_component_meshes=sec_component_meshes,
+                        vertex_component_id=sec_component_ids
                     )
             else:
                 self.progress.emit("")
@@ -3009,13 +3204,18 @@ class CombinedSurfaceSmoothingWorker(QThread):
             current_boundary_type  # Return the vertex_boundary_type for downstream use
         )
 
-    def _smooth_single_surface_no_collar(self, mesh, vertex_boundary_type, part_mesh, hull_mesh, primary_mesh, label: str):
+    def _smooth_single_surface_no_collar(self, mesh, vertex_boundary_type, part_mesh, hull_mesh,
+                                         primary_mesh, label: str,
+                                         secondary_component_meshes=None,
+                                         vertex_component_id=None):
         """
         Smooth a single surface mesh WITHOUT collar creation.
         
         This is used for secondary surfaces where collar creation is deferred
         to a later step. Part boundary vertices are re-projected to the part mesh,
         and other boundary vertices are re-projected to the primary membrane if close.
+        bt=5 (secondary junction) vertices are re-projected to the OTHER secondary
+        component's surface when component meshes and IDs are provided.
         
         Args:
             mesh: The mesh to smooth
@@ -3024,6 +3224,9 @@ class CombinedSurfaceSmoothingWorker(QThread):
             hull_mesh: Hull mesh (not used for re-projection, but passed for consistency)
             primary_mesh: Primary membrane mesh for re-projection of non-part boundary vertices
             label: Label for progress messages
+            secondary_component_meshes: Optional list of per-component secondary surface meshes
+                                       for bt=5 reprojection
+            vertex_component_id: Optional array tracking component membership per vertex
         
         Returns tuple of:
             (mesh, num_vertices, num_faces, boundary_vertices, interior_vertices,
@@ -3070,7 +3273,9 @@ class CombinedSurfaceSmoothingWorker(QThread):
                 vertex_boundary_type=current_boundary_type,
                 feature_aware_smoothing=self.feature_aware_smoothing,
                 reproject_to_hull=False,          # Secondary: don't re-project to hull
-                reproject_to_primary=has_primary   # Secondary: re-project to primary if available
+                reproject_to_primary=has_primary,  # Secondary: re-project to primary if available
+                secondary_component_meshes=secondary_component_meshes,
+                vertex_component_id=vertex_component_id
             )
             
             smoothing_time_ms = (time.time() - smoothing_start) * 1000

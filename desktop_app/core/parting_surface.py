@@ -131,6 +131,7 @@ BOUNDARY_TYPE_H1 = 1          # On hull H1 boundary (outer boundary - reproject 
 BOUNDARY_TYPE_H2 = 2          # On hull H2 boundary (outer boundary - reproject to hull)
 BOUNDARY_TYPE_PRIMARY_JUNCTION = 3  # At primary-secondary junction (reproject to primary surface)
 BOUNDARY_TYPE_PRIMARY_THEN_PART = 4  # Triple junction: reproject to primary, then to part
+BOUNDARY_TYPE_SECONDARY_JUNCTION = 5  # At secondary-secondary junction (reproject to other secondary surface)
 
 
 # =============================================================================
@@ -148,19 +149,41 @@ TET_EDGES = [
     (2, 3),  # Edge 5
 ]
 
+# Face definitions: face index -> (v_i, v_j, v_k) and which edges bound the face
+# Each tetrahedral face is a triangle of 3 vertices.
+# TET_FACE_EDGES[face_idx] = list of (local_edge_idx) that bound that face.
+TET_FACES = [
+    (0, 1, 2),  # Face 0: v0-v1-v2  (edges 0,1,3)
+    (0, 1, 3),  # Face 1: v0-v1-v3  (edges 0,2,4)
+    (0, 2, 3),  # Face 2: v0-v2-v3  (edges 1,2,5)
+    (1, 2, 3),  # Face 3: v1-v2-v3  (edges 3,4,5)
+]
 
-def _build_marching_tet_table() -> Dict[int, List[Tuple]]:
+TET_FACE_EDGES = [
+    [0, 1, 3],  # Face 0: edges (v0-v1), (v0-v2), (v1-v2)
+    [0, 2, 4],  # Face 1: edges (v0-v1), (v0-v3), (v1-v3)
+    [1, 2, 5],  # Face 2: edges (v0-v2), (v0-v3), (v2-v3)
+    [3, 4, 5],  # Face 3: edges (v1-v2), (v1-v3), (v2-v3)
+]
+
+
+def _build_marching_tet_table() -> Dict[int, object]:
     """
-    Build the marching tetrahedra lookup table for BINARY (2-class) labeling.
+    Build the marching tetrahedra lookup table for BINARY and MULTI-REGION labeling.
     
     In a proper binary system where every vertex is labeled H1 or H2:
     - 0-edge config: All 4 vertices same label → no surface
     - 3-edge config: 1 vertex isolated (3+1 split) → single triangle
     - 4-edge config: 2 vs 2 vertices (2+2 split) → quad (2 triangles)
     
-    5-edge and 6-edge configs should NOT occur in a binary system (they require
-    3+ classes). If they do occur, it indicates a labeling bug upstream.
-    We handle them as warnings but still attempt reasonable triangulation.
+    For multi-region systems (secondary membranes meeting each other or primary):
+    - 5-edge config: 3 regions meet → face vertex + 5 triangles
+      Per Bloomenthal & Ferguson 1995, Section 4: "three regions are spanned
+      by a single face. This suggests the computation of three edge vertices,
+      a face vertex, and their connection by three face lines."
+    - 6-edge config: 4 regions meet → 4 face vertices + 1 inner vertex + 12 triangles
+      Per Bloomenthal 1995, Section 4: "one tetrahedron may contain four face
+      vertices... our polygonizer supports an inner vertex within the tetrahedron"
     
     Edge numbering:
         Edge 0: (v0, v1)    Edge 3: (v1, v2)
@@ -168,8 +191,10 @@ def _build_marching_tet_table() -> Dict[int, List[Tuple]]:
         Edge 2: (v0, v3)    Edge 5: (v2, v3)
     
     Returns:
-        Dictionary mapping 6-bit config -> list of triangle specs
-        Each triangle is (edge0, edge1, edge2) using local edge indices
+        Dictionary mapping 6-bit config -> triangulation specification:
+        - For 0/3/4-edge: List of (edge0, edge1, edge2) tuples
+        - For 5-edge: 'FACE_VERTEX' sentinel (handled procedurally)
+        - For 6-edge: 'INNER_VERTEX' sentinel (handled procedurally)
     """
     table = {}
     
@@ -236,26 +261,335 @@ def _build_marching_tet_table() -> Dict[int, List[Tuple]]:
     table[51] = [(0, 4, 5), (0, 5, 1)]
     
     # ===========================================================================
-    # INVALID CONFIGS (should not occur in binary system)
-    # These indicate a labeling bug. We mark them for warning but don't generate
-    # triangles since doing so incorrectly causes self-intersections.
+    # 5-EDGE CONFIGS: Three regions meet → face vertex required
+    #
+    # Per Bloomenthal & Ferguson 1995, Section 4:
+    # "three regions are spanned by a single tetrahedral face"
+    # The face with 3 cut edges gets a face vertex at the centroid of its
+    # 3 mid-edge points. This produces 5 triangles total:
+    #   - 3 triangles fan around the face vertex on the 3-cut face
+    #   - 2 triangles form the quad on the opposite face
+    #
+    # These are handled procedurally by _generate_5_edge_triangles()
     # ===========================================================================
-    # 5-edge configs (would require 3 classes)
-    table[62] = 'SKIP'  # Edge 0 not cut - invalid in binary
-    table[61] = 'SKIP'  # Edge 1 not cut
-    table[59] = 'SKIP'  # Edge 2 not cut
-    table[55] = 'SKIP'  # Edge 3 not cut
-    table[47] = 'SKIP'  # Edge 4 not cut
-    table[31] = 'SKIP'  # Edge 5 not cut
+    table[62] = 'FACE_VERTEX'  # Edge 0 (v0-v1) not cut → face 3 (v1,v2,v3) has 3 cuts but that's wrong
+    table[61] = 'FACE_VERTEX'  # Edge 1 (v0-v2) not cut
+    table[59] = 'FACE_VERTEX'  # Edge 2 (v0-v3) not cut
+    table[55] = 'FACE_VERTEX'  # Edge 3 (v1-v2) not cut
+    table[47] = 'FACE_VERTEX'  # Edge 4 (v1-v3) not cut
+    table[31] = 'FACE_VERTEX'  # Edge 5 (v2-v3) not cut
     
-    # 6-edge config (would require 4 classes)
-    table[63] = 'SKIP'  # All edges cut - invalid in binary
+    # ===========================================================================
+    # 6-EDGE CONFIG: Four regions meet → inner vertex required
+    #
+    # Per Bloomenthal & Ferguson 1995, Section 4:
+    # "one tetrahedron may contain four face vertices... our polygonizer
+    # supports an inner vertex within the tetrahedron that connects face
+    # and edge vertices"
+    #
+    # All 4 faces have 3 cut edges each → each gets a face vertex.
+    # These 4 face vertices connect through 1 inner vertex at their average.
+    # This produces 12 triangles (3 per face, each: edge_v, face_v, inner_v).
+    #
+    # Handled procedurally by _generate_6_edge_triangles()
+    # ===========================================================================
+    table[63] = 'INNER_VERTEX'  # All 6 edges cut
     
     return table
 
 
 # Pre-build the lookup table
 MARCHING_TET_TABLE = _build_marching_tet_table()
+
+
+# =============================================================================
+# 5-EDGE AND 6-EDGE CONFIGURATION HELPERS (Bloomenthal & Ferguson 1995)
+# =============================================================================
+
+def _find_uncut_edge(config: int) -> int:
+    """
+    For a 5-edge config, find the single uncut edge index (0-5).
+    
+    Args:
+        config: 6-bit configuration bitmask
+        
+    Returns:
+        Local edge index (0-5) that is NOT cut
+    """
+    for e in range(6):
+        if not (config & (1 << e)):
+            return e
+    return -1  # Should never happen for 5-edge configs
+
+
+def _find_face_with_3_cut_edges(config: int) -> int:
+    """
+    For a 5-edge config, find the face that has all 3 of its edges cut.
+    
+    In a 5-edge config (one edge uncut), EXACTLY ONE face has all 3 boundary
+    edges cut. This is the face where 3 regions meet and where we place the
+    face vertex.
+    
+    The two vertices of the uncut edge share the same label. The face OPPOSITE
+    to both of these vertices does not exist in a tet (a tet face has 3 verts).
+    Instead, we find the face that does NOT contain EITHER vertex of the uncut edge.
+    Actually, every face contains at least one of those two verts in a tet, so
+    the face with ALL 3 edges cut is the one opposite to the constraints.
+    
+    The correct approach: check which face has all 3 of its edges in the cut set.
+    
+    Args:
+        config: 6-bit configuration bitmask (5 bits set)
+        
+    Returns:
+        Face index (0-3) where all 3 edges are cut
+    """
+    for face_idx, face_edges in enumerate(TET_FACE_EDGES):
+        all_cut = all((config & (1 << e)) for e in face_edges)
+        if all_cut:
+            return face_idx
+    return -1  # Should not happen for valid 5-edge configs
+
+
+def _generate_5_edge_triangles(
+    config: int,
+    local_edge_to_sv: Dict[int, int],
+    surface_vertices: np.ndarray,
+    next_vertex_index: int
+) -> Tuple[List[List[int]], np.ndarray, np.ndarray, int]:
+    """
+    Generate triangles for a 5-edge configuration using a face vertex.
+    
+    Per Bloomenthal & Ferguson 1995 Section 4, Figure 7:
+    When 3 regions meet at a tetrahedral face, we place a FACE VERTEX at the
+    centroid of the 3 mid-edge points on that face. Then we create:
+    - 3 triangles fanning around the face vertex on the 3-cut face
+    - 2 triangles forming the quad on an adjacent face (the standard 4-edge quad)
+    
+    The face vertex is a NEW vertex that does not sit on any tet edge. It sits
+    at(roughly) the intersection point where the 3 region boundaries meet on
+    the face.
+    
+    Per Bloomenthal: "the face vertex is located at the center of [the final
+    triangle in the contour following process]" — we approximate this as the
+    centroid of the 3 edge midpoints on the face.
+    
+    Args:
+        config: 6-bit configuration (5 edges cut)
+        local_edge_to_sv: Map from local edge index to surface vertex index
+        surface_vertices: Current array of surface vertex positions
+        next_vertex_index: Index to assign to the new face vertex
+        
+    Returns:
+        Tuple of:
+        - triangles: List of [sv0, sv1, sv2] triangle vertex index lists
+        - new_vertex_pos: (1, 3) position of the face vertex (to append to surface_vertices)
+        - new_vertex_bt: (1,) boundary type of the face vertex
+        - n_new_vertices: Number of new vertices created (1 for face vertex)
+    """
+    # Identify the face with all 3 edges cut
+    face_idx = _find_face_with_3_cut_edges(config)
+    
+    if face_idx < 0:
+        logger.warning(f"5-edge config {config:06b}: could not find face with 3 cut edges")
+        return [], np.zeros((0, 3)), np.zeros(0, dtype=np.int8), 0
+    
+    face_edge_indices = TET_FACE_EDGES[face_idx]  # 3 local edge indices on this face
+    
+    # Get the 3 surface vertex indices on this face
+    face_svs = []
+    face_positions = []
+    for le in face_edge_indices:
+        sv = local_edge_to_sv.get(le)
+        if sv is None:
+            logger.warning(f"5-edge config {config:06b}: missing surface vertex for edge {le}")
+            return [], np.zeros((0, 3)), np.zeros(0, dtype=np.int8), 0
+        face_svs.append(sv)
+        face_positions.append(surface_vertices[sv])
+    
+    # Compute face vertex position = centroid of the 3 edge midpoints
+    face_vertex_pos = np.mean(face_positions, axis=0)
+    fv_idx = next_vertex_index  # This will be the new vertex index
+    
+    # Boundary type for face vertex: interior (0) since it's inside a face
+    face_vertex_bt = np.array([0], dtype=np.int8)
+    
+    triangles = []
+    
+    # 3 triangles fanning around the face vertex on the 3-cut face
+    # Each triangle connects two adjacent edge midpoints to the face vertex
+    for i in range(3):
+        sv_a = face_svs[i]
+        sv_b = face_svs[(i + 1) % 3]
+        triangles.append([sv_a, sv_b, fv_idx])
+    
+    # Find the remaining 2 cut edges not on this face → they form a pair
+    # In a 5-edge config, 3 edges are on the face, the other 2 cut edges
+    # are the ones NOT on this face (and not the uncut edge).
+    # These 2 edges + 1 edge from the face form a quad on an adjacent face.
+    uncut_edge = _find_uncut_edge(config)
+    remaining_cut_edges = []
+    for e in range(6):
+        if e == uncut_edge:
+            continue
+        if e not in face_edge_indices:
+            remaining_cut_edges.append(e)
+    
+    if len(remaining_cut_edges) == 2:
+        # The 2 remaining cut edges share a vertex (the vertex opposite to the face).
+        # Each of these edges connects to one of the face edges at a shared tet vertex.
+        # We need to connect them through the face vertex to form 2 additional triangles.
+        sv_r0 = local_edge_to_sv.get(remaining_cut_edges[0])
+        sv_r1 = local_edge_to_sv.get(remaining_cut_edges[1])
+        
+        if sv_r0 is not None and sv_r1 is not None:
+            # Connect each remaining edge vertex to the face vertex and to the
+            # nearest face edge vertex.
+            # Find which face edge vertices are adjacent to each remaining edge.
+            re0_verts = set(TET_EDGES[remaining_cut_edges[0]])
+            re1_verts = set(TET_EDGES[remaining_cut_edges[1]])
+            
+            # For each face edge, check which remaining edge shares a tet vertex
+            for i, fe in enumerate(face_edge_indices):
+                fe_verts = set(TET_EDGES[fe])
+                if fe_verts & re0_verts:
+                    # face edge i connects to remaining edge 0
+                    triangles.append([face_svs[i], sv_r0, fv_idx])
+                if fe_verts & re1_verts:
+                    # face edge i connects to remaining edge 1
+                    triangles.append([face_svs[i], sv_r1, fv_idx])
+            
+            # Remove duplicate triangles if any (shouldn't happen but safety)
+            # Also connect the two remaining edges directly if they share a tet vertex
+            # (the apex vertex), forming one more triangle
+            # Actually: the two remaining edges + face vertex form the outer fan.
+            # The total should be 5 triangles: 3 inner fan + 2 outer connecting.
+            # But the loop above may produce more than 2. Let me count:
+            # Each remaining edge shares exactly one vertex with one face edge.
+            # So the loop produces exactly 2 additional triangles.
+    
+    return triangles, face_vertex_pos.reshape(1, 3), face_vertex_bt, 1
+
+
+def _generate_6_edge_triangles(
+    local_edge_to_sv: Dict[int, int],
+    surface_vertices: np.ndarray,
+    next_vertex_index: int
+) -> Tuple[List[List[int]], np.ndarray, np.ndarray, int]:
+    """
+    Generate triangles for a 6-edge configuration using face + inner vertices.
+    
+    Per Bloomenthal & Ferguson 1995 Section 4, Figure 11:
+    When all 4 tet corners have different region labels, each of the 4 faces
+    has 3 cut edges. We create:
+    - 4 face vertices (one per face, at centroid of that face's 3 edge midpoints)
+    - 1 inner vertex (at the centroid of the 4 face vertices)
+    - 12 triangles (3 per face): each triangle is (edge_midpoint, face_vertex, inner_vertex)
+    
+    Per Bloomenthal: "each face line, together with this inner vertex, creates
+    one triangle"
+    
+    Args:
+        local_edge_to_sv: Map from local edge index to surface vertex index
+        surface_vertices: Current array of surface vertex positions
+        next_vertex_index: Index to assign to the first new vertex
+        
+    Returns:
+        Tuple of:
+        - triangles: List of [sv0, sv1, sv2] triangle vertex index lists
+        - new_vertex_positions: (5, 3) positions of the 4 face vertices + 1 inner vertex
+        - new_vertex_bts: (5,) boundary types (all 0 = interior)
+        - n_new_vertices: Number of new vertices created (5)
+    """
+    # Verify all 6 edge midpoints exist
+    for e in range(6):
+        if e not in local_edge_to_sv:
+            logger.warning(f"6-edge config: missing surface vertex for edge {e}")
+            return [], np.zeros((0, 3)), np.zeros(0, dtype=np.int8), 0
+    
+    # Step 1: Compute 4 face vertices
+    face_vertex_positions = []
+    face_vertex_indices = []  # Will be next_vertex_index, +1, +2, +3
+    
+    for face_idx in range(4):
+        face_edges = TET_FACE_EDGES[face_idx]
+        positions = [surface_vertices[local_edge_to_sv[e]] for e in face_edges]
+        fv_pos = np.mean(positions, axis=0)
+        face_vertex_positions.append(fv_pos)
+        face_vertex_indices.append(next_vertex_index + face_idx)
+    
+    # Step 2: Compute inner vertex = centroid of face vertices
+    inner_pos = np.mean(face_vertex_positions, axis=0)
+    inner_idx = next_vertex_index + 4
+    
+    # Step 3: Generate 12 triangles (3 per face)
+    # On each face, the 3 edge midpoints and the face vertex create 3 triangles.
+    # Each triangle connects: (edge_midpoint_i, edge_midpoint_j, face_vertex)
+    # But per Bloomenthal, with the inner vertex, each face line (between two
+    # edge midpoints through the face vertex) becomes a triangle:
+    # (edge_midpoint, face_vertex, inner_vertex)
+    #
+    # Actually Bloomenthal says "Each face line, together with this inner vertex,
+    # creates one triangle." A face line connects two edge vertices through the
+    # face vertex. So each face has 3 face lines (connecting pairs of edge midpoints
+    # via the face vertex), and each line + inner_vertex = 1 triangle.
+    #
+    # Triangle for each edge midpoint on the face:
+    # (edge_midpoint_i, face_vertex, inner_vertex)
+    # 3 such triangles per face, 4 faces = 12 triangles.
+    
+    triangles = []
+    for face_idx in range(4):
+        fv_idx = face_vertex_indices[face_idx]
+        face_edges = TET_FACE_EDGES[face_idx]
+        
+        for i in range(3):
+            sv_a = local_edge_to_sv[face_edges[i]]
+            sv_b = local_edge_to_sv[face_edges[(i + 1) % 3]]
+            triangles.append([sv_a, sv_b, fv_idx])
+            # Also fan to inner vertex
+        
+    # Wait — the above produces 12 triangles on the face surfaces, but doesn't
+    # connect through the inner vertex. Let me reconsider.
+    #
+    # The correct interpretation per Bloomenthal Figure 11 and Section 5:
+    # - On each face, 3 edge midpoints connect to 1 face vertex → 3 triangles
+    #   (this triangulates the face's portion of the separating surface)
+    # - The face vertices of different faces are then connected through the
+    #   inner vertex to form the "interior" portion of the separating surfaces.
+    #
+    # For a full 4-region separation, each pair of adjacent faces shares one
+    # edge midpoint. The surface between their two regions goes through:
+    #   edge_midpoint → face_vertex_A → inner_vertex → face_vertex_B → edge_midpoint
+    #
+    # The simplest correct approach: for each face, create 3 triangles fanning
+    # the edge midpoints around the face vertex (same as 5-edge face treatment),
+    # then for each edge of the tet, create a triangle connecting:
+    #   (face_vertex_of_face_A, face_vertex_of_face_B, inner_vertex)
+    # where face_A and face_B are the two faces that share that edge.
+    #
+    # Total: 4×3 + 6 = 18 triangles? That's too many.
+    #
+    # Actually the correct Bloomenthal approach is simpler:
+    # Each face has 3 "face lines" (segments from edge_midpoint through face_vertex).
+    # Each face line + inner_vertex = 1 triangle.
+    # So: 4 faces × 3 face lines = 12 triangles.
+    # Triangle = (edge_midpoint_i, face_vertex_of_this_face, inner_vertex)
+    
+    triangles = []
+    for face_idx in range(4):
+        fv_idx = face_vertex_indices[face_idx]
+        face_edges = TET_FACE_EDGES[face_idx]
+        
+        for e_local in face_edges:
+            sv = local_edge_to_sv[e_local]
+            triangles.append([sv, fv_idx, inner_idx])
+    
+    # Build new vertex arrays
+    all_new_positions = np.array(face_vertex_positions + [inner_pos], dtype=np.float64)
+    all_new_bts = np.zeros(5, dtype=np.int8)  # All interior
+    
+    return triangles, all_new_positions, all_new_bts, 5
 
 
 # =============================================================================
@@ -1032,9 +1366,17 @@ def extract_parting_surface(
     
     # Track configuration statistics for debugging
     config_counts = {}
-    n_skipped_configs = 0  # Count of invalid 5/6-edge configs (indicates labeling issues)
+    n_skipped_configs = 0  # Count of unresolvable configs
+    n_5edge_configs = 0    # Count of 5-edge configs resolved with face vertex
+    n_6edge_configs = 0    # Count of 6-edge configs resolved with inner vertex
     n_label_derived = 0    # Count of configs derived from vertex labels
     n_flag_derived = 0     # Count of configs derived from cut_edge_flags
+    
+    # For 5-edge and 6-edge configs: we create NEW vertices (face/inner vertices)
+    # that don't sit on any tet edge. We collect them here and append after the loop.
+    new_vertex_positions = []  # List of np.ndarray (K, 3) arrays
+    new_vertex_bts = []        # List of np.ndarray (K,) arrays
+    next_new_vertex_index = len(surface_vertices)  # Starting index for new vertices
     
     # Local edge definitions: (v0_local, v1_local) for each of 6 edges
     LOCAL_TET_EDGES = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
@@ -1084,12 +1426,87 @@ def extract_parting_surface(
         
         if table_entry == 'SKIP':
             # =================================================================
-            # INVALID CONFIGURATION (5 or 6 edges cut)
-            # This should not occur in a proper binary labeling system.
-            # It indicates that some vertices are unlabeled or have inconsistent labels.
-            # Skip to avoid generating broken geometry.
+            # INVALID CONFIGURATION (5 or 6 edges cut) - LEGACY SKIP
+            # Should not reach here anymore; FACE_VERTEX/INNER_VERTEX handle these.
             # =================================================================
             n_skipped_configs += 1
+            continue
+        
+        elif table_entry == 'FACE_VERTEX':
+            # =================================================================
+            # 5-EDGE CONFIGURATION: Face vertex required
+            # Per Bloomenthal & Ferguson 1995, Section 4:
+            # Three regions meet at a face → place face vertex at centroid
+            # of the 3 edge midpoints on that face, then fan 5 triangles.
+            # =================================================================
+            n_5edge_configs += 1
+            tets_contributing += 1
+            
+            new_tris, new_pos, new_bt, n_new = _generate_5_edge_triangles(
+                config, local_edge_to_vertex, surface_vertices,
+                next_new_vertex_index
+            )
+            
+            if n_new > 0 and new_tris:
+                # Append the face vertex to our growing lists
+                new_vertex_positions.append(new_pos)
+                new_vertex_bts.append(new_bt)
+                
+                # Temporarily extend surface_vertices so orientation can access
+                # the new face vertex positions by index
+                surface_vertices = np.concatenate(
+                    [surface_vertices, new_pos], axis=0
+                )
+                next_new_vertex_index += n_new
+                
+                # Orient and append triangles
+                for tri_verts in new_tris:
+                    if vertex_escape_distances is not None:
+                        tri_verts = _orient_triangle_by_escape_distance(
+                            tri_verts, surface_vertices, tet_verts,
+                            vertex_escape_distances, verts
+                        )
+                    triangles.append(tri_verts)
+            else:
+                n_skipped_configs += 1
+            continue
+        
+        elif table_entry == 'INNER_VERTEX':
+            # =================================================================
+            # 6-EDGE CONFIGURATION: Inner vertex required
+            # Per Bloomenthal & Ferguson 1995, Section 4, Figure 11:
+            # Four regions meet → 4 face vertices + 1 inner vertex → 12 triangles
+            # =================================================================
+            n_6edge_configs += 1
+            tets_contributing += 1
+            
+            new_tris, new_pos, new_bt, n_new = _generate_6_edge_triangles(
+                local_edge_to_vertex, surface_vertices,
+                next_new_vertex_index
+            )
+            
+            if n_new > 0 and new_tris:
+                # Append face vertices + inner vertex to our growing lists
+                new_vertex_positions.append(new_pos)
+                new_vertex_bts.append(new_bt)
+                
+                # Temporarily extend surface_vertices so orientation can access
+                # the new face/inner vertex positions by index
+                surface_vertices = np.concatenate(
+                    [surface_vertices, new_pos], axis=0
+                )
+                next_new_vertex_index += n_new
+                
+                # Orient and append triangles
+                for tri_verts in new_tris:
+                    if vertex_escape_distances is not None:
+                        tri_verts = _orient_triangle_by_escape_distance(
+                            tri_verts, surface_vertices, tet_verts,
+                            vertex_escape_distances, verts
+                        )
+                    triangles.append(tri_verts)
+            else:
+                n_skipped_configs += 1
             continue
             
         elif table_entry:
@@ -1135,6 +1552,22 @@ def extract_parting_surface(
     # The mapping will be invalidated by any vertex merge later
     result.vertex_to_edge = cut_edge_indices.copy()
     
+    # =========================================================================
+    # Update vertex_boundary_type for face/inner vertices created by 5/6-edge configs.
+    # NOTE: surface_vertices was already extended incrementally in the loop above
+    # (to allow orientation functions to access new vertex positions by index).
+    # Only vertex_boundary_type needs to be extended here.
+    # =========================================================================
+    if new_vertex_bts:
+        all_new_bts = np.concatenate(new_vertex_bts, axis=0)
+        vertex_boundary_type = np.concatenate(
+            [vertex_boundary_type, all_new_bts], axis=0
+        )
+        logger.info(
+            f"Created {len(all_new_bts)} face/inner vertices "
+            f"({n_5edge_configs} from 5-edge, {n_6edge_configs} from 6-edge configs)"
+        )
+    
     # === VALIDATION: Check that all triangle indices are within bounds ===
     n_total_vertices = len(surface_vertices)
     invalid_triangles = []
@@ -1158,13 +1591,14 @@ def extract_parting_surface(
     # Log configuration statistics
     config_source = "vertex_mold_labels" if n_label_derived > 0 else "cut_edge_flags"
     logger.info(f"Configuration statistics ({len(config_counts)} unique configs, source: {config_source}):")
-    invalid_config_tets = 0  # Count tets with invalid configs (1, 2, 5, 6 edges)
+    invalid_config_tets = 0  # Count tets with invalid configs (1, 2 edges)
     for config in sorted(config_counts.keys()):
         n_edges = bin(config).count('1')
         table_entry = MARCHING_TET_TABLE.get(config, [])
-        if table_entry == 'SKIP':
-            status = "-> SKIPPED (invalid in binary system)"
-            invalid_config_tets += config_counts[config]
+        if table_entry == 'FACE_VERTEX':
+            status = "-> FACE_VERTEX (5-edge, face vertex generated)"
+        elif table_entry == 'INNER_VERTEX':
+            status = "-> INNER_VERTEX (6-edge, inner vertex generated)"
         elif table_entry:
             status = "-> triangles"
         else:
@@ -1174,10 +1608,14 @@ def extract_parting_surface(
         if config_counts[config] > 10:  # Only log significant configs
             logger.info(f"  Config {config:2d} ({config:06b}, {n_edges} edges): {config_counts[config]:5d} tets {status}")
     
+    if n_5edge_configs > 0:
+        logger.info(f"  {n_5edge_configs} tets resolved via 5-edge face vertex (Bloomenthal)")
+    if n_6edge_configs > 0:
+        logger.info(f"  {n_6edge_configs} tets resolved via 6-edge inner vertex (Bloomenthal)")
     if n_skipped_configs > 0:
-        logger.warning(f"  {n_skipped_configs} tets had 5/6-edge configs (SKIPPED) - indicates labeling issues upstream")
+        logger.warning(f"  {n_skipped_configs} tets had unresolvable configs (SKIPPED)")
     if invalid_config_tets > 0:
-        logger.warning(f"  {invalid_config_tets} total tets with invalid/empty configs (1, 2, 5, or 6 edges)")
+        logger.warning(f"  {invalid_config_tets} total tets with invalid/empty configs (1 or 2 edges)")
     
     result.num_tets_contributing = tets_contributing
     
@@ -2000,21 +2438,25 @@ def repair_parting_surface(
                 #   hull ∂H, not part M. If a part and hull vertex merge at a seam,
                 #   the outer boundary projection is more critical.
                 #
-                # SECONDARY surfaces: part(-1) > primary_junction(3) > hull(1/2) > interior(0)
+                # SECONDARY surfaces: part(-1) > primary_then_part(4) > primary_junction(3)
+                #                     > secondary_junction(5) > hull(1/2) > interior(0)
                 #   Part takes priority because secondary part-boundary vertices must
                 #   stay on the part surface M. Primary junction (3) next so that
-                #   junction vertices re-project to the primary membrane. Hull last
-                #   among boundary types.
+                #   junction vertices re-project to the primary membrane. Secondary
+                #   junction (5) for inter-component boundaries. Hull last among
+                #   boundary types.
                 if has_boundary_type:
                     merged_types = [current_boundary_type[j] for j in neighbors]
                     if is_secondary:
-                        # Secondary priority: part > primary_then_part > primary_junction > hull > interior
+                        # Secondary priority: part > primary_then_part > primary_junction > secondary_junction > hull > interior
                         if -1 in merged_types:
                             new_boundary_type.append(-1)
                         elif 4 in merged_types:
                             new_boundary_type.append(4)
                         elif 3 in merged_types:
                             new_boundary_type.append(3)
+                        elif 5 in merged_types:
+                            new_boundary_type.append(5)
                         elif 1 in merged_types or 2 in merged_types:
                             hull_types = [t for t in merged_types if t in (1, 2)]
                             new_boundary_type.append(hull_types[0])
@@ -2112,6 +2554,7 @@ def repair_parting_surface(
                 logger.info(f"Preserved boundary types: {np.sum(bt == -1)} part, "
                            f"{np.sum(bt == 3)} primary junction, "
                            f"{np.sum(bt == 4)} primary→part, "
+                           f"{np.sum(bt == 5)} secondary junction, "
                            f"{np.sum(bt == 1) + np.sum(bt == 2)} hull, "
                            f"{np.sum(bt == 0)} interior")
         
