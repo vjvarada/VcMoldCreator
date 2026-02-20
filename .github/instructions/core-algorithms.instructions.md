@@ -121,17 +121,22 @@ Edge 2: (v0, v3)    Edge 5: (v2, v3)
 | 0 | 0 | No surface | None |
 | 3 | 7, 25, 42, 52 | 1 triangle | Mid-edge |
 | 4 | 30, 45, 51 | 2 triangles | Mid-edge |
-| 5 | 62, 61, 59, 55, 47, 31 | 5 triangles | Mid-edge + face |
-| 6 | 63 | 12 triangles | Mid-edge + face + inner |
+| 5 | 62, 61, 59, 55, 47, 31 | 8 triangles | Mid-edge + 2 face + inner |
+| 6 | 63 | 12 triangles | Mid-edge + 4 face + inner |
 
 #### 5-Edge Configuration (Case 3)
-One edge NOT cut means two vertices share same label.
+One edge NOT cut means two vertices share same label; 3 regions meet.
+In a 5-edge config, TWO faces always have all 3 edges cut (not one).
 ```python
-# Face opposite to same-label vertices has 3 cut edges
-# Face vertex = centroid of 3 mid-edge points on that face
-face_vertex = (m_ij + m_ik + m_jk) / 3
+# Both faces opposite to uncut edge endpoints get face vertices
+# face_vertex_a = centroid of 3 mid-edge points on face A
+# face_vertex_b = centroid of 3 mid-edge points on face B  
+# inner_vertex = (face_vertex_a + face_vertex_b) / 2
 
-# Generate 5 triangles connecting mid-edges through face vertex
+# Generate 8 triangles:
+# - 3 per 3-cut face: (edge_midpoint, face_vertex, inner_vertex)
+# - 1 per 2-cut face: (edge_midpoint_a, edge_midpoint_b, inner_vertex)
+# Total: 3 + 3 + 1 + 1 = 8 triangles, 3 new vertices
 ```
 
 #### 6-Edge Configuration (Case 4)

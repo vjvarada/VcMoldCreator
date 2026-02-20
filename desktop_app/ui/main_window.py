@@ -2578,7 +2578,10 @@ class SecondarySurfaceExtractionWorker(QThread):
                 repair_parting_surface_with_part
             )
             from core.tetrahedral_mesh import prepare_parting_surface_data
-            from core.secondary_membrane import extract_secondary_surfaces_per_component
+            from core.secondary_membrane import (
+                extract_secondary_surfaces_per_component,
+                classify_secondary_membranes_by_mold_half
+            )
             import time
             
             result = SecondarySurfaceExtractionResult()
@@ -2600,101 +2603,62 @@ class SecondarySurfaceExtractionWorker(QThread):
                 self.tet_result = prepare_parting_surface_data(self.tet_result)
             
             # =====================================================================
-            # STEP 2: Extract secondary surfaces per connected component
-            # 
-            # Per Bloomenthal 1995 and Paper Section 4.2:
-            # Each connected component of secondary edges forms an independent
-            # membrane. 5/6-edge configs at junctions (where components meet
-            # primary or each other) are resolved with face/inner vertices.
+            # STEP 2: UNIFIED secondary surface extraction
+            #
+            # CRITICAL: We use a SINGLE unified extraction with ALL secondary
+            # edges (from all components) + junction primary edges. This ensures
+            # that junction tets where multiple secondary surfaces meet see the
+            # FULL 5 or 6-edge config, triggering proper face/inner vertex
+            # creation per Bloomenthal & Ferguson 1995.
+            #
+            # Per-component extraction would split junction tets — each component
+            # would only see its OWN edges, never triggering the 5/6-edge handlers,
+            # leaving gaps at junctions.
             # =====================================================================
-            self.progress.emit("Extracting secondary surfaces per component...")
+            self.progress.emit("Extracting secondary surfaces (unified)...")
             extraction_start = time.time()
             
-            component_results = extract_secondary_surfaces_per_component(
+            extraction_result = extract_parting_surface_from_tet_result(
                 self.tet_result,
-                part_mesh=self.part_mesh,
-                include_orphan_primary=True,
+                use_original_vertices=True,
+                prepare_data=False,
+                cut_type='secondary',
                 extend_to_primary=True
             )
             
             result.extraction_time_ms = (time.time() - extraction_start) * 1000
-            result.component_surfaces = component_results
-            result.num_components = len(component_results)
             
-            if not component_results:
-                self.progress.emit("No secondary surfaces from components — falling back to merged extraction...")
-                
-                # Fallback: try the original merged extraction
-                extraction_result = extract_parting_surface_from_tet_result(
-                    self.tet_result,
-                    use_original_vertices=True,
-                    prepare_data=False,
-                    cut_type='secondary',
-                    extend_to_primary=True
+            if extraction_result.mesh is None or extraction_result.num_faces == 0:
+                self.progress.emit("No secondary surface generated")
+                result.total_time_ms = (time.time() - total_start) * 1000
+                self.complete.emit(result)
+                return
+            
+            result.num_tets_processed = extraction_result.num_tets_processed
+            result.num_tets_contributing = extraction_result.num_tets_contributing
+            result.vertex_to_edge = extraction_result.vertex_to_edge
+            
+            self.progress.emit(
+                f"Extracted: {extraction_result.num_vertices:,} verts, "
+                f"{extraction_result.num_faces:,} faces "
+                f"({result.num_tets_contributing} tets contributing)"
+            )
+            
+            # Gather component metadata (for tracking/smoothing, not for geometry)
+            try:
+                h1_membranes, h2_membranes = classify_secondary_membranes_by_mold_half(
+                    self.tet_result, self.part_mesh
                 )
-                
-                if extraction_result.mesh is None or extraction_result.num_faces == 0:
-                    self.progress.emit("No secondary surface generated")
-                    result.total_time_ms = (time.time() - total_start) * 1000
-                    self.complete.emit(result)
-                    return
-                
-                result.num_tets_processed = extraction_result.num_tets_processed
-                result.num_tets_contributing = extraction_result.num_tets_contributing
-                result.vertex_to_edge = extraction_result.vertex_to_edge
-                
-                merged_extraction = extraction_result
-            else:
-                # Merge per-component surfaces into a single mesh
-                self.progress.emit(f"Merging {len(component_results)} component surfaces...")
-                all_verts = []
-                all_faces = []
-                all_bts = []
-                vertex_offset = 0
-                total_tets_contributing = 0
-                
-                for membrane_info, surface in component_results:
-                    if surface.mesh is not None and surface.num_faces > 0:
-                        all_verts.append(surface.vertices)
-                        all_faces.append(surface.faces + vertex_offset)
-                        if surface.vertex_boundary_type is not None:
-                            all_bts.append(surface.vertex_boundary_type)
-                        else:
-                            all_bts.append(np.zeros(len(surface.vertices), dtype=np.int8))
-                        vertex_offset += len(surface.vertices)
-                        total_tets_contributing += surface.num_tets_contributing
-                
-                if not all_verts:
-                    self.progress.emit("All component surfaces were empty")
-                    result.total_time_ms = (time.time() - total_start) * 1000
-                    self.complete.emit(result)
-                    return
-                
-                merged_verts = np.concatenate(all_verts, axis=0)
-                merged_faces = np.concatenate(all_faces, axis=0)
-                merged_bts = np.concatenate(all_bts, axis=0)
-                
-                from core.parting_surface import PartingSurfaceResult
-                merged_extraction = PartingSurfaceResult()
-                merged_extraction.vertices = merged_verts
-                merged_extraction.faces = merged_faces
-                merged_extraction.vertex_boundary_type = merged_bts
-                merged_extraction.mesh = trimesh.Trimesh(
-                    vertices=merged_verts,
-                    faces=merged_faces,
-                    process=False
-                )
-                merged_extraction.num_vertices = len(merged_verts)
-                merged_extraction.num_faces = len(merged_faces)
-                merged_extraction.num_tets_contributing = total_tets_contributing
-                
-                result.num_tets_contributing = total_tets_contributing
-                
+                result.num_components = len(h1_membranes) + len(h2_membranes)
                 self.progress.emit(
-                    f"Merged: {merged_extraction.num_vertices:,} verts, "
-                    f"{merged_extraction.num_faces:,} faces from "
-                    f"{len(component_results)} components"
+                    f"Detected {result.num_components} membrane components "
+                    f"({len(h1_membranes)} H1, {len(h2_membranes)} H2)"
                 )
+            except Exception as e:
+                logger.warning(f"Component classification failed (non-critical): {e}")
+                result.num_components = 1
+            
+            merged_extraction = extraction_result
             
             # =====================================================================
             # STEP 3: Clean surface (merge vertices, remove degenerates)
@@ -2720,10 +2684,10 @@ class SecondarySurfaceExtractionWorker(QThread):
             
             if repaired_result.mesh is None:
                 self.progress.emit("Surface cleaning failed - using unrepaired")
-                result.mesh = extraction_result.mesh
-                result.num_vertices = extraction_result.num_vertices
-                result.num_faces = extraction_result.num_faces
-                result.vertex_boundary_type = extraction_result.vertex_boundary_type
+                result.mesh = merged_extraction.mesh
+                result.num_vertices = merged_extraction.num_vertices
+                result.num_faces = merged_extraction.num_faces
+                result.vertex_boundary_type = merged_extraction.vertex_boundary_type
             else:
                 result.mesh = repaired_result.mesh
                 result.num_vertices = repaired_result.num_vertices
