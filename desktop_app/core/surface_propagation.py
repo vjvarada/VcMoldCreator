@@ -1180,9 +1180,7 @@ def smooth_membrane_with_boundary_reprojection(
     vertex_boundary_type: Optional[np.ndarray] = None,
     feature_aware_smoothing: bool = True,
     reproject_to_hull: bool = True,
-    reproject_to_primary: bool = False,
-    secondary_component_meshes: Optional[List[trimesh.Trimesh]] = None,
-    vertex_component_id: Optional[np.ndarray] = None
+    reproject_to_primary: bool = False
 ) -> SmoothingResult:
     """
     Smooth the membrane surface following the algorithm from Section 4.4 of the paper.
@@ -1225,14 +1223,6 @@ def smooth_membrane_with_boundary_reprojection(
         reproject_to_primary: If True, re-project non-part boundary vertices to primary mesh
                              (if primary_mesh is provided and they are close enough).
                              Use True for secondary surfaces to connect to primary membrane.
-        secondary_component_meshes: Optional list of per-component secondary surface meshes.
-                                   Used for bt=5 (secondary junction) reprojection. Each mesh
-                                   is a trimesh.Trimesh representing one secondary component.
-                                   bt=5 vertices are reprojected to the nearest component mesh
-                                   that is NOT the vertex's own component.
-        vertex_component_id: Optional array of shape (N,) tracking which secondary component
-                            each vertex belongs to. -1 = junction vertex (multi-component).
-                            Used together with secondary_component_meshes for bt=5 reprojection.
     
     Returns:
         SmoothingResult with smoothed mesh and statistics
@@ -1273,17 +1263,6 @@ def smooth_membrane_with_boundary_reprojection(
     if primary_mesh is not None and len(primary_mesh.faces) > 0:
         primary_proximity = ProximityQuery(primary_mesh)
         logger.debug(f"Primary mesh for re-projection: {len(primary_mesh.faces)} faces")
-    
-    # Build proximity queries for secondary component meshes (for bt=5 reprojection)
-    secondary_proximities: List[Optional[ProximityQuery]] = []
-    if secondary_component_meshes:
-        for comp_idx, comp_mesh in enumerate(secondary_component_meshes):
-            if comp_mesh is not None and len(comp_mesh.faces) > 0:
-                secondary_proximities.append(ProximityQuery(comp_mesh))
-            else:
-                secondary_proximities.append(None)
-        logger.debug(f"Secondary component meshes for bt=5 re-projection: "
-                     f"{len(secondary_proximities)} components")
     
     # Find boundary vertices and classify which surface they belong to
     # CRITICAL: Use process=False to prevent merge_vertices() from renumbering
@@ -1354,13 +1333,11 @@ def smooth_membrane_with_boundary_reprojection(
             n_type_hull = np.sum((vertex_boundary_type == 1) | (vertex_boundary_type == 2))
             n_type_primary_junc = np.sum(vertex_boundary_type == 3)
             n_type_primary_part = np.sum(vertex_boundary_type == 4)
-            n_type_secondary_junc = np.sum(vertex_boundary_type == 5)
             n_type_interior = np.sum(vertex_boundary_type == 0)
             logger.info(f"vertex_boundary_type distribution (all {len(vertex_boundary_type)} verts): "
                        f"{n_type_part} part (-1), {n_type_hull} hull (1/2), "
                        f"{n_type_primary_junc} primary junction (3), "
                        f"{n_type_primary_part} primary+part (4), "
-                       f"{n_type_secondary_junc} secondary junction (5), "
                        f"{n_type_interior} interior (0)")
         
         for vi in boundary_verts:
@@ -1384,16 +1361,6 @@ def smooth_membrane_with_boundary_reprojection(
                     boundary_surface[vi] = 'primary'
                 else:
                     boundary_surface[vi] = 'hull'
-            elif bt == 5:
-                # SECONDARY JUNCTION - vertex at the boundary between two
-                # secondary membrane components. Reprojected to the nearest
-                # OTHER secondary component's surface to maintain the
-                # inter-membrane connection.
-                if secondary_component_meshes and vertex_component_id is not None:
-                    boundary_surface[vi] = 'secondary_junction'
-                else:
-                    # No component meshes available — treat as free
-                    boundary_surface[vi] = 'hull'
             elif bt in (1, 2):
                 # OUTER boundary - originally on hull boundary ∂H (H1 or H2)
                 boundary_surface[vi] = 'hull'
@@ -1409,13 +1376,11 @@ def smooth_membrane_with_boundary_reprojection(
         hull_count = sum(1 for s in boundary_surface.values() if s == 'hull')
         primary_count = sum(1 for s in boundary_surface.values() if s == 'primary')
         ptp_count = sum(1 for s in boundary_surface.values() if s == 'primary_then_part')
-        sec_junction_count = sum(1 for s in boundary_surface.values() if s == 'secondary_junction')
         patch_count = sum(1 for s in boundary_surface.values() if s == 'patch')
         
         logger.info(f"Boundary classification (from extraction): {part_count} part, "
                    f"{hull_count} hull, {primary_count} primary, "
-                   f"{ptp_count} primary→part, {sec_junction_count} secondary junction, "
-                   f"{patch_count} patch")
+                   f"{ptp_count} primary→part, {patch_count} patch")
         
         # For 'patch' vertices, use NEIGHBOR PROPAGATION first, then distance as last resort
         # This is important because the inflated hull CONTAINS the part mesh, so interior-
@@ -1645,7 +1610,6 @@ def smooth_membrane_with_boundary_reprojection(
     hull_boundary_indices = []
     primary_boundary_indices = []
     primary_then_part_indices = []  # bt=4: dual reprojection (primary first, then part)
-    secondary_junction_indices = []  # bt=5: reproject to other secondary component
     
     for vi in boundary_verts:
         if vi in excluded_set:
@@ -1655,8 +1619,6 @@ def smooth_membrane_with_boundary_reprojection(
             part_boundary_indices.append(vi)
         elif surface_type == 'primary_then_part':
             primary_then_part_indices.append(vi)
-        elif surface_type == 'secondary_junction':
-            secondary_junction_indices.append(vi)
         elif surface_type in ('hull', 'closest_hull', 'propagated_hull'):
             # Only add to hull re-projection list if reproject_to_hull is True
             if reproject_to_hull:
@@ -1669,18 +1631,14 @@ def smooth_membrane_with_boundary_reprojection(
     hull_boundary_indices = np.array(hull_boundary_indices, dtype=np.int64)
     primary_boundary_indices = np.array(primary_boundary_indices, dtype=np.int64)
     primary_then_part_indices = np.array(primary_then_part_indices, dtype=np.int64)
-    secondary_junction_indices = np.array(secondary_junction_indices, dtype=np.int64)
     
     # Count how many boundary vertices are FREE (not re-projected anywhere)
-    n_pinned = (len(part_boundary_indices) + len(hull_boundary_indices) +
-                len(primary_boundary_indices) + len(primary_then_part_indices) +
-                len(secondary_junction_indices))
+    n_pinned = len(part_boundary_indices) + len(hull_boundary_indices) + len(primary_boundary_indices) + len(primary_then_part_indices)
     n_free_boundary = len(boundary_verts) - n_pinned
     
     logger.info(f"Batched re-projection: {len(part_boundary_indices)} part, "
                f"{len(primary_boundary_indices)} primary, "
                f"{len(primary_then_part_indices)} primary→part, "
-               f"{len(secondary_junction_indices)} secondary junction, "
                f"{len(hull_boundary_indices)} hull, "
                f"{n_free_boundary} free")
     
@@ -2130,31 +2088,6 @@ def smooth_membrane_with_boundary_reprojection(
                 ptp_positions = vertices[primary_then_part_indices]
                 closest_pts, _, _ = part_proximity.on_surface(ptp_positions)
                 vertices[primary_then_part_indices] = closest_pts
-        
-        # Re-project bt=5 secondary junction vertices to the OTHER component's surface.
-        # For each junction vertex, find the nearest point on every secondary component
-        # mesh EXCEPT the vertex's own component. This constrains junction vertices to
-        # the inter-membrane boundary curve while allowing them to slide along it.
-        if len(secondary_junction_indices) > 0 and secondary_proximities:
-            for vi in secondary_junction_indices:
-                own_comp = vertex_component_id[vi] if vertex_component_id is not None else -1
-                best_pt = None
-                best_dist = np.inf
-                
-                for comp_idx, prox in enumerate(secondary_proximities):
-                    if prox is None:
-                        continue
-                    # Skip the vertex's own component (reproject to OTHER components)
-                    if comp_idx == own_comp:
-                        continue
-                    
-                    pt, dist, _ = prox.on_surface(vertices[vi:vi+1])
-                    if dist[0] < best_dist:
-                        best_dist = dist[0]
-                        best_pt = pt[0]
-                
-                if best_pt is not None:
-                    vertices[vi] = best_pt
         
         # === Step 3: Smooth interior vertices (boundary vertices now fixed) ===
         # Per paper: "Then, we smooth all the interior vertices, keeping the ones 
