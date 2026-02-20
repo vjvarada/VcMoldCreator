@@ -107,6 +107,7 @@ class ResinChannelResult:
     
     # Resin plug
     plug_mesh: Optional[trimesh.Trimesh] = None  # The resin pouring plug
+    plug_merged_into_metamold: bool = False  # True when plug is unioned into metamold mesh
 
     # Silicone mold pouring holes (through BOTH hard shell halves)
     silicone_pour_hole_position: Optional[np.ndarray] = None  # (3,) 3-D centre of the hole
@@ -330,6 +331,58 @@ def _manifold_to_trimesh(manifold: 'manifold3d.Manifold') -> trimesh.Trimesh:
     faces = np.asarray(mesh_data.tri_verts, dtype=np.int64)
     
     return trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
+
+
+# ============================================================================
+# PLUG MERGE UTILITY
+# ============================================================================
+
+def merge_plug_into_metamold(
+    metamold_mesh: trimesh.Trimesh,
+    plug_mesh: trimesh.Trimesh,
+) -> Optional[trimesh.Trimesh]:
+    """
+    Boolean-union the resin plug into the metamold mesh.
+
+    This produces an integrated metamold where the pour spout is a permanent
+    protrusion (no separate plug part is required during casting).
+
+    The metamold already has the tapered inlet hole drilled; unioning the plug
+    fills that cavity and adds the protruding stub section above the metamold
+    surface.  The silicone is cast around this stub, forming a matching pour
+    channel socket.  Resin is later poured into the socket without any
+    loose plug piece.
+
+    Args:
+        metamold_mesh: The metamold half (already has resin channels drilled).
+        plug_mesh:     The plug geometry (as returned by create_resin_plug).
+
+    Returns:
+        Merged trimesh, or the original metamold_mesh if the boolean fails.
+    """
+    if metamold_mesh is None or plug_mesh is None:
+        return metamold_mesh
+
+    if not MANIFOLD_AVAILABLE:
+        logger.warning(
+            "manifold3d not available — cannot merge plug into metamold; "
+            "returning original metamold mesh"
+        )
+        return metamold_mesh
+
+    try:
+        mm_mani   = _trimesh_to_manifold(metamold_mesh)
+        plug_mani = _trimesh_to_manifold(plug_mesh)
+        merged    = mm_mani + plug_mani   # Manifold boolean UNION
+        result    = _manifold_to_trimesh(merged)
+        logger.info(
+            "Plug merged into metamold: %d verts, %d faces",
+            len(result.vertices), len(result.faces),
+        )
+        return result
+    except Exception as exc:
+        logger.error("merge_plug_into_metamold failed: %s", exc)
+        return metamold_mesh
 
 
 # ============================================================================
@@ -1323,7 +1376,8 @@ def create_resin_channels(
     local_diameter_mm: float = DEFAULT_LOCAL_DIAMETER_MM,
     global_diameter_mm: float = DEFAULT_GLOBAL_DIAMETER_MM,
     global_bottom_diameter_mm: float = DEFAULT_GLOBAL_BOTTOM_DIAMETER_MM,
-    mold_half: int = 1
+    mold_half: int = 1,
+    skip_inlet_hole: bool = False,
 ) -> ResinChannelResult:
     """
     Create resin pouring and air escape channels in a metamold half.
@@ -1353,6 +1407,10 @@ def create_resin_channels(
         global_diameter_mm: Top diameter of tapered resin inlet hole
         global_bottom_diameter_mm: Bottom diameter of tapered resin inlet hole
         mold_half: Which mold half this is (1=upper, 2=lower)
+        skip_inlet_hole: When True, compute all inlet metadata (so the plug can
+            be built) but do NOT subtract the inlet cutter from the metamold.
+            Use this when the plug is merged into the metamold as an integrated
+            pour spout — no socket hole is needed in that case.
         
     Returns:
         ResinChannelResult with the modified mesh and metadata
@@ -1511,7 +1569,12 @@ def create_resin_channels(
                 upper_height=upper_height,
                 angled_depth=angled_depth
             )
-            cylinders.append(compound)
+            if not skip_inlet_hole:
+                cylinders.append(compound)
+            else:
+                logger.info(
+                    "  skip_inlet_hole=True: inlet geometry computed but NOT subtracted"
+                )
 
             result.inlet_depth_mm = upper_height + angled_depth
             result.inlet_depth_auto = upper_height + angled_depth
@@ -1522,7 +1585,7 @@ def create_resin_channels(
             angle_deg = np.degrees(np.arccos(
                 np.clip(np.dot(into_part_dir, drill_direction), -1, 1)))
             logger.info("  Adaptive inlet: upper=%.2fmm, angled=%.2fmm, "
-                        "deviation=%.1f°",
+                        "deviation=%.1f\u00b0",
                          upper_height, angled_depth, angle_deg)
         else:
             # Fallback: straight frustum (no part entry found)
@@ -1548,7 +1611,12 @@ def create_resin_channels(
                 bottom_radius=global_bottom_radius,
                 height=inlet_depth
             )
-            cylinders.append(frustum)
+            if not skip_inlet_hole:
+                cylinders.append(frustum)
+            else:
+                logger.info(
+                    "  skip_inlet_hole=True: straight frustum computed but NOT subtracted"
+                )
 
         result.n_global_channels = 1
         result.global_channel_position = global_pos.copy()
@@ -1615,7 +1683,8 @@ def create_resin_channels_on_both_halves(
     inlet_min_depth_mm: float = DEFAULT_INLET_MIN_DEPTH_MM,
     local_diameter_mm: float = DEFAULT_LOCAL_DIAMETER_MM,
     global_diameter_mm: float = DEFAULT_GLOBAL_DIAMETER_MM,
-    global_bottom_diameter_mm: float = DEFAULT_GLOBAL_BOTTOM_DIAMETER_MM
+    global_bottom_diameter_mm: float = DEFAULT_GLOBAL_BOTTOM_DIAMETER_MM,
+    skip_inlet_hole: bool = False,
 ) -> Tuple[ResinChannelResult, Optional[trimesh.Trimesh]]:
     """
     Create resin channels on the correct metamold half.
@@ -1680,7 +1749,8 @@ def create_resin_channels_on_both_halves(
         local_diameter_mm=local_diameter_mm,
         global_diameter_mm=global_diameter_mm,
         global_bottom_diameter_mm=global_bottom_diameter_mm,
-        mold_half=target_half
+        mold_half=target_half,
+        skip_inlet_hole=skip_inlet_hole,
     )
     
     return channel_result, other_mesh

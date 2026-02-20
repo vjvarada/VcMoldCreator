@@ -1169,7 +1169,8 @@ class ResinChannelsWorker(QThread):
         shell_inlet_diameter_mm=12.0,
         add_alignment_notches=True,
         notch_width_mm=4.0,
-        notch_depth_mm=0.5
+        notch_depth_mm=0.5,
+        merge_plug=False,
     ):
         super().__init__()
         self.metamold_half_1_with_part = metamold_half_1_with_part
@@ -1188,6 +1189,7 @@ class ResinChannelsWorker(QThread):
         self.add_alignment_notches_flag = add_alignment_notches
         self.notch_width_mm = notch_width_mm
         self.notch_depth_mm = notch_depth_mm
+        self.merge_plug = merge_plug
     
     def run(self):
         try:
@@ -1196,7 +1198,8 @@ class ResinChannelsWorker(QThread):
                 determine_shell_half_for_inlet,
                 create_hard_shell_inlet,
                 create_hard_shell_air_escapes,
-                create_resin_plug
+                create_resin_plug,
+                merge_plug_into_metamold,
             )
             
             self.progress.emit("Determining which half contains maxima...")
@@ -1217,7 +1220,8 @@ class ResinChannelsWorker(QThread):
                 air_escape_depth_mm=self.air_escape_depth_mm,
                 inlet_min_depth_mm=self.inlet_min_depth_mm,
                 local_diameter_mm=self.local_diameter_mm,
-                global_diameter_mm=self.global_diameter_mm
+                global_diameter_mm=self.global_diameter_mm,
+                skip_inlet_hole=self.merge_plug,
             )
             
             # Drill hard shell through-hole if we have shell halves and a global inlet
@@ -1290,8 +1294,27 @@ class ResinChannelsWorker(QThread):
                 )
                 
                 if plug is not None:
-                    channel_result.plug_mesh = plug
-                    logger.info(f"Resin plug created: {len(plug.vertices)} verts")
+                    if self.merge_plug:
+                        # Union plug into the metamold mesh (integrated pour spout)
+                        self.progress.emit("Merging plug into metamold...")
+                        merged = merge_plug_into_metamold(channel_result.mesh, plug)
+                        if merged is not None:
+                            channel_result.mesh = merged
+                            channel_result.plug_merged_into_metamold = True
+                            logger.info(
+                                "Resin plug merged into metamold half %d: "
+                                "%d verts, %d faces",
+                                channel_result.mold_half,
+                                len(merged.vertices), len(merged.faces),
+                            )
+                        else:
+                            logger.warning(
+                                "Plug merge failed — falling back to separate plug"
+                            )
+                            channel_result.plug_mesh = plug
+                    else:
+                        channel_result.plug_mesh = plug
+                        logger.info("Resin plug created: %d verts", len(plug.vertices))
                 else:
                     logger.warning("Failed to create resin plug")
 
@@ -7154,6 +7177,55 @@ class MainWindow(QMainWindow):
         
         self.context_layout.addWidget(params_group)
 
+        # ── Plug mode group ───────────────────────────────────────────────
+        plug_mode_group = QGroupBox("Resin Plug Mode")
+        plug_mode_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 12px;
+                font-weight: bold;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+            QLabel {{ color: {Colors.DARK}; font-size: 12px; }}
+        """)
+        plug_mode_layout = QVBoxLayout(plug_mode_group)
+        plug_mode_layout.setContentsMargins(8, 16, 8, 8)
+        plug_mode_layout.setSpacing(6)
+
+        self.plug_separate_radio = QRadioButton(
+            "Separate plug  (printed separately, inserted before casting)"
+        )
+        self.plug_separate_radio.setChecked(True)
+        self.plug_separate_radio.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
+        self.plug_separate_radio.setToolTip(
+            "The resin pour spout is a standalone part.\n"
+            "Insert it into the metamold inlet before casting silicone,\n"
+            "then remove it to pour resin."
+        )
+        plug_mode_layout.addWidget(self.plug_separate_radio)
+
+        self.plug_merged_radio = QRadioButton(
+            "Merge plug into metamold  (integrated — no separate plug piece)"
+        )
+        self.plug_merged_radio.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
+        self.plug_merged_radio.setToolTip(
+            "The plug geometry is boolean-unioned into the metamold mesh.\n"
+            "The metamold is printed as a single piece with an integrated\n"
+            "pour spout — no loose plug to track or lose.\n"
+            "The silicone forms a matching socket around the stub."
+        )
+        plug_mode_layout.addWidget(self.plug_merged_radio)
+
+        self.context_layout.addWidget(plug_mode_group)
+
         # ── Alignment notch group ─────────────────────────────────────────
         notch_group = QGroupBox("Alignment Notches")
         notch_group.setStyleSheet(f"""
@@ -7274,9 +7346,13 @@ class MainWindow(QMainWindow):
             elif result.shell_half_modified == 0:
                 self.resin_channels_stats.add_row('Shell holes: no shell halves available')
             
-            if result.plug_mesh is not None:
+            if result.plug_merged_into_metamold:
                 self.resin_channels_stats.add_row(
-                    f'Plug: {len(result.plug_mesh.vertices):,} verts'
+                    f'Plug: merged into metamold half {result.mold_half} \u2014 no separate part'
+                )
+            elif result.plug_mesh is not None:
+                self.resin_channels_stats.add_row(
+                    f'Plug: {len(result.plug_mesh.vertices):,} verts (separate part)'
                 )
 
             # Silicone pour hole
@@ -7329,6 +7405,7 @@ class MainWindow(QMainWindow):
         shell_inlet_diameter = self.resin_shell_diameter_spin.value()
         do_notches   = self.alignment_notch_checkbox.isChecked()
         notch_width  = self.notch_width_spin.value()
+        merge_plug   = self.plug_merged_radio.isChecked()
 
         self._resin_channels_worker = ResinChannelsWorker(
             self._metamold_half_1_with_part,
@@ -7347,6 +7424,7 @@ class MainWindow(QMainWindow):
             add_alignment_notches=do_notches,
             notch_width_mm=notch_width,
             notch_depth_mm=0.5,
+            merge_plug=merge_plug,
         )
         self._resin_channels_worker.progress.connect(self._on_resin_channels_progress)
         self._resin_channels_worker.complete.connect(self._on_resin_channels_complete)
@@ -7424,14 +7502,22 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     logger.warning(f"Could not update shell viewer: {e}")
             
-            # Show resin plug if created
-            if channel_result.plug_mesh is not None:
+            # Show resin plug if created as a separate part
+            if channel_result.plug_mesh is not None and not channel_result.plug_merged_into_metamold:
                 try:
                     self.mesh_viewer.show_resin_plug(channel_result.plug_mesh)
                     self.display_options.show_resin_plug_option(True)
                     logger.info("Resin plug displayed in yellow")
                 except Exception as e:
                     logger.warning(f"Could not display resin plug: {e}")
+            elif channel_result.plug_merged_into_metamold:
+                # Plug is now part of the metamold mesh — hide any old plug actor
+                try:
+                    self.mesh_viewer.remove_resin_plug()
+                    self.display_options.show_resin_plug_option(False)
+                except Exception:
+                    pass
+                logger.info("Plug merged into metamold — no separate plug actor")
             
             logger.info(f"Resin channels created in half {channel_result.mold_half}: "
                        f"{channel_result.n_local_channels} local + {channel_result.n_global_channels} global channels "
@@ -7512,8 +7598,23 @@ class MainWindow(QMainWindow):
             ("🏠 Hard Shell Half 2", self._get_export_shell_half(2) is not None),
             ("🧊 Metamold Half 1", self._get_export_metamold_half(1) is not None),
             ("🧊 Metamold Half 2", self._get_export_metamold_half(2) is not None),
-            ("🔌 Pouring Plug", self._get_export_plug() is not None),
         ]
+
+        # Plug row: separate part, merged (not exported separately), or missing
+        plug_mesh = self._get_export_plug()
+        plug_merged = (
+            self._resin_channel_result is not None and
+            self._resin_channel_result.plug_merged_into_metamold
+        )
+        if plug_merged:
+            plug_icon, plug_color = "🔗", Colors.INFO
+            plug_label = "🔌 Pouring Plug  (integrated into metamold — no separate file)"
+        elif plug_mesh is not None:
+            plug_icon, plug_color = "✅", Colors.SUCCESS
+            plug_label = "🔌 Pouring Plug  (separate part)"
+        else:
+            plug_icon, plug_color = "❌", Colors.DANGER
+            plug_label = "🔌 Pouring Plug  (not available)"
 
         for name, available in artifacts:
             status_icon = "✅" if available else "❌"
@@ -7521,6 +7622,10 @@ class MainWindow(QMainWindow):
             row = QLabel(f"{status_icon} {name}")
             row.setStyleSheet(f"color: {color}; font-size: 12px; padding: 2px 0;")
             info_layout.addWidget(row)
+
+        plug_row = QLabel(plug_label)
+        plug_row.setStyleSheet(f"color: {plug_color}; font-size: 12px; padding: 2px 0;")
+        info_layout.addWidget(plug_row)
 
         self.context_layout.addWidget(info_group)
 
@@ -7595,9 +7700,10 @@ class MainWindow(QMainWindow):
         return self._metamold_half_1_with_part if half == 1 else self._metamold_half_2_with_part
 
     def _get_export_plug(self) -> 'Optional[trimesh.Trimesh]':
-        """Get the pouring plug mesh."""
+        """Get the pouring plug mesh (None when merged into the metamold)."""
         if (self._resin_channel_result is not None and
-            self._resin_channel_result.plug_mesh is not None):
+                self._resin_channel_result.plug_mesh is not None and
+                not self._resin_channel_result.plug_merged_into_metamold):
             return self._resin_channel_result.plug_mesh
         return None
 
