@@ -7673,21 +7673,35 @@ class MainWindow(QMainWindow):
     def _get_export_shell_half(self, half: int) -> 'Optional[trimesh.Trimesh]':
         """Get the final shell half (with through-holes if drilled).
 
+        Priority: notched > silicone-hole (shell_half_N_final) > resin-inlet
+        only (modified_shell_mesh) > original.
+
         Args:
             half: Which half to get (1 or 2).
 
         Returns:
             The best available shell half mesh, or None.
         """
-        if (self._resin_channel_result is not None and
-            self._resin_channel_result.success and
-            self._resin_channel_result.shell_half_modified == half and
-            self._resin_channel_result.modified_shell_mesh is not None):
-            return self._resin_channel_result.modified_shell_mesh
+        r = self._resin_channel_result
+        if r is not None and r.success:
+            # 1. Notched versions (have silicone holes + notches)
+            if r.alignment_notches_applied:
+                notched = r.notched_shell_half_1 if half == 1 else r.notched_shell_half_2
+                if notched is not None:
+                    return notched
+            # 2. Post-silicone-hole versions (both halves drilled)
+            final = r.shell_half_1_final if half == 1 else r.shell_half_2_final
+            if final is not None:
+                return final
+            # 3. Resin-inlet-only half (modified_shell_mesh covers only one half)
+            if r.shell_half_modified == half and r.modified_shell_mesh is not None:
+                return r.modified_shell_mesh
         return self._shell_half_1 if half == 1 else self._shell_half_2
 
     def _get_export_metamold_half(self, half: int) -> 'Optional[trimesh.Trimesh]':
-        """Get the final metamold half (with channels if created).
+        """Get the final metamold half (with channels/notches if created).
+
+        Priority: notched > resin-channeled (mesh / other_half) > original.
 
         Args:
             half: Which half to get (1 or 2).
@@ -7695,11 +7709,16 @@ class MainWindow(QMainWindow):
         Returns:
             The best available metamold half mesh, or None.
         """
-        if (self._resin_channel_result is not None and
-            self._resin_channel_result.success and
-            self._resin_channel_result.mesh is not None):
-            if self._resin_channel_result.mold_half == half:
-                return self._resin_channel_result.mesh
+        r = self._resin_channel_result
+        if r is not None and r.success and r.mesh is not None:
+            # 1. Notched versions (have resin channels + notches)
+            if r.alignment_notches_applied:
+                notched = r.notched_metamold_half_1 if half == 1 else r.notched_metamold_half_2
+                if notched is not None:
+                    return notched
+            # 2. Resin-channeled versions
+            if r.mold_half == half:
+                return r.mesh
             return self._resin_channel_other_half
         return self._metamold_half_1_with_part if half == 1 else self._metamold_half_2_with_part
 
