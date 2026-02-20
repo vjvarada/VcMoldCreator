@@ -1197,62 +1197,67 @@ def identify_outer_boundary_by_distance(
     tolerance_fraction: float = 0.02
 ) -> Tuple[Set[int], Set[int]]:
     """
-    Fast outer boundary detection using vertex distance to part mesh.
-    
-    A face is "inner" (from part surface) if ALL its vertices are within 
-    tolerance of the part mesh surface. Otherwise it's "outer" (from hull surface).
-    
-    Uses KDTree for fast vertex-to-vertex distance computation.
-    For most cases, this is accurate enough since boundary mesh vertices that
-    are on the part surface will be very close to part mesh vertices.
-    
+    Outer boundary detection using true vertex-to-surface distance to the part mesh.
+
+    A face is "inner" (from part surface M) if ALL its vertices are within
+    tolerance of the part mesh SURFACE (not just original part vertices).
+
+    Uses trimesh ProximityQuery.on_surface() so that fTetWild-generated vertices
+    that lie on a part face (but are not coincident with any original part vertex)
+    are still correctly identified as inner boundary vertices.
+
+    Previously this used a KDTree against part mesh vertices, which failed for
+    complex/cage geometry where fTetWild places intermediate vertices along cage
+    bar faces far from the original cage vertices — those vertices were falsely
+    classified as outer, resulting in cage surface tets being labelled H1/H2
+    instead of the unlabelled inner boundary.
+
     Args:
         boundary_mesh: The boundary mesh to classify
         part_mesh: The original part mesh
         tolerance_fraction: Fraction of mesh size for tolerance (default 2%)
-    
+
     Returns:
         Tuple of (outer_triangles, inner_triangles) sets
     """
     import time
-    from scipy.spatial import cKDTree
-    
+    from trimesh.proximity import ProximityQuery
+
     start = time.time()
-    
+
     # Compute tolerance based on mesh size
     bounds = boundary_mesh.bounds
     mesh_size = np.linalg.norm(bounds[1] - bounds[0])
     tolerance = mesh_size * tolerance_fraction
-    
-    # Build KDTree on part mesh vertices (fast O(n log n))
-    boundary_verts = boundary_mesh.vertices
-    part_verts = part_mesh.vertices
-    
-    kdtree_start = time.time()
-    part_tree = cKDTree(part_verts)
-    distances, _ = part_tree.query(boundary_verts, k=1)
-    kdtree_time = (time.time() - kdtree_start) * 1000
-    
+
+    boundary_verts = np.asarray(boundary_mesh.vertices, dtype=np.float64)
+
+    # True surface distance: finds closest point on ANY face, not just nearest vertex.
+    # This correctly handles fTetWild intermediate vertices on long cage bar faces.
+    prox_start = time.time()
+    part_prox = ProximityQuery(part_mesh)
+    _, distances, _ = part_prox.on_surface(boundary_verts)
+    prox_time = (time.time() - prox_start) * 1000
+
     # Mark vertices as "near part surface" if within tolerance
     near_part = distances < tolerance  # (n_verts,)
-    
-    # Log distance statistics for debugging
-    logger.debug(f"Distance to part (KDTree): min={distances.min():.4f}, max={distances.max():.4f}, "
-                f"tolerance={tolerance:.4f}, query_time={kdtree_time:.0f}ms")
+
+    logger.debug(f"Distance to part (surface): min={distances.min():.4f}, max={distances.max():.4f}, "
+                f"tolerance={tolerance:.4f}, query_time={prox_time:.0f}ms")
     logger.debug(f"Vertices near part: {np.sum(near_part)} / {len(boundary_verts)}")
-    
-    # A face is inner if ALL its vertices are near part surface
+
+    # A face is inner if ALL its vertices are near the part surface
     faces = boundary_mesh.faces  # (n_faces, 3)
     face_near_part = near_part[faces]  # (n_faces, 3)
     all_near_part = np.all(face_near_part, axis=1)  # (n_faces,)
-    
+
     inner_triangles = set(np.where(all_near_part)[0])
     outer_triangles = set(np.where(~all_near_part)[0])
-    
+
     elapsed = (time.time() - start) * 1000
-    logger.debug(f"KDTree-based outer detection: {len(outer_triangles)} outer, "
+    logger.debug(f"Surface-distance outer detection: {len(outer_triangles)} outer, "
                 f"{len(inner_triangles)} inner in {elapsed:.0f}ms")
-    
+
     return outer_triangles, inner_triangles
 
 
