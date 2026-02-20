@@ -51,6 +51,9 @@ INLET_DEPTH_SAMPLE_POINTS = 24        # Points around circumference for depth ra
 MAX_INTO_PART_ANGLE_DEG = 25.0        # Max angle for adaptive into-part direction
 CSG_OVERLAP_MM = 0.5                  # Overlap distance for clean CSG union at junctions
 INLET_CONTAINMENT_MARGIN_MM = 0.5     # Extra depth beyond first-contained point
+SILICONE_POUR_HOLE_DIAMETER_MM = 12.0  # Through-hole diameter for silicone mold pouring
+SILICONE_POUR_CLEARANCE_MM = 5.0       # Min clearance from any other shell hole
+SILICONE_POUR_GRID_STEP_MM = 1.5       # Grid resolution for candidate sampling
 
 
 # ============================================================================
@@ -104,7 +107,13 @@ class ResinChannelResult:
     
     # Resin plug
     plug_mesh: Optional[trimesh.Trimesh] = None  # The resin pouring plug
-    
+
+    # Silicone mold pouring holes (through BOTH hard shell halves)
+    silicone_pour_hole_position: Optional[np.ndarray] = None  # (3,) 3-D centre of the hole
+    silicone_pour_hole_diameter_mm: float = SILICONE_POUR_HOLE_DIAMETER_MM
+    shell_half_1_final: Optional[trimesh.Trimesh] = None  # shell 1 with ALL holes applied
+    shell_half_2_final: Optional[trimesh.Trimesh] = None  # shell 2 with ALL holes applied
+
     # Alignment notches (applied after resin channels and shell drilling)
     alignment_notches_applied: bool = False
     notched_shell_half_1:    Optional[trimesh.Trimesh] = None
@@ -1717,6 +1726,284 @@ def determine_shell_half_for_inlet(
                 f"proj_1={proj_1:.2f}, proj_2={proj_2:.2f} → shell half {target}")
     
     return target
+
+
+# ============================================================================
+# SILICONE POUR HOLE HELPERS
+# ============================================================================
+
+def _find_silicone_pour_hole_position(
+    shell_half_1: Optional['trimesh.Trimesh'],
+    shell_half_2: Optional['trimesh.Trimesh'],
+    resin_direction: np.ndarray,
+    hole_radius_mm: float,
+    inlet_cylinder_center: Optional[np.ndarray],
+    inlet_shell_radius_mm: float,
+    air_escape_positions: Optional[np.ndarray],
+    air_escape_radius_mm: float,
+    part_mesh: Optional['trimesh.Trimesh'] = None,
+    part_hull_inset_mm: float = 5.0,
+    clearance_mm: float = SILICONE_POUR_CLEARANCE_MM,
+    grid_step_mm: float = SILICONE_POUR_GRID_STEP_MM,
+) -> Optional[np.ndarray]:
+    """
+    Find the best 3-D position for the silicone mold pouring hole.
+
+    The hole is placed within the 2-D footprint of the *part* mesh projected
+    perpendicular to *resin_direction*.  Using the part footprint (rather than
+    the larger shell silhouette) guarantees the hole lands over solid material
+    and avoids the thin outer shell wall.
+
+    The chosen position:
+      - Lies fully inside the part\'s 2-D convex hull with an inset of
+        *hole_radius_mm* + *part_hull_inset_mm* from each hull edge
+      - Is >= (*clearance_mm* + sum of radii) away from the resin inlet hole
+      - Is >= (*clearance_mm* + sum of radii) away from every air-escape hole
+      - Maximises the distance from the part centroid so it is off-centre
+        (critical for the locating-pin function)
+
+    Falls back to the combined shell silhouette if no part mesh is provided.
+
+    Args:
+        shell_half_1:            Hard-shell upper half (used for height / fallback).
+        shell_half_2:            Hard-shell lower half (used for height / fallback).
+        resin_direction:         Resin pouring direction unit vector.
+        hole_radius_mm:          Radius of the silicone pouring hole.
+        inlet_cylinder_center:   3-D centre of the resin inlet hole (or None).
+        inlet_shell_radius_mm:   Radius of the resin inlet shell through-hole.
+        air_escape_positions:    (N, 3) centres of air-escape holes (or None).
+        air_escape_radius_mm:    Radius of each air-escape hole.
+        part_mesh:               Original part mesh — defines the valid region.
+        part_hull_inset_mm:      Extra inset inside the part hull boundary beyond
+                                 the hole radius (default 5 mm).
+        clearance_mm:            Minimum edge-to-edge gap between holes.
+        grid_step_mm:            Sampling grid resolution.
+
+    Returns:
+        3-D position of the hole centre, or None if no valid location exists.
+    """
+    from scipy.spatial import ConvexHull
+
+    # ── Build orthonormal frame ──────────────────────────────────────────────
+    d = np.asarray(resin_direction, dtype=np.float64)
+    d = d / (np.linalg.norm(d) + 1e-12)
+
+    ref = np.array([1.0, 0.0, 0.0]) if abs(d[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(d, ref);  u = u / np.linalg.norm(u)
+    v = np.cross(d, u);    v = v / np.linalg.norm(v)
+
+    # ── Height: mid-point of combined shell extent along resin axis ──────────
+    pieces = [m for m in [shell_half_1, shell_half_2] if m is not None]
+    if not pieces and part_mesh is None:
+        logger.warning("No meshes provided for silicone pour hole placement")
+        return None
+
+    height_verts = np.vstack([m.vertices for m in pieces]) if pieces else np.zeros((1, 3))
+    heights = height_verts @ d
+    h_centre = (heights.min() + heights.max()) * 0.5
+
+    # ── Choose bounding region: part hull (preferred) or shell hull (fallback) ─
+    if part_mesh is not None:
+        boundary_verts_3d = np.asarray(part_mesh.vertices, dtype=np.float64)
+        logger.info("Silicone pour hole: using part mesh convex hull as bounding region")
+    elif pieces:
+        boundary_verts_3d = height_verts
+        logger.info("Silicone pour hole: no part mesh — falling back to shell silhouette")
+    else:
+        return None
+
+    coords_2d = np.column_stack([boundary_verts_3d @ u, boundary_verts_3d @ v])
+    centroid_2d = coords_2d.mean(axis=0)
+
+    try:
+        hull_2d = ConvexHull(coords_2d)
+    except Exception as exc:
+        logger.warning("ConvexHull failed for silicone pour hole placement: %s", exc)
+        return None
+
+    # Hull half-plane equations: eqs[:, :2] @ p + eqs[:, 2] <= 0  ⟺  inside hull.
+    # Required inset = hole_radius + extra part inset (0 when using shell fallback).
+    eqs = hull_2d.equations
+    required_inset = hole_radius_mm + (part_hull_inset_mm if part_mesh is not None else 0.0)
+
+    # ── Forbidden zones: list of (centre_2d, hole_radius) ───────────────────
+    blocked: list = []
+
+    if inlet_cylinder_center is not None:
+        ic = np.asarray(inlet_cylinder_center, dtype=np.float64)
+        ic_2d = np.array([ic @ u, ic @ v])
+        blocked.append((ic_2d, inlet_shell_radius_mm))
+
+    if air_escape_positions is not None and len(air_escape_positions) > 0:
+        for ae in air_escape_positions:
+            ae_3d = np.asarray(ae, dtype=np.float64)
+            ae_2d = np.array([ae_3d @ u, ae_3d @ v])
+            blocked.append((ae_2d, air_escape_radius_mm))
+
+    # ── Grid search over bounding box of the region hull ───────────────────
+    hull_pts = coords_2d[hull_2d.vertices]
+    bb_min = hull_pts.min(axis=0)
+    bb_max = hull_pts.max(axis=0)
+
+    xs = np.arange(bb_min[0] + required_inset,
+                   bb_max[0] - required_inset + grid_step_mm,
+                   grid_step_mm)
+    ys = np.arange(bb_min[1] + required_inset,
+                   bb_max[1] - required_inset + grid_step_mm,
+                   grid_step_mm)
+
+    best_pos_2d: Optional[np.ndarray] = None
+    best_dist   = -1.0
+
+    for x in xs:
+        for y in ys:
+            p = np.array([x, y])
+
+            # Test 1: fully inside hull with the required inset
+            margins = -(eqs[:, :2] @ p + eqs[:, 2])
+            if np.any(margins < required_inset):
+                continue
+
+            # Test 2: edge-to-edge clearance from all existing holes
+            clear = True
+            for (bc, br) in blocked:
+                if np.linalg.norm(p - bc) < hole_radius_mm + br + clearance_mm:
+                    clear = False
+                    break
+            if not clear:
+                continue
+
+            # Score: distance from centroid (maximise for off-centre placement)
+            dist = np.linalg.norm(p - centroid_2d)
+            if dist > best_dist:
+                best_dist   = dist
+                best_pos_2d = p.copy()
+
+    if best_pos_2d is None:
+        logger.warning(
+            "No valid position found for silicone pour hole "
+            "(clearance %.1f mm, hole r=%.1f mm, grid %.1f mm)",
+            clearance_mm, hole_radius_mm, grid_step_mm,
+        )
+        return None
+
+    # Convert back to 3-D: use the mid-height on the resin axis
+    pos_3d = best_pos_2d[0] * u + best_pos_2d[1] * v + h_centre * d
+    offset_from_centroid_mm = best_dist
+    logger.info(
+        "Silicone pour hole: pos_2d=(%.2f, %.2f)  offset_from_centroid=%.1f mm",
+        best_pos_2d[0], best_pos_2d[1], offset_from_centroid_mm,
+    )
+    return pos_3d
+
+
+def create_silicone_pour_holes(
+    shell_half_1: Optional[trimesh.Trimesh],
+    shell_half_2: Optional[trimesh.Trimesh],
+    resin_direction: np.ndarray,
+    inlet_cylinder_center: Optional[np.ndarray] = None,
+    inlet_shell_diameter_mm: float = DEFAULT_SHELL_INLET_DIAMETER_MM,
+    air_escape_positions: Optional[np.ndarray] = None,
+    air_escape_diameter_mm: float = DEFAULT_LOCAL_DIAMETER_MM,
+    hole_diameter_mm: float = SILICONE_POUR_HOLE_DIAMETER_MM,
+    clearance_mm: float = SILICONE_POUR_CLEARANCE_MM,
+    part_mesh: Optional[trimesh.Trimesh] = None,
+    part_hull_inset_mm: float = 5.0,
+) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], Optional[np.ndarray]]:
+    """
+    Drill a silicone mold pouring / locating-pin hole through both hard shell halves.
+
+    The 12 mm through-hole is intentionally placed off-centre — within the
+    footprint of the *part* mesh (not the outer shell wall) — so that the
+    silicone mold can only be re-inserted into the hard shell in one orientation,
+    functioning as a locating pin.
+
+    Placement constraints:
+      - Fully inside the part\'s 2-D convex hull with >= *part_hull_inset_mm* inset
+      - >= clearance_mm edge-to-edge from the resin inlet hole
+      - >= clearance_mm edge-to-edge from every air-escape hole
+      - Maximally off-centre (farthest valid position from the part centroid)
+
+    Args:
+        shell_half_1:            Hard-shell upper half (may be None).
+        shell_half_2:            Hard-shell lower half (may be None).
+        resin_direction:         Resin pouring direction unit vector.
+        inlet_cylinder_center:   3-D centre of the resin inlet hole (or None).
+        inlet_shell_diameter_mm: Diameter of the resin inlet through-hole.
+        air_escape_positions:    (N, 3) positions of air-escape holes (or None).
+        air_escape_diameter_mm:  Diameter of each air-escape hole.
+        hole_diameter_mm:        Diameter of the silicone pour hole.
+        clearance_mm:            Minimum edge-to-edge gap from any other hole.
+        part_mesh:               Original part mesh — constrains placement inside
+                                 the part footprint.
+        part_hull_inset_mm:      Extra inset inside part hull boundary (default 5 mm).
+
+    Returns:
+        Tuple of ``(shell_half_1_modified, shell_half_2_modified, hole_position_3d)``.
+    """
+    if not MANIFOLD_AVAILABLE:
+        logger.error("manifold3d not available — cannot drill silicone pour holes")
+        return shell_half_1, shell_half_2, None
+
+    hole_radius = hole_diameter_mm / 2.0
+
+    # ── Find placement position ──────────────────────────────────────────────
+    pos_3d = _find_silicone_pour_hole_position(
+        shell_half_1           = shell_half_1,
+        shell_half_2           = shell_half_2,
+        resin_direction        = resin_direction,
+        hole_radius_mm         = hole_radius,
+        inlet_cylinder_center  = inlet_cylinder_center,
+        inlet_shell_radius_mm  = inlet_shell_diameter_mm / 2.0,
+        air_escape_positions   = air_escape_positions,
+        air_escape_radius_mm   = air_escape_diameter_mm / 2.0,
+        part_mesh              = part_mesh,
+        part_hull_inset_mm     = part_hull_inset_mm,
+        clearance_mm           = clearance_mm,
+    )
+
+    if pos_3d is None:
+        logger.warning("Silicone pour hole skipped: no valid position found")
+        return shell_half_1, shell_half_2, None
+
+    # ── Build a single cutter cylinder (tall enough to pierce any shell half) ─
+    resin_dir = np.asarray(resin_direction, dtype=np.float64)
+    resin_dir = resin_dir / (np.linalg.norm(resin_dir) + 1e-12)
+    drill_dir = -resin_dir    # drill top-to-bottom (same convention as other holes)
+
+    def _drill_one_shell(
+        shell: Optional[trimesh.Trimesh], label: str
+    ) -> Optional[trimesh.Trimesh]:
+        if shell is None:
+            return None
+        bbox_diag = np.linalg.norm(shell.bounds[1] - shell.bounds[0])
+        cyl_height = bbox_diag * 2.0
+        # Start well above so the cylinder passes cleanly through
+        cyl_start  = pos_3d - drill_dir * (cyl_height / 2.0)
+
+        cyl = _create_cylinder(
+            center    = cyl_start,
+            direction = drill_dir,
+            radius    = hole_radius,
+            height    = cyl_height,
+        )
+        try:
+            result = _manifold_to_trimesh(
+                _trimesh_to_manifold(shell) - _trimesh_to_manifold(cyl)
+            )
+            logger.info(
+                "Silicone pour hole drilled in %s: %d verts, pos=(%.1f,%.1f,%.1f)",
+                label, len(result.vertices), *pos_3d,
+            )
+            return result
+        except Exception as exc:
+            logger.error("Failed to drill silicone pour hole in %s: %s", label, exc)
+            return shell   # return unmodified on failure
+
+    sh1_out = _drill_one_shell(shell_half_1, "shell_half_1")
+    sh2_out = _drill_one_shell(shell_half_2, "shell_half_2")
+
+    return sh1_out, sh2_out, pos_3d
 
 
 def create_hard_shell_inlet(

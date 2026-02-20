@@ -1294,14 +1294,62 @@ class ResinChannelsWorker(QThread):
                     logger.info(f"Resin plug created: {len(plug.vertices)} verts")
                 else:
                     logger.warning("Failed to create resin plug")
-            
+
+            # ── Silicone mold pouring holes (through BOTH shell halves) ───────────
+            if self.shell_half_1 is not None or self.shell_half_2 is not None:
+                self.progress.emit("Drilling silicone pouring holes in both hard shell halves...")
+                try:
+                    from core.resin_channels import create_silicone_pour_holes
+
+                    # Start from the latest state of each shell half
+                    cur_sh1 = (channel_result.modified_shell_mesh
+                               if channel_result.shell_half_modified == 1
+                               else self.shell_half_1)
+                    cur_sh2 = (channel_result.modified_shell_mesh
+                               if channel_result.shell_half_modified == 2
+                               else self.shell_half_2)
+
+                    sh1_final, sh2_final, sil_pos = create_silicone_pour_holes(
+                        shell_half_1           = cur_sh1,
+                        shell_half_2           = cur_sh2,
+                        resin_direction        = self.resin_direction,
+                        inlet_cylinder_center  = channel_result.inlet_cylinder_center,
+                        inlet_shell_diameter_mm= self.shell_inlet_diameter_mm,
+                        air_escape_positions   = channel_result.local_channel_positions,
+                        air_escape_diameter_mm = channel_result.local_diameter_mm,
+                        part_mesh              = self.part_mesh,
+                        part_hull_inset_mm     = 5.0,
+                    )
+
+                    channel_result.shell_half_1_final          = sh1_final
+                    channel_result.shell_half_2_final          = sh2_final
+                    channel_result.silicone_pour_hole_position = sil_pos
+                    channel_result.silicone_pour_hole_diameter_mm = 12.0
+
+                    # Keep modified_shell_mesh in sync (the half that already had
+                    # the resin inlet now also has the silicone hole)
+                    if channel_result.shell_half_modified == 1 and sh1_final is not None:
+                        channel_result.modified_shell_mesh = sh1_final
+                    elif channel_result.shell_half_modified == 2 and sh2_final is not None:
+                        channel_result.modified_shell_mesh = sh2_final
+
+                    if sil_pos is not None:
+                        logger.info(
+                            "Silicone pour holes drilled in both shell halves at "
+                            "(%.1f, %.1f, %.1f)", *sil_pos
+                        )
+                    else:
+                        logger.warning("Silicone pour hole placement failed: no valid position")
+                except Exception as sil_err:
+                    logger.error("Error drilling silicone pour holes: %s", sil_err)
+
             # ── Alignment notches ─────────────────────────────────────────────────
             if self.add_alignment_notches_flag:
                 self.progress.emit("Cutting alignment notches into all mold pieces...")
                 try:
                     from core.alignment_notches import add_alignment_notches as _add_notches
 
-                    # Determine current processed state of each metamold half
+                    # Metamold halves
                     if channel_result.mold_half == 1:
                         mm1 = channel_result.mesh
                         mm2 = other_half
@@ -1309,13 +1357,18 @@ class ResinChannelsWorker(QThread):
                         mm1 = other_half
                         mm2 = channel_result.mesh
 
-                    # Determine current processed state of each shell half
-                    sh1 = (channel_result.modified_shell_mesh
-                           if channel_result.shell_half_modified == 1
-                           else self.shell_half_1)
-                    sh2 = (channel_result.modified_shell_mesh
-                           if channel_result.shell_half_modified == 2
-                           else self.shell_half_2)
+                    # Use the fully-processed shell halves (with silicone holes)
+                    # if available; otherwise fall back to the resin-inlet state.
+                    sh1 = (channel_result.shell_half_1_final
+                           if channel_result.shell_half_1_final is not None
+                           else (channel_result.modified_shell_mesh
+                                 if channel_result.shell_half_modified == 1
+                                 else self.shell_half_1))
+                    sh2 = (channel_result.shell_half_2_final
+                           if channel_result.shell_half_2_final is not None
+                           else (channel_result.modified_shell_mesh
+                                 if channel_result.shell_half_modified == 2
+                                 else self.shell_half_2))
 
                     notch_result = _add_notches(
                         shell_half_1    = sh1,
@@ -7226,6 +7279,16 @@ class MainWindow(QMainWindow):
                     f'Plug: {len(result.plug_mesh.vertices):,} verts'
                 )
 
+            # Silicone pour hole
+            if result.silicone_pour_hole_position is not None:
+                p = result.silicone_pour_hole_position
+                self.resin_channels_stats.add_row(
+                    f'Silicone pour hole: ⌀{result.silicone_pour_hole_diameter_mm:.0f}mm '
+                    f'on both shells — ({p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f})'
+                )
+            else:
+                self.resin_channels_stats.add_row('Silicone pour hole: not placed (no valid position)')
+
             if result.alignment_notches_applied:
                 self.resin_channels_stats.add_row(
                     f'Alignment notches: 1 ▽ {result.notch_width_mm:.1f}×0.5 mm '
@@ -7327,9 +7390,8 @@ class MainWindow(QMainWindow):
             if mm2_show is not None:
                 self.mesh_viewer.show_metamold_half_2_with_part(mm2_show)
 
-            # Update hard-shell viewer
-            # If notches were applied, prefer the notched shells; otherwise
-            # fall back to showing only the drilled shell half as before.
+            # Update hard-shell viewer.
+            # Priority: notched versions > silicone-hole versions > old single-half.
             if channel_result.alignment_notches_applied:
                 try:
                     if channel_result.notched_shell_half_1 is not None:
@@ -7339,6 +7401,17 @@ class MainWindow(QMainWindow):
                     logger.info("Updated both shell halves with alignment notches")
                 except Exception as e:
                     logger.warning(f"Could not update shell viewer with notches: {e}")
+            elif (channel_result.shell_half_1_final is not None or
+                  channel_result.shell_half_2_final is not None):
+                # Both halves processed with silicone pour holes
+                try:
+                    if channel_result.shell_half_1_final is not None:
+                        self.mesh_viewer.show_shell_half_1(channel_result.shell_half_1_final)
+                    if channel_result.shell_half_2_final is not None:
+                        self.mesh_viewer.show_shell_half_2(channel_result.shell_half_2_final)
+                    logger.info("Updated both shell halves with silicone pour holes")
+                except Exception as e:
+                    logger.warning(f"Could not update shell viewer with silicone holes: {e}")
             elif (channel_result.modified_shell_mesh is not None and
                   channel_result.shell_half_modified > 0):
                 shell_half = channel_result.shell_half_modified
