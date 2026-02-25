@@ -204,24 +204,41 @@ def _build_marching_tet_table() -> Dict[int, object]:
         table[i] = []
     
     # ===========================================================================
-    # 3-EDGE CONFIGS: Single triangle (one vertex isolated from the other three)
-    # These are the ONLY valid 3-edge configs in a binary system.
+    # 3-EDGE CONFIGS: Single triangle from 3 edge midpoints.
+    #
+    # In a BINARY system, only 4 configs are valid (one vertex isolated).
+    # However, for MULTI-REGION secondary surfaces (mixed secondary + junction
+    # primary edges), ANY 3-edge combination can occur. All produce a single
+    # triangle from the 3 cut edge midpoints.
+    #
+    # We enumerate ALL C(6,3) = 20 three-edge configs so that secondary
+    # surfaces at junctions don't leave gaps.
     # ===========================================================================
-    # Vertex 0 isolated (label differs from v1,v2,v3): edges 0,1,2 cut
-    # Config 7 = 000111 (binary)
-    table[7] = [(0, 1, 2)]
+    # --- Binary-valid configs (one vertex isolated) ---
+    table[7]  = [(0, 1, 2)]   # v0 isolated: edges 0,1,2
+    table[25] = [(0, 3, 4)]   # v1 isolated: edges 0,3,4
+    table[42] = [(1, 3, 5)]   # v2 isolated: edges 1,3,5
+    table[52] = [(2, 4, 5)]   # v3 isolated: edges 2,4,5
     
-    # Vertex 1 isolated: edges 0,3,4 cut
-    # Config 25 = 011001
-    table[25] = [(0, 3, 4)]
-    
-    # Vertex 2 isolated: edges 1,3,5 cut
-    # Config 42 = 101010
-    table[42] = [(1, 3, 5)]
-    
-    # Vertex 3 isolated: edges 2,4,5 cut
-    # Config 52 = 110100
-    table[52] = [(2, 4, 5)]
+    # --- Multi-region 3-edge configs (not binary-valid) ---
+    # These occur at secondary-primary junctions where the mixed cut flags
+    # don't correspond to a binary vertex labeling.
+    table[11] = [(0, 1, 3)]   # edges 0,1,3 (face 0: v0-v1-v2)
+    table[13] = [(0, 2, 3)]   # edges 0,2,3
+    table[14] = [(1, 2, 3)]   # edges 1,2,3
+    table[19] = [(0, 1, 4)]   # edges 0,1,4
+    table[21] = [(0, 2, 4)]   # edges 0,2,4 (face 1: v0-v1-v3)
+    table[22] = [(1, 2, 4)]   # edges 1,2,4
+    table[26] = [(1, 3, 4)]   # edges 1,3,4
+    table[28] = [(2, 3, 4)]   # edges 2,3,4
+    table[35] = [(0, 1, 5)]   # edges 0,1,5
+    table[37] = [(0, 2, 5)]   # edges 0,2,5
+    table[38] = [(1, 2, 5)]   # edges 1,2,5 (face 2: v0-v2-v3)
+    table[41] = [(0, 3, 5)]   # edges 0,3,5
+    table[44] = [(2, 3, 5)]   # edges 2,3,5
+    table[49] = [(0, 4, 5)]   # edges 0,4,5
+    table[50] = [(1, 4, 5)]   # edges 1,4,5
+    table[56] = [(3, 4, 5)]   # edges 3,4,5 (face 3: v1-v2-v3)
     
     # ===========================================================================
     # 4-EDGE CONFIGS: Quadrilateral surface (two triangles)
@@ -260,6 +277,28 @@ def _build_marching_tet_table() -> Dict[int, object]:
     # Config 51 = 110011
     # Diagonal m0-m5: triangles (m0,m4,m5) and (m0,m5,m1) = (0,4,5) and (0,5,1)
     table[51] = [(0, 4, 5), (0, 5, 1)]
+    
+    # ===========================================================================
+    # 4-EDGE MULTI-REGION CONFIGS: face vertex + connecting triangles
+    #
+    # In multi-region secondary surfaces, 4-edge configs that aren't binary-valid
+    # occur at junctions. ALL 12 unhandled 4-edge configs have exactly one face
+    # with all 3 edges cut. We treat them as FACE_VERTEX: the single-face
+    # fallback creates a face vertex on the 3-cut face + connecting triangles
+    # for the extra edge.
+    # ===========================================================================
+    table[15] = 'FACE_VERTEX'   # edges 0,1,2,3: face 0 (0,1,3) + edge 2
+    table[23] = 'FACE_VERTEX'   # edges 0,1,2,4: face 1 (0,2,4) + edge 1
+    table[27] = 'FACE_VERTEX'   # edges 0,1,3,4: face 0 (0,1,3) + edge 4
+    table[29] = 'FACE_VERTEX'   # edges 0,2,3,4: face 1 (0,2,4) + edge 3
+    table[39] = 'FACE_VERTEX'   # edges 0,1,2,5: face 2 (1,2,5) + edge 0
+    table[43] = 'FACE_VERTEX'   # edges 0,1,3,5: face 0 (0,1,3) + edge 5
+    table[46] = 'FACE_VERTEX'   # edges 1,2,3,5: face 2 (1,2,5) + edge 3
+    table[53] = 'FACE_VERTEX'   # edges 0,2,4,5: face 1 (0,2,4) + edge 5
+    table[54] = 'FACE_VERTEX'   # edges 1,2,4,5: face 2 (1,2,5) + edge 4
+    table[57] = 'FACE_VERTEX'   # edges 0,3,4,5: face 3 (3,4,5) + edge 0
+    table[58] = 'FACE_VERTEX'   # edges 1,3,4,5: face 3 (3,4,5) + edge 1
+    table[60] = 'FACE_VERTEX'   # edges 2,3,4,5: face 3 (3,4,5) + edge 2
     
     # ===========================================================================
     # 5-EDGE CONFIGS: Three regions meet → 2 face vertices + 1 inner vertex
@@ -420,10 +459,15 @@ def _generate_5_edge_triangles(
     faces_3cut = _find_faces_with_3_cut_edges(config)
     
     if len(faces_3cut) < 2:
-        # Fallback: if we can't find 2 faces (shouldn't happen for valid 5-edge),
-        # try the single-face approach as a degraded fallback
-        logger.warning(f"5-edge config {config:06b}: expected 2 faces with 3 cut edges, "
-                      f"found {len(faces_3cut)} — using degraded fallback")
+        # Single-face approach: 4-edge multi-region configs have exactly 1 face
+        # with 3 cuts. Also used as fallback for any unexpected 5-edge case.
+        n_cut = bin(config).count('1')
+        if n_cut != 5:
+            logger.debug(f"{n_cut}-edge config {config:06b}: 1 face with 3 cuts — "
+                        f"using single-face handler")
+        else:
+            logger.warning(f"5-edge config {config:06b}: expected 2 faces with 3 cut edges, "
+                          f"found {len(faces_3cut)} — using single-face fallback")
         if len(faces_3cut) == 1:
             return _generate_5_edge_triangles_single_face_fallback(
                 config, faces_3cut[0], local_edge_to_sv, surface_vertices, next_vertex_index
@@ -541,10 +585,12 @@ def _generate_5_edge_triangles_single_face_fallback(
         sv_b = face_svs[(i + 1) % 3]
         triangles.append([sv_a, sv_b, fv_idx])
     
-    # Connect remaining cut edges through face vertex
-    uncut_edge = _find_uncut_edge(config)
-    remaining_cut_edges = [e for e in range(6) 
-                          if e != uncut_edge and e not in face_edge_indices]
+    # Connect remaining cut edges (not on the 3-cut face) through face vertex.
+    # For each extra cut edge, find all face-edges it shares a tet face with
+    # and create connecting triangles. This ensures proper surface coverage
+    # at junctions where secondary meets primary.
+    remaining_cut_edges = [e for e in range(6)
+                          if (config & (1 << e)) and e not in face_edge_indices]
     
     for re in remaining_cut_edges:
         sv_r = local_edge_to_sv.get(re)
@@ -554,7 +600,6 @@ def _generate_5_edge_triangles_single_face_fallback(
                 fe_verts = set(TET_EDGES[fe])
                 if fe_verts & re_verts:
                     triangles.append([face_svs[i], sv_r, fv_idx])
-                    break  # Only connect to first matching face edge
     
     return triangles, face_vertex_pos.reshape(1, 3), np.array([0], dtype=np.int8), 1
 
@@ -1684,7 +1729,7 @@ def extract_parting_surface(
         n_edges = bin(config).count('1')
         table_entry = MARCHING_TET_TABLE.get(config, [])
         if table_entry == 'FACE_VERTEX':
-            status = "-> FACE_VERTEX (5-edge, face vertex generated)"
+            status = f"-> FACE_VERTEX ({n_edges}-edge, face vertex generated)"
         elif table_entry == 'INNER_VERTEX':
             status = "-> INNER_VERTEX (6-edge, inner vertex generated)"
         elif table_entry:

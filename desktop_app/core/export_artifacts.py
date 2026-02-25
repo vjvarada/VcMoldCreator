@@ -25,8 +25,129 @@ from pathlib import Path
 from typing import Optional, List
 
 import trimesh
+import trimesh.repair as _trimesh_repair
 
 logger = logging.getLogger(__name__)
+
+
+def _repair_mesh_for_export(mesh: Optional[trimesh.Trimesh], label: str) -> Optional[trimesh.Trimesh]:
+    """Attempt to repair a mesh before export so the STL is as watertight as possible.
+
+    Uses meshlib as the primary engine (most robust for complex topology),
+    with trimesh as a fallback.
+
+    Args:
+        mesh: Input trimesh, or None.
+        label: Human-readable name for log messages.
+
+    Returns:
+        Repaired mesh (or original if it was already watertight / None).
+    """
+    if mesh is None or len(mesh.vertices) == 0:
+        return mesh
+
+    if mesh.is_watertight:
+        logger.info("Export mesh '%s': already watertight (%d verts, %d faces)",
+                    label, len(mesh.vertices), len(mesh.faces))
+        return mesh
+
+    def _count_open_edges(m: trimesh.Trimesh) -> int:
+        ec: dict = {}
+        for face in m.faces:
+            for i in range(3):
+                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                ek = (min(v0, v1), max(v0, v1))
+                ec[ek] = ec.get(ek, 0) + 1
+        return sum(1 for c in ec.values() if c == 1)
+
+    open_before = _count_open_edges(mesh)
+    logger.warning(
+        "Export mesh '%s' is NOT watertight before export: %d open boundary edges "
+        "(%d verts, %d faces). Attempting repair...",
+        label, open_before, len(mesh.vertices), len(mesh.faces)
+    )
+
+    # ------------------------------------------------------------------
+    # meshlib primary repair
+    # ------------------------------------------------------------------
+    try:
+        import numpy as _np
+        import meshlib.mrmeshnumpy as _mrn
+        import meshlib.mrmeshpy as _mr
+
+        _eec: dict = {}
+        for _ef in mesh.faces:
+            for _ei in range(3):
+                _eva, _evb = int(_ef[_ei]), int(_ef[(_ei + 1) % 3])
+                _eek = (min(_eva, _evb), max(_eva, _evb))
+                _eec[_eek] = _eec.get(_eek, 0) + 1
+        _e_closed_nm = (sum(1 for _ec_v in _eec.values() if _ec_v == 1) == 0)
+        mesh_mr = _mrn.meshFromFacesVerts(
+            mesh.faces.astype(_np.int32),
+            mesh.vertices.astype(_np.float32),
+        )
+        if not _e_closed_nm:
+            _mr.fixMeshDegeneracies(mesh_mr, _mr.FixMeshDegeneraciesParams())
+            for loop in _mr.findRightBoundary(mesh_mr.topology, None):
+                _mr.fillHoleNicely(mesh_mr, loop[0], _mr.FillHoleNicelySettings())
+
+        out_verts = _mrn.getNumpyVerts(mesh_mr)
+        out_faces = _mrn.getNumpyFaces(mesh_mr.topology)
+        result = trimesh.Trimesh(vertices=out_verts, faces=out_faces, process=False)
+        result.fix_normals()
+
+        if result.is_watertight:
+            logger.info(
+                "Export mesh '%s': repaired via meshlib → watertight (%d verts, %d faces)",
+                label, len(result.vertices), len(result.faces)
+            )
+            return result
+
+        open_after_ml = _count_open_edges(result)
+        if open_after_ml == 0:
+            # Non-manifold topology (0 open edges, no holes to fill).
+            # Trimesh process=True would re-merge the vertices that meshlib just split,
+            # recreating the non-manifold edges and causing geometry explosion.  Return as-is.
+            logger.warning(
+                "Export mesh '%s': 0 open edges but not watertight (non-manifold topology). "
+                "Skipping trimesh fallback to avoid geometry explosion.",
+                label,
+            )
+            return result
+        logger.warning(
+            "Export mesh '%s': meshlib repair left %d open edges. Falling back to trimesh.",
+            label, open_after_ml
+        )
+        mesh = result
+    except Exception as exc:
+        logger.warning("Export mesh '%s': meshlib repair failed (%s). Falling back to trimesh.",
+                       label, exc)
+
+    # ------------------------------------------------------------------
+    # trimesh fallback (only reached when there are real open boundary edges)
+    # ------------------------------------------------------------------
+    m = trimesh.Trimesh(
+        vertices=mesh.vertices.copy(),
+        faces=mesh.faces.copy(),
+        process=True,
+    )
+    _trimesh_repair.fix_normals(m, multibody=True)
+    _trimesh_repair.fill_holes(m)
+
+    if m.is_watertight:
+        logger.info(
+            "Export mesh '%s': repaired via trimesh fallback → watertight (%d verts, %d faces)",
+            label, len(m.vertices), len(m.faces)
+        )
+        return m
+
+    open_after = _count_open_edges(m)
+    logger.warning(
+        "Export mesh '%s': still NOT watertight after repair (%d open boundary edges remain). "
+        "STL will have open faces.",
+        label, open_after
+    )
+    return m
 
 
 # ============================================================================
@@ -267,11 +388,14 @@ def export_artifacts(
         for artifact in artifacts:
             if artifact.mesh is not None:
                 filepath = export_path / artifact.filename
-                artifact.mesh.export(str(filepath), file_type='stl')
+                # Repair before export to maximise watertightness
+                repaired = _repair_mesh_for_export(artifact.mesh, artifact.filename)
+                repaired.export(str(filepath), file_type='stl')
                 result.exported_files.append(artifact.filename)
-                logger.info("Exported %s: %s (%d verts, %d faces)",
+                logger.info("Exported %s: %s (%d verts, %d faces, watertight=%s)",
                            artifact.description, artifact.filename,
-                           len(artifact.mesh.vertices), len(artifact.mesh.faces))
+                           len(repaired.vertices), len(repaired.faces),
+                           repaired.is_watertight)
             else:
                 result.skipped_files.append(artifact.filename)
                 logger.warning("Skipped %s: mesh not available", artifact.description)

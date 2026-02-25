@@ -300,14 +300,74 @@ def _csg_subtract(
 
     try:
         import manifold3d as m3d
+        import trimesh.repair as _tr
 
-        def _to_manifold(mesh: trimesh.Trimesh) -> m3d.Manifold:
+        def _repair(mesh: trimesh.Trimesh, lbl: str) -> trimesh.Trimesh:
+            if mesh.is_watertight:
+                return mesh
+            # Try meshlib first
+            try:
+                import numpy as _np
+                import meshlib.mrmeshnumpy as _mrn
+                import meshlib.mrmeshpy as _mr
+                _aec: dict = {}
+                for _af in mesh.faces:
+                    for _ai in range(3):
+                        _ava, _avb = int(_af[_ai]), int(_af[(_ai + 1) % 3])
+                        _aek = (min(_ava, _avb), max(_ava, _avb))
+                        _aec[_aek] = _aec.get(_aek, 0) + 1
+                _a_closed_nm = (sum(1 for _ac in _aec.values() if _ac == 1) == 0)
+                mesh_mr = _mrn.meshFromFacesVerts(
+                    mesh.faces.astype(_np.int32),
+                    mesh.vertices.astype(_np.float32),
+                )
+                if not _a_closed_nm:
+                    _mr.fixMeshDegeneracies(mesh_mr, _mr.FixMeshDegeneraciesParams())
+                    for loop in _mr.findRightBoundary(mesh_mr.topology, None):
+                        _mr.fillHoleNicely(mesh_mr, loop[0], _mr.FillHoleNicelySettings())
+                out_verts = _mrn.getNumpyVerts(mesh_mr)
+                out_faces = _mrn.getNumpyFaces(mesh_mr.topology)
+                r = trimesh.Trimesh(vertices=out_verts, faces=out_faces, process=False)
+                r.fix_normals()
+                if r.is_watertight:
+                    return r
+                # Check open edge count: 0 open edges = non-manifold topology (not holes).
+                # Applying trimesh process=True would re-merge split vertices and make it worse.
+                _ec: dict = {}
+                for _face in r.faces:
+                    for _i in range(3):
+                        _va, _vb = int(_face[_i]), int(_face[(_i + 1) % 3])
+                        _ek = (min(_va, _vb), max(_va, _vb))
+                        _ec[_ek] = _ec.get(_ek, 0) + 1
+                if sum(1 for _c in _ec.values() if _c == 1) == 0:
+                    logger.debug(
+                        "alignment_notch CSG input '%s': 0 open edges but not watertight "
+                        "(non-manifold topology). Skipping trimesh fallback.", lbl
+                    )
+                    return r  # trimesh fallback would cause geometry explosion
+                mesh = r  # pass to trimesh fallback
+            except Exception:
+                pass
+            # trimesh fallback (only reached when there are real open boundary edges)
+            m = trimesh.Trimesh(
+                vertices=mesh.vertices.copy(),
+                faces=mesh.faces.copy(),
+                process=True,
+            )
+            _tr.fix_normals(m, multibody=True)
+            _tr.fill_holes(m)
+            if not m.is_watertight:
+                logger.debug("alignment_notch CSG input '%s' still not watertight after repair", lbl)
+            return m
+
+        def _to_manifold(mesh: trimesh.Trimesh, lbl: str) -> m3d.Manifold:
+            mesh = _repair(mesh, lbl)
             verts = np.asarray(mesh.vertices, dtype=np.float32)
             tris  = np.asarray(mesh.faces,    dtype=np.uint32)
             return m3d.Manifold(mesh=m3d.Mesh(vert_properties=verts, tri_verts=tris))
 
-        a = _to_manifold(target)
-        b = _to_manifold(cutter)
+        a = _to_manifold(target, 'target')
+        b = _to_manifold(cutter, 'cutter')
         result_manifold = a - b
 
         result_mesh_data = result_manifold.to_mesh()
@@ -318,7 +378,9 @@ def _csg_subtract(
             logger.warning("CSG subtraction produced empty mesh")
             return None
 
-        return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        result = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        result.fix_normals()
+        return result
 
     except Exception as exc:
         logger.error("Alignment notch CSG subtraction failed: %s", exc)

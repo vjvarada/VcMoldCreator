@@ -909,7 +909,8 @@ class HardShellWorker(QThread):
                 create_hard_shell_prism,
                 create_shell_with_cavity,
                 create_outer_collar_extension,
-                split_shell_with_membrane
+                split_shell_with_membrane,
+                _save_debug_mesh
             )
             
             logger.info(f"Generating hard shell with wall_thickness={self.wall_thickness}mm")
@@ -944,7 +945,11 @@ class HardShellWorker(QThread):
             )
             logger.info(f"Hard shell prism: {prism_result.vertex_count} vertices, "
                        f"silhouette has {len(prism_result.silhouette_2d)} points")
-            
+
+            # Export prism and hull for offline CSG debugging
+            _save_debug_mesh(prism_result.prism_mesh, 'hard_shell_prism')
+            _save_debug_mesh(self.inner_hull, 'hard_shell_inner_hull')
+
             # Step 3: CSG subtraction - shell = prism - hull
             self.progress.emit("Performing CSG: subtracting hull from prism...")
             shell_with_cavity, csg_time_ms, csg_success = create_shell_with_cavity(
@@ -959,12 +964,16 @@ class HardShellWorker(QThread):
                 logger.info(f"CSG cavity complete: shell has {len(shell_with_cavity.vertices)} vertices, "
                            f"{len(shell_with_cavity.faces)} faces in {csg_time_ms:.1f}ms")
                 
-                # Step 4: Split shell into two halves using the outer collar membrane
+                # Step 4: Split shell into two halves using the outer collar membrane.
+                # Pass prism + hull so split can use the full (prism-hull)-blade
+                # manifold3d chain without an intermediate round-trip.
                 self.progress.emit("Splitting shell into two halves using membrane...")
                 shell_half_1, shell_half_2, split_time_ms, split_success = split_shell_with_membrane(
                     shell_with_cavity,
                     collar_result.mesh,
-                    self.pouring_direction
+                    self.pouring_direction,
+                    prism_mesh=prism_result.prism_mesh,
+                    subtractor_mesh=self.inner_hull,
                 )
                 
                 if split_success:
@@ -1026,7 +1035,8 @@ class MetamoldWorker(QThread):
                 split_shell_with_membrane,
                 add_part_to_metamold_halves,
                 create_part_with_thickened_secondary,
-                trim_metamold_halves
+                trim_metamold_halves,
+                _save_debug_mesh
             )
             
             logger.info(f"Generating metamold with wall_thickness={self.wall_thickness}mm, "
@@ -1050,7 +1060,13 @@ class MetamoldWorker(QThread):
                 parting_surface=self.outer_collar_mesh  # Ensures prism includes parting surface level
             )
             logger.info(f"Metamold prism: {prism_result.vertex_count} vertices, {prism_result.face_count} faces")
-            
+
+            # Export all CSG ingredients for offline debugging
+            _save_debug_mesh(prism_result.prism_mesh, 'metamold_prism')
+            _save_debug_mesh(self.hull_mesh, 'metamold_hull')
+            _save_debug_mesh(self.part_mesh, 'metamold_part_mesh')
+            _save_debug_mesh(self.outer_collar_mesh, 'metamold_outer_collar')
+
             # Step 2: CSG subtraction - metamold = prism - part_mesh
             # The metamold cavity is shaped like the part (different from hard shell which uses hull)
             self.progress.emit("Performing CSG: subtracting part from prism...")
@@ -1074,7 +1090,9 @@ class MetamoldWorker(QThread):
                 metamold_half_1, metamold_half_2, split_time_ms, split_success = split_shell_with_membrane(
                     metamold_with_cavity,
                     self.outer_collar_mesh,  # Same parting surface + collar used in hard shell
-                    self.resin_pouring_direction
+                    self.resin_pouring_direction,
+                    prism_mesh=prism_result.prism_mesh,
+                    subtractor_mesh=self.part_mesh,
                 )
                 
                 if split_success:

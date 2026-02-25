@@ -20,6 +20,7 @@ Author: VcMoldCreator
 import logging
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 import numpy as np
 
@@ -621,26 +622,334 @@ def create_hard_shell_prism(
 # CSG OPERATIONS FOR HARD SHELL (Cavity + Split)
 # ============================================================================
 
-def _trimesh_to_manifold(mesh: trimesh.Trimesh) -> 'manifold3d.Manifold':
-    """Convert a trimesh to manifold3d Manifold object."""
+# Directory where problematic input/output meshes are saved for visual debugging.
+# Auto-initialised to <workspace_root>/.tmp/csg_debug/ so debug STLs are saved
+# on every run without any extra wiring from the UI layer.
+# Override with set_csg_debug_dir() to use a per-session path.
+_CSG_DEBUG_DIR: Optional[Path] = None
+try:
+    _CSG_DEBUG_DIR = (
+        Path(__file__).parent   # desktop_app/core/
+        .parent                 # desktop_app/
+        .parent                 # VcMoldCreator/ (workspace root)
+        / ".tmp"
+        / "csg_debug"
+    )
+    _CSG_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    _CSG_DEBUG_DIR = None  # Disable silently on any filesystem error
+
+
+def set_csg_debug_dir(path: Optional[Path]) -> None:
+    """Set the directory where bad CSG meshes are saved as STL for inspection.
+
+    Called from the main window once a session directory is known.  If *None*,
+    debug saving is disabled.
+    """
+    global _CSG_DEBUG_DIR
+    _CSG_DEBUG_DIR = path
+    if path is not None:
+        path.mkdir(parents=True, exist_ok=True)
+        logger.info("CSG debug meshes will be saved to: %s", path)
+
+
+def _save_debug_mesh(mesh: trimesh.Trimesh, label: str) -> None:
+    """Save *mesh* to the CSG debug directory as ``<label>.stl``.
+
+    Silently does nothing if the debug directory has not been set or if the
+    mesh has no vertices.
+    """
+    if _CSG_DEBUG_DIR is None or mesh is None or len(mesh.vertices) == 0:
+        return
+    _CSG_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    # Sanitise label for use as a filename
+    safe = label.replace('/', '_').replace('\\', '_').replace(' ', '_')
+    out = _CSG_DEBUG_DIR / f"{safe}.stl"
+    try:
+        mesh.export(str(out))
+        logger.info("  [CSG DEBUG] Saved mesh '%s' -> %s", label, out)
+    except Exception as exc:
+        logger.warning("  [CSG DEBUG] Could not save '%s': %s", label, exc)
+
+
+def _repair_mesh_for_csg(mesh: trimesh.Trimesh, label: str = 'mesh') -> trimesh.Trimesh:
+    """Repair a trimesh to make it as watertight as possible before CSG with manifold3d.
+
+    Uses meshlib as the primary repair engine (handles non-manifold edges/vertices,
+    complex holes, and self-intersections robustly), with trimesh as a fallback.
+
+    Repair sequence:
+    1. meshlib: fixMeshDegeneracies  – removes degenerate/non-manifold faces & edges
+    2. meshlib: fillHoleNicely       – fills each open boundary loop with quality triangles
+    3. trimesh  (fallback)           – process=True + fix_normals + fill_holes
+
+    Args:
+        mesh: Input trimesh (may be non-manifold / non-watertight).
+        label: Human-readable label for log messages.
+
+    Returns:
+        Repaired trimesh.  The input is not modified.
+    """
+    if mesh is None or len(mesh.vertices) == 0:
+        return mesh
+
+    # Step 0: merge coincident vertices (fixes triangle soup from STL loading).
+    # STL format stores every triangle independently so each face has its own 3
+    # vertices even when adjacent faces share an edge position.  Without merging,
+    # every edge looks like a boundary edge → fixMeshDegeneracies treats each
+    # vertex as a non-manifold junction and explodes the vertex count 300×+.
+    # Merging first is always safe because coincident identical-position vertices
+    # carry no geometric information.
+    if len(mesh.vertices) != len(np.unique(mesh.vertices, axis=0)):
+        mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, process=True)
+        logger.debug("  '%s' vertex merge: %d verts after merge", label, len(mesh.vertices))
+
+    if mesh.is_watertight:
+        return mesh
+
+    logger.debug("Repairing '%s' before CSG (verts=%d, faces=%d)",
+                 label, len(mesh.vertices), len(mesh.faces))
+
+    # ------------------------------------------------------------------
+    # Try meshlib first (most robust)
+    # ------------------------------------------------------------------
+    try:
+        import numpy as _np
+        import meshlib.mrmeshnumpy as _mrn
+        import meshlib.mrmeshpy as _mr
+
+        # Check INPUT for closed non-manifold topology (0 open boundary edges but
+        # not watertight).  In that case fixMeshDegeneracies causes a 29x geometry
+        # explosion and fillHoleNicely is a no-op (no holes to fill).  Instead, just
+        # do the round-trip: meshFromFacesVerts auto-splits non-manifold edges during
+        # import via the half-edge structure, producing clean topology at minimal cost.
+        _input_ec: dict = {}
+        for _f in mesh.faces:
+            for _i in range(3):
+                _va, _vb = int(_f[_i]), int(_f[(_i + 1) % 3])
+                _ek = (min(_va, _vb), max(_va, _vb))
+                _input_ec[_ek] = _input_ec.get(_ek, 0) + 1
+        _input_open = sum(1 for _c in _input_ec.values() if _c == 1)
+        _is_closed_nonmanifold = (_input_open == 0)  # no boundary → topology problem
+
+        mesh_mr = _mrn.meshFromFacesVerts(
+            mesh.faces.astype(_np.int32),
+            mesh.vertices.astype(_np.float32),
+        )
+
+        if not _is_closed_nonmanifold:
+            # Real open boundary edges → run full degeneracy + hole-fill repair.
+            _mr.fixMeshDegeneracies(mesh_mr, _mr.FixMeshDegeneraciesParams())
+            holes = _mr.findRightBoundary(mesh_mr.topology, None)
+            if holes:
+                for loop in holes:
+                    _mr.fillHoleNicely(mesh_mr, loop[0], _mr.FillHoleNicelySettings())
+        # else: the round-trip already resolved non-manifold edges; nothing more needed.
+
+        out_verts = _mrn.getNumpyVerts(mesh_mr)
+        out_faces = _mrn.getNumpyFaces(mesh_mr.topology)
+        result = trimesh.Trimesh(vertices=out_verts, faces=out_faces, process=False)
+        result.fix_normals()
+
+        if result.is_watertight:
+            logger.debug("  '%s' repaired via meshlib: watertight (%d verts, %d faces)",
+                         label, len(result.vertices), len(result.faces))
+            return result
+
+        ec: dict = {}
+        for face in result.faces:
+            for i in range(3):
+                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                ek = (min(v0, v1), max(v0, v1))
+                ec[ek] = ec.get(ek, 0) + 1
+        open_edges = sum(1 for c in ec.values() if c == 1)
+
+        if open_edges == 0:
+            # Zero open boundary edges means the mesh has non-manifold topology
+            # (e.g., 3+ faces sharing one edge, or fan vertices).  Applying
+            # trimesh process=True here would re-merge the vertices that meshlib
+            # just split, recreating the problem and exploding face count 4×.
+            #
+            # Instead: pre-import into manifold3d and immediately re-export.
+            # manifold3d will cleanly discard any non-manifold faces during import
+            # (the same faces it would drop mid-CSG), but by doing it here we get
+            # back a perfectly watertight trimesh that manifold3d accepts 100% in
+            # the subsequent CSG step — preventing holes / bad interior triangles.
+            if MANIFOLD_AVAILABLE:
+                try:
+                    _pre_verts = np.asarray(result.vertices, dtype=np.float32)
+                    _pre_faces = np.asarray(result.faces, dtype=np.uint32)
+                    _pre_m3d_mesh = manifold3d.Mesh(
+                        vert_properties=_pre_verts,
+                        tri_verts=_pre_faces,
+                    )
+                    _pre_mgl = manifold3d.Manifold(_pre_m3d_mesh)
+                    if not _pre_mgl.is_empty() and _pre_mgl.num_tri() > 0:
+                        _pre_out = _pre_mgl.to_mesh()
+                        _pre_clean_v = np.array(_pre_out.vert_properties, dtype=np.float64)
+                        _pre_clean_f = np.array(_pre_out.tri_verts, dtype=np.int64)
+                        _clean_result = trimesh.Trimesh(
+                            vertices=_pre_clean_v,
+                            faces=_pre_clean_f,
+                            process=False,
+                        )
+                        _clean_result.fix_normals()
+                        dropped = len(result.faces) - _pre_mgl.num_tri()
+                        if _clean_result.is_watertight:
+                            logger.info(
+                                "  '%s' pre-cleaned via manifold3d: %d verts, %d faces "
+                                "(watertight, dropped %d non-manifold faces)",
+                                label, len(_clean_result.vertices),
+                                len(_clean_result.faces), dropped,
+                            )
+                            return _clean_result
+                        logger.warning(
+                            "  '%s' manifold3d pre-clean produced non-watertight result "
+                            "(%d faces, dropped %d). Returning meshlib result.",
+                            label, len(_clean_result.faces), dropped,
+                        )
+                except Exception as _pre_exc:
+                    logger.warning(
+                        "  '%s' manifold3d pre-clean failed (%s). "
+                        "Returning meshlib result as-is.",
+                        label, _pre_exc,
+                    )
+
+            logger.warning(
+                "  '%s' has 0 open edges but is still non-manifold after meshlib "
+                "and manifold3d pre-clean. CSG result may have minor artifacts.",
+                label,
+            )
+            return result
+
+        logger.warning("  '%s' still NOT watertight after meshlib repair (%d open edges). "
+                       "Falling back to trimesh repair.", label, open_edges)
+        mesh = result
+
+    except Exception as exc:
+        logger.warning("  meshlib repair failed for '%s' (%s). Falling back to trimesh.",
+                       label, exc)
+
+    # ------------------------------------------------------------------
+    # Fallback: trimesh repair (only reached when there are real open boundary edges)
+    # ------------------------------------------------------------------
+    import trimesh.repair as _tr_repair
+
+    m = trimesh.Trimesh(
+        vertices=mesh.vertices.copy(),
+        faces=mesh.faces.copy(),
+        process=True,
+    )
+    _tr_repair.fix_normals(m, multibody=True)
+    _tr_repair.fill_holes(m)
+
+    if m.is_watertight:
+        logger.debug("  '%s' repaired via trimesh fallback: watertight.", label)
+    else:
+        ec2: dict = {}
+        for face in m.faces:
+            for i in range(3):
+                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                ek = (min(v0, v1), max(v0, v1))
+                ec2[ek] = ec2.get(ek, 0) + 1
+        open_edges2 = sum(1 for c in ec2.values() if c == 1)
+        logger.warning(
+            "  '%s' still NOT watertight after trimesh fallback (%d open edges, %d verts, %d faces). "
+            "CSG result may have gaps.",
+            label, open_edges2, len(m.vertices), len(m.faces)
+        )
+
+    return m
+
+
+def _trimesh_to_manifold(mesh: trimesh.Trimesh, label: str = 'mesh') -> 'manifold3d.Manifold':
+    """Convert a trimesh to manifold3d Manifold object.
+
+    Repairs the mesh before conversion so manifold3d receives a clean input.
+    A non-watertight input causes manifold3d to silently discard geometry,
+    which leaves holes in subsequent CSG outputs.
+
+    Logs the manifold3d status code and saves the input mesh as a debug STL
+    whenever manifold3d rejects it (status != NoError or num_tri == 0).
+    """
     if not MANIFOLD_AVAILABLE:
         raise RuntimeError("manifold3d is not available")
-    
+
+    # Repair non-manifold / non-watertight meshes before handing to manifold3d
+    mesh = _repair_mesh_for_csg(mesh, label)
+
     vertices = np.asarray(mesh.vertices, dtype=np.float32)
     faces = np.asarray(mesh.faces, dtype=np.uint32)
-    
+
+    # Log what we're handing to manifold3d
+    logger.info(
+        "  CSG INPUT  '%s': %d verts, %d faces, watertight=%s",
+        label, len(vertices), len(faces), mesh.is_watertight
+    )
+
     # Create Mesh then Manifold (correct API for manifold3d v3.x)
     m3d_mesh = manifold3d.Mesh(vert_properties=vertices, tri_verts=faces)
-    return manifold3d.Manifold(m3d_mesh)
+    m = manifold3d.Manifold(m3d_mesh)
+
+    # Validate: manifold3d silently accepts bad inputs but reports them via status()
+    status = m.status()
+    if status != manifold3d.Error.NoError or m.num_tri() == 0:
+        logger.error(
+            "  CSG INPUT  '%s' REJECTED by manifold3d: status=%s, "
+            "manifold_tris=%d (input watertight=%s, verts=%d, faces=%d). "
+            "Saving input mesh for inspection.",
+            label, status, m.num_tri(), mesh.is_watertight,
+            len(mesh.vertices), len(mesh.faces)
+        )
+        _save_debug_mesh(mesh, f"bad_csg_input_{label}")
+    else:
+        logger.info(
+            "  CSG INPUT  '%s' accepted: manifold_tris=%d",
+            label, m.num_tri()
+        )
+
+    return m
 
 
-def _manifold_to_trimesh(manifold: 'manifold3d.Manifold') -> trimesh.Trimesh:
-    """Convert a manifold3d Manifold object to trimesh."""
+def _manifold_to_trimesh(manifold: 'manifold3d.Manifold', label: str = 'result') -> trimesh.Trimesh:
+    """Convert a manifold3d Manifold object to trimesh.
+
+    Checks whether the CSG result is empty (which indicates a non-manifold operand
+    caused manifold3d to discard geometry) and logs the output watertight status.
+    Saves an empty-marker file to the debug directory on failure.
+    """
+    status = manifold.status()
+    n_tri = manifold.num_tri()
+
+    if manifold.is_empty() or n_tri == 0:
+        logger.error(
+            "  CSG OUTPUT '%s' is EMPTY after operation: status=%s, num_tri=%d. "
+            "One or more CSG operands were non-manifold — check 'bad_csg_input_*' "
+            "files in the debug directory.",
+            label, status, n_tri
+        )
+    else:
+        logger.info(
+            "  CSG OUTPUT '%s': manifold_tris=%d, volume=%.3f mm^3",
+            label, n_tri, manifold.volume()
+        )
+
     mesh_data = manifold.to_mesh()
     vertices = np.asarray(mesh_data.vert_properties, dtype=np.float64)
     faces = np.asarray(mesh_data.tri_verts, dtype=np.int64)
-    
-    return trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
+
+    result = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    # Fix normals on the raw output (process=False avoids unwanted vertex merges)
+    result.fix_normals()
+
+    logger.info(
+        "  CSG OUTPUT '%s' as trimesh: %d verts, %d faces, watertight=%s",
+        label, len(result.vertices), len(result.faces), result.is_watertight
+    )
+    if not result.is_watertight:
+        _save_debug_mesh(result, f"bad_csg_output_{label}")
+
+    return result
 
 
 def create_shell_with_cavity(
@@ -668,15 +977,15 @@ def create_shell_with_cavity(
     try:
         logger.info("Creating shell with cavity (prism - hull)...")
         
-        # Convert to manifold
-        prism_manifold = _trimesh_to_manifold(prism_mesh)
-        hull_manifold = _trimesh_to_manifold(hull_mesh)
-        
+        # Convert to manifold (repair applied inside _trimesh_to_manifold)
+        prism_manifold = _trimesh_to_manifold(prism_mesh, 'prism')
+        hull_manifold = _trimesh_to_manifold(hull_mesh, 'hull')
+
         # Perform subtraction: shell = prism - hull
         shell_manifold = prism_manifold - hull_manifold
         
         # Convert back to trimesh
-        shell_mesh = _manifold_to_trimesh(shell_manifold)
+        shell_mesh = _manifold_to_trimesh(shell_manifold, 'prism_minus_hull')
         
         elapsed_ms = (time.time() - start_time) * 1000
         
@@ -756,21 +1065,13 @@ def _create_cutting_volume_from_surface(
         # Get the original edge orientation from the face
         _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
         
-        # Bottom vertices
-        b0, b1 = v0, v1
-        # Top vertices (offset by n_verts)
-        t0, t1 = v0 + n_verts, v1 + n_verts
-        
-        # Create quad (2 triangles) with correct winding
-        # The winding depends on the original edge direction in the face
-        if orig_v0 == v0:
-            # Edge goes v0->v1 in original face, so outward normal faces "right"
-            side_faces.append([b0, t0, t1])
-            side_faces.append([b0, t1, b1])
-        else:
-            # Edge goes v1->v0 in original face
-            side_faces.append([b0, b1, t1])
-            side_faces.append([b0, t1, t0])
+        # Use face traversal order (orig_v0 → orig_v1) to determine winding.
+        # For boundary edge A→B in CCW face order, outward side normal = cross(B-A, dir).
+        # CCW from outside: A_bottom → B_bottom → B_top  and  A_bottom → B_top → A_top
+        a = orig_v0
+        b = orig_v1
+        side_faces.append([a, b, b + n_verts])
+        side_faces.append([a, b + n_verts, a + n_verts])
     
     # Combine all faces
     all_faces = np.vstack([
@@ -782,13 +1083,14 @@ def _create_cutting_volume_from_surface(
     volume_mesh = trimesh.Trimesh(
         vertices=all_vertices,
         faces=all_faces,
-        process=True
+        process=False
     )
     volume_mesh.fix_normals()
-    
-    logger.debug(f"Created cutting volume: {len(all_vertices)} verts, {len(all_faces)} faces, "
+    volume_mesh = _repair_mesh_for_csg(volume_mesh, 'cutting_volume')
+
+    logger.debug(f"Created cutting volume: {len(volume_mesh.vertices)} verts, {len(volume_mesh.faces)} faces, "
                 f"from {n_verts} surface verts, {len(boundary_edges)} boundary edges")
-    
+
     return volume_mesh
 
 
@@ -860,19 +1162,16 @@ def _create_half_space_from_membrane(
     for v0, v1 in boundary_edges:
         _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
         
-        # Bottom (membrane) vertices
-        b0, b1 = v0, v1
-        # Top (extruded) vertices
-        t0, t1 = v0 + n_verts, v1 + n_verts
-        
-        # Create quad with correct winding for outward-facing normals
-        # Since bottom faces are reversed, side faces should create outward normals
-        if orig_v0 == v0:
-            side_faces.append([b0, b1, t1])
-            side_faces.append([b0, t1, t0])
-        else:
-            side_faces.append([b0, t0, t1])
-            side_faces.append([b0, t1, b1])
+        # Use face traversal order (orig_v0 → orig_v1) to determine winding.
+        # For boundary edge A→B in CCW face order, outward side normal =
+        # cross(B-A, extrusion_dir).  CCW from outside:
+        #   A_bottom → B_bottom → B_top  (first tri)
+        #   A_bottom → B_top    → A_top  (second tri)
+        # This is correct for BOTH outer and inner (hole) boundary loops.
+        a = orig_v0
+        b = orig_v1
+        side_faces.append([a, b, b + n_verts])
+        side_faces.append([a, b + n_verts, a + n_verts])
     
     # Combine all faces
     all_faces_list = [bottom_faces, top_faces]
@@ -883,13 +1182,14 @@ def _create_half_space_from_membrane(
     half_space_mesh = trimesh.Trimesh(
         vertices=all_vertices,
         faces=all_faces,
-        process=True
+        process=False
     )
     half_space_mesh.fix_normals()
-    
-    logger.debug(f"Created half-space volume: {len(all_vertices)} verts, {len(all_faces)} faces, "
+    half_space_mesh = _repair_mesh_for_csg(half_space_mesh, 'half_space')
+
+    logger.debug(f"Created half-space volume: {len(half_space_mesh.vertices)} verts, {len(half_space_mesh.faces)} faces, "
                 f"extruded {extrusion_distance:.1f}mm in direction {direction}")
-    
+
     return half_space_mesh
 
 
@@ -916,14 +1216,62 @@ def _create_cutting_blade_from_membrane(
     # Normalize direction
     direction = np.array(direction, dtype=np.float64)
     direction = direction / (np.linalg.norm(direction) + 1e-10)
-    
-    # Get membrane geometry
-    vertices = np.asarray(membrane.vertices, dtype=np.float64)
-    faces = np.asarray(membrane.faces, dtype=np.int64)
+
+    # Export raw membrane to the debug directory so it can be inspected
+    # independently of the rest of the pipeline.
+    _save_debug_mesh(membrane, 'blade_input_membrane')
+    logger.debug("Blade input membrane: %dv, %df, watertight=%s",
+                 len(membrane.vertices), len(membrane.faces), membrane.is_watertight)
+
+    # Pre-clean membrane topology BEFORE extrusion.
+    #
+    # The membrane that arrives here is frequently a "triangle soup" — every
+    # face has its own three unique vertices (typical STL/marching-tets output).
+    # That means every edge looks like a boundary edge, which breaks boundary-
+    # loop detection and produces a blade that is all side-walls with no caps.
+    #
+    # Two-step fix:
+    #   1. trimesh merge_vertices (process=True) — welds coincident vertices so
+    #      the mesh has proper shared-edge connectivity.
+    #   2. meshlib round-trip — meshlib's half-edge structure cannot represent
+    #      non-manifold edges (T-junctions from marching tets). The round-trip
+    #      auto-splits them by vertex duplication so every edge is shared by at
+    #      most 2 faces WITHOUT triggering the 29× fixMeshDegeneracies explosion.
+    try:
+        import meshlib.mrmeshnumpy as _mrn_blade
+        import numpy as _np_blade
+
+        # Step 1: merge coincident vertices (fix triangle soup → connected mesh)
+        _merged = trimesh.Trimesh(
+            vertices=membrane.vertices,
+            faces=membrane.faces,
+            process=True,   # merges vertices, removes degenerate faces
+        )
+        logger.debug("Blade pre-clean step1 (merge): %dv/%df → %dv/%df",
+                     len(membrane.vertices), len(membrane.faces),
+                     len(_merged.vertices), len(_merged.faces))
+
+        # Step 2: meshlib round-trip (fix non-manifold T-junction edges)
+        _mesh_mr = _mrn_blade.meshFromFacesVerts(
+            _merged.faces.astype(_np_blade.int32),
+            _merged.vertices.astype(_np_blade.float32),
+        )
+        vertices = _mrn_blade.getNumpyVerts(_mesh_mr).astype(np.float64)
+        faces = _mrn_blade.getNumpyFaces(_mesh_mr.topology).astype(np.int64)
+        logger.debug("Blade pre-clean step2 (meshlib): %dv/%df → %dv/%df",
+                     len(_merged.vertices), len(_merged.faces), len(vertices), len(faces))
+
+        # Export the pre-cleaned membrane so we can compare against the raw one
+        _cleaned = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        _save_debug_mesh(_cleaned, 'blade_input_membrane_precleaned')
+    except Exception as _exc:
+        logger.debug("meshlib blade pre-clean skipped (%s), using raw membrane", _exc)
+        vertices = np.asarray(membrane.vertices, dtype=np.float64)
+        faces = np.asarray(membrane.faces, dtype=np.int64)
     n_verts = len(vertices)
-    
+
     half_thickness = thickness / 2.0
-    
+
     # Create vertices for both sides of the blade
     # Bottom side: membrane shifted in -direction
     bottom_vertices = vertices - direction * half_thickness
@@ -959,18 +1307,16 @@ def _create_cutting_blade_from_membrane(
     for v0, v1 in boundary_edges:
         _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
         
-        # Bottom vertices
-        b0, b1 = v0, v1
-        # Top vertices (offset by n_verts)
-        t0, t1 = v0 + n_verts, v1 + n_verts
-        
-        # Create quad with correct winding for outward-facing normals
-        if orig_v0 == v0:
-            side_faces.append([b0, b1, t1])
-            side_faces.append([b0, t1, t0])
-        else:
-            side_faces.append([b0, t0, t1])
-            side_faces.append([b0, t1, b1])
+        # Use the face's traversal order (orig_v0 → orig_v1) to determine winding.
+        # For boundary edge traversed A→B in the face's CCW order, the outward side
+        # normal is cross(B-A, extrusion_dir), so CCW from outside:
+        #   A_bottom → B_bottom → B_top → A_bottom  (first tri)
+        #   A_bottom → B_top    → A_top → A_bottom  (second tri)
+        # This is correct for BOTH outer and inner (hole) boundary loops.
+        a = orig_v0
+        b = orig_v1
+        side_faces.append([a, b, b + n_verts])
+        side_faces.append([a, b + n_verts, a + n_verts])
     
     # Combine all faces
     all_faces_list = [bottom_faces, top_faces]
@@ -981,13 +1327,14 @@ def _create_cutting_blade_from_membrane(
     blade_mesh = trimesh.Trimesh(
         vertices=all_vertices,
         faces=all_faces,
-        process=True
+        process=False
     )
     blade_mesh.fix_normals()
-    
-    logger.debug(f"Created cutting blade: {len(all_vertices)} verts, {len(all_faces)} faces, "
+    blade_mesh = _repair_mesh_for_csg(blade_mesh, 'cutting_blade')
+
+    logger.debug(f"Created cutting blade: {len(blade_mesh.vertices)} verts, {len(blade_mesh.faces)} faces, "
                 f"thickness={thickness:.6f}mm")
-    
+
     return blade_mesh
 
 
@@ -1020,11 +1367,39 @@ def _create_tall_cutting_blade(
     direction = np.array(direction, dtype=np.float64)
     direction = direction / (np.linalg.norm(direction) + 1e-10)
     
-    # Get membrane geometry
-    vertices = np.asarray(membrane.vertices, dtype=np.float64)
-    faces = np.asarray(membrane.faces, dtype=np.int64)
+    # Pre-clean membrane topology BEFORE extrusion.
+    # Same two-step process as _create_cutting_blade_from_membrane:
+    #   1. Merge coincident vertices (fix triangle soup → connected mesh).
+    #   2. meshlib round-trip (fix non-manifold T-junction edges).
+    try:
+        import meshlib.mrmeshnumpy as _mrn_blade
+        import numpy as _np_blade
+
+        # Step 1: merge coincident vertices
+        _merged = trimesh.Trimesh(
+            vertices=membrane.vertices,
+            faces=membrane.faces,
+            process=True,
+        )
+        logger.debug("Tall blade pre-clean step1 (merge): %dv/%df → %dv/%df",
+                     len(membrane.vertices), len(membrane.faces),
+                     len(_merged.vertices), len(_merged.faces))
+
+        # Step 2: meshlib round-trip
+        _mesh_mr = _mrn_blade.meshFromFacesVerts(
+            _merged.faces.astype(_np_blade.int32),
+            _merged.vertices.astype(_np_blade.float32),
+        )
+        vertices = _mrn_blade.getNumpyVerts(_mesh_mr).astype(np.float64)
+        faces = _mrn_blade.getNumpyFaces(_mesh_mr.topology).astype(np.int64)
+        logger.debug("Tall blade pre-clean step2 (meshlib): %dv/%df → %dv/%df",
+                     len(_merged.vertices), len(_merged.faces), len(vertices), len(faces))
+    except Exception as _exc:
+        logger.debug("meshlib tall blade pre-clean skipped (%s), using raw membrane", _exc)
+        vertices = np.asarray(membrane.vertices, dtype=np.float64)
+        faces = np.asarray(membrane.faces, dtype=np.int64)
     n_verts = len(vertices)
-    
+
     # The blade extends far in both directions along the pouring axis
     # We add a tiny offset (blade_thickness/2) to create a gap
     half_gap = blade_thickness / 2.0
@@ -1068,18 +1443,16 @@ def _create_tall_cutting_blade(
     for v0, v1 in boundary_edges:
         _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
         
-        # Bottom vertices
-        b0, b1 = v0, v1
-        # Top vertices (offset by n_verts)
-        t0, t1 = v0 + n_verts, v1 + n_verts
-        
-        # Create quad with correct winding for outward-facing normals
-        if orig_v0 == v0:
-            side_faces.append([b0, b1, t1])
-            side_faces.append([b0, t1, t0])
-        else:
-            side_faces.append([b0, t0, t1])
-            side_faces.append([b0, t1, b1])
+        # Use the face's traversal order (orig_v0 → orig_v1) to determine winding.
+        # For boundary edge traversed A→B in the face's CCW order, the outward side
+        # normal is cross(B-A, extrusion_dir), so CCW from outside:
+        #   A_bottom → B_bottom → B_top  (first tri)
+        #   A_bottom → B_top    → A_top  (second tri)
+        # This is correct for BOTH outer and inner (hole) boundary loops.
+        a = orig_v0
+        b = orig_v1
+        side_faces.append([a, b, b + n_verts])
+        side_faces.append([a, b + n_verts, a + n_verts])
     
     # Combine all faces
     all_faces_list = [bottom_faces, top_faces]
@@ -1090,13 +1463,14 @@ def _create_tall_cutting_blade(
     blade_mesh = trimesh.Trimesh(
         vertices=all_vertices,
         faces=all_faces,
-        process=True
+        process=False
     )
     blade_mesh.fix_normals()
-    
-    logger.info(f"Created tall cutting blade: {len(all_vertices)} verts, {len(all_faces)} faces, "
+    blade_mesh = _repair_mesh_for_csg(blade_mesh, 'tall_cutting_blade')
+
+    logger.info(f"Created tall cutting blade: {len(blade_mesh.vertices)} verts, {len(blade_mesh.faces)} faces, "
                f"extrusion={extrusion_distance:.1f}mm each direction")
-    
+
     return blade_mesh
 
 
@@ -1216,24 +1590,22 @@ def extend_membrane_height(
         
         # Create collar faces for bottom
         for v0, v1 in bottom_edges:
-            ext_v0 = bottom_extension_map.get(v0)
-            ext_v1 = bottom_extension_map.get(v1)
-            if ext_v0 is not None and ext_v1 is not None:
-                # Get winding from original face
-                edge_key = (min(v0, v1), max(v0, v1))
-                face_info = edge_to_face.get(edge_key)
-                if face_info is not None:
-                    fi, orig_v0, orig_v1, _ = face_info
-                    # Create quad connecting original to extended (downward)
-                    # Winding should be consistent with face orientation
-                    if orig_v0 == v0:
-                        # Edge goes v0->v1 in the face
-                        new_faces.append([v0, ext_v0, ext_v1])
-                        new_faces.append([v0, ext_v1, v1])
-                    else:
-                        # Edge goes v1->v0 in the face
-                        new_faces.append([v0, v1, ext_v1])
-                        new_faces.append([v0, ext_v1, ext_v0])
+            # Get winding from original face
+            edge_key = (min(v0, v1), max(v0, v1))
+            face_info = edge_to_face.get(edge_key)
+            if face_info is not None:
+                fi, orig_v0, orig_v1, _ = face_info
+                # Use face traversal order (A=orig_v0 → B=orig_v1) to pick winding.
+                # For extrusion in direction D (downward here), outward normal =
+                # cross(B-A, D).  CCW from outside: [A, B, B_ext, A_ext] →
+                #   tri1: [A, B, B_ext]   tri2: [A, B_ext, A_ext]
+                a = orig_v0
+                b = orig_v1
+                ext_a = bottom_extension_map.get(a)
+                ext_b = bottom_extension_map.get(b)
+                if ext_a is not None and ext_b is not None:
+                    new_faces.append([a, b, ext_b])
+                    new_faces.append([a, ext_b, ext_a])
     
     # Extend top boundary if needed
     if extension_above > 0.1 and len(top_edges) > 0:
@@ -1249,21 +1621,22 @@ def extend_membrane_height(
         
         # Create collar faces for top
         for v0, v1 in top_edges:
-            ext_v0 = top_extension_map.get(v0)
-            ext_v1 = top_extension_map.get(v1)
-            if ext_v0 is not None and ext_v1 is not None:
-                # Get winding from original face
-                edge_key = (min(v0, v1), max(v0, v1))
-                face_info = edge_to_face.get(edge_key)
-                if face_info is not None:
-                    fi, orig_v0, orig_v1, _ = face_info
-                    # Create quad connecting original to extended (upward)
-                    if orig_v0 == v0:
-                        new_faces.append([v0, v1, ext_v1])
-                        new_faces.append([v0, ext_v1, ext_v0])
-                    else:
-                        new_faces.append([v0, ext_v0, ext_v1])
-                        new_faces.append([v0, ext_v1, v1])
+            # Get winding from original face
+            edge_key = (min(v0, v1), max(v0, v1))
+            face_info = edge_to_face.get(edge_key)
+            if face_info is not None:
+                fi, orig_v0, orig_v1, _ = face_info
+                # Use face traversal order (A=orig_v0 → B=orig_v1) to pick winding.
+                # For extrusion in direction D (upward here), outward normal =
+                # cross(B-A, D).  CCW from outside: [A, A_ext, B_ext, B] →
+                #   tri1: [A, A_ext, B_ext]   tri2: [A, B_ext, B]
+                a = orig_v0
+                b = orig_v1
+                ext_a = top_extension_map.get(a)
+                ext_b = top_extension_map.get(b)
+                if ext_a is not None and ext_b is not None:
+                    new_faces.append([a, ext_a, ext_b])
+                    new_faces.append([a, ext_b, b])
     
     # Create extended mesh
     extended_mesh = trimesh.Trimesh(
@@ -1283,28 +1656,33 @@ def split_shell_with_membrane(
     shell_with_cavity: trimesh.Trimesh,
     membrane: trimesh.Trimesh,
     pouring_direction: np.ndarray,
-    blade_thickness: float = 0.0001
+    blade_thickness: float = 0.0001,
+    prism_mesh: Optional[trimesh.Trimesh] = None,
+    subtractor_mesh: Optional[trimesh.Trimesh] = None,
 ) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool]:
     """
     Split the shell into two manifold halves using the membrane as a cutting blade.
-    
-    This creates a very thin volume (blade) from the membrane and subtracts it
-    from the shell, leaving a tiny gap that separates the shell into two 
-    disconnected manifold components.
-    
-    Algorithm:
-    1. Create thin "blade" by extruding membrane ±thickness/2 in pouring direction
-    2. Subtract blade from shell: cut_shell = shell - blade
-    3. Split result into connected components
-    4. Return the two largest components as half_1 (upper) and half_2 (lower)
-    
+
+    Performs the full CSG chain  (prism - subtractor) - blade  in a single
+    uninterrupted manifold3d session when ``prism_mesh`` and ``subtractor_mesh``
+    are supplied.  This avoids the manifold3d → trimesh → manifold3d round-trip
+    that rebuilds internal topology and causes different (incorrect) CSG results.
+
+    When the optional meshes are not provided the function falls back to the
+    legacy  shell_with_cavity - blade  path (kept for backward compatibility).
+
     Args:
-        shell_with_cavity: The shell mesh (prism - hull)
-        membrane: The cutting membrane (outer collar extended parting surface)
-        pouring_direction: Unit vector defining the "upper" direction
-        blade_thickness: Thickness of the cutting blade (default: 0.0001mm = 0.1 micron)
-                        The blade is centered on the membrane (±thickness/2 each side)
-        
+        shell_with_cavity: The shell mesh (prism - subtractor), used for display
+                           and as the fallback CSG operand.
+        membrane: The cutting membrane (outer collar extended parting surface).
+        pouring_direction: Unit vector defining the "upper" direction.
+        blade_thickness: Thickness of the cutting blade (default: 0.0001 mm).
+        prism_mesh: Optional raw prism trimesh.  When provided together with
+                    ``subtractor_mesh`` the full chain is computed in one
+                    manifold3d session.
+        subtractor_mesh: Optional hull or part mesh that was subtracted from the
+                         prism to form the shell cavity.
+
     Returns:
         Tuple of (shell_half_1, shell_half_2, computation_time_ms, success)
         shell_half_1 is the half in the positive pouring direction (upper)
@@ -1327,6 +1705,8 @@ def split_shell_with_membrane(
         logger.info("Creating cutting blade from membrane...")
         blade = _create_cutting_blade_from_membrane(membrane, direction, blade_thickness)
         logger.info(f"Blade: {len(blade.vertices)} verts, {len(blade.faces)} faces")
+        _save_debug_mesh(blade, 'cutting_blade_final')
+        _save_debug_mesh(shell_with_cavity, 'shell_with_cavity_input')
         
         # Diagnostic: blade and membrane properties (debug level to reduce log noise)
         if logger.isEnabledFor(logging.DEBUG):
@@ -1382,60 +1762,72 @@ def split_shell_with_membrane(
                 for i, comp in enumerate(sorted(shell_components_before, key=lambda m: len(m.faces), reverse=True)[:5]):
                     logger.debug(f"  Component {i+1}: {len(comp.vertices)} verts, {len(comp.faces)} faces")
         
-        # Step 2: Convert to manifold3d
+        # Step 2: Convert to manifold3d (repair applied inside _trimesh_to_manifold)
         logger.info("Converting meshes to manifold...")
-        shell_manifold = _trimesh_to_manifold(shell_with_cavity)
-        blade_manifold = _trimesh_to_manifold(blade)
-        
-        # Step 3: CSG subtraction - cut the shell with the blade
-        logger.info("Performing CSG subtraction: shell - blade...")
-        cut_shell_manifold = shell_manifold - blade_manifold
-        
+        blade_manifold = _trimesh_to_manifold(blade, 'cutting_blade')
+
+        # Step 3: CSG subtraction
+        # Preferred: full chain (prism - subtractor) - blade in one manifold3d
+        # session.  This avoids the manifold3d→trimesh→manifold3d round-trip
+        # which rebuilds internal topology and causes incorrect split results.
+        use_chain = prism_mesh is not None and subtractor_mesh is not None
+        if use_chain:
+            logger.info("Performing CSG chain: (prism - subtractor) - blade (no round-trip)...")
+            prism_manifold    = _trimesh_to_manifold(prism_mesh,     'prism')
+            subtractor_manifold = _trimesh_to_manifold(subtractor_mesh, 'subtractor')
+            cut_shell_manifold = (prism_manifold - subtractor_manifold) - blade_manifold
+        else:
+            logger.info("Performing CSG subtraction: shell - blade (legacy path)...")
+            shell_manifold = _trimesh_to_manifold(shell_with_cavity, 'shell_with_cavity')
+            cut_shell_manifold = shell_manifold - blade_manifold
+
         # Step 4: Convert back to trimesh
-        cut_shell = _manifold_to_trimesh(cut_shell_manifold)
+        cut_shell = _manifold_to_trimesh(cut_shell_manifold, 'shell_with_cavity_minus_blade')
         logger.info(f"Cut shell: {len(cut_shell.vertices)} verts, {len(cut_shell.faces)} faces")
-        
+
         # Step 5: Split into connected components
         logger.info("Splitting into connected components...")
         components = cut_shell.split(only_watertight=False)
         logger.info(f"Found {len(components)} connected components")
-        
+
         if len(components) < 2:
             logger.warning("Failed to split shell into two components - blade may not have cut through")
             elapsed_ms = (time.time() - start_time) * 1000
             if len(components) == 1:
                 return components[0], None, elapsed_ms, False
             return None, None, elapsed_ms, False
-        
+
         # Step 6: Sort by size and take the two largest
         components = sorted(components, key=lambda m: len(m.faces), reverse=True)
         comp1, comp2 = components[0], components[1]
-        
+
         # Step 7: Classify which is upper vs lower based on centroid position
         centroid1 = comp1.centroid
         centroid2 = comp2.centroid
-        
+
         # Project centroids onto pouring direction
         proj1 = np.dot(centroid1, direction)
         proj2 = np.dot(centroid2, direction)
-        
+
         # Upper half has higher projection value
         if proj1 > proj2:
             shell_half_1, shell_half_2 = comp1, comp2
         else:
             shell_half_1, shell_half_2 = comp2, comp1
-        
+
         elapsed_ms = (time.time() - start_time) * 1000
-        
+
         logger.info(f"Shell split complete in {elapsed_ms:.1f}ms:")
-        logger.info(f"  Half 1 (upper): {len(shell_half_1.vertices)} verts, {len(shell_half_1.faces)} faces")
-        logger.info(f"  Half 2 (lower): {len(shell_half_2.vertices)} verts, {len(shell_half_2.faces)} faces")
-        
+        logger.info(f"  Half 1 (upper): {len(shell_half_1.vertices)} verts, {len(shell_half_1.faces)} faces "
+                   f"watertight={shell_half_1.is_watertight}")
+        logger.info(f"  Half 2 (lower): {len(shell_half_2.vertices)} verts, {len(shell_half_2.faces)} faces "
+                   f"watertight={shell_half_2.is_watertight}")
+
         if len(components) > 2:
             logger.warning(f"  Note: {len(components) - 2} additional small fragments were discarded")
-        
+
         return shell_half_1, shell_half_2, elapsed_ms, True
-        
+
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000
         logger.error(f"Failed to split shell with membrane: {e}")
@@ -1494,17 +1886,17 @@ def split_shell_with_tall_blade(
         blade = _create_tall_cutting_blade(membrane, direction, extrusion_distance, blade_gap)
         logger.info(f"Tall blade: {len(blade.vertices)} verts, {len(blade.faces)} faces")
         
-        # Step 2: Convert to manifold3d
+        # Step 2: Convert to manifold3d (repair applied inside _trimesh_to_manifold)
         logger.info("Converting meshes to manifold...")
-        shell_manifold = _trimesh_to_manifold(shell)
-        blade_manifold = _trimesh_to_manifold(blade)
-        
+        shell_manifold = _trimesh_to_manifold(shell, 'shell')
+        blade_manifold = _trimesh_to_manifold(blade, 'tall_blade')
+
         # Step 3: CSG subtraction - cut the shell with the blade
         logger.info("Performing CSG subtraction: shell - tall_blade...")
         cut_shell_manifold = shell_manifold - blade_manifold
         
         # Step 4: Convert back to trimesh
-        cut_shell = _manifold_to_trimesh(cut_shell_manifold)
+        cut_shell = _manifold_to_trimesh(cut_shell_manifold, 'shell_minus_tall_blade')
         logger.info(f"Cut shell: {len(cut_shell.vertices)} verts, {len(cut_shell.faces)} faces")
         
         # Step 5: Split into connected components
@@ -1594,8 +1986,8 @@ def split_shell_along_parting_surface(
         )
         
         # Convert to manifold
-        shell_manifold = _trimesh_to_manifold(shell_with_cavity)
-        cutting_manifold = _trimesh_to_manifold(cutting_volume)
+        shell_manifold = _trimesh_to_manifold(shell_with_cavity, 'shell_with_cavity')
+        cutting_manifold = _trimesh_to_manifold(cutting_volume, 'cutting_volume')
         
         # Split using intersection and subtraction:
         # half_1 = shell - cutting_volume (part above the parting surface)
@@ -1658,16 +2050,16 @@ def split_shell_along_parting_surface(
         )
         
         # Convert boxes to manifold
-        box_manifold_1 = _trimesh_to_manifold(box_1)
-        box_manifold_2 = _trimesh_to_manifold(box_2)
+        box_manifold_1 = _trimesh_to_manifold(box_1, 'half_space_box_1')
+        box_manifold_2 = _trimesh_to_manifold(box_2, 'half_space_box_2')
         
         # Intersect shell with each half-space box
         half_1_manifold = shell_manifold ^ box_manifold_1  # Intersection
         half_2_manifold = shell_manifold ^ box_manifold_2  # Intersection
         
         # Convert back to trimesh
-        shell_half_1 = _manifold_to_trimesh(half_1_manifold)
-        shell_half_2 = _manifold_to_trimesh(half_2_manifold)
+        shell_half_1 = _manifold_to_trimesh(half_1_manifold, 'shell_half_1_intersection')
+        shell_half_2 = _manifold_to_trimesh(half_2_manifold, 'shell_half_2_intersection')
         
         elapsed_ms = (time.time() - start_time) * 1000
         
@@ -1877,11 +2269,11 @@ def create_part_with_thickened_secondary(
         # Step 2: Boolean union part + thickened secondary
         logger.info("Performing boolean union: part + thickened_secondary...")
         
-        part_manifold = _trimesh_to_manifold(part_mesh)
-        secondary_manifold = _trimesh_to_manifold(thickened_secondary)
+        part_manifold = _trimesh_to_manifold(part_mesh, 'part_mesh')
+        secondary_manifold = _trimesh_to_manifold(thickened_secondary, 'thickened_secondary')
         
         combined_manifold = part_manifold + secondary_manifold
-        combined_mesh = _manifold_to_trimesh(combined_manifold)
+        combined_mesh = _manifold_to_trimesh(combined_manifold, 'part_union_thickened_secondary')
         
         elapsed_ms = (time.time() - start_time) * 1000
         
@@ -1947,14 +2339,14 @@ def add_part_to_metamold_half(
         logger.info(f"  Part mesh: {len(part_mesh.vertices)} verts, {len(part_mesh.faces)} faces")
         
         # Convert to manifold
-        half_manifold = _trimesh_to_manifold(metamold_half)
-        part_manifold = _trimesh_to_manifold(part_mesh)
+        half_manifold = _trimesh_to_manifold(metamold_half, 'metamold_half')
+        part_manifold = _trimesh_to_manifold(part_mesh, 'part_mesh_for_union')
         
         # Perform union: result = half + part
         result_manifold = half_manifold + part_manifold
         
         # Convert back to trimesh
-        result_mesh = _manifold_to_trimesh(result_manifold)
+        result_mesh = _manifold_to_trimesh(result_manifold, 'metamold_union_part')
         
         elapsed_ms = (time.time() - start_time) * 1000
         
@@ -2100,14 +2492,14 @@ def trim_metamold_halves(
             logger.info(f"  Upper half extent: {float(np.min(uh)):.2f} to {half_max:.2f}")
             
             if gap > 0.01:
-                manifold = _trimesh_to_manifold(upper_half)
+                manifold = _trimesh_to_manifold(upper_half, 'upper_half')
                 # trim_by_plane(normal, offset) keeps geometry where dot(v, normal) >= offset.
                 # To keep everything BELOW trim_at (i.e. dot(v, pouring_dir) <= trim_at),
                 # we negate both: normal = -pouring_dir, offset = -trim_at.
                 manifold = manifold.trim_by_plane(
                     (-pouring_dir).tolist(), float(-trim_at)
                 )
-                trimmed_upper = _manifold_to_trimesh(manifold)
+                trimmed_upper = _manifold_to_trimesh(manifold, 'upper_half_trimmed')
                 upper_saved = gap
                 logger.info(f"    Trimmed upper top by {gap:.2f}mm (cut at h={trim_at:.2f})")
             else:
@@ -2130,12 +2522,12 @@ def trim_metamold_halves(
             logger.info(f"  Lower half extent: {half_min:.2f} to {float(np.max(lh)):.2f}")
             
             if gap > 0.01:
-                manifold = _trimesh_to_manifold(lower_half)
+                manifold = _trimesh_to_manifold(lower_half, 'lower_half')
                 # normal = pouring_dir, offset = trim_at → keeps above trim_at
                 manifold = manifold.trim_by_plane(
                     pouring_dir.tolist(), float(trim_at)
                 )
-                trimmed_lower = _manifold_to_trimesh(manifold)
+                trimmed_lower = _manifold_to_trimesh(manifold, 'lower_half_trimmed')
                 lower_saved = gap
                 logger.info(f"    Trimmed lower bottom by {gap:.2f}mm (cut at h={trim_at:.2f})")
             else:

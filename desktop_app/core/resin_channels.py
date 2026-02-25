@@ -315,25 +315,183 @@ def _create_frustum(
 # MANIFOLD CSG HELPERS
 # ============================================================================
 
-def _trimesh_to_manifold(mesh: trimesh.Trimesh) -> 'manifold3d.Manifold':
-    """Convert a trimesh to manifold3d Manifold object."""
+def _repair_mesh_for_csg(mesh: trimesh.Trimesh, label: str = 'mesh') -> trimesh.Trimesh:
+    """Repair a mesh to make it as watertight as possible before CSG operations.
+
+    Uses meshlib as the primary engine (most robust) with trimesh as fallback.
+    Non-watertight inputs cause manifold3d to silently discard geometry,
+    leaving holes in the CSG output.
+    """
+    if mesh is None or len(mesh.vertices) == 0:
+        return mesh
+    if mesh.is_watertight:
+        return mesh
+
+    # ------------------------------------------------------------------
+    # meshlib primary repair
+    # ------------------------------------------------------------------
+    try:
+        import numpy as _np
+        import meshlib.mrmeshnumpy as _mrn
+        import meshlib.mrmeshpy as _mr
+
+        # Skip fixMeshDegeneracies for closed non-manifold inputs (0 open edges)
+        # — the round-trip alone resolves the topology at minimal cost.
+        _input_ec2: dict = {}
+        for _f2 in mesh.faces:
+            for _i2 in range(3):
+                _va2, _vb2 = int(_f2[_i2]), int(_f2[(_i2 + 1) % 3])
+                _ek2 = (min(_va2, _vb2), max(_va2, _vb2))
+                _input_ec2[_ek2] = _input_ec2.get(_ek2, 0) + 1
+        _is_closed_nm2 = (sum(1 for _c2 in _input_ec2.values() if _c2 == 1) == 0)
+
+        mesh_mr = _mrn.meshFromFacesVerts(
+            mesh.faces.astype(_np.int32),
+            mesh.vertices.astype(_np.float32),
+        )
+        if not _is_closed_nm2:
+            _mr.fixMeshDegeneracies(mesh_mr, _mr.FixMeshDegeneraciesParams())
+            for loop in _mr.findRightBoundary(mesh_mr.topology, None):
+                _mr.fillHoleNicely(mesh_mr, loop[0], _mr.FillHoleNicelySettings())
+
+        out_verts = _mrn.getNumpyVerts(mesh_mr)
+        out_faces = _mrn.getNumpyFaces(mesh_mr.topology)
+        result = trimesh.Trimesh(vertices=out_verts, faces=out_faces, process=False)
+        result.fix_normals()
+
+        if result.is_watertight:
+            return result
+
+        ec: dict = {}
+        for face in result.faces:
+            for i in range(3):
+                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                ek = (min(v0, v1), max(v0, v1))
+                ec[ek] = ec.get(ek, 0) + 1
+        open_edges = sum(1 for c in ec.values() if c == 1)
+
+        if open_edges == 0:
+            # Non-manifold topology (no holes), not a hole-fill problem.
+            # Trimesh process=True would re-merge split vertices, undoing
+            # meshlib's repair and causing geometry explosion.  Return as-is.
+            logger.warning(
+                "CSG input '%s': 0 open edges but not watertight (non-manifold topology). "
+                "Skipping trimesh fallback to avoid geometry explosion.",
+                label,
+            )
+            return result
+
+        logger.warning("CSG input '%s': meshlib repair left %d open edges, falling back to trimesh.",
+                       label, open_edges)
+        mesh = result
+    except Exception as exc:
+        logger.warning("meshlib repair failed for '%s' (%s). Falling back to trimesh.", label, exc)
+
+    # ------------------------------------------------------------------
+    # trimesh fallback (only reached when there are real open boundary edges)
+    # ------------------------------------------------------------------
+    import trimesh.repair as _tr
+
+    # Re-create with process=True to strip degenerate/duplicate faces
+    # and merge coincident vertices.
+    m = trimesh.Trimesh(
+        vertices=mesh.vertices.copy(),
+        faces=mesh.faces.copy(),
+        process=True,
+    )
+    _tr.fix_normals(m, multibody=True)
+    _tr.fill_holes(m)
+
+    if not m.is_watertight:
+        ec2: dict = {}
+        for face in m.faces:
+            for i in range(3):
+                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                ek = (min(v0, v1), max(v0, v1))
+                ec2[ek] = ec2.get(ek, 0) + 1
+        open_edges2 = sum(1 for c in ec2.values() if c == 1)
+        logger.warning(
+            "CSG input '%s' still NOT watertight after repair (%d open edges). "
+            "CSG result may have gaps.",
+            label, open_edges2
+        )
+    return m
+
+
+def _trimesh_to_manifold(mesh: trimesh.Trimesh, label: str = 'mesh') -> 'manifold3d.Manifold':
+    """Convert a trimesh to manifold3d Manifold object (with pre-repair and status check)."""
     if not MANIFOLD_AVAILABLE:
         raise RuntimeError("manifold3d is not available")
-    
+
+    mesh = _repair_mesh_for_csg(mesh, label)
+
     vertices = np.asarray(mesh.vertices, dtype=np.float32)
     faces = np.asarray(mesh.faces, dtype=np.uint32)
-    
+
+    logger.info(
+        "  CSG INPUT  '%s': %d verts, %d faces, watertight=%s",
+        label, len(vertices), len(faces), mesh.is_watertight
+    )
+
     m3d_mesh = manifold3d.Mesh(vert_properties=vertices, tri_verts=faces)
-    return manifold3d.Manifold(m3d_mesh)
+    m = manifold3d.Manifold(m3d_mesh)
+
+    status = m.status()
+    if status != manifold3d.Error.NoError or m.num_tri() == 0:
+        logger.error(
+            "  CSG INPUT  '%s' REJECTED by manifold3d: status=%s, "
+            "manifold_tris=%d (input watertight=%s, verts=%d, faces=%d). "
+            "Saving input mesh for inspection.",
+            label, status, m.num_tri(), mesh.is_watertight,
+            len(mesh.vertices), len(mesh.faces)
+        )
+        try:
+            from core.mold_fabrication import _save_debug_mesh
+            _save_debug_mesh(mesh, f"bad_csg_input_resin_{label}")
+        except Exception:
+            pass
+    else:
+        logger.info("  CSG INPUT  '%s' accepted: manifold_tris=%d", label, m.num_tri())
+
+    return m
 
 
-def _manifold_to_trimesh(manifold: 'manifold3d.Manifold') -> trimesh.Trimesh:
-    """Convert a manifold3d Manifold object to trimesh."""
+def _manifold_to_trimesh(manifold: 'manifold3d.Manifold', label: str = 'result') -> trimesh.Trimesh:
+    """Convert a manifold3d Manifold object to trimesh with status logging."""
+    status = manifold.status()
+    n_tri = manifold.num_tri()
+
+    if manifold.is_empty() or n_tri == 0:
+        logger.error(
+            "  CSG OUTPUT '%s' is EMPTY: status=%s, num_tri=%d. "
+            "One or more CSG operands were non-manifold.",
+            label, status, n_tri
+        )
+    else:
+        logger.info(
+            "  CSG OUTPUT '%s': manifold_tris=%d, volume=%.3f mm^3",
+            label, n_tri, manifold.volume()
+        )
+
     mesh_data = manifold.to_mesh()
     vertices = np.asarray(mesh_data.vert_properties, dtype=np.float64)
     faces = np.asarray(mesh_data.tri_verts, dtype=np.int64)
-    
-    return trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
+
+    result = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    result.fix_normals()
+
+    logger.info(
+        "  CSG OUTPUT '%s' as trimesh: %d verts, %d faces, watertight=%s",
+        label, len(result.vertices), len(result.faces), result.is_watertight
+    )
+    if not result.is_watertight:
+        try:
+            from core.mold_fabrication import _save_debug_mesh
+            _save_debug_mesh(result, f"bad_csg_output_resin_{label}")
+        except Exception:
+            pass
+
+    return result
 
 
 # ============================================================================
@@ -374,10 +532,10 @@ def merge_plug_into_metamold(
         return metamold_mesh
 
     try:
-        mm_mani   = _trimesh_to_manifold(metamold_mesh)
-        plug_mani = _trimesh_to_manifold(plug_mesh)
+        mm_mani   = _trimesh_to_manifold(metamold_mesh, 'metamold_mesh')
+        plug_mani = _trimesh_to_manifold(plug_mesh, 'plug_mesh')
         merged    = mm_mani + plug_mani   # Manifold boolean UNION
-        result    = _manifold_to_trimesh(merged)
+        result    = _manifold_to_trimesh(merged, 'metamold_union_plug')
         logger.info(
             "Plug merged into metamold: %d verts, %d faces",
             len(result.vertices), len(result.faces),
@@ -1641,12 +1799,12 @@ def create_resin_channels(
         logger.info(f"Performing CSG subtraction: metamold half - {len(cylinders)} cylinder(s)...")
         
         # Convert metamold half to manifold
-        half_manifold = _trimesh_to_manifold(metamold_half)
+        half_manifold = _trimesh_to_manifold(metamold_half, 'metamold_half_for_channels')
         
         # Subtract each cylinder sequentially
         for i, cyl in enumerate(cylinders):
             try:
-                cyl_manifold = _trimesh_to_manifold(cyl)
+                cyl_manifold = _trimesh_to_manifold(cyl, f'resin_channel_cyl_{i}')
                 half_manifold = half_manifold - cyl_manifold
                 logger.debug(f"  Subtracted cylinder {i+1}/{len(cylinders)}")
             except Exception as e:
@@ -1654,7 +1812,7 @@ def create_resin_channels(
                 # Continue with remaining cylinders
         
         # Convert back to trimesh
-        result_mesh = _manifold_to_trimesh(half_manifold)
+        result_mesh = _manifold_to_trimesh(half_manifold, 'metamold_minus_channels')
         
         result.mesh = result_mesh
         result.success = True
@@ -2071,7 +2229,9 @@ def create_silicone_pour_holes(
         )
         try:
             result = _manifold_to_trimesh(
-                _trimesh_to_manifold(shell) - _trimesh_to_manifold(cyl)
+                _trimesh_to_manifold(shell, 'shell_for_silicone_hole')
+                - _trimesh_to_manifold(cyl, 'silicone_hole_cyl'),
+                'shell_minus_silicone_hole'
             )
             logger.info(
                 "Silicone pour hole drilled in %s: %d verts, pos=(%.1f,%.1f,%.1f)",
@@ -2145,10 +2305,10 @@ def create_hard_shell_inlet(
     )
     
     try:
-        shell_manifold = _trimesh_to_manifold(shell_half)
-        cyl_manifold = _trimesh_to_manifold(cyl)
+        shell_manifold = _trimesh_to_manifold(shell_half, 'shell_half_for_inlet')
+        cyl_manifold = _trimesh_to_manifold(cyl, 'inlet_cyl')
         result_manifold = shell_manifold - cyl_manifold
-        result_mesh = _manifold_to_trimesh(result_manifold)
+        result_mesh = _manifold_to_trimesh(result_manifold, 'shell_minus_inlet_cyl')
         
         logger.info(f"Hard shell inlet created: {len(result_mesh.vertices)} verts, "
                     f"{len(result_mesh.faces)} faces")
@@ -2220,10 +2380,10 @@ def create_hard_shell_air_escapes(
         )
         
         try:
-            shell_manifold = _trimesh_to_manifold(current_mesh)
-            cyl_manifold = _trimesh_to_manifold(cyl)
+            shell_manifold = _trimesh_to_manifold(current_mesh, f'shell_air_escape_iter_{i}')
+            cyl_manifold = _trimesh_to_manifold(cyl, f'air_escape_cyl_{i}')
             result_manifold = shell_manifold - cyl_manifold
-            current_mesh = _manifold_to_trimesh(result_manifold)
+            current_mesh = _manifold_to_trimesh(result_manifold, f'shell_minus_air_escape_{i}')
             logger.debug(f"  Air escape hole {i}: pos={pos}")
         except Exception as e:
             logger.warning(f"Failed to drill air escape hole {i}: {e}")
