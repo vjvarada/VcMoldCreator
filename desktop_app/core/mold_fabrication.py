@@ -667,7 +667,27 @@ def _save_debug_mesh(mesh: trimesh.Trimesh, label: str) -> None:
     out = _CSG_DEBUG_DIR / f"{safe}.stl"
     try:
         mesh.export(str(out))
-        logger.info("  [CSG DEBUG] Saved mesh '%s' -> %s", label, out)
+        # Compute component count and open-edge count for instant diagnosis
+        try:
+            components = mesh.split(only_watertight=False)
+            n_components = len(components)
+        except Exception:
+            n_components = -1
+        try:
+            ec: dict = {}
+            for face in mesh.faces:
+                for i in range(3):
+                    v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                    ek = (min(v0, v1), max(v0, v1))
+                    ec[ek] = ec.get(ek, 0) + 1
+            open_edges = sum(1 for c in ec.values() if c == 1)
+        except Exception:
+            open_edges = -1
+        logger.info(
+            "  [CSG DEBUG] '%s' → %s  |  %dv %df  watertight=%s  components=%s  open_edges=%s",
+            label, out, len(mesh.vertices), len(mesh.faces),
+            mesh.is_watertight, n_components, open_edges,
+        )
     except Exception as exc:
         logger.warning("  [CSG DEBUG] Could not save '%s': %s", label, exc)
 
@@ -693,19 +713,27 @@ def _repair_mesh_for_csg(mesh: trimesh.Trimesh, label: str = 'mesh') -> trimesh.
     if mesh is None or len(mesh.vertices) == 0:
         return mesh
 
+    # Fast path: already perfectly watertight – return immediately without any
+    # vertex merging or repair.  This is critical for meshes produced by
+    # manifold3d (via _manifold_to_trimesh with process=False) which have
+    # intentionally split vertices at seam edges.  Merging those vertices
+    # creates T-junctions → non-manifold topology, so we must never touch a
+    # mesh that is already watertight.
+    if mesh.is_watertight:
+        return mesh
+
     # Step 0: merge coincident vertices (fixes triangle soup from STL loading).
     # STL format stores every triangle independently so each face has its own 3
     # vertices even when adjacent faces share an edge position.  Without merging,
     # every edge looks like a boundary edge → fixMeshDegeneracies treats each
     # vertex as a non-manifold junction and explodes the vertex count 300×+.
-    # Merging first is always safe because coincident identical-position vertices
-    # carry no geometric information.
+    # This step is safe here because we already know the mesh is NOT watertight,
+    # so any coincident vertices are genuine triangle-soup duplicates.
     if len(mesh.vertices) != len(np.unique(mesh.vertices, axis=0)):
         mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, process=True)
         logger.debug("  '%s' vertex merge: %d verts after merge", label, len(mesh.vertices))
-
-    if mesh.is_watertight:
-        return mesh
+        if mesh.is_watertight:
+            return mesh
 
     logger.debug("Repairing '%s' before CSG (verts=%d, faces=%d)",
                  label, len(mesh.vertices), len(mesh.faces))
