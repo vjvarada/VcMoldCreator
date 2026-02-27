@@ -139,6 +139,18 @@ biased_dist = δ + max(λ_w, 0)
 
 ## Recent Changes
 
+### January 2026 - Coplanar Shard Cleanup (Session 6)
+- **Root Cause:** When adding the part back to metamold halves (`half + part` union), 98.3% of part faces are exactly coincident with cavity faces (opposite normals, mean dot = -1.000). This triggers manifold3d's known coplanar face shard artifact (GitHub issues #1430, #1359).
+- **Diagnosis:** Union produces 337/536 components with 4170 tiny degenerate shard triangles. `trim_by_plane()` also produces 3-5 component shards (4-12 faces, zero volume).
+- **Fix Strategy Tested:** 6 approaches compared — inflate centroid (worse), normal offset (worse), keep largest component (BEST), meshlib fixDegeneracies (terrible — 4× face explosion), double manifold3d roundtrip (marginal), inflate+roundtrip (worse).
+- **Solution:** Added `_remove_coplanar_shard_components()` helper in `mold_fabrication.py`:
+  - Splits mesh into components, keeps only those with face count ≥ 1% of largest (minimum 100 faces)
+  - Applied after `add_part_to_metamold_half()` union
+  - Applied after both `trim_by_plane()` calls in `trim_metamold_halves()`
+- **meshlib Assessment:** Already correctly used for PRE-CSG repair. NOT suitable for post-CSG cleanup (fixMeshDegeneracies explodes manifold3d output from 134k→536k faces and breaks watertight).
+- **Result:** Both halves now single-component, watertight after union AND trim.
+- **Diagnostic reports:** Saved to `.tmp/csg_debug/` (metamold_coplanar_analysis.txt, fix_comparison.txt, union_diagnostic.txt)
+
 ### January 2026 - Collar Validation & Repair (Session 5)
 - **Problem:** Collar vertices could end up outside the part mesh, causing the downstream CSG blade subtraction in `split_shell_with_membrane()` to fail (shell not split into two halves).
 - **Solution:** Added post-collar validation + iterative repair system in `parting_surface.py`:

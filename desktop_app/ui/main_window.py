@@ -1155,6 +1155,15 @@ class MetamoldWorker(QThread):
                         if bot_saved > 0 or top_saved > 0:
                             logger.info(f"Metamold trim: bottom saved {bot_saved:.1f}mm, "
                                        f"top saved {top_saved:.1f}mm in {trim_ms:.1f}ms")
+                        # Log post-trim diagnostics for each half
+                        for _hlabel, _hmesh in [('Half1', half_1_with_part), ('Half2', half_2_with_part)]:
+                            if _hmesh is not None:
+                                try:
+                                    _ncomps = len(_hmesh.split(only_watertight=False))
+                                except Exception:
+                                    _ncomps = -1
+                                logger.info(f"  {_hlabel} final: {len(_hmesh.faces)}f, "
+                                           f"watertight={_hmesh.is_watertight}, components={_ncomps}")
                         _save_debug_mesh(half_1_with_part, 'metamold_half1_final')
                         _save_debug_mesh(half_2_with_part, 'metamold_half2_final')
                     else:

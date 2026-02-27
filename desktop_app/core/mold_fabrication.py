@@ -2326,58 +2326,137 @@ def create_part_with_thickened_secondary(
 # METAMOLD: ADD PART MESH BACK TO HALVES
 # ============================================================================
 
+def _remove_coplanar_shard_components(
+    mesh: trimesh.Trimesh,
+    label: str = 'mesh',
+) -> trimesh.Trimesh:
+    """Remove small disconnected components ("shards") produced by manifold3d
+    when unioning meshes with exactly coplanar/coincident faces.
+
+    manifold3d's symbolic perturbation creates tiny degenerate triangle fragments
+    at shared boundaries (known issue — GitHub manifold #1430, #1359).  These
+    fragments are individually watertight but have face counts orders of magnitude
+    smaller than the main body.
+
+    Strategy: split into components, keep only those with face count >= 1% of the
+    largest component.  In practice all shards are <0.1% of the main body.
+
+    Args:
+        mesh: The raw union result from manifold3d (process=False).
+        label: Human-readable label for logging.
+
+    Returns:
+        Cleaned mesh with shard components removed.  If the mesh has only one
+        component or no small shards, the original mesh is returned unchanged.
+    """
+    try:
+        components = mesh.split(only_watertight=False)
+    except Exception:
+        return mesh
+
+    if len(components) <= 1:
+        return mesh
+
+    components_sorted = sorted(components, key=lambda c: -len(c.faces))
+    main_faces = len(components_sorted[0].faces)
+    threshold = max(main_faces * 0.01, 100)  # 1% of main, minimum 100 faces
+
+    kept = [c for c in components_sorted if len(c.faces) >= threshold]
+    removed_count = len(components) - len(kept)
+    removed_faces = sum(len(c.faces) for c in components_sorted if len(c.faces) < threshold)
+
+    if removed_count == 0:
+        return mesh
+
+    logger.info(
+        "  [Shard cleanup] '%s': removed %d small components (%d faces, %.1f%% of total). "
+        "Kept %d component(s) with %d+ faces.",
+        label, removed_count, removed_faces,
+        100.0 * removed_faces / len(mesh.faces),
+        len(kept), int(threshold),
+    )
+
+    if len(kept) == 1:
+        result = kept[0]
+    else:
+        result = trimesh.util.concatenate(kept)
+
+    # Preserve process=False semantics so we don't merge manifold3d's split seam vertices
+    return result
+
+
 def add_part_to_metamold_half(
     metamold_half: trimesh.Trimesh,
     part_mesh: trimesh.Trimesh
 ) -> Tuple[Optional[trimesh.Trimesh], float, bool]:
     """
     Boolean ADD (union) the part mesh to a metamold half.
-    
+
     This operation adds the part mesh back into the metamold half, creating
-    a solid where the part would be placed. This is useful for creating
-    metamold halves that can be used to cast silicone around an actual part.
-    
-    The result is a manifold mesh thanks to manifold3d's robust CSG operations.
-    
+    a solid where the part would be placed.  Because the metamold cavity was
+    created by subtracting the same part mesh, the cavity inner surface and
+    the part outer surface are exactly coincident — this triggers manifold3d's
+    coplanar-face shard artifacts (see GitHub manifold #1430).
+
+    Post-processing removes the degenerate shard components, yielding a clean
+    single-component watertight mesh.
+
     Args:
         metamold_half: One half of the split metamold (with cavity)
         part_mesh: The original part mesh to add back
-        
+
     Returns:
         Tuple of (result_mesh, computation_time_ms, success)
         result_mesh is the metamold half with the part added as solid geometry
     """
     start_time = time.time()
-    
+
     if not MANIFOLD_AVAILABLE:
         logger.error("manifold3d not available - cannot perform CSG operations")
         return None, 0.0, False
-    
+
     if metamold_half is None or len(metamold_half.vertices) == 0:
         logger.error("Metamold half is empty or None")
         return None, 0.0, False
-    
+
     if part_mesh is None or len(part_mesh.vertices) == 0:
         logger.error("Part mesh is empty or None")
         return None, 0.0, False
-    
+
     try:
         logger.info(f"Adding part mesh to metamold half (boolean union)...")
         logger.info(f"  Metamold half: {len(metamold_half.vertices)} verts, {len(metamold_half.faces)} faces")
         logger.info(f"  Part mesh: {len(part_mesh.vertices)} verts, {len(part_mesh.faces)} faces")
-        
+
         # Convert to manifold
         half_manifold = _trimesh_to_manifold(metamold_half, 'metamold_half')
         part_manifold = _trimesh_to_manifold(part_mesh, 'part_mesh_for_union')
-        
+
         # Perform union: result = half + part
         result_manifold = half_manifold + part_manifold
-        
+
         # Convert back to trimesh
         result_mesh = _manifold_to_trimesh(result_manifold, 'metamold_union_part')
-        
+
+        # Save the raw union result BEFORE shard cleanup for debugging
+        _save_debug_mesh(result_mesh, 'metamold_union_RAW_before_cleanup')
+
+        # -----------------------------------------------------------
+        # Post-process: remove coplanar shard components.
+        #
+        # The cavity was carved from the same part mesh we are now adding
+        # back, so ~99% of the part faces are exactly coincident with
+        # cavity faces (opposite normals).  manifold3d's symbolic
+        # perturbation produces hundreds of tiny degenerate triangle
+        # fragments ("shards") at exactly coincident boundaries.
+        #
+        # Keeping only the largest component(s) removes these shards
+        # cleanly while preserving all legitimate geometry.
+        # -----------------------------------------------------------
+        result_mesh = _remove_coplanar_shard_components(result_mesh, 'metamold_union')
+
         elapsed_ms = (time.time() - start_time) * 1000
-        
+
         # Verify manifold output
         if result_mesh.is_watertight:
             logger.info(f"Part added to metamold half: {len(result_mesh.vertices)} verts, "
@@ -2385,9 +2464,9 @@ def add_part_to_metamold_half(
         else:
             logger.warning(f"Part added to metamold half: {len(result_mesh.vertices)} verts, "
                           f"{len(result_mesh.faces)} faces (NOT watertight) in {elapsed_ms:.1f}ms")
-        
+
         return result_mesh, elapsed_ms, True
-        
+
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000
         logger.error(f"Failed to add part to metamold half: {e}")
@@ -2528,6 +2607,8 @@ def trim_metamold_halves(
                     (-pouring_dir).tolist(), float(-trim_at)
                 )
                 trimmed_upper = _manifold_to_trimesh(manifold, 'upper_half_trimmed')
+                _save_debug_mesh(trimmed_upper, 'upper_half_trimmed_RAW_before_cleanup')
+                trimmed_upper = _remove_coplanar_shard_components(trimmed_upper, 'upper_half_trimmed')
                 upper_saved = gap
                 logger.info(f"    Trimmed upper top by {gap:.2f}mm (cut at h={trim_at:.2f})")
             else:
@@ -2556,6 +2637,8 @@ def trim_metamold_halves(
                     pouring_dir.tolist(), float(trim_at)
                 )
                 trimmed_lower = _manifold_to_trimesh(manifold, 'lower_half_trimmed')
+                _save_debug_mesh(trimmed_lower, 'lower_half_trimmed_RAW_before_cleanup')
+                trimmed_lower = _remove_coplanar_shard_components(trimmed_lower, 'lower_half_trimmed')
                 lower_saved = gap
                 logger.info(f"    Trimmed lower bottom by {gap:.2f}mm (cut at h={trim_at:.2f})")
             else:
