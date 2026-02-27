@@ -2385,6 +2385,112 @@ def _remove_coplanar_shard_components(
     return result
 
 
+# Default simplification tolerance in mm.  manifold3d's CSG creates very thin
+# sliver triangles along intersection curves (blade ∩ part surface).  A
+# tolerance of 0.005 mm (5 µm) is well below the resolution of any desktop 3D
+# printer (FDM ≈ 100–200 µm, SLA ≈ 25–50 µm) and eliminates ~90 % of the
+# degenerate needles while keeping the mesh single-component.
+CSG_SIMPLIFY_TOLERANCE: float = 0.005
+
+
+def cleanup_csg_mesh(
+    mesh: trimesh.Trimesh,
+    label: str = 'mesh',
+    tolerance: float = CSG_SIMPLIFY_TOLERANCE,
+) -> trimesh.Trimesh:
+    """Clean up degenerate sliver triangles produced by manifold3d CSG operations.
+
+    manifold3d creates very thin triangles along intersection curves where two
+    meshes meet (e.g. where the cutting blade intersects the part surface).
+    These slivers have edge ratios in the millions and areas near zero, causing
+    visual artifacts and potential slicer issues for 3D printing.
+
+    Uses ``manifold3d.Manifold.simplify(tolerance)`` to collapse edges shorter
+    than *tolerance* (surface displacement ≤ tolerance), followed by shard
+    component removal in case the simplification disconnects tiny regions.
+
+    Args:
+        mesh: Post-CSG trimesh (typically from _manifold_to_trimesh).
+        label: Human-readable label for logging.
+        tolerance: Maximum surface displacement in mm.  Default is
+            CSG_SIMPLIFY_TOLERANCE (0.005 mm / 5 µm).
+
+    Returns:
+        Cleaned mesh with fewer degenerate triangles.  The original mesh is
+        returned unchanged if manifold3d is unavailable or if simplification
+        fails.
+    """
+    if not MANIFOLD_AVAILABLE:
+        return mesh
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh
+
+    try:
+        import numpy as np
+
+        # --- pre-simplify stats (for logging) ---
+        areas = mesh.area_faces
+        v = mesh.vertices[mesh.faces]
+        e0 = np.linalg.norm(v[:, 1] - v[:, 0], axis=1)
+        e1 = np.linalg.norm(v[:, 2] - v[:, 1], axis=1)
+        e2 = np.linalg.norm(v[:, 0] - v[:, 2], axis=1)
+        longest = np.maximum(e0, np.maximum(e1, e2))
+        shortest = np.minimum(e0, np.minimum(e1, e2))
+        edge_ratio = longest / (shortest + 1e-15)
+        pre_zero = int(np.sum(areas < 1e-10))
+        pre_needles = int(np.sum(edge_ratio > 100))
+
+        if pre_needles == 0 and pre_zero == 0:
+            logger.info("  [CSG cleanup] '%s': no degenerate triangles — skipping", label)
+            return mesh
+
+        # --- convert to manifold3d and simplify ---
+        verts = np.asarray(mesh.vertices, dtype=np.float64)
+        faces_arr = np.asarray(mesh.faces, dtype=np.uint32)
+        import manifold3d
+        m3_mesh = manifold3d.Mesh(vert_properties=verts, tri_verts=faces_arr)
+        m3 = manifold3d.Manifold(m3_mesh)
+        simplified = m3.simplify(tolerance)
+
+        out = simplified.to_mesh()
+        result = trimesh.Trimesh(
+            vertices=np.array(out.vert_properties[:, :3]),
+            faces=np.array(out.tri_verts),
+            process=False,
+        )
+        result.merge_vertices()
+
+        # --- shard cleanup (simplify may split off tiny regions) ---
+        result = _remove_coplanar_shard_components(result, f'{label}_simplified')
+
+        # --- post-simplify stats ---
+        areas2 = result.area_faces
+        v2 = result.vertices[result.faces]
+        e0 = np.linalg.norm(v2[:, 1] - v2[:, 0], axis=1)
+        e1 = np.linalg.norm(v2[:, 2] - v2[:, 1], axis=1)
+        e2 = np.linalg.norm(v2[:, 0] - v2[:, 2], axis=1)
+        longest2 = np.maximum(e0, np.maximum(e1, e2))
+        shortest2 = np.minimum(e0, np.minimum(e1, e2))
+        edge_ratio2 = longest2 / (shortest2 + 1e-15)
+        post_zero = int(np.sum(areas2 < 1e-10))
+        post_needles = int(np.sum(edge_ratio2 > 100))
+
+        logger.info(
+            "  [CSG cleanup] '%s': simplify(tol=%.4fmm) %df→%df, "
+            "zero-area: %d→%d, needles(>100): %d→%d",
+            label, tolerance,
+            len(mesh.faces), len(result.faces),
+            pre_zero, post_zero,
+            pre_needles, post_needles,
+        )
+
+        return result
+
+    except Exception as exc:
+        logger.warning("  [CSG cleanup] '%s' failed — returning original: %s", label, exc)
+        return mesh
+
+
 def add_part_to_metamold_half(
     metamold_half: trimesh.Trimesh,
     part_mesh: trimesh.Trimesh

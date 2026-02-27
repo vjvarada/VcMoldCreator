@@ -910,6 +910,7 @@ class HardShellWorker(QThread):
                 create_shell_with_cavity,
                 create_outer_collar_extension,
                 split_shell_with_membrane,
+                cleanup_csg_mesh,
                 _save_debug_mesh
             )
             
@@ -982,6 +983,9 @@ class HardShellWorker(QThread):
                     logger.info(f"Shell split complete in {split_time_ms:.1f}ms")
                     logger.info(f"  Half 1: {len(shell_half_1.vertices)} verts, {len(shell_half_1.faces)} faces")
                     logger.info(f"  Half 2: {len(shell_half_2.vertices)} verts, {len(shell_half_2.faces)} faces")
+                    # Clean up degenerate slivers from blade intersection
+                    shell_half_1 = cleanup_csg_mesh(shell_half_1, 'hard_shell_half1')
+                    shell_half_2 = cleanup_csg_mesh(shell_half_2, 'hard_shell_half2')
                     _save_debug_mesh(shell_half_1, 'hard_shell_half1_final')
                     _save_debug_mesh(shell_half_2, 'hard_shell_half2_final')
                 else:
@@ -1040,6 +1044,7 @@ class MetamoldWorker(QThread):
                 add_part_to_metamold_halves,
                 create_part_with_thickened_secondary,
                 trim_metamold_halves,
+                cleanup_csg_mesh,
                 _save_debug_mesh
             )
             
@@ -1155,7 +1160,17 @@ class MetamoldWorker(QThread):
                         if bot_saved > 0 or top_saved > 0:
                             logger.info(f"Metamold trim: bottom saved {bot_saved:.1f}mm, "
                                        f"top saved {top_saved:.1f}mm in {trim_ms:.1f}ms")
-                        # Log post-trim diagnostics for each half
+                        # Step 7: Clean up degenerate sliver triangles from CSG
+                        # manifold3d creates very thin needles along intersection
+                        # curves (blade ∩ part surface).  simplify() collapses
+                        # those edges within a tiny tolerance (5 µm).
+                        self.progress.emit("Cleaning up CSG intersection artifacts...")
+                        _save_debug_mesh(half_1_with_part, 'metamold_half1_pre_cleanup')
+                        _save_debug_mesh(half_2_with_part, 'metamold_half2_pre_cleanup')
+                        half_1_with_part = cleanup_csg_mesh(half_1_with_part, 'metamold_half1')
+                        half_2_with_part = cleanup_csg_mesh(half_2_with_part, 'metamold_half2')
+
+                        # Log final diagnostics for each half
                         for _hlabel, _hmesh in [('Half1', half_1_with_part), ('Half2', half_2_with_part)]:
                             if _hmesh is not None:
                                 try:
