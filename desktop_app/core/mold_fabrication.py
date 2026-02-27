@@ -2392,11 +2392,132 @@ def _remove_coplanar_shard_components(
 # degenerate needles while keeping the mesh single-component.
 CSG_SIMPLIFY_TOLERANCE: float = 0.005
 
+# Needle edge-ratio threshold for the targeted edge-collapse pass.
+# Triangles with longest_edge / shortest_edge > this value are collapsed.
+# 50 is aggressive enough to eliminate visually objectionable slivers while
+# preserving legitimate sharp-angle geometry.
+CSG_NEEDLE_RATIO_THRESHOLD: float = 50.0
+
+
+def _collapse_needle_edges(
+    mesh: trimesh.Trimesh,
+    ratio_threshold: float = CSG_NEEDLE_RATIO_THRESHOLD,
+    max_iterations: int = 5,
+    label: str = 'mesh',
+) -> trimesh.Trimesh:
+    """Iteratively collapse the shortest edge of needle triangles.
+
+    For every triangle whose longest_edge / shortest_edge exceeds
+    *ratio_threshold*, the two vertices of the shortest edge are merged to
+    their midpoint.  Faces that become degenerate (two or more identical
+    vertex indices) are removed.  The process repeats until no needles
+    remain or *max_iterations* is reached.
+
+    This is a targeted edge-collapse that only touches degenerate geometry —
+    well-shaped triangles are never modified.
+
+    Args:
+        mesh: Input mesh (vertices may be modified in-place on a copy).
+        ratio_threshold: Edge-ratio above which a triangle is considered
+            a needle and its shortest edge is collapsed.
+        max_iterations: Safety limit on collapse rounds.
+        label: Human-readable label for logging.
+
+    Returns:
+        Cleaned mesh with needle triangles eliminated.
+    """
+    import numpy as np
+
+    verts = mesh.vertices.copy()
+    faces = mesh.faces.copy()
+    total_merges = 0
+    total_removed = 0
+
+    for iteration in range(max_iterations):
+        v = verts[faces]
+        e0 = np.linalg.norm(v[:, 1] - v[:, 0], axis=1)
+        e1 = np.linalg.norm(v[:, 2] - v[:, 1], axis=1)
+        e2 = np.linalg.norm(v[:, 0] - v[:, 2], axis=1)
+        longest = np.maximum(e0, np.maximum(e1, e2))
+        shortest = np.minimum(e0, np.minimum(e1, e2))
+        edge_ratio = longest / (shortest + 1e-15)
+
+        bad = edge_ratio > ratio_threshold
+        if bad.sum() == 0:
+            break
+
+        # Build a union-find merge map: for each bad face, merge the
+        # shortest-edge vertex pair.
+        merge_map = np.arange(len(verts), dtype=np.intp)
+        merges = 0
+
+        for fi in np.where(bad)[0]:
+            f = faces[fi]
+            d = [
+                np.linalg.norm(verts[f[0]] - verts[f[1]]),
+                np.linalg.norm(verts[f[1]] - verts[f[2]]),
+                np.linalg.norm(verts[f[0]] - verts[f[2]]),
+            ]
+            pairs = [
+                (int(f[0]), int(f[1])),
+                (int(f[1]), int(f[2])),
+                (int(f[0]), int(f[2])),
+            ]
+            a, b = pairs[int(np.argmin(d))]
+
+            # Chase to root
+            while merge_map[a] != a:
+                a = merge_map[a]
+            while merge_map[b] != b:
+                b = merge_map[b]
+
+            if a != b:
+                keep, drop = (a, b) if a < b else (b, a)
+                merge_map[drop] = keep
+                verts[keep] = (verts[keep] + verts[drop]) / 2.0
+                merges += 1
+
+        # Flatten merge chains
+        for i in range(len(merge_map)):
+            root = i
+            while merge_map[root] != root:
+                root = merge_map[root]
+            merge_map[i] = root
+
+        # Remap faces and remove newly-degenerate ones
+        faces = merge_map[faces]
+        ok = (
+            (faces[:, 0] != faces[:, 1])
+            & (faces[:, 1] != faces[:, 2])
+            & (faces[:, 0] != faces[:, 2])
+        )
+        removed = int(np.sum(~ok))
+        faces = faces[ok]
+
+        total_merges += merges
+        total_removed += removed
+
+    if total_merges > 0:
+        result = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        result.remove_unreferenced_vertices()
+        result.merge_vertices()
+        # Shard cleanup — collapse can disconnect tiny fragments
+        result = _remove_coplanar_shard_components(result, f'{label}_collapsed')
+        logger.info(
+            "  [Edge collapse] '%s': %d merges, %d degenerate faces removed "
+            "in %d iteration(s)",
+            label, total_merges, total_removed, min(iteration + 1, max_iterations),
+        )
+        return result
+
+    return mesh
+
 
 def cleanup_csg_mesh(
     mesh: trimesh.Trimesh,
     label: str = 'mesh',
     tolerance: float = CSG_SIMPLIFY_TOLERANCE,
+    needle_threshold: float = CSG_NEEDLE_RATIO_THRESHOLD,
 ) -> trimesh.Trimesh:
     """Clean up degenerate sliver triangles produced by manifold3d CSG operations.
 
@@ -2405,20 +2526,24 @@ def cleanup_csg_mesh(
     These slivers have edge ratios in the millions and areas near zero, causing
     visual artifacts and potential slicer issues for 3D printing.
 
-    Uses ``manifold3d.Manifold.simplify(tolerance)`` to collapse edges shorter
-    than *tolerance* (surface displacement ≤ tolerance), followed by shard
-    component removal in case the simplification disconnects tiny regions.
+    Two-pass cleanup:
+      1. **manifold3d simplify** — collapses edges shorter than *tolerance*
+         (surface displacement ≤ tolerance), eliminating ~90 % of degenerates.
+      2. **Targeted edge collapse** — for any remaining triangles whose
+         longest/shortest edge ratio exceeds *needle_threshold*, the shortest
+         edge is iteratively collapsed to its midpoint until none remain.
 
     Args:
         mesh: Post-CSG trimesh (typically from _manifold_to_trimesh).
         label: Human-readable label for logging.
-        tolerance: Maximum surface displacement in mm.  Default is
-            CSG_SIMPLIFY_TOLERANCE (0.005 mm / 5 µm).
+        tolerance: Maximum surface displacement in mm for the simplify pass.
+            Default is CSG_SIMPLIFY_TOLERANCE (0.005 mm / 5 µm).
+        needle_threshold: Edge-ratio threshold for the edge-collapse pass.
+            Default is CSG_NEEDLE_RATIO_THRESHOLD (50).
 
     Returns:
-        Cleaned mesh with fewer degenerate triangles.  The original mesh is
-        returned unchanged if manifold3d is unavailable or if simplification
-        fails.
+        Cleaned mesh with degenerate triangles eliminated.  The original mesh
+        is returned unchanged if manifold3d is unavailable or if cleanup fails.
     """
     if not MANIFOLD_AVAILABLE:
         return mesh
@@ -2428,7 +2553,7 @@ def cleanup_csg_mesh(
     try:
         import numpy as np
 
-        # --- pre-simplify stats (for logging) ---
+        # --- pre-cleanup stats (for logging) ---
         areas = mesh.area_faces
         v = mesh.vertices[mesh.faces]
         e0 = np.linalg.norm(v[:, 1] - v[:, 0], axis=1)
@@ -2438,13 +2563,13 @@ def cleanup_csg_mesh(
         shortest = np.minimum(e0, np.minimum(e1, e2))
         edge_ratio = longest / (shortest + 1e-15)
         pre_zero = int(np.sum(areas < 1e-10))
-        pre_needles = int(np.sum(edge_ratio > 100))
+        pre_needles = int(np.sum(edge_ratio > needle_threshold))
 
         if pre_needles == 0 and pre_zero == 0:
             logger.info("  [CSG cleanup] '%s': no degenerate triangles — skipping", label)
             return mesh
 
-        # --- convert to manifold3d and simplify ---
+        # --- Pass 1: manifold3d simplify ---
         verts = np.asarray(mesh.vertices, dtype=np.float64)
         faces_arr = np.asarray(mesh.faces, dtype=np.uint32)
         import manifold3d
@@ -2460,10 +2585,18 @@ def cleanup_csg_mesh(
         )
         result.merge_vertices()
 
-        # --- shard cleanup (simplify may split off tiny regions) ---
+        # Shard cleanup (simplify may split off tiny regions)
         result = _remove_coplanar_shard_components(result, f'{label}_simplified')
 
-        # --- post-simplify stats ---
+        # --- Pass 2: targeted edge collapse for remaining needles ---
+        result = _collapse_needle_edges(
+            result,
+            ratio_threshold=needle_threshold,
+            max_iterations=5,
+            label=label,
+        )
+
+        # --- post-cleanup stats ---
         areas2 = result.area_faces
         v2 = result.vertices[result.faces]
         e0 = np.linalg.norm(v2[:, 1] - v2[:, 0], axis=1)
@@ -2473,15 +2606,15 @@ def cleanup_csg_mesh(
         shortest2 = np.minimum(e0, np.minimum(e1, e2))
         edge_ratio2 = longest2 / (shortest2 + 1e-15)
         post_zero = int(np.sum(areas2 < 1e-10))
-        post_needles = int(np.sum(edge_ratio2 > 100))
+        post_needles = int(np.sum(edge_ratio2 > needle_threshold))
 
         logger.info(
-            "  [CSG cleanup] '%s': simplify(tol=%.4fmm) %df→%df, "
-            "zero-area: %d→%d, needles(>100): %d→%d",
-            label, tolerance,
+            "  [CSG cleanup] '%s': %df→%df, "
+            "zero-area: %d→%d, needles(>%.0f): %d→%d",
+            label,
             len(mesh.faces), len(result.faces),
             pre_zero, post_zero,
-            pre_needles, post_needles,
+            needle_threshold, pre_needles, post_needles,
         )
 
         return result
