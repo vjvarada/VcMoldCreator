@@ -910,7 +910,6 @@ class HardShellWorker(QThread):
                 create_shell_with_cavity,
                 create_outer_collar_extension,
                 split_shell_with_membrane,
-                cleanup_csg_mesh,
                 _save_debug_mesh
             )
             
@@ -983,9 +982,6 @@ class HardShellWorker(QThread):
                     logger.info(f"Shell split complete in {split_time_ms:.1f}ms")
                     logger.info(f"  Half 1: {len(shell_half_1.vertices)} verts, {len(shell_half_1.faces)} faces")
                     logger.info(f"  Half 2: {len(shell_half_2.vertices)} verts, {len(shell_half_2.faces)} faces")
-                    # Clean up degenerate slivers from blade intersection
-                    shell_half_1 = cleanup_csg_mesh(shell_half_1, 'hard_shell_half1')
-                    shell_half_2 = cleanup_csg_mesh(shell_half_2, 'hard_shell_half2')
                     _save_debug_mesh(shell_half_1, 'hard_shell_half1_final')
                     _save_debug_mesh(shell_half_2, 'hard_shell_half2_final')
                 else:
