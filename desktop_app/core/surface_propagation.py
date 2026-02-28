@@ -41,6 +41,62 @@ CORNER_SHARP_EDGE_COUNT = 2        # A vertex with >= this many sharp edges meet
 
 
 # =============================================================================
+# SHARED HELPERS
+# =============================================================================
+
+def _check_edge_concavity(
+    v0: int,
+    v1: int,
+    mesh: trimesh.Trimesh,
+    edge_to_faces: dict,
+    angle_threshold: float
+) -> bool:
+    """
+    Check if the edge (v0, v1) is concave on the given mesh.
+    
+    An edge is concave if the dihedral angle exceeds the threshold
+    and the adjacent faces fold inward. Used for feature detection
+    on both part meshes and target meshes.
+    
+    Args:
+        v0: First vertex index of the edge
+        v1: Second vertex index of the edge
+        mesh: The mesh to check concavity on
+        edge_to_faces: Dict mapping (min_v, max_v) -> list of face indices
+        angle_threshold: Minimum dihedral angle in degrees to consider sharp
+        
+    Returns:
+        True if the edge is concave (folds inward), False otherwise
+    """
+    edge = (min(v0, v1), max(v0, v1))
+    face_indices = edge_to_faces.get(edge, [])
+    
+    if len(face_indices) != 2:
+        return False  # Boundary edge - not concave
+    
+    n0 = mesh.face_normals[face_indices[0]]
+    n1 = mesh.face_normals[face_indices[1]]
+    
+    dot = np.clip(np.dot(n0, n1), -1.0, 1.0)
+    angle_deg = np.degrees(np.arccos(dot))
+    
+    if angle_deg <= angle_threshold:
+        return False  # Not sharp
+    
+    # Determine concavity: check if faces fold inward
+    face1 = mesh.faces[face_indices[1]]
+    opposite_v1 = [v for v in face1 if v != v0 and v != v1][0]
+    
+    p_opposite1 = mesh.vertices[opposite_v1]
+    p_edge0 = mesh.vertices[v0]
+    
+    vec_to_opp1 = p_opposite1 - p_edge0
+    side = np.dot(vec_to_opp1, n0)
+    
+    return side > 0  # side > 0 means faces fold INWARD = CONCAVE
+
+
+# =============================================================================
 # DATA CLASSES
 # =============================================================================
 
@@ -233,33 +289,7 @@ def get_feature_debug_visualization(
         
         def is_edge_concave(v0: int, v1: int) -> bool:
             """Check if the edge (v0, v1) is concave on the target mesh."""
-            edge = (min(v0, v1), max(v0, v1))
-            face_indices = edge_to_faces.get(edge, [])
-            
-            if len(face_indices) != 2:
-                return False  # Boundary edge - not concave
-            
-            n0 = target_mesh.face_normals[face_indices[0]]
-            n1 = target_mesh.face_normals[face_indices[1]]
-            
-            dot = np.clip(np.dot(n0, n1), -1.0, 1.0)
-            angle_deg = np.degrees(np.arccos(dot))
-            
-            if angle_deg <= angle_threshold:
-                return False  # Not sharp
-            
-            # Determine concavity: check if faces fold inward
-            face0 = target_mesh.faces[face_indices[0]]
-            face1 = target_mesh.faces[face_indices[1]]
-            opposite_v1 = [v for v in face1 if v != v0 and v != v1][0]
-            
-            p_opposite1 = target_mesh.vertices[opposite_v1]
-            p_edge0 = target_mesh.vertices[v0]
-            
-            vec_to_opp1 = p_opposite1 - p_edge0
-            side = np.dot(vec_to_opp1, n0)
-            
-            return side > 0  # side > 0 means faces fold INWARD = CONCAVE
+            return _check_edge_concavity(v0, v1, target_mesh, edge_to_faces, angle_threshold)
         
         def is_edge_convex_sharp(v0: int, v1: int) -> bool:
             """Check if the edge (v0, v1) is convex sharp on the target mesh."""
@@ -1723,38 +1753,7 @@ def smooth_membrane_with_boundary_reprojection(
         # Pre-compute which edges are concave
         def is_edge_concave(v0: int, v1: int) -> bool:
             """Check if the edge (v0, v1) is concave on the part mesh."""
-            edge = (min(v0, v1), max(v0, v1))
-            face_indices = edge_to_faces.get(edge, [])
-            
-            if len(face_indices) != 2:
-                # Boundary edge - not concave (no folding)
-                return False
-            
-            # Get face normals
-            n0 = part_mesh.face_normals[face_indices[0]]
-            n1 = part_mesh.face_normals[face_indices[1]]
-            
-            # Compute dihedral angle
-            dot = np.clip(np.dot(n0, n1), -1.0, 1.0)
-            angle_deg = np.degrees(np.arccos(dot))
-            
-            if angle_deg <= angle_threshold:
-                # Not a sharp edge
-                return False
-            
-            # Determine concavity: check if faces fold inward
-            face0 = part_mesh.faces[face_indices[0]]
-            face1 = part_mesh.faces[face_indices[1]]
-            opposite_v1 = [v for v in face1 if v != v0 and v != v1][0]
-            
-            p_opposite1 = part_mesh.vertices[opposite_v1]
-            p_edge0 = part_mesh.vertices[v0]
-            
-            vec_to_opp1 = p_opposite1 - p_edge0
-            side = np.dot(vec_to_opp1, n0)
-            
-            # side > 0 means faces fold INWARD = CONCAVE
-            return side > 0
+            return _check_edge_concavity(v0, v1, part_mesh, edge_to_faces, angle_threshold)
         
         def is_vertex_at_concave_feature(vi: int) -> bool:
             """Check if vertex vi is at a concave edge or corner on the part mesh."""

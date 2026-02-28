@@ -446,10 +446,10 @@ def _trimesh_to_manifold(mesh: trimesh.Trimesh, label: str = 'mesh') -> 'manifol
             len(mesh.vertices), len(mesh.faces)
         )
         try:
-            from core.mold_fabrication import _save_debug_mesh
-            _save_debug_mesh(mesh, f"bad_csg_input_resin_{label}")
+            from core.mold_fabrication import save_debug_mesh
+            save_debug_mesh(mesh, f"bad_csg_input_resin_{label}")
         except Exception:
-            pass
+            logger.debug("Failed to save debug mesh for bad CSG input '%s'", label, exc_info=True)
     else:
         logger.info("  CSG INPUT  '%s' accepted: manifold_tris=%d", label, m.num_tri())
 
@@ -486,10 +486,10 @@ def _manifold_to_trimesh(manifold: 'manifold3d.Manifold', label: str = 'result')
     )
     if not result.is_watertight:
         try:
-            from core.mold_fabrication import _save_debug_mesh
-            _save_debug_mesh(result, f"bad_csg_output_resin_{label}")
+            from core.mold_fabrication import save_debug_mesh
+            save_debug_mesh(result, f"bad_csg_output_resin_{label}")
         except Exception:
-            pass
+            logger.debug("Failed to save debug mesh for bad CSG output '%s'", label, exc_info=True)
 
     return result
 

@@ -34,13 +34,6 @@ logger = logging.getLogger(__name__)
 
 # Constants for analysis thresholds
 DEGENERATE_FACE_AREA_THRESHOLD = 1e-10
-QUALITY_PENALTY_NON_MANIFOLD = 30
-QUALITY_PENALTY_NOT_WATERTIGHT = 20
-QUALITY_PENALTY_DEGENERATE = 10
-QUALITY_PENALTY_DUPLICATE = 10
-QUALITY_PENALTY_FLIPPED = 10
-QUALITY_PENALTY_PER_GENUS = 5
-QUALITY_MAX_GENUS_PENALTY = 20
 
 
 @dataclass(frozen=True)
@@ -334,43 +327,6 @@ class MeshAnalyzer:
     def diagnostics(self) -> Optional[MeshDiagnostics]:
         """Get cached diagnostics (call analyze() first)."""
         return self._diagnostics
-    
-    def get_mesh_quality_score(self) -> float:
-        """
-        Compute an overall mesh quality score (0-100).
-        
-        Higher scores indicate better quality meshes suitable for
-        downstream processing.
-        
-        Returns:
-            Quality score from 0 (poor) to 100 (excellent)
-        """
-        if self._diagnostics is None:
-            self.analyze()
-        
-        diag = self._diagnostics
-        score = 100.0
-        
-        if not diag.is_manifold:
-            score -= QUALITY_PENALTY_NON_MANIFOLD
-        
-        if not diag.is_watertight:
-            score -= QUALITY_PENALTY_NOT_WATERTIGHT
-        
-        if diag.has_degenerate_faces:
-            score -= QUALITY_PENALTY_DEGENERATE
-        
-        if diag.has_duplicate_faces:
-            score -= QUALITY_PENALTY_DUPLICATE
-        
-        if diag.has_flipped_normals:
-            score -= QUALITY_PENALTY_FLIPPED
-        
-        if diag.genus > 0:
-            genus_penalty = min(QUALITY_PENALTY_PER_GENUS * diag.genus, QUALITY_MAX_GENUS_PENALTY)
-            score -= genus_penalty
-        
-        return max(0.0, score)
 
 
 # =============================================================================

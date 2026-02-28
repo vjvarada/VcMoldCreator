@@ -910,7 +910,7 @@ class HardShellWorker(QThread):
                 create_shell_with_cavity,
                 create_outer_collar_extension,
                 split_shell_with_membrane,
-                _save_debug_mesh
+                save_debug_mesh
             )
             
             logger.info(f"Generating hard shell with wall_thickness={self.wall_thickness}mm")
@@ -947,9 +947,9 @@ class HardShellWorker(QThread):
                        f"silhouette has {len(prism_result.silhouette_2d)} points")
 
             # Export prism, hull and blade for offline CSG debugging
-            _save_debug_mesh(prism_result.prism_mesh, 'hard_shell_prism')
-            _save_debug_mesh(self.inner_hull, 'hard_shell_inner_hull')
-            _save_debug_mesh(collar_result.mesh, 'hard_shell_collar_blade')
+            save_debug_mesh(prism_result.prism_mesh, 'hard_shell_prism')
+            save_debug_mesh(self.inner_hull, 'hard_shell_inner_hull')
+            save_debug_mesh(collar_result.mesh, 'hard_shell_collar_blade')
 
             # Step 3: CSG subtraction - shell = prism - hull
             self.progress.emit("Performing CSG: subtracting hull from prism...")
@@ -964,7 +964,7 @@ class HardShellWorker(QThread):
             if csg_success and shell_with_cavity is not None:
                 logger.info(f"CSG cavity complete: shell has {len(shell_with_cavity.vertices)} vertices, "
                            f"{len(shell_with_cavity.faces)} faces in {csg_time_ms:.1f}ms")
-                _save_debug_mesh(shell_with_cavity, 'hard_shell_cavity_result')
+                save_debug_mesh(shell_with_cavity, 'hard_shell_cavity_result')
                 
                 # Step 4: Split shell into two halves using the outer collar membrane.
                 # Pass prism + hull so split can use the full (prism-hull)-blade
@@ -982,8 +982,8 @@ class HardShellWorker(QThread):
                     logger.info(f"Shell split complete in {split_time_ms:.1f}ms")
                     logger.info(f"  Half 1: {len(shell_half_1.vertices)} verts, {len(shell_half_1.faces)} faces")
                     logger.info(f"  Half 2: {len(shell_half_2.vertices)} verts, {len(shell_half_2.faces)} faces")
-                    _save_debug_mesh(shell_half_1, 'hard_shell_half1_final')
-                    _save_debug_mesh(shell_half_2, 'hard_shell_half2_final')
+                    save_debug_mesh(shell_half_1, 'hard_shell_half1_final')
+                    save_debug_mesh(shell_half_2, 'hard_shell_half2_final')
                 else:
                     logger.warning("Shell splitting failed - halves may be incomplete")
             else:
@@ -1041,7 +1041,7 @@ class MetamoldWorker(QThread):
                 create_part_with_thickened_secondary,
                 trim_metamold_halves,
                 cleanup_csg_mesh,
-                _save_debug_mesh
+                save_debug_mesh
             )
             
             logger.info(f"Generating metamold with wall_thickness={self.wall_thickness}mm, "
@@ -1067,10 +1067,10 @@ class MetamoldWorker(QThread):
             logger.info(f"Metamold prism: {prism_result.vertex_count} vertices, {prism_result.face_count} faces")
 
             # Export all CSG ingredients for offline debugging
-            _save_debug_mesh(prism_result.prism_mesh, 'metamold_prism')
-            _save_debug_mesh(self.hull_mesh, 'metamold_hull')
-            _save_debug_mesh(self.part_mesh, 'metamold_part_mesh')
-            _save_debug_mesh(self.outer_collar_mesh, 'metamold_outer_collar')
+            save_debug_mesh(prism_result.prism_mesh, 'metamold_prism')
+            save_debug_mesh(self.hull_mesh, 'metamold_hull')
+            save_debug_mesh(self.part_mesh, 'metamold_part_mesh')
+            save_debug_mesh(self.outer_collar_mesh, 'metamold_outer_collar')
 
             # Step 2: CSG subtraction - metamold = prism - part_mesh
             # The metamold cavity is shaped like the part (different from hard shell which uses hull)
@@ -1088,7 +1088,7 @@ class MetamoldWorker(QThread):
             if csg_success and metamold_with_cavity is not None:
                 logger.info(f"CSG cavity complete: metamold has {len(metamold_with_cavity.vertices)} vertices, "
                            f"{len(metamold_with_cavity.faces)} faces in {csg_time_ms:.1f}ms")
-                _save_debug_mesh(metamold_with_cavity, 'metamold_cavity_result')
+                save_debug_mesh(metamold_with_cavity, 'metamold_cavity_result')
                 
                 # Step 3: Split metamold using the same blade from hard shell
                 # Simple CSG: metamold_halves = metamold - blade
@@ -1105,8 +1105,8 @@ class MetamoldWorker(QThread):
                     logger.info(f"Metamold split complete in {split_time_ms:.1f}ms")
                     logger.info(f"  Half 1: {len(metamold_half_1.vertices)} verts, {len(metamold_half_1.faces)} faces")
                     logger.info(f"  Half 2: {len(metamold_half_2.vertices)} verts, {len(metamold_half_2.faces)} faces")
-                    _save_debug_mesh(metamold_half_1, 'metamold_half1_split')
-                    _save_debug_mesh(metamold_half_2, 'metamold_half2_split')
+                    save_debug_mesh(metamold_half_1, 'metamold_half1_split')
+                    save_debug_mesh(metamold_half_2, 'metamold_half2_split')
                     
                     # Step 4: Create combined mesh (part + thickened secondary surface)
                     # This ensures secondary membrane features are included in the mold
@@ -1124,7 +1124,7 @@ class MetamoldWorker(QThread):
                         else:
                             logger.info(f"Combined part mesh: {len(combined_part_mesh.vertices)} verts, "
                                        f"{len(combined_part_mesh.faces)} faces in {combine_time_ms:.1f}ms")
-                    _save_debug_mesh(combined_part_mesh, 'metamold_combined_part_mesh')
+                    save_debug_mesh(combined_part_mesh, 'metamold_combined_part_mesh')
                     
                     # Step 5: Add combined part mesh back to each metamold half (boolean union)
                     # This creates halves where the part is solid geometry inside the mold
@@ -1139,8 +1139,8 @@ class MetamoldWorker(QThread):
                         logger.info(f"Part added to metamold halves in {add_time_ms:.1f}ms")
                         logger.info(f"  Half 1 with part: {len(half_1_with_part.vertices)} verts, {len(half_1_with_part.faces)} faces")
                         logger.info(f"  Half 2 with part: {len(half_2_with_part.vertices)} verts, {len(half_2_with_part.faces)} faces")
-                        _save_debug_mesh(half_1_with_part, 'metamold_half1_with_part_pretrim')
-                        _save_debug_mesh(half_2_with_part, 'metamold_half2_with_part_pretrim')
+                        save_debug_mesh(half_1_with_part, 'metamold_half1_with_part_pretrim')
+                        save_debug_mesh(half_2_with_part, 'metamold_half2_with_part_pretrim')
                         
                         # Step 6: Trim both halves to save 3D printing material
                         # This is done AFTER part union so the planar cut clips
@@ -1161,8 +1161,8 @@ class MetamoldWorker(QThread):
                         # curves (blade ∩ part surface).  simplify() collapses
                         # those edges within a tiny tolerance (5 µm).
                         self.progress.emit("Cleaning up CSG intersection artifacts...")
-                        _save_debug_mesh(half_1_with_part, 'metamold_half1_pre_cleanup')
-                        _save_debug_mesh(half_2_with_part, 'metamold_half2_pre_cleanup')
+                        save_debug_mesh(half_1_with_part, 'metamold_half1_pre_cleanup')
+                        save_debug_mesh(half_2_with_part, 'metamold_half2_pre_cleanup')
                         half_1_with_part = cleanup_csg_mesh(half_1_with_part, 'metamold_half1')
                         half_2_with_part = cleanup_csg_mesh(half_2_with_part, 'metamold_half2')
 
@@ -1175,8 +1175,8 @@ class MetamoldWorker(QThread):
                                     _ncomps = -1
                                 logger.info(f"  {_hlabel} final: {len(_hmesh.faces)}f, "
                                            f"watertight={_hmesh.is_watertight}, components={_ncomps}")
-                        _save_debug_mesh(half_1_with_part, 'metamold_half1_final')
-                        _save_debug_mesh(half_2_with_part, 'metamold_half2_final')
+                        save_debug_mesh(half_1_with_part, 'metamold_half1_final')
+                        save_debug_mesh(half_2_with_part, 'metamold_half2_final')
                     else:
                         logger.warning("Adding part to metamold halves failed")
                 else:

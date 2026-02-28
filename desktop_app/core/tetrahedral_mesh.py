@@ -345,30 +345,6 @@ class TetrahedralMeshResult:
     num_boundary_faces: int = 0
     tetrahedralize_time_ms: float = 0.0
     total_time_ms: float = 0.0
-    
-    # =========================================================================
-    # HELPER METHODS
-    # =========================================================================
-    
-    @property
-    def has_escape_labels(self) -> bool:
-        """Return True if Dijkstra escape labeling has been computed."""
-        return self.seed_escape_labels is not None
-    
-    @property
-    def has_cut_edges(self) -> bool:
-        """Return True if cut edges have been computed."""
-        return self.cut_edge_flags is not None
-    
-    @property
-    def num_primary_cuts(self) -> int:
-        """Return number of primary cut edges."""
-        return len(self.primary_cut_edges) if self.primary_cut_edges else 0
-    
-    @property
-    def num_secondary_cuts(self) -> int:
-        """Return number of secondary cut edges."""
-        return len(self.secondary_cut_edges) if self.secondary_cut_edges else 0
 
 
 # =============================================================================
@@ -4432,63 +4408,6 @@ def _find_nearest_boundary_vertex(point: np.ndarray, boundary_verts: np.ndarray)
     """Find nearest vertex in boundary mesh to a given point."""
     distances = np.linalg.norm(boundary_verts - point, axis=1)
     return int(np.argmin(distances))
-
-
-def _shortest_path_on_boundary(
-    start: int, 
-    end: int, 
-    boundary_mesh: trimesh.Trimesh,
-    adjacency: Dict[int, List[Tuple[int, float]]]
-) -> List[int]:
-    """
-    Compute shortest path between two vertices on the boundary mesh using Dijkstra.
-    
-    Returns list of boundary mesh vertex indices from start to end.
-    """
-    import heapq
-    
-    if start == end:
-        return [start]
-    
-    n_verts = len(boundary_mesh.vertices)
-    dist = np.full(n_verts, np.inf, dtype=np.float64)
-    dist[start] = 0.0
-    predecessor = np.full(n_verts, -1, dtype=np.int64)
-    
-    pq = [(0.0, start)]
-    visited = np.zeros(n_verts, dtype=bool)
-    
-    while pq:
-        d, u = heapq.heappop(pq)
-        
-        if visited[u]:
-            continue
-        visited[u] = True
-        
-        if u == end:
-            break
-        
-        for v, cost in adjacency.get(u, []):
-            if visited[v]:
-                continue
-            new_dist = d + cost
-            if new_dist < dist[v]:
-                dist[v] = new_dist
-                predecessor[v] = u
-                heapq.heappush(pq, (new_dist, v))
-    
-    # Reconstruct path
-    if predecessor[end] < 0 and start != end:
-        return []  # No path found
-    
-    path = []
-    current = end
-    while current >= 0:
-        path.append(current)
-        current = predecessor[current]
-    path.reverse()
-    
-    return path
 
 
 def _multi_target_dijkstra_boundary(

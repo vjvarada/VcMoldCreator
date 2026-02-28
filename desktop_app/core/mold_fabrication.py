@@ -653,7 +653,7 @@ def set_csg_debug_dir(path: Optional[Path]) -> None:
         logger.info("CSG debug meshes will be saved to: %s", path)
 
 
-def _save_debug_mesh(mesh: trimesh.Trimesh, label: str) -> None:
+def save_debug_mesh(mesh: trimesh.Trimesh, label: str) -> None:
     """Save *mesh* to the CSG debug directory as ``<label>.stl``.
 
     Silently does nothing if the debug directory has not been set or if the
@@ -929,7 +929,7 @@ def _trimesh_to_manifold(mesh: trimesh.Trimesh, label: str = 'mesh') -> 'manifol
             label, status, m.num_tri(), mesh.is_watertight,
             len(mesh.vertices), len(mesh.faces)
         )
-        _save_debug_mesh(mesh, f"bad_csg_input_{label}")
+        save_debug_mesh(mesh, f"bad_csg_input_{label}")
     else:
         logger.info(
             "  CSG INPUT  '%s' accepted: manifold_tris=%d",
@@ -975,7 +975,7 @@ def _manifold_to_trimesh(manifold: 'manifold3d.Manifold', label: str = 'result')
         label, len(result.vertices), len(result.faces), result.is_watertight
     )
     if not result.is_watertight:
-        _save_debug_mesh(result, f"bad_csg_output_{label}")
+        save_debug_mesh(result, f"bad_csg_output_{label}")
 
     return result
 
@@ -1122,105 +1122,6 @@ def _create_cutting_volume_from_surface(
     return volume_mesh
 
 
-def _create_half_space_from_membrane(
-    membrane: trimesh.Trimesh,
-    direction: np.ndarray,
-    extrusion_distance: float = 500.0
-) -> trimesh.Trimesh:
-    """
-    Create a watertight half-space volume bounded by the membrane on one side.
-    
-    This extrudes the membrane along the given direction to create a closed volume
-    representing "everything on one side of the membrane".
-    
-    The resulting volume has:
-    - The membrane as its bottom face (with appropriate winding)
-    - The extruded membrane as its top face
-    - Side faces connecting the membrane boundary to the extruded boundary
-    
-    Args:
-        membrane: The membrane mesh (e.g., outer collar)
-        direction: Unit vector for extrusion direction (defines "which side")
-        extrusion_distance: How far to extrude (should be larger than the shell)
-        
-    Returns:
-        A watertight volume mesh representing the half-space
-    """
-    # Normalize direction
-    direction = np.array(direction, dtype=np.float64)
-    direction = direction / (np.linalg.norm(direction) + 1e-10)
-    
-    # Get membrane geometry
-    vertices = np.asarray(membrane.vertices, dtype=np.float64)
-    faces = np.asarray(membrane.faces, dtype=np.int64)
-    n_verts = len(vertices)
-    
-    # Create extruded vertices (far end of the half-space)
-    extruded_vertices = vertices + direction * extrusion_distance
-    
-    # Combined vertices: [membrane, extruded]
-    all_vertices = np.vstack([vertices, extruded_vertices])
-    
-    # Faces:
-    # 1. Membrane faces (bottom) - reverse winding so normals point into the half-space
-    #    (i.e., pointing in the negative direction)
-    bottom_faces = faces[:, ::-1]  # Reversed winding
-    
-    # 2. Extruded faces (top) - keep original winding, offset indices
-    #    These normals point outward (in positive direction)
-    top_faces = faces + n_verts
-    
-    # 3. Side faces connecting boundary edges
-    # Find boundary edges of membrane
-    edge_count = {}
-    edge_to_face = {}
-    
-    for fi, face in enumerate(faces):
-        for i in range(3):
-            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-            edge_key = (min(v0, v1), max(v0, v1))
-            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
-            if edge_key not in edge_to_face:
-                edge_to_face[edge_key] = (fi, v0, v1)
-    
-    # Boundary edges have count == 1
-    boundary_edges = [e for e, c in edge_count.items() if c == 1]
-    
-    side_faces = []
-    for v0, v1 in boundary_edges:
-        _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
-        
-        # Use face traversal order (orig_v0 → orig_v1) to determine winding.
-        # For boundary edge A→B in CCW face order, outward side normal =
-        # cross(B-A, extrusion_dir).  CCW from outside:
-        #   A_bottom → B_bottom → B_top  (first tri)
-        #   A_bottom → B_top    → A_top  (second tri)
-        # This is correct for BOTH outer and inner (hole) boundary loops.
-        a = orig_v0
-        b = orig_v1
-        side_faces.append([a, b, b + n_verts])
-        side_faces.append([a, b + n_verts, a + n_verts])
-    
-    # Combine all faces
-    all_faces_list = [bottom_faces, top_faces]
-    if side_faces:
-        all_faces_list.append(np.array(side_faces, dtype=np.int64))
-    all_faces = np.vstack(all_faces_list)
-    
-    half_space_mesh = trimesh.Trimesh(
-        vertices=all_vertices,
-        faces=all_faces,
-        process=False
-    )
-    half_space_mesh.fix_normals()
-    half_space_mesh = _repair_mesh_for_csg(half_space_mesh, 'half_space')
-
-    logger.debug(f"Created half-space volume: {len(half_space_mesh.vertices)} verts, {len(half_space_mesh.faces)} faces, "
-                f"extruded {extrusion_distance:.1f}mm in direction {direction}")
-
-    return half_space_mesh
-
-
 def _create_cutting_blade_from_membrane(
     membrane: trimesh.Trimesh,
     direction: np.ndarray,
@@ -1247,7 +1148,7 @@ def _create_cutting_blade_from_membrane(
 
     # Export raw membrane to the debug directory so it can be inspected
     # independently of the rest of the pipeline.
-    _save_debug_mesh(membrane, 'blade_input_membrane')
+    save_debug_mesh(membrane, 'blade_input_membrane')
     logger.debug("Blade input membrane: %dv, %df, watertight=%s",
                  len(membrane.vertices), len(membrane.faces), membrane.is_watertight)
 
@@ -1291,7 +1192,7 @@ def _create_cutting_blade_from_membrane(
 
         # Export the pre-cleaned membrane so we can compare against the raw one
         _cleaned = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-        _save_debug_mesh(_cleaned, 'blade_input_membrane_precleaned')
+        save_debug_mesh(_cleaned, 'blade_input_membrane_precleaned')
     except Exception as _exc:
         logger.debug("meshlib blade pre-clean skipped (%s), using raw membrane", _exc)
         vertices = np.asarray(membrane.vertices, dtype=np.float64)
@@ -1733,8 +1634,8 @@ def split_shell_with_membrane(
         logger.info("Creating cutting blade from membrane...")
         blade = _create_cutting_blade_from_membrane(membrane, direction, blade_thickness)
         logger.info(f"Blade: {len(blade.vertices)} verts, {len(blade.faces)} faces")
-        _save_debug_mesh(blade, 'cutting_blade_final')
-        _save_debug_mesh(shell_with_cavity, 'shell_with_cavity_input')
+        save_debug_mesh(blade, 'cutting_blade_final')
+        save_debug_mesh(shell_with_cavity, 'shell_with_cavity_input')
         
         # Diagnostic: blade and membrane properties (debug level to reduce log noise)
         if logger.isEnabledFor(logging.DEBUG):
@@ -1859,118 +1760,6 @@ def split_shell_with_membrane(
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000
         logger.error(f"Failed to split shell with membrane: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, None, elapsed_ms, False
-
-
-def split_shell_with_tall_blade(
-    shell: trimesh.Trimesh,
-    membrane: trimesh.Trimesh,
-    pouring_direction: np.ndarray,
-    extrusion_distance: float = 200.0,
-    blade_gap: float = 0.0001
-) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool]:
-    """
-    Split a shell using a tall cutting blade that extends far above and below the membrane.
-    
-    This is designed for splitting the metamold, where the shell may have different
-    height bounds than the membrane (parting surface + outer collar from hard shell step).
-    The tall blade ensures the cut extends through the entire shell regardless of height.
-    
-    Algorithm:
-    1. Create tall blade by extruding membrane ±extrusion_distance in pouring direction
-    2. Subtract blade from shell: cut_shell = shell - blade
-    3. Split result into connected components
-    4. Return the two largest components as half_1 (upper) and half_2 (lower)
-    
-    Args:
-        shell: The shell mesh to split (e.g., metamold with cavity)
-        membrane: The cutting membrane (parting surface + outer collar from hard shell)
-        pouring_direction: Unit vector defining the "upper" direction
-        extrusion_distance: How far to extrude blade above/below membrane (default: 200mm)
-        blade_gap: The thin gap created by the cut (default: 0.1 micron)
-        
-    Returns:
-        Tuple of (shell_half_1, shell_half_2, computation_time_ms, success)
-        shell_half_1 is the half in the positive pouring direction (upper)
-        shell_half_2 is the half in the negative pouring direction (lower)
-    """
-    start_time = time.time()
-    
-    if not MANIFOLD_AVAILABLE:
-        logger.error("manifold3d not available - cannot perform CSG operations")
-        return None, None, 0.0, False
-    
-    try:
-        logger.info(f"Splitting shell using tall blade (extrusion={extrusion_distance}mm, gap={blade_gap:.6f}mm)...")
-        
-        # Normalize direction
-        direction = np.array(pouring_direction, dtype=np.float64)
-        direction = direction / (np.linalg.norm(direction) + 1e-10)
-        
-        # Step 1: Create tall cutting blade from membrane
-        logger.info("Creating tall cutting blade from membrane...")
-        blade = _create_tall_cutting_blade(membrane, direction, extrusion_distance, blade_gap)
-        logger.info(f"Tall blade: {len(blade.vertices)} verts, {len(blade.faces)} faces")
-        
-        # Step 2: Convert to manifold3d (repair applied inside _trimesh_to_manifold)
-        logger.info("Converting meshes to manifold...")
-        shell_manifold = _trimesh_to_manifold(shell, 'shell')
-        blade_manifold = _trimesh_to_manifold(blade, 'tall_blade')
-
-        # Step 3: CSG subtraction - cut the shell with the blade
-        logger.info("Performing CSG subtraction: shell - tall_blade...")
-        cut_shell_manifold = shell_manifold - blade_manifold
-        
-        # Step 4: Convert back to trimesh
-        cut_shell = _manifold_to_trimesh(cut_shell_manifold, 'shell_minus_tall_blade')
-        logger.info(f"Cut shell: {len(cut_shell.vertices)} verts, {len(cut_shell.faces)} faces")
-        
-        # Step 5: Split into connected components
-        logger.info("Splitting into connected components...")
-        components = cut_shell.split(only_watertight=False)
-        logger.info(f"Found {len(components)} connected components")
-        
-        if len(components) < 2:
-            logger.warning("Failed to split shell into two components - blade may not have cut through")
-            elapsed_ms = (time.time() - start_time) * 1000
-            if len(components) == 1:
-                return components[0], None, elapsed_ms, False
-            return None, None, elapsed_ms, False
-        
-        # Step 6: Sort by size and take the two largest
-        components = sorted(components, key=lambda m: len(m.faces), reverse=True)
-        comp1, comp2 = components[0], components[1]
-        
-        # Step 7: Classify which is upper vs lower based on centroid position
-        centroid1 = comp1.centroid
-        centroid2 = comp2.centroid
-        
-        # Project centroids onto pouring direction
-        proj1 = np.dot(centroid1, direction)
-        proj2 = np.dot(centroid2, direction)
-        
-        # Upper half has higher projection value
-        if proj1 > proj2:
-            shell_half_1, shell_half_2 = comp1, comp2
-        else:
-            shell_half_1, shell_half_2 = comp2, comp1
-        
-        elapsed_ms = (time.time() - start_time) * 1000
-        
-        logger.info(f"Shell split complete in {elapsed_ms:.1f}ms:")
-        logger.info(f"  Half 1 (upper): {len(shell_half_1.vertices)} verts, {len(shell_half_1.faces)} faces")
-        logger.info(f"  Half 2 (lower): {len(shell_half_2.vertices)} verts, {len(shell_half_2.faces)} faces")
-        
-        if len(components) > 2:
-            logger.warning(f"  Note: {len(components) - 2} additional small fragments were discarded")
-        
-        return shell_half_1, shell_half_2, elapsed_ms, True
-        
-    except Exception as e:
-        elapsed_ms = (time.time() - start_time) * 1000
-        logger.error(f"Failed to split shell with tall blade: {e}")
         import traceback
         traceback.print_exc()
         return None, None, elapsed_ms, False
@@ -2678,7 +2467,7 @@ def add_part_to_metamold_half(
         result_mesh = _manifold_to_trimesh(result_manifold, 'metamold_union_part')
 
         # Save the raw union result BEFORE shard cleanup for debugging
-        _save_debug_mesh(result_mesh, 'metamold_union_RAW_before_cleanup')
+        save_debug_mesh(result_mesh, 'metamold_union_RAW_before_cleanup')
 
         # -----------------------------------------------------------
         # Post-process: remove coplanar shard components.
@@ -2846,7 +2635,7 @@ def trim_metamold_halves(
                     (-pouring_dir).tolist(), float(-trim_at)
                 )
                 trimmed_upper = _manifold_to_trimesh(manifold, 'upper_half_trimmed')
-                _save_debug_mesh(trimmed_upper, 'upper_half_trimmed_RAW_before_cleanup')
+                save_debug_mesh(trimmed_upper, 'upper_half_trimmed_RAW_before_cleanup')
                 trimmed_upper = _remove_coplanar_shard_components(trimmed_upper, 'upper_half_trimmed')
                 upper_saved = gap
                 logger.info(f"    Trimmed upper top by {gap:.2f}mm (cut at h={trim_at:.2f})")
@@ -2876,7 +2665,7 @@ def trim_metamold_halves(
                     pouring_dir.tolist(), float(trim_at)
                 )
                 trimmed_lower = _manifold_to_trimesh(manifold, 'lower_half_trimmed')
-                _save_debug_mesh(trimmed_lower, 'lower_half_trimmed_RAW_before_cleanup')
+                save_debug_mesh(trimmed_lower, 'lower_half_trimmed_RAW_before_cleanup')
                 trimmed_lower = _remove_coplanar_shard_components(trimmed_lower, 'lower_half_trimmed')
                 lower_saved = gap
                 logger.info(f"    Trimmed lower bottom by {gap:.2f}mm (cut at h={trim_at:.2f})")
@@ -2891,73 +2680,6 @@ def trim_metamold_halves(
                f"(upper saved: {upper_saved:.2f}mm, lower saved: {lower_saved:.2f}mm)")
     
     return trimmed_upper, trimmed_lower, upper_saved, lower_saved, elapsed_ms
-
-
-def create_split_hard_shell(
-    prism_result: HardShellPrismResult,
-    hull_mesh: trimesh.Trimesh,
-    parting_surface_with_collar: trimesh.Trimesh,
-    pouring_direction: np.ndarray
-) -> HardShellSplitResult:
-    """
-    Complete CSG pipeline: create shell with cavity and split into two halves.
-    
-    Pipeline:
-    1. Subtract hull from prism to create cavity
-    2. Split along parting surface into two halves
-    
-    Args:
-        prism_result: The hard shell prism result
-        hull_mesh: The inflated hull mesh (defines mold cavity)
-        parting_surface_with_collar: The parting surface with extended collar
-        pouring_direction: The resin pouring direction
-        
-    Returns:
-        HardShellSplitResult with both shell halves
-    """
-    result = HardShellSplitResult(
-        pouring_direction=np.array(pouring_direction)
-    )
-    
-    total_start = time.time()
-    
-    # Step 1: Create shell with cavity
-    shell_with_cavity, cavity_time, cavity_success = create_shell_with_cavity(
-        prism_result.prism_mesh,
-        hull_mesh
-    )
-    
-    result.shell_with_cavity = shell_with_cavity
-    result.cavity_time_ms = cavity_time
-    result.cavity_success = cavity_success
-    
-    if not cavity_success or shell_with_cavity is None:
-        result.total_time_ms = (time.time() - total_start) * 1000
-        return result
-    
-    # Step 2: Split along parting surface
-    shell_half_1, shell_half_2, split_time, split_success = split_shell_along_parting_surface(
-        shell_with_cavity,
-        parting_surface_with_collar,
-        pouring_direction
-    )
-    
-    result.shell_half_1 = shell_half_1
-    result.shell_half_2 = shell_half_2
-    result.split_time_ms = split_time
-    result.split_success = split_success
-    
-    if shell_half_1 is not None:
-        result.half_1_vertex_count = len(shell_half_1.vertices)
-        result.half_1_face_count = len(shell_half_1.faces)
-    
-    if shell_half_2 is not None:
-        result.half_2_vertex_count = len(shell_half_2.vertices)
-        result.half_2_face_count = len(shell_half_2.faces)
-    
-    result.total_time_ms = (time.time() - total_start) * 1000
-    
-    return result
 
 
 def _offset_polygon_2d(polygon: np.ndarray, offset: float) -> np.ndarray:
@@ -3878,23 +3600,3 @@ def _extract_boundary_loop(
         current = next_v
     
     return loop
-
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-def compute_wall_thickness_from_bbox(mesh: trimesh.Trimesh, fraction: float = 0.02) -> float:
-    """
-    Compute a reasonable wall thickness based on mesh size.
-    
-    Args:
-        mesh: Input mesh
-        fraction: Fraction of bounding box diagonal (default 2%)
-        
-    Returns:
-        Wall thickness in mesh units
-    """
-    bounds = mesh.bounds
-    diagonal = np.linalg.norm(bounds[1] - bounds[0])
-    return diagonal * fraction

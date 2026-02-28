@@ -107,10 +107,6 @@ class MeshDecimator:
         """Get the current triangle count."""
         return len(self.mesh.faces)
     
-    def get_recommendation(self) -> dict:
-        """Get decimation recommendation for this mesh."""
-        return get_decimation_recommendation(self.get_triangle_count())
-    
     def decimate(self, 
                  quality: DecimationQuality = DecimationQuality.MEDIUM,
                  target_triangles: Optional[int] = None) -> DecimationResult:
@@ -179,25 +175,3 @@ class MeshDecimator:
                 quality_setting=quality_str,
                 error_message=error_msg
             )
-    
-    def preview_decimation(self, target_triangles: int) -> dict:
-        """
-        Preview what decimation would do without actually performing it.
-        
-        Args:
-            target_triangles: Target triangle count
-            
-        Returns:
-            Dictionary with preview information
-        """
-        original_count = len(self.original_mesh.faces)
-        target = max(100, min(target_triangles, original_count))
-        expected_reduction = ((original_count - target) / original_count) * 100
-        
-        return {
-            'original_triangles': original_count,
-            'target_triangles': target,
-            'expected_reduction_percentage': expected_reduction,
-            'original_vertices': len(self.original_mesh.vertices),
-            'estimated_vertices': int(len(self.original_mesh.vertices) * (target / original_count))
-        }

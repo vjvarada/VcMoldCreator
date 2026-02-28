@@ -1,6 +1,9 @@
 # STL files
 *.stl
 
+# Session files
+*.vcm
+
 # Python
 __pycache__/
 *.py[cod]
@@ -52,6 +55,3 @@ Thumbs.db
 
 # Export artifacts
 .tmp/
-desktop_app/Soen Medamold DOne.vcm
-desktop_app/TD600_Sphere in Dodecahedron_session.vcm
-desktop_app/motherchild_session.vcm

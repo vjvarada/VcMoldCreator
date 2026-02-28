@@ -236,22 +236,6 @@ class STLLoader:
         """Get the result of the last load operation."""
         return self._last_result
     
-    def is_valid_stl_file(self, file_path: str) -> Tuple[bool, str]:
-        """
-        Check if a file is a valid STL file.
-        
-        Args:
-            file_path: Path to the file to check
-            
-        Returns:
-            Tuple of (is_valid, error_message)
-        """
-        try:
-            validate_stl_path(file_path)
-            return True, ""
-        except ValidationError as e:
-            return False, str(e)
-    
     def load(self, file_path: str) -> LoadResult:
         """
         Load an STL file and return a trimesh mesh.

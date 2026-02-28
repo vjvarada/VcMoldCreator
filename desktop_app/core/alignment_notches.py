@@ -347,7 +347,7 @@ def _csg_subtract(
                     return r  # trimesh fallback would cause geometry explosion
                 mesh = r  # pass to trimesh fallback
             except Exception:
-                pass
+                logger.debug("Edge analysis for CSG input failed, proceeding to trimesh fallback", exc_info=True)
             # trimesh fallback (only reached when there are real open boundary edges)
             m = trimesh.Trimesh(
                 vertices=mesh.vertices.copy(),

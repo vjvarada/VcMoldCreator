@@ -348,42 +348,6 @@ MARCHING_TET_TABLE = _build_marching_tet_table()
 # 5-EDGE AND 6-EDGE CONFIGURATION HELPERS (Bloomenthal & Ferguson 1995)
 # =============================================================================
 
-def _find_uncut_edge(config: int) -> int:
-    """
-    For a 5-edge config, find the single uncut edge index (0-5).
-    
-    Args:
-        config: 6-bit configuration bitmask
-        
-    Returns:
-        Local edge index (0-5) that is NOT cut
-    """
-    for e in range(6):
-        if not (config & (1 << e)):
-            return e
-    return -1  # Should never happen for 5-edge configs
-
-
-def _find_face_with_3_cut_edges(config: int) -> int:
-    """
-    For a 5-edge config, find the FIRST face that has all 3 of its edges cut.
-    
-    NOTE: In a 5-edge config, EXACTLY TWO faces have all 3 edges cut.
-    Use _find_faces_with_3_cut_edges() to get both.
-    
-    Args:
-        config: 6-bit configuration bitmask (5 bits set)
-        
-    Returns:
-        Face index (0-3) where all 3 edges are cut, or -1 if none found
-    """
-    for face_idx, face_edges in enumerate(TET_FACE_EDGES):
-        all_cut = all((config & (1 << e)) for e in face_edges)
-        if all_cut:
-            return face_idx
-    return -1  # Should not happen for valid 5-edge configs
-
-
 def _find_faces_with_3_cut_edges(config: int) -> List[int]:
     """
     For a 5-edge config, find ALL faces that have all 3 edges cut.
@@ -3207,176 +3171,6 @@ class FloatingEdgeFillingResult:
     processing_time_ms: float = 0.0
 
 
-@dataclass
-class FloatingEdgeDetectionResult:
-    """Result of floating boundary edge detection."""
-    # List of (v0, v1) tuples for edges that are floating
-    floating_edges: List[Tuple[int, int]] = None
-    
-    # For each floating edge, the maximum distance from part surface
-    edge_distances: List[float] = None
-    
-    # All boundary edges checked
-    total_boundary_edges: int = 0
-    
-    # Number of inner boundary edges (on part surface)
-    inner_boundary_edges: int = 0
-    
-    # Vertices involved in floating edges
-    floating_edge_vertices: Set[int] = None
-    
-    def __post_init__(self):
-        if self.floating_edges is None:
-            self.floating_edges = []
-        if self.edge_distances is None:
-            self.edge_distances = []
-        if self.floating_edge_vertices is None:
-            self.floating_edge_vertices = set()
-
-
-def detect_floating_boundary_edges(
-    mesh: trimesh.Trimesh,
-    part_mesh: trimesh.Trimesh,
-    vertex_boundary_type: Optional[np.ndarray] = None,
-    tolerance_fraction: float = FLOATING_EDGE_TOLERANCE_FRACTION,
-    min_tolerance: float = FLOATING_EDGE_MIN_TOLERANCE,
-    n_samples: int = 5
-) -> FloatingEdgeDetectionResult:
-    """
-    Detect boundary edges where both vertices are on the part surface but
-    the edge itself "floats" away from it.
-    
-    After smoothing, boundary VERTICES are re-projected to the part surface,
-    but the EDGES connecting them may curve away. This creates gaps between
-    the membrane boundary and the actual part surface that need to be filled.
-    
-    Algorithm:
-    1. Find all boundary edges of the mesh
-    2. Filter to inner boundary edges (both vertices on part, vertex_boundary_type == -1)
-    3. For each inner edge, sample N points along the edge
-    4. Measure distance from each sample point to part surface
-    5. If max_distance > threshold, mark edge as "floating"
-    
-    Args:
-        mesh: The membrane mesh to analyze
-        part_mesh: The part mesh (target surface)
-        vertex_boundary_type: Array with -1=part, 0=interior, 1/2=hull
-        tolerance_fraction: Fraction of edge length as tolerance
-        min_tolerance: Minimum absolute tolerance in mm
-        n_samples: Number of sample points per edge (default 5)
-    
-    Returns:
-        FloatingEdgeDetectionResult with list of floating edges and statistics
-    """
-    result = FloatingEdgeDetectionResult()
-    
-    if mesh is None or part_mesh is None:
-        logger.warning("Missing mesh for floating edge detection")
-        return result
-    
-    vertices = np.array(mesh.vertices, dtype=np.float64)
-    faces = np.array(mesh.faces, dtype=np.int64)
-    
-    # Find boundary edges (edges that belong to only one face)
-    edge_face_count = {}
-    for fi, face in enumerate(faces):
-        for i in range(3):
-            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-            edge_key = (min(v0, v1), max(v0, v1))
-            edge_face_count[edge_key] = edge_face_count.get(edge_key, 0) + 1
-    
-    boundary_edges = [(v0, v1) for (v0, v1), count in edge_face_count.items() if count == 1]
-    result.total_boundary_edges = len(boundary_edges)
-    
-    if not boundary_edges:
-        return result
-    
-    # Compute distances to part mesh for boundary vertices
-    boundary_verts = list(set([v for e in boundary_edges for v in e]))
-    boundary_vert_positions = vertices[boundary_verts]
-    
-    try:
-        _, dists_to_part, _ = trimesh.proximity.closest_point(part_mesh, boundary_vert_positions)
-        vert_to_part_dist = dict(zip(boundary_verts, dists_to_part))
-    except Exception as e:
-        logger.warning(f"Distance computation failed: {e}")
-        return result
-    
-    # Filter to inner boundary edges (on part surface) - STRICT CHECK
-    inner_edges = []
-    for v0, v1 in boundary_edges:
-        is_inner = False
-        
-        if vertex_boundary_type is not None and len(vertex_boundary_type) > 0:
-            # Use vertex_boundary_type - STRICT: both must be -1 (part)
-            bt0 = vertex_boundary_type[v0] if v0 < len(vertex_boundary_type) else 0
-            bt1 = vertex_boundary_type[v1] if v1 < len(vertex_boundary_type) else 0
-            
-            # REJECT if either vertex is on hull (1 or 2)
-            if bt0 in (1, 2) or bt1 in (1, 2):
-                is_inner = False
-            # ACCEPT only if both are explicitly on part
-            elif bt0 == -1 and bt1 == -1:
-                is_inner = True
-            else:
-                is_inner = False
-        else:
-            # Fallback: vertices very close to part surface (conservative threshold)
-            d0 = vert_to_part_dist.get(v0, 999)
-            d1 = vert_to_part_dist.get(v1, 999)
-            is_inner = (d0 < 0.1 and d1 < 0.1)  # Reduced from 0.5mm to 0.1mm
-        
-        if is_inner:
-            inner_edges.append((v0, v1))
-    
-    result.inner_boundary_edges = len(inner_edges)
-    
-    if not inner_edges:
-        return result
-    
-    # Check each inner edge for floating
-    for v0, v1 in inner_edges:
-        v0_pos = vertices[v0]
-        v1_pos = vertices[v1]
-        edge_vec = v1_pos - v0_pos
-        edge_length = np.linalg.norm(edge_vec)
-        
-        if edge_length < 1e-10:
-            continue
-        
-        # Compute threshold for this edge
-        threshold = max(edge_length * tolerance_fraction, min_tolerance)
-        
-        # Sample points along the edge (excluding endpoints since they're already on part)
-        sample_distances = []
-        for i in range(1, n_samples + 1):
-            t = i / (n_samples + 1)  # Avoid endpoints
-            sample_pt = v0_pos + t * edge_vec
-            
-            try:
-                closest_pts, dists, _ = trimesh.proximity.closest_point(part_mesh, [sample_pt])
-                sample_distances.append(dists[0])
-            except Exception:
-                continue
-        
-        if not sample_distances:
-            continue
-        
-        max_dist = max(sample_distances)
-        
-        if max_dist > threshold:
-            result.floating_edges.append((v0, v1))
-            result.edge_distances.append(max_dist)
-            result.floating_edge_vertices.add(v0)
-            result.floating_edge_vertices.add(v1)
-    
-    logger.info(f"Floating edge detection: {len(result.floating_edges)} floating edges "
-               f"out of {result.inner_boundary_edges} inner boundary edges "
-               f"({result.total_boundary_edges} total)")
-    
-    return result
-
-
 # =============================================================================
 # HELPER FUNCTIONS FOR BOUNDARY EDGE AND FAN VERTEX DETECTION
 # =============================================================================
@@ -4563,7 +4357,7 @@ def create_robust_collar_extension(
             _, dists_to_hull, _ = trimesh.proximity.closest_point(hull_mesh, boundary_vert_positions)
             vert_to_hull_dist = dict(zip(boundary_verts, dists_to_hull))
         except Exception:
-            pass
+            logger.debug("Hull distance computation failed, using empty hull distances", exc_info=True)
     
     inner_boundary_edges = []
     outer_count = 0
@@ -4988,6 +4782,7 @@ def create_robust_collar_extension(
         # Sort collar vertices by angle around vi
         def collar_angle(ci, vi_pos=vi_pos, ref_normal=ref_normal, 
                          x_axis=x_axis_ref, y_axis=y_axis_ref):
+            """Compute angle of collar vertex around vi for sorting."""
             _, pos = ci
             d = pos - vi_pos
             d_proj = d - np.dot(d, ref_normal) * ref_normal
@@ -5227,7 +5022,7 @@ def create_robust_collar_extension(
                         if _pn_len > 1e-10:
                             _frontier_into_part[_vi] = -_pn / _pn_len
             except Exception:
-                pass  # fallback: no blending, use edge perp only
+                logger.debug("Part normal blending failed, using edge perp only", exc_info=True)
 
         for _vi, _ek_list in _vert_to_outside_edges.items():
             if _vi in _vert_new_idx:

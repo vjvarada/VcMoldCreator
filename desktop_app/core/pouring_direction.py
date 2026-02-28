@@ -1,4 +1,4 @@
-﻿"""
+"""
 Pouring Direction Optimization Module
 
 Determines optimal silicone and resin pouring directions by minimizing
@@ -1028,6 +1028,7 @@ def evaluate_candidate_directions_fast(
     current_eval = [0]
     
     def internal_progress(current, total):
+        """Forward progress from scoring loop to caller's progress callback."""
         current_eval[0] = current
         if progress_callback:
             progress_callback(current_eval[0], total_evals)
@@ -1920,11 +1921,13 @@ def find_mold_aware_pouring_directions(
     current_progress = [0]  # Use list to allow modification in nested function
     
     def h1_progress_callback(current, total):
+        """Forward H1 evaluation progress to caller's progress callback."""
         current_progress[0] = current
         if progress_callback:
             progress_callback(current_progress[0], total_directions)
     
     def h2_progress_callback(current, total):
+        """Forward H2 evaluation progress to caller's progress callback."""
         current_progress[0] = total_dirs_count + current
         if progress_callback:
             progress_callback(current_progress[0], total_directions)

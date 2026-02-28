@@ -465,7 +465,7 @@ def validate_manifold(mesh: trimesh.Trimesh) -> ManifoldValidation:
             boundary_edge_count = int(np.sum(edge_face_counts == 1))
             non_manifold_edge_count = int(np.sum(edge_face_counts > 2))
     except Exception:
-        pass  # Keep defaults if this fails
+        logger.debug("Edge face adjacency computation failed, using defaults", exc_info=True)
     
     # Compute Euler characteristic: V - E + F
     euler_characteristic = len(mesh.vertices) - total_edge_count + len(mesh.faces)

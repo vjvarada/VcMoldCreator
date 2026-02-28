@@ -1,4 +1,4 @@
-﻿"""
+"""
 Registration Marks Module
 
 Adds sinusoidal displacement patterns to the parting surface to create registration
