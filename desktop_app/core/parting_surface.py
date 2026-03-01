@@ -4034,6 +4034,67 @@ def _detect_boundary_vertices(
     return result
 
 
+# Number of sample points along each edge for containment testing
+_EDGE_CONTAINMENT_SAMPLES = 5
+# t-values for sampling: avoid exact endpoints (0 and 1) to prevent
+# surface-coincident false positives; sample interior of the edge
+_EDGE_SAMPLE_T = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
+
+
+def _test_edges_inside_part(
+    edges: List[Tuple[int, int]],
+    verts_arr: np.ndarray,
+    part_mesh: trimesh.Trimesh,
+    n_samples: int = _EDGE_CONTAINMENT_SAMPLES
+) -> np.ndarray:
+    """Test whether edges lie fully inside the part mesh using multi-sample containment.
+
+    For each edge, sample ``n_samples`` evenly-spaced interior points and test
+    containment.  An edge is considered "outside" if ANY sample point is outside.
+    This is much more robust than a single midpoint check — it catches edges
+    that pass through concave regions of the part surface where both endpoints
+    are inside but the connecting line segment exits the volume.
+
+    Args:
+        edges: List of (v0, v1) vertex index pairs.
+        verts_arr: (N, 3) vertex positions array.
+        part_mesh: The part mesh (must support ``contains``).
+        n_samples: Number of interior sample points per edge (default 5).
+
+    Returns:
+        Boolean array of shape (len(edges),).  True = edge fully inside,
+        False = at least one sample is outside the part.
+    """
+    if len(edges) == 0:
+        return np.array([], dtype=bool)
+
+    t_vals = _EDGE_SAMPLE_T[:n_samples]
+    edge_arr = np.array(edges, dtype=np.int64)
+    p0 = verts_arr[edge_arr[:, 0]]  # (E, 3)
+    p1 = verts_arr[edge_arr[:, 1]]  # (E, 3)
+
+    n_edges = len(edges)
+    # Build all sample points in one flat array for a single batch call
+    # Shape: (E * n_samples, 3)
+    all_samples = np.empty((n_edges * len(t_vals), 3), dtype=np.float64)
+    for ti, t in enumerate(t_vals):
+        all_samples[ti * n_edges:(ti + 1) * n_edges] = p0 + t * (p1 - p0)
+
+    try:
+        inside_flat = part_mesh.contains(all_samples)  # (E * n_samples,)
+    except Exception:
+        # Fallback: single midpoint test (legacy behaviour)
+        midpoints = (p0 + p1) / 2.0
+        try:
+            return part_mesh.contains(midpoints)
+        except Exception:
+            return np.ones(n_edges, dtype=bool)  # assume inside on failure
+
+    # Reshape to (n_samples, E) and require ALL samples inside for the edge
+    inside_matrix = inside_flat.reshape(len(t_vals), n_edges)
+    return np.all(inside_matrix, axis=0)  # (E,)  True = fully inside
+
+
 def _create_collar_vertex(
     vi_pos: np.ndarray,
     part_mesh: trimesh.Trimesh,
@@ -4043,45 +4104,88 @@ def _create_collar_vertex(
 ) -> np.ndarray:
     """
     Create a collar vertex by offsetting in the membrane plane direction.
-    
-    Always uses the coplanar direction hint when available.  Previous
-    fallback strategies (surface projection, part-normal push) could
-    place the collar vertex perpendicular to the membrane face,
-    causing visible 90-degree twists in fan triangles.
-    
+
+    Strategy:
+    1. If a coplanar direction hint is available, compute the candidate
+       position along that direction.
+    2. Test whether the candidate is inside the part mesh.
+    3. If outside, fall back to projecting onto the closest point of the
+       part surface and then pushing inward along the inward surface normal
+       by ``collar_depth``.  This guarantees the collar vertex ends up
+       inside the part.
+
     The collar is a tiny extension (typically 0.2 mm) whose purpose is
-    to create continuous geometry for CSG operations.  Being exactly
-    inside the part is not required — being coplanar with the membrane
-    and close to the part surface is sufficient.
-    
+    to create continuous geometry for CSG operations.
+
     Args:
         vi_pos: Position of the membrane vertex (should be ON part surface)
         part_mesh: The part mesh
         part_face_normals: Pre-computed part face normals
         collar_depth: How far to offset (mm)
         collar_dir_hint: Direction for collar (perpendicular to edge in membrane plane)
-    
+
     Returns:
         Position of the collar vertex
     """
+    candidate = None
+
+    # --- Primary: use coplanar hint direction ---
     if collar_dir_hint is not None:
         collar_dir = collar_dir_hint / (np.linalg.norm(collar_dir_hint) + 1e-8)
-        return vi_pos + collar_depth * collar_dir
-    
-    # FALLBACK: If no hint, use part surface normal (rare)
+        candidate = vi_pos + collar_depth * collar_dir
+
+        # Quick containment check – if the candidate is inside the part,
+        # accept it immediately (cheapest happy path).
+        try:
+            if part_mesh.contains([candidate])[0]:
+                return candidate
+        except Exception:
+            # contains() can fail on degenerate meshes – accept the
+            # candidate optimistically in that case.
+            return candidate
+
+        # Candidate is outside the part.  Try blending the hint direction
+        # with the inward part-surface normal so the result has a stronger
+        # inward component while preserving some coplanar alignment.
+        try:
+            closest_pts, _, closest_faces = trimesh.proximity.closest_point(
+                part_mesh, [vi_pos])
+            closest_face = closest_faces[0]
+            if closest_face < len(part_face_normals):
+                into_part = -part_face_normals[closest_face]
+                into_part = into_part / (np.linalg.norm(into_part) + 1e-8)
+                # 50/50 blend of hint and inward normal
+                blended = 0.5 * collar_dir + 0.5 * into_part
+                bl_len = np.linalg.norm(blended)
+                if bl_len > 1e-8:
+                    blended = blended / bl_len
+                    blended_candidate = vi_pos + collar_depth * blended
+                    if part_mesh.contains([blended_candidate])[0]:
+                        return blended_candidate
+        except Exception:
+            pass
+
+        # Blend didn't help — fall through to surface-projection fallback.
+
+    # --- Fallback: project to closest part surface point + push inward ---
     try:
-        closest_pts, _, closest_faces = trimesh.proximity.closest_point(part_mesh, [vi_pos])
+        closest_pts, _, closest_faces = trimesh.proximity.closest_point(
+            part_mesh, [vi_pos])
         closest_pt = closest_pts[0]
         closest_face = closest_faces[0]
-        
+
         if closest_face < len(part_face_normals):
             into_part = -part_face_normals[closest_face]
         else:
             into_part = np.array([0, 0, -1])
-        
+
         into_part = into_part / (np.linalg.norm(into_part) + 1e-8)
         return closest_pt + collar_depth * into_part
     except Exception:
+        # Last resort: return the hint-based candidate if we have one,
+        # otherwise a naive offset.
+        if candidate is not None:
+            return candidate
         return vi_pos + collar_depth * np.array([0, 0, -1])
 
 
@@ -4641,7 +4745,55 @@ def create_robust_collar_extension(
             edge_endpoint_collar[edge_key][vi] = collar_idx
     
     logger.info(f"Created {len(vertices) - n_orig_verts} collar vertices")
-    
+
+    # =========================================================================
+    # STEP 4b: Snap-to-surface validation for collar vertices
+    # =========================================================================
+    # After all collar vertices are created (Phase 1 + Phase 2), verify that
+    # each one is inside the part mesh.  Any that are outside get projected
+    # to the closest point on the part surface and pushed inward along the
+    # inward surface normal.  This catches cases where the hint-based
+    # direction was tangential to the part and the collar vertex ended up
+    # just outside the surface.
+    _n_collar_verts = len(vertices) - n_orig_verts
+    if _n_collar_verts > 0:
+        _collar_indices = list(range(n_orig_verts, len(vertices)))
+        _collar_positions = np.array([vertices[ci] for ci in _collar_indices], dtype=np.float64)
+        try:
+            _collar_inside = part_mesh.contains(_collar_positions)
+            _collar_outside_count = int(np.sum(~_collar_inside))
+            if _collar_outside_count > 0:
+                _outside_local = np.where(~_collar_inside)[0]
+                _outside_positions = _collar_positions[_outside_local]
+                _cp_pts, _, _cp_faces = trimesh.proximity.closest_point(
+                    part_mesh, _outside_positions)
+                _snap_push = collar_depth * 0.5  # push half collar_depth inward
+                _n_snapped = 0
+                for _oi, _li in enumerate(_outside_local):
+                    _ci = _collar_indices[_li]
+                    _pfi = _cp_faces[_oi]
+                    if _pfi < len(part_face_normals):
+                        _pn = part_face_normals[_pfi]
+                        _pn_len = np.linalg.norm(_pn)
+                        if _pn_len > 1e-10:
+                            _into = -_pn / _pn_len
+                            vertices[_ci] = (_cp_pts[_oi] + _snap_push * _into).copy()
+                        else:
+                            vertices[_ci] = _cp_pts[_oi].copy()
+                    else:
+                        vertices[_ci] = _cp_pts[_oi].copy()
+                    _n_snapped += 1
+                logger.info(
+                    f"Step 4b: snapped {_n_snapped}/{_n_collar_verts} outside "
+                    "collar vertices to part surface + inward push")
+            else:
+                logger.info(
+                    f"Step 4b: all {_n_collar_verts} collar vertices "
+                    "already inside part mesh")
+        except Exception as _ex:
+            logger.warning(f"Step 4b: containment check failed ({_ex}), "
+                          "skipping snap-to-surface")
+
     # =========================================================================
     # STEP 5: Create quad collars for ALL boundary edges
     # =========================================================================
@@ -4816,9 +4968,12 @@ def create_robust_collar_extension(
     # STEP 6b: Iterative collar extension for boundary edges outside part mesh
     # =========================================================================
     # After collar creation, check every boundary edge of the collar region.
-    # If the midpoint of a collar boundary edge is NOT inside the part mesh,
-    # first re-project its vertices to the closest part surface, then re-check:
-    # if still outside, extend that edge with another collar quad.
+    # Uses MULTI-SAMPLE containment testing: sample 5 interior points along
+    # each edge and require ALL to be inside the part.  This catches edges
+    # that pass through concave surface regions where both endpoints are
+    # inside but the connecting segment exits the volume.
+    # For edges that fail, first re-project vertices to the closest part
+    # surface, then extend with another collar quad.
     # Repeat up to 5 iterations or until all collar boundary edges are inside.
     #
     # Adjacent extension quads share new vertices so the extension strip
@@ -4858,18 +5013,16 @@ def create_robust_collar_extension(
                         "no frontier collar boundary edges found")
             break
 
-        # ----- Compute midpoints and test containment -----
+        # ----- Multi-sample containment test along each edge -----
         _verts_arr = np.array(vertices, dtype=np.float64)
-        _midpts = np.array([
-            (_verts_arr[va] + _verts_arr[vb]) / 2.0
-            for va, vb in _collar_be
-        ])
 
         try:
-            _inside = part_mesh.contains(_midpts)
+            _inside = _test_edges_inside_part(
+                _collar_be, _verts_arr, part_mesh)
         except Exception as _ex:
             logger.warning(f"Collar extension iter {_ext_iter + 1}: "
-                           f"contains() failed ({_ex}), stopping iterations")
+                           f"edge containment test failed ({_ex}), "
+                           "stopping iterations")
             break
 
         _outside_indices = [
@@ -4879,7 +5032,7 @@ def create_robust_collar_extension(
         if not _outside_indices:
             logger.info(f"Collar extension iter {_ext_iter + 1}: all "
                         f"{len(_collar_be)} collar boundary edges "
-                        "are inside the part mesh")
+                        "are fully inside the part mesh")
             break
 
         # =================================================================
@@ -5002,6 +5155,13 @@ def create_robust_collar_extension(
         # Skip creating vertices that would be nearly coincident with
         # their source (degenerate after re-projection).
         #
+        # ADAPTIVE EXTENSION LENGTH: Instead of using a fixed collar_depth
+        # for every iteration, raycast from each frontier vertex along the
+        # extension direction to find where the ray re-enters the part
+        # mesh.  Use that distance (+ a small overshoot) so the extension
+        # spans the full gap in one step.  Falls back to collar_depth if
+        # the raycast fails or the gap is very small.
+        #
         # ROBUSTNESS: Blend edge-perpendicular with the inward part
         # surface normal at each frontier vertex.  This ensures the
         # extension always has a component pointing INTO the part,
@@ -5024,10 +5184,18 @@ def create_robust_collar_extension(
             except Exception:
                 logger.debug("Part normal blending failed, using edge perp only", exc_info=True)
 
+        # Maximum extension distance cap — prevent runaway extensions
+        # that would overshoot the part entirely.  Use 10x collar_depth
+        # or 5% of mesh diagonal (whichever is larger).
+        _mesh_diag = np.linalg.norm(np.ptp(_verts_arr[:n_orig_verts], axis=0))
+        _max_ext_dist = max(collar_depth * 10.0, _mesh_diag * 0.05)
+
+        # Pre-compute blended directions for all frontier vertices FIRST,
+        # so we can batch-raycast afterwards.
+        _vi_directions: Dict[int, np.ndarray] = {}  # vi -> unit direction
         for _vi, _ek_list in _vert_to_outside_edges.items():
             if _vi in _vert_new_idx:
                 continue
-            _vi_pos = _verts_arr[_vi]
 
             # Average perpendicular directions from all adjacent edges
             _perp_sum = np.zeros(3)
@@ -5061,7 +5229,74 @@ def create_robust_collar_extension(
                 if _bl_len > 1e-10:
                     _avg_perp = _blended / _bl_len
 
-            _new_pos = _vi_pos + collar_depth * _avg_perp
+            _vi_directions[_vi] = _avg_perp
+
+        # -----------------------------------------------------------------
+        # Batch raycast to compute adaptive extension distances.
+        # Cast a ray from each frontier vertex along _avg_perp.  The first
+        # intersection with the part mesh tells us where the extension
+        # will re-enter the part volume.  Extension distance = hit distance
+        # + collar_depth (overshoot to ensure the new vertex is inside).
+        # -----------------------------------------------------------------
+        _vi_ext_dist: Dict[int, float] = {}  # vi -> adaptive distance
+        _ray_vi_list = [vi for vi in _vi_directions if vi not in _vert_new_idx]
+        if _ray_vi_list:
+            _ray_origins = np.array([_verts_arr[vi] for vi in _ray_vi_list],
+                                    dtype=np.float64)
+            _ray_dirs = np.array([_vi_directions[vi] for vi in _ray_vi_list],
+                                 dtype=np.float64)
+            try:
+                _hit_locs, _hit_ray_idx, _ = part_mesh.ray.intersects_location(
+                    _ray_origins, _ray_dirs, multiple_hits=True)
+                # For each ray, find the NEAREST hit along the positive direction
+                _ray_min_t: Dict[int, float] = {}
+                for _hi in range(len(_hit_locs)):
+                    _ri = int(_hit_ray_idx[_hi])
+                    _t = np.dot(_hit_locs[_hi] - _ray_origins[_ri],
+                                _ray_dirs[_ri])
+                    if _t > 1e-6:  # positive direction only, skip surface-grazing
+                        if _ri not in _ray_min_t or _t < _ray_min_t[_ri]:
+                            _ray_min_t[_ri] = _t
+
+                _n_adaptive = 0
+                for _ri, _vi in enumerate(_ray_vi_list):
+                    if _ri in _ray_min_t:
+                        _hit_t = _ray_min_t[_ri]
+                        # Overshoot by collar_depth to land inside the part
+                        _ext = min(_hit_t + collar_depth, _max_ext_dist)
+                        # Floor: at least collar_depth so we always make progress
+                        _ext = max(_ext, collar_depth)
+                        _vi_ext_dist[_vi] = _ext
+                        _n_adaptive += 1
+                    else:
+                        _vi_ext_dist[_vi] = collar_depth  # no hit → default
+
+                if _n_adaptive > 0:
+                    _dists = [_vi_ext_dist[vi] for vi in _ray_vi_list
+                              if _vi_ext_dist.get(vi, collar_depth) != collar_depth]
+                    if _dists:
+                        logger.info(
+                            f"Collar extension iter {_ext_iter + 1}: "
+                            f"adaptive distances for {_n_adaptive} vertices "
+                            f"(min={min(_dists):.4f}, max={max(_dists):.4f}, "
+                            f"median={np.median(_dists):.4f} mm)")
+            except Exception as _ray_ex:
+                logger.debug(
+                    f"Raycast for adaptive distances failed ({_ray_ex}), "
+                    "using fixed collar_depth", exc_info=True)
+                for _vi in _ray_vi_list:
+                    _vi_ext_dist[_vi] = collar_depth
+
+        # -----------------------------------------------------------------
+        # Create new vertex positions using adaptive distances
+        # -----------------------------------------------------------------
+        for _vi in _ray_vi_list:
+            if _vi in _vert_new_idx:
+                continue
+            _vi_pos = _verts_arr[_vi]
+            _dir = _vi_directions[_vi]
+            _dist = _vi_ext_dist.get(_vi, collar_depth)
+            _new_pos = _vi_pos + _dist * _dir
 
             # Skip if new position is coincident with source (post re-proj)
             if np.linalg.norm(_new_pos - _vi_pos) < 1e-6:
@@ -5070,6 +5305,48 @@ def create_robust_collar_extension(
             _new_idx = len(vertices)
             vertices.append(_new_pos.copy())
             _vert_new_idx[_vi] = _new_idx
+
+        # -----------------------------------------------------------------
+        # Post-extension containment snap: ensure all new extension
+        # vertices are inside the part mesh.  Any that overshot (e.g.
+        # through a thin wall) get snapped to the closest part surface
+        # point and pushed inward by collar_depth.
+        # -----------------------------------------------------------------
+        if _vert_new_idx:
+            _new_vi_list = sorted(_vert_new_idx.values())
+            _new_positions = np.array(
+                [vertices[ni] for ni in _new_vi_list], dtype=np.float64)
+            try:
+                _new_inside = part_mesh.contains(_new_positions)
+                _new_outside_count = int(np.sum(~_new_inside))
+                if _new_outside_count > 0:
+                    _nout_local = np.where(~_new_inside)[0]
+                    _nout_pos = _new_positions[_nout_local]
+                    _snap_pts, _, _snap_faces = trimesh.proximity.closest_point(
+                        part_mesh, _nout_pos)
+                    _snap_push = collar_depth * 0.5
+                    for _si, _li in enumerate(_nout_local):
+                        _ni = _new_vi_list[_li]
+                        _sf = _snap_faces[_si]
+                        if _sf < len(part_mesh.face_normals):
+                            _sn = part_mesh.face_normals[_sf]
+                            _sn_len = np.linalg.norm(_sn)
+                            if _sn_len > 1e-10:
+                                _into = -_sn / _sn_len
+                                vertices[_ni] = (
+                                    _snap_pts[_si] + _snap_push * _into
+                                ).copy()
+                            else:
+                                vertices[_ni] = _snap_pts[_si].copy()
+                        else:
+                            vertices[_ni] = _snap_pts[_si].copy()
+                    logger.info(
+                        f"Collar extension iter {_ext_iter + 1}: "
+                        f"snapped {_new_outside_count}/{len(_new_vi_list)} "
+                        "overshot extension vertices to part surface")
+            except Exception as _snap_ex:
+                logger.debug(
+                    f"Extension snap failed ({_snap_ex})", exc_info=True)
 
         # =================================================================
         # SUB-STEP D: Create quad faces for each outside edge
@@ -5212,7 +5489,7 @@ def create_robust_collar_extension(
                         f"Final frontier: all {len(_cbv_list)} collar "
                         "boundary vertices inside part")
 
-                # Diagnostic: test midpoints of collar boundary edges
+                # Diagnostic: multi-sample containment of collar boundary edges
                 _collar_be_final = [
                     (va, vb) for (va, vb), cnt in _final_efc.items()
                     if cnt == 1
@@ -5220,23 +5497,25 @@ def create_robust_collar_extension(
                 ]
                 if _collar_be_final:
                     _diag_verts = np.array(vertices, dtype=np.float64)
-                    _fmids = np.array([
-                        (_diag_verts[va] + _diag_verts[vb]) / 2.0
-                        for va, vb in _collar_be_final
-                    ])
-                    _fmid_inside = part_mesh.contains(_fmids)
-                    _n_in = int(np.sum(_fmid_inside))
-                    _n_out = len(_collar_be_final) - _n_in
-                    if _n_out > 0:
+                    try:
+                        _fmid_inside = _test_edges_inside_part(
+                            _collar_be_final, _diag_verts, part_mesh)
+                        _n_in = int(np.sum(_fmid_inside))
+                        _n_out = len(_collar_be_final) - _n_in
+                        if _n_out > 0:
+                            logger.warning(
+                                f"Final collar validation: {_n_out}/"
+                                f"{len(_collar_be_final)} edges have "
+                                "samples outside part mesh")
+                        else:
+                            logger.info(
+                                f"Final collar validation: all "
+                                f"{len(_collar_be_final)} edges fully "
+                                "inside part mesh")
+                    except Exception as _diag_ex:
                         logger.warning(
-                            f"Final collar validation: {_n_out}/"
-                            f"{len(_collar_be_final)} edge midpoints "
-                            "still outside part mesh")
-                    else:
-                        logger.info(
-                            f"Final collar validation: all "
-                            f"{len(_collar_be_final)} edge midpoints "
-                            "inside part mesh")
+                            f"Final collar validation diagnostic failed: "
+                            f"{_diag_ex}")
             except Exception as _ex:
                 logger.warning(
                     f"Final frontier validation failed: {_ex}")
