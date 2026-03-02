@@ -5652,6 +5652,83 @@ class MeshViewer(QWidget):
             logger.debug(f"Outer collar visibility set to {visible}")
 
     # =========================================================================
+    # CUTTING BLADE VISUALIZATION (DEBUG)
+    # =========================================================================
+
+    def show_cutting_blade(self, mesh: 'trimesh.Trimesh'):
+        """
+        Display the cutting blade used to split the hard shell.
+
+        The blade is the thin thickened membrane that was subtracted from the
+        shell via CSG to produce the two halves.  Displayed in yellow-green
+        for easy contrast against the teal/coral shell halves.
+
+        Args:
+            mesh: The cutting blade trimesh.
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+
+        import pyvista as pv
+
+        self.remove_cutting_blade()
+
+        if mesh is None or len(mesh.vertices) == 0:
+            logger.warning("No valid cutting blade mesh to display")
+            return
+
+        self._cutting_blade_mesh = mesh
+
+        try:
+            vertices = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.faces)
+            faces_pv = np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64)
+            pv_mesh = pv.PolyData(vertices, faces_pv.flatten())
+        except Exception as e:
+            logger.error(f"Failed to convert cutting blade mesh to PyVista: {e}")
+            return
+
+        self._cutting_blade_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='#ADFF2F',   # Green-Yellow
+            opacity=0.7,
+            show_edges=True,
+            edge_color='#7CFC00',  # Lawn Green
+            line_width=1.0,
+        )
+        self._cutting_blade_visible = True
+        logger.info(f"Cutting blade displayed: {len(vertices)} vertices, {len(faces)} faces")
+
+        self.plotter.update()
+
+    def remove_cutting_blade(self):
+        """Remove the cutting blade mesh from the display."""
+        if hasattr(self, '_cutting_blade_actor') and self._cutting_blade_actor is not None:
+            try:
+                self.plotter.remove_actor(self._cutting_blade_actor)
+            except Exception:
+                pass
+            self._cutting_blade_actor = None
+
+        if hasattr(self, '_cutting_blade_mesh'):
+            self._cutting_blade_mesh = None
+
+        self.plotter.update()
+
+    def set_cutting_blade_visible(self, visible: bool):
+        """
+        Set visibility of the cutting blade.
+
+        Args:
+            visible: True to show, False to hide
+        """
+        self._cutting_blade_visible = visible
+        if hasattr(self, '_cutting_blade_actor') and self._cutting_blade_actor is not None:
+            self._cutting_blade_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Cutting blade visibility set to {visible}")
+
+    # =========================================================================
     # SHELL HALVES VISUALIZATION (SPLIT BY MEMBRANE)
     # =========================================================================
     

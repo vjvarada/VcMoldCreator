@@ -884,8 +884,8 @@ class HardShellWorker(QThread):
     """Background worker for generating hard shell geometry (prism + CSG cavity + collar + split into halves)."""
     
     progress = pyqtSignal(str)
-    # (HardShellPrismResult, shell_with_cavity, OuterCollarResult, shell_half_1, shell_half_2, success)
-    complete = pyqtSignal(object, object, object, object, object, bool)
+    # (HardShellPrismResult, shell_with_cavity, OuterCollarResult, shell_half_1, shell_half_2, cutting_blade, success)
+    complete = pyqtSignal(object, object, object, object, object, object, bool)
     error = pyqtSignal(str)
     
     def __init__(
@@ -970,7 +970,7 @@ class HardShellWorker(QThread):
                 # Pass prism + hull so split can use the full (prism-hull)-blade
                 # manifold3d chain without an intermediate round-trip.
                 self.progress.emit("Splitting shell into two halves using membrane...")
-                shell_half_1, shell_half_2, split_time_ms, split_success = split_shell_with_membrane(
+                shell_half_1, shell_half_2, cutting_blade, split_time_ms, split_success = split_shell_with_membrane(
                     shell_with_cavity,
                     collar_result.mesh,
                     self.pouring_direction,
@@ -987,10 +987,11 @@ class HardShellWorker(QThread):
                 else:
                     logger.warning("Shell splitting failed - halves may be incomplete")
             else:
+                cutting_blade = None
                 logger.warning("CSG cavity subtraction failed - cannot split shell")
             
             self.progress.emit(f"Hard shell generation complete")
-            self.complete.emit(prism_result, shell_with_cavity, collar_result, shell_half_1, shell_half_2, csg_success)
+            self.complete.emit(prism_result, shell_with_cavity, collar_result, shell_half_1, shell_half_2, cutting_blade, csg_success)
             
         except Exception as e:
             logger.exception("Error generating hard shell: %s", e)
@@ -1093,7 +1094,7 @@ class MetamoldWorker(QThread):
                 # Step 3: Split metamold using the same blade from hard shell
                 # Simple CSG: metamold_halves = metamold - blade
                 self.progress.emit("Splitting metamold into two halves...")
-                metamold_half_1, metamold_half_2, split_time_ms, split_success = split_shell_with_membrane(
+                metamold_half_1, metamold_half_2, _blade, split_time_ms, split_success = split_shell_with_membrane(
                     metamold_with_cavity,
                     self.outer_collar_mesh,  # Same parting surface + collar used in hard shell
                     self.resin_pouring_direction,
@@ -4218,6 +4219,7 @@ class DisplayOptionsPanel(QFrame):
     show_shell_with_cavity_changed = pyqtSignal(bool)  # Toggle shell with cavity
     show_hard_shell_prism_changed = pyqtSignal(bool)  # Toggle hard shell prism (debug)
     show_outer_collar_changed = pyqtSignal(bool)  # Toggle outer collar extension visibility
+    show_cutting_blade_changed = pyqtSignal(bool)  # Toggle cutting blade visualization
     show_shell_half_1_changed = pyqtSignal(bool)  # Toggle shell half 1 (upper half)
     show_shell_half_2_changed = pyqtSignal(bool)  # Toggle shell half 2 (lower half)
     
@@ -4672,6 +4674,13 @@ class DisplayOptionsPanel(QFrame):
         self.show_outer_collar_cb.hide()
         layout.addWidget(self.show_outer_collar_cb)
         
+        # Cutting blade checkbox (debug: shows the thickened blade used to split the shell)
+        self.show_cutting_blade_cb = QCheckBox('Cutting Blade (Debug)')
+        self.show_cutting_blade_cb.setChecked(False)
+        self.show_cutting_blade_cb.stateChanged.connect(lambda s: self.show_cutting_blade_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_cutting_blade_cb.hide()
+        layout.addWidget(self.show_cutting_blade_cb)
+        
         # Shell half 1 (upper, teal) checkbox
         self.show_shell_half_1_cb = QCheckBox('Shell Half 1 (Teal)')
         self.show_shell_half_1_cb.setChecked(True)  # Shown by default
@@ -4946,9 +4955,9 @@ class DisplayOptionsPanel(QFrame):
         self._mesh_viewer = mesh_viewer
         self._feature_debug_data = feature_debug_data
     
-    def show_hard_shell_options(self, show_cavity: bool = False, show_prism: bool = False, show_collar: bool = False, show_halves: bool = False):
+    def show_hard_shell_options(self, show_cavity: bool = False, show_prism: bool = False, show_collar: bool = False, show_blade: bool = False, show_halves: bool = False):
         """Show or hide the hard shell visibility checkboxes."""
-        show_any = show_cavity or show_prism or show_collar or show_halves
+        show_any = show_cavity or show_prism or show_collar or show_blade or show_halves
         
         if show_any:
             self.hard_shell_separator.show()
@@ -4974,6 +4983,12 @@ class DisplayOptionsPanel(QFrame):
             self.show_outer_collar_cb.setChecked(False)  # Hidden by default
         else:
             self.show_outer_collar_cb.hide()
+        
+        if show_blade:
+            self.show_cutting_blade_cb.show()
+            self.show_cutting_blade_cb.setChecked(False)  # Hidden by default
+        else:
+            self.show_cutting_blade_cb.hide()
         
         if show_halves:
             self.show_shell_half_1_cb.show()
@@ -5149,6 +5164,7 @@ class MainWindow(QMainWindow):
         self._outer_collar_result = None  # OuterCollarResult (extended parting surface)
         self._shell_half_1 = None  # Upper half of split shell (manifold)
         self._shell_half_2 = None  # Lower half of split shell (manifold)
+        self._cutting_blade = None  # Thin blade mesh used to split the shell
         self._csg_success = False
         
         # Metamold state
@@ -5600,6 +5616,9 @@ class MainWindow(QMainWindow):
         )
         self.display_options.show_outer_collar_changed.connect(
             self._on_toggle_outer_collar
+        )
+        self.display_options.show_cutting_blade_changed.connect(
+            self._on_toggle_cutting_blade
         )
         self.display_options.show_shell_half_1_changed.connect(
             self._on_toggle_shell_half_1
@@ -6515,6 +6534,7 @@ class MainWindow(QMainWindow):
         has_cavity = self._shell_with_cavity is not None and self._csg_success
         has_collar = self._outer_collar_result is not None and self._outer_collar_result.collar_vertex_count > 0
         has_halves = self._shell_half_1 is not None and self._shell_half_2 is not None
+        has_blade = self._cutting_blade is not None
         
         if has_prism:
             prism_result = self._hard_shell_prism_result
@@ -6528,21 +6548,21 @@ class MainWindow(QMainWindow):
                 self.shell_stats.add_row(f'Half 2: {len(self._shell_half_2.vertices):,} verts, {len(self._shell_half_2.faces):,} faces')
                 
                 # Show hard shell options with halves
-                self.display_options.show_hard_shell_options(show_cavity=has_cavity, show_prism=True, show_collar=has_collar, show_halves=True)
+                self.display_options.show_hard_shell_options(show_cavity=has_cavity, show_prism=True, show_collar=has_collar, show_blade=has_blade, show_halves=True)
                 self.display_options.show()
             elif has_cavity:
                 self.shell_stats.add_header('Hard Shell with Cavity Created', Colors.SUCCESS)
                 self.shell_stats.add_row(f'Shell: {len(self._shell_with_cavity.vertices):,} verts, {len(self._shell_with_cavity.faces):,} faces')
                 
                 # Show hard shell options in display panel (including collar)
-                self.display_options.show_hard_shell_options(show_cavity=True, show_prism=True, show_collar=has_collar, show_halves=False)
+                self.display_options.show_hard_shell_options(show_cavity=True, show_prism=True, show_collar=has_collar, show_blade=has_blade, show_halves=False)
                 self.display_options.show()
             else:
                 self.shell_stats.add_header('Hard Shell Generated', Colors.WARNING if not self._csg_success else Colors.SUCCESS)
                 if not self._csg_success:
                     self.shell_stats.add_row('⚠️ CSG subtraction failed - showing prism only')
                 # Still show display options for prism and collar
-                self.display_options.show_hard_shell_options(show_cavity=False, show_prism=True, show_collar=has_collar, show_halves=False)
+                self.display_options.show_hard_shell_options(show_cavity=False, show_prism=True, show_collar=has_collar, show_blade=has_blade, show_halves=False)
                 self.display_options.show()
             
             # Show collar details if available
@@ -6599,10 +6619,12 @@ class MainWindow(QMainWindow):
         self._outer_collar_result = None
         self._shell_half_1 = None
         self._shell_half_2 = None
+        self._cutting_blade = None
         self._csg_success = False
         self.mesh_viewer.remove_hard_shell_prism()
         self.mesh_viewer.remove_shell_with_cavity()
         self.mesh_viewer.remove_outer_collar()
+        self.mesh_viewer.remove_cutting_blade()
         self.mesh_viewer.remove_shell_half_1()
         self.mesh_viewer.remove_shell_half_2()
         
@@ -6623,18 +6645,24 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'shell_progress_label'):
             self.shell_progress_label.setText(message)
 
-    def _on_hard_shell_complete(self, prism_result, shell_with_cavity, collar_result, shell_half_1, shell_half_2, csg_success):
+    def _on_hard_shell_complete(self, prism_result, shell_with_cavity, collar_result, shell_half_1, shell_half_2, cutting_blade, csg_success):
         self._hard_shell_prism_result = prism_result
         self._shell_with_cavity = shell_with_cavity
         self._outer_collar_result = collar_result
         self._shell_half_1 = shell_half_1
         self._shell_half_2 = shell_half_2
+        self._cutting_blade = cutting_blade
         self._csg_success = csg_success
         
         # Show the outer collar extension (extended parting surface)
         if collar_result is not None and collar_result.mesh is not None:
             self.mesh_viewer.show_outer_collar(collar_result.mesh)
             self.mesh_viewer.set_outer_collar_visible(False)  # Hidden by default
+        
+        # Show the cutting blade (the thin thickened membrane used to split the shell)
+        if cutting_blade is not None:
+            self.mesh_viewer.show_cutting_blade(cutting_blade)
+            self.mesh_viewer.set_cutting_blade_visible(False)  # Hidden by default
         
         if csg_success and shell_with_cavity is not None:
             # Show the shell with cavity (prism - hull) but hide it by default
@@ -6681,6 +6709,9 @@ class MainWindow(QMainWindow):
 
     def _on_toggle_outer_collar(self, show: bool):
         self.mesh_viewer.set_outer_collar_visible(show)
+
+    def _on_toggle_cutting_blade(self, show: bool):
+        self.mesh_viewer.set_cutting_blade_visible(show)
 
     def _on_toggle_shell_half_1(self, show: bool):
         self.mesh_viewer.set_shell_half_1_visible(show)
@@ -8263,6 +8294,7 @@ class MainWindow(QMainWindow):
         self._outer_collar_result = None
         self._shell_half_1 = None
         self._shell_half_2 = None
+        self._cutting_blade = None
         self._csg_success = False
         
         # Clear metamold results
@@ -8537,6 +8569,7 @@ class MainWindow(QMainWindow):
             'outer_collar_result': result_to_dict(self._outer_collar_result),
             'shell_half_1': mesh_to_dict(self._shell_half_1),
             'shell_half_2': mesh_to_dict(self._shell_half_2),
+            'cutting_blade': mesh_to_dict(self._cutting_blade),
             'csg_success': self._csg_success,
             
             # Metamold state
@@ -8913,6 +8946,9 @@ class MainWindow(QMainWindow):
         if session.get('shell_half_2'):
             self._shell_half_2 = dict_to_mesh(session['shell_half_2'])
         
+        if session.get('cutting_blade'):
+            self._cutting_blade = dict_to_mesh(session['cutting_blade'])
+        
         self._csg_success = session.get('csg_success', False)
         
         # Restore hard shell viewer state
@@ -8924,11 +8960,16 @@ class MainWindow(QMainWindow):
                          hasattr(self._outer_collar_result, 'mesh') and 
                          self._outer_collar_result.mesh is not None)
             has_halves = self._shell_half_1 is not None and self._shell_half_2 is not None
+            has_blade = self._cutting_blade is not None
             
             try:
                 if has_collar:
                     self.mesh_viewer.show_outer_collar(self._outer_collar_result.mesh)
                     self.mesh_viewer.set_outer_collar_visible(False)
+                
+                if has_blade:
+                    self.mesh_viewer.show_cutting_blade(self._cutting_blade)
+                    self.mesh_viewer.set_cutting_blade_visible(False)
                 
                 if has_prism:
                     self.mesh_viewer.show_hard_shell_prism(self._hard_shell_prism_result.prism_mesh)
@@ -8946,6 +8987,7 @@ class MainWindow(QMainWindow):
                     show_cavity=has_cavity,
                     show_prism=has_prism,
                     show_collar=has_collar,
+                    show_blade=has_blade,
                     show_halves=has_halves
                 )
             except Exception as e:

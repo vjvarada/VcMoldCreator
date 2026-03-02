@@ -3181,30 +3181,41 @@ def _classify_boundary_edge(
     vertex_boundary_type: Optional[np.ndarray],
     vert_to_part_dist: Dict[int, float],
     vert_to_hull_dist: Dict[int, float],
-    part_proximity_threshold: float = 0.1  # Reduced from 0.5 to be more conservative
+    part_proximity_threshold: float = 0.1
 ) -> Tuple[bool, str]:
     """
     Classify a boundary edge as inner (part) or outer (hull).
-    
-    Classification priority (STRICT - only inner if BOTH vertices are on part):
-    1. HIGHEST: Both vertices have vertex_boundary_type == -1 → inner
-    2. REJECT: Either vertex has vertex_boundary_type == 1 or 2 → outer (NOT inner)
-    3. PRIMARY: Both vertices closer to part than hull by margin → inner (requires hull distances)
-    4. FALLBACK: Only if no other info, both vertices very close to part → inner
-    
-    IMPORTANT: This function is CONSERVATIVE - when in doubt, classify as OUTER.
-    It's better to miss an inner edge than to incorrectly collar an outer edge.
-    
+
+    Classification priority:
+
+    1. **Stale-hull override** — If either vertex has bt 1/2 but BOTH are
+       close to the part surface (d_part < threshold) and at least as
+       close to part as to hull (d_part <= d_hull + eps), the hull label
+       is considered stale (moved during smoothing) and the edge is
+       accepted as inner.
+    2. **Hull reject** — If either vertex has bt 1/2 and the override
+       does not apply → outer.
+    3. **Both part** — Both bt == -1 → inner.
+    4. **Mixed part/interior** — One bt == -1, other 0 → inner.
+    5. **Distance-based** — Both bt == 0 (or no bt): compare d_part vs
+       d_hull with 80 % margin; fall back to proximity threshold.
+
+    A separate proximity rescue pass (STEP 2b in the caller) catches any
+    remaining outer edges where both vertices and midpoint are genuinely
+    close to the part.
+
     Args:
-        v0, v1: Vertex indices
-        vertex_boundary_type: Array with -1=part, 0=interior, 1/2=hull
-        vert_to_part_dist: Precomputed distances to part mesh
-        vert_to_hull_dist: Precomputed distances to hull mesh (empty if no hull)
-        part_proximity_threshold: Distance threshold for fallback classification (conservative)
-    
+        v0, v1: Vertex indices.
+        vertex_boundary_type: Array with -1=part, 0=interior, 1/2=hull.
+        vert_to_part_dist: Pre-computed distances to part mesh.
+        vert_to_hull_dist: Pre-computed distances to hull mesh (empty if
+            no hull).
+        part_proximity_threshold: Distance threshold for fallback
+            classification.
+
     Returns:
-        Tuple of (is_inner, reason) where is_inner is True if edge is inner
-        (part) boundary, and reason is a string describing the classification.
+        ``(is_inner, reason)`` — *is_inner* is True when the edge should
+        receive a collar; *reason* is a human-readable tag for logging.
     """
     has_boundary_type = vertex_boundary_type is not None and len(vertex_boundary_type) > 0
     has_hull_dist = len(vert_to_hull_dist) > 0
@@ -4413,22 +4424,39 @@ def create_robust_collar_extension(
     """
     Create robust collar extension for inner boundary edges.
     
-    Algorithm:
-    1. Find inner boundary edges (touching part, not hull)
-    2. Create collar vertices by projecting edge endpoints onto part and offsetting inward
-    3. Create quad collars connecting membrane edges to collar edges
-    4. Create fan triangles at corners and isolated tip vertices
+    Extends the membrane toward the part surface along every inner
+    (part-touching) boundary edge so that the final mold cavity has a
+    clean seal against the cast object.
+    
+    Pipeline:
+        1. Find boundary edges (edge_face_count == 1).
+        2. Classify each edge as inner/outer via ``_classify_boundary_edge``
+           with stale-hull-label override + a proximity rescue pass
+           (STEP 2b) that promotes outer edges close to the part.
+        3. Detect boundary-vertex topology (fans, quads, corners, tips).
+        3b. Greedily downgrade adjacent fans to quads for strip continuity.
+        4. Phase 1 — shared collar vertex per QUAD vertex (averaged perp).
+           Phase 2 — per-edge collar per FAN vertex (face-normal perp),
+           with automatic quad-linking and geometry-less fallback.
+        4b. Snap-to-surface: push any collar vertex outside the part
+            back onto the surface.
+        5. Assemble quad strips along each inner boundary edge.
+        6. Create fan triangles at fan vertices.
+        6b. Iterative extension (up to ``MAX_COLLAR_EXTENSION_ITERATIONS``).
+        6c. Final frontier inward push.
+        7. Build result mesh.
     
     Args:
-        membrane_mesh: The smoothed membrane mesh
-        part_mesh: The part mesh to connect to
-        hull_mesh: Optional hull mesh for accurate boundary classification
-        vertex_boundary_type: Array with -1=part, 0=interior, 1/2=hull
-        collar_depth: How far to extend into part (mm)
-        restored_corner_positions: Optional positions of restored concave corners
+        membrane_mesh: The smoothed membrane mesh.
+        part_mesh: The part mesh to connect to.
+        hull_mesh: Optional hull mesh for boundary classification.
+        vertex_boundary_type: Array with -1=part, 0=interior, 1/2=hull.
+        collar_depth: How far to extend into part (mm).
+        restored_corner_positions: Optional positions of restored concave
+            corners (currently unused, reserved for future parity).
     
     Returns:
-        FloatingEdgeFillingResult with the collared mesh
+        ``FloatingEdgeFillingResult`` with the collared mesh.
     """
     import time
     start = time.time()
@@ -4546,21 +4574,6 @@ def create_robust_collar_extension(
                f"(proximity threshold: {relative_proximity_threshold:.4f})")
     logger.info(f"Classification breakdown: {classification_reasons}")
     
-    # Log details of outer edges that might be misclassified (both bt==0)
-    suspicious_outer = [(edge, reason) for edge, reason in outer_edge_reasons
-                        if 'too_far_from_part' in reason]
-    if suspicious_outer:
-        logger.warning(f"COLLAR DEBUG: {len(suspicious_outer)} boundary edges classified OUTER "
-                      f"via 'too_far_from_part' — these may be inner edges that lost "
-                      f"boundary_type during smoothing:")
-        for (v0, v1), reason in suspicious_outer[:20]:  # Log first 20
-            d0 = vert_to_part_dist.get(v0, -1)
-            d1 = vert_to_part_dist.get(v1, -1)
-            bt0 = vertex_boundary_type[v0] if vertex_boundary_type is not None and v0 < len(vertex_boundary_type) else None
-            bt1 = vertex_boundary_type[v1] if vertex_boundary_type is not None and v1 < len(vertex_boundary_type) else None
-            logger.warning(f"  Edge ({v0},{v1}): bt=({bt0},{bt1}), "
-                          f"d_part=({d0:.4f},{d1:.4f}), reason={reason}")
-    
     # =========================================================================
     # STEP 2b: Proximity-based inner edge rescue
     # =========================================================================
@@ -4662,7 +4675,7 @@ def create_robust_collar_extension(
     # can twist or overlap.  Keep the sharper vertex (smaller edge angle) as
     # a fan and downgrade the other to a quad.
     
-    _fan_sets = [
+    fan_category_sets = [
         boundary_info.sharp_corners,
         boundary_info.high_valence,
         boundary_info.isolated_tips,
@@ -4671,47 +4684,47 @@ def create_robust_collar_extension(
         boundary_info.protrusion_tips,
         boundary_info.collar_spread_predicted,
     ]
-    _current_fans = set()
-    for _fs in _fan_sets:
-        _current_fans.update(_fs)
+    current_fans = set()
+    for fs in fan_category_sets:
+        current_fans.update(fs)
     
     # Build adjacency from inner boundary edges
-    _boundary_adj: Dict[int, set] = {}
-    for _v0, _v1 in inner_boundary_edges:
-        _boundary_adj.setdefault(_v0, set()).add(_v1)
-        _boundary_adj.setdefault(_v1, set()).add(_v0)
+    boundary_adj: Dict[int, set] = {}
+    for bv0, bv1 in inner_boundary_edges:
+        boundary_adj.setdefault(bv0, set()).add(bv1)
+        boundary_adj.setdefault(bv1, set()).add(bv0)
     
     # Greedy: iterate fans sorted by edge angle ascending (sharpest first).
     # The sharpest vertex keeps its fan; its neighbours are downgraded.
-    _fan_angles = []
-    for _vi in _current_fans:
-        _angle = boundary_info.vertex_edge_angles.get(_vi, 180.0)
-        _fan_angles.append((_angle, _vi))
-    _fan_angles.sort()  # sharpest (smallest angle) first
+    fan_angles = []
+    for vi in current_fans:
+        angle = boundary_info.vertex_edge_angles.get(vi, 180.0)
+        fan_angles.append((angle, vi))
+    fan_angles.sort()  # sharpest (smallest angle) first
     
-    _kept_fans: set = set()
-    _downgraded: set = set()
-    for _angle, _vi in _fan_angles:
-        if _vi in _downgraded:
+    kept_fans: set = set()
+    downgraded_fans: set = set()
+    for angle, vi in fan_angles:
+        if vi in downgraded_fans:
             continue
-        _kept_fans.add(_vi)
+        kept_fans.add(vi)
         # Downgrade all fan neighbours of this vertex
-        for _nb in _boundary_adj.get(_vi, set()):
-            if _nb in _current_fans and _nb not in _kept_fans:
-                _downgraded.add(_nb)
+        for nb in boundary_adj.get(vi, set()):
+            if nb in current_fans and nb not in kept_fans:
+                downgraded_fans.add(nb)
     
-    if _downgraded:
-        logger.info(f"Downgraded {len(_downgraded)} adjacent fan vertices to quads: "
-                   f"{sorted(_downgraded)}")
+    if downgraded_fans:
+        logger.info(f"Downgraded {len(downgraded_fans)} adjacent fan vertices to quads: "
+                   f"{sorted(downgraded_fans)}")
         # Remove downgraded vertices from every fan list
-        for _fs in _fan_sets:
-            for _vi in list(_fs):
-                if _vi in _downgraded:
-                    _fs.remove(_vi)
+        for fs in fan_category_sets:
+            for vi in list(fs):
+                if vi in downgraded_fans:
+                    fs.remove(vi)
         # Add them to corners (quad treatment)
-        for _vi in _downgraded:
-            if _vi not in boundary_info.corners:
-                boundary_info.corners.append(_vi)
+        for vi in downgraded_fans:
+            if vi not in boundary_info.corners:
+                boundary_info.corners.append(vi)
     
     # =========================================================================
     # STEP 4: Create collar vertices for each edge endpoint
@@ -4838,12 +4851,11 @@ def create_robust_collar_extension(
         vertices.append(collar_pt.copy())
         quad_vertex_collar[vi] = collar_idx
     
-    # PHASE 2: Create per-edge collar vertices for FAN vertices
-    # (Fan vertices need separate collars per edge for the fan triangle arcs)
-    _phase2_no_face = 0
-    _phase2_degenerate = 0
-    _phase2_linked_quad = 0
-    _phase2_created_fan = 0
+    # PHASE 2: Create per-edge collar vertices for FAN vertices and link
+    # quad vertices from Phase 1.  Fan vertices get a separate collar per
+    # edge so the fan triangle arcs remain coplanar with each face.
+    phase2_fan_created = 0
+    phase2_skipped = 0
     
     for v0, v1 in inner_boundary_edges:
         edge_key = (min(v0, v1), max(v0, v1))
@@ -4852,137 +4864,66 @@ def create_robust_collar_extension(
             edge_endpoint_collar[edge_key] = {}
         
         face_info = edge_to_face.get(edge_key)
-        if face_info is None:
-            _phase2_no_face += 1
-            # NOTE: Don't skip entirely — link quad vertices first
-            # (Recovery step below will handle remaining gaps)
-            for vi in [v0, v1]:
-                if vi not in edge_endpoint_collar[edge_key] and vi in quad_vertex_collar:
-                    edge_endpoint_collar[edge_key][vi] = quad_vertex_collar[vi]
-                    _phase2_linked_quad += 1
-            continue
-        
-        fi, _ = face_info
+        fi = face_info[0] if face_info is not None else None
         
         v0_pos, v1_pos = vertices_arr[v0], vertices_arr[v1]
         edge_vec = v1_pos - v0_pos
         edge_len = np.linalg.norm(edge_vec)
-        if edge_len < 1e-8:
-            _phase2_degenerate += 1
-            # NOTE: Don't skip entirely — link quad vertices first
-            for vi in [v0, v1]:
-                if vi not in edge_endpoint_collar[edge_key] and vi in quad_vertex_collar:
-                    edge_endpoint_collar[edge_key][vi] = quad_vertex_collar[vi]
-                    _phase2_linked_quad += 1
-            continue
-        edge_dir = edge_vec / edge_len
+        has_geometry = face_info is not None and edge_len >= 1e-8
+        edge_dir = edge_vec / edge_len if has_geometry else None
+        
+        if not has_geometry:
+            phase2_skipped += 1
         
         for vi in [v0, v1]:
             if vi in edge_endpoint_collar[edge_key]:
                 continue
             
-            # For QUAD vertices: use the shared collar from Phase 1
+            # QUAD vertices: link to the shared collar from Phase 1
             if vi in quad_vertex_collar:
                 edge_endpoint_collar[edge_key][vi] = quad_vertex_collar[vi]
-                _phase2_linked_quad += 1
                 continue
             
-            # For FAN vertices: create per-edge collar vertex using
-            # the FACE NORMAL of the adjacent face (not vertex normal).
-            # This keeps each collar vertex coplanar with its specific
-            # membrane face, rather than an averaged plane that may
-            # not match any face.
+            # FAN vertices: create per-edge collar using the adjacent
+            # face normal (keeps collar coplanar with that face).
             vi_pos = vertices_arr[vi]
-            face_n = (membrane_face_normals[fi]
-                      if fi < len(membrane_face_normals)
-                      else vertex_normals.get(vi, np.array([0.0, 0.0, 1.0])))
-            face_n_len = np.linalg.norm(face_n)
-            if face_n_len < 1e-10:
-                face_n = vertex_normals.get(vi, np.array([0.0, 0.0, 1.0]))
-            else:
-                face_n = face_n / face_n_len
-            
-            perp = np.cross(face_n, edge_dir)
-            perp_len = np.linalg.norm(perp)
             collar_hint = None
-            if perp_len > 1e-8:
-                perp = perp / perp_len
-                face_verts = faces_arr[fi]
-                third_v = [fv for fv in face_verts if fv != v0 and fv != v1]
-                if third_v:
-                    to_third = vertices_arr[third_v[0]] - vi_pos
-                    if np.dot(perp, to_third) > 0:
-                        perp = -perp
-                collar_hint = perp
             
-            collar_pt = _create_collar_vertex(vi_pos, part_mesh, part_face_normals, collar_depth, collar_hint)
+            if has_geometry:
+                face_n = (membrane_face_normals[fi]
+                          if fi < len(membrane_face_normals)
+                          else vertex_normals.get(vi, np.array([0.0, 0.0, 1.0])))
+                face_n_len = np.linalg.norm(face_n)
+                if face_n_len < 1e-10:
+                    face_n = vertex_normals.get(vi, np.array([0.0, 0.0, 1.0]))
+                else:
+                    face_n = face_n / face_n_len
+                
+                perp = np.cross(face_n, edge_dir)
+                perp_len = np.linalg.norm(perp)
+                if perp_len > 1e-8:
+                    perp = perp / perp_len
+                    face_verts = faces_arr[fi]
+                    third_v = [fv for fv in face_verts if fv != v0 and fv != v1]
+                    if third_v:
+                        to_third = vertices_arr[third_v[0]] - vi_pos
+                        if np.dot(perp, to_third) > 0:
+                            perp = -perp
+                    collar_hint = perp
+            
+            collar_pt = _create_collar_vertex(
+                vi_pos, part_mesh, part_face_normals, collar_depth, collar_hint)
+            # Skip degenerate collar (coincident with source vertex)
+            if np.linalg.norm(collar_pt - vi_pos) < 1e-8:
+                continue
             collar_idx = len(vertices)
             vertices.append(collar_pt.copy())
             edge_endpoint_collar[edge_key][vi] = collar_idx
-            _phase2_created_fan += 1
+            phase2_fan_created += 1
     
-    logger.info(f"Phase 2 summary: linked {_phase2_linked_quad} quad collars, "
-               f"created {_phase2_created_fan} fan collars, "
-               f"skipped {_phase2_no_face} edges (no face), "
-               f"{_phase2_degenerate} edges (degenerate)")
-    
-    # =========================================================================
-    # PHASE 2b RECOVERY: Fill missing collar vertices for inner boundary edges
-    # =========================================================================
-    # Phase 2 skips edges early when face_info is None or edge_len < 1e-8,
-    # before linking quad vertices from Phase 1. This recovery step ensures
-    # that every inner boundary edge vertex has a collar vertex entry.
-    
-    _recovery_linked = 0
-    _recovery_created = 0
-    _recovery_skipped_degenerate = 0
-    _edges_missing_before = 0
-    
-    for v0, v1 in inner_boundary_edges:
-        edge_key = (min(v0, v1), max(v0, v1))
-        
-        if edge_key not in edge_endpoint_collar:
-            edge_endpoint_collar[edge_key] = {}
-        
-        collar_data = edge_endpoint_collar[edge_key]
-        
-        for vi in [v0, v1]:
-            if vi in collar_data:
-                continue  # Already has collar vertex for this edge
-            
-            _edges_missing_before += 1
-            
-            # Try to link from Phase 1 shared collar
-            if vi in quad_vertex_collar:
-                collar_data[vi] = quad_vertex_collar[vi]
-                _recovery_linked += 1
-                continue
-            
-            # Vertex is a fan vertex or otherwise has no collar at all.
-            # Create a fallback collar vertex using closest-point-on-part.
-            vi_pos = vertices_arr[vi]
-            collar_pt = _create_collar_vertex(
-                vi_pos, part_mesh, part_face_normals, collar_depth, None
-            )
-            # Safety: skip if collar point is coincident with vertex
-            if np.linalg.norm(collar_pt - vi_pos) < 1e-8:
-                _recovery_skipped_degenerate += 1
-                continue
-            collar_idx = len(vertices)
-            vertices.append(collar_pt.copy())
-            collar_data[vi] = collar_idx
-            _recovery_created += 1
-    
-    if _edges_missing_before > 0:
-        logger.info(
-            f"COLLAR RECOVERY: {_edges_missing_before} vertex-edge pairs "
-            f"were missing collar vertices after Phase 2. "
-            f"Linked {_recovery_linked} from Phase 1 shared collars, "
-            f"created {_recovery_created} fallback collars, "
-            f"skipped {_recovery_skipped_degenerate} degenerate."
-        )
-    
-    logger.info(f"Created {len(vertices) - n_orig_verts} collar vertices")
+    logger.info(f"Phase 2: created {phase2_fan_created} fan collars"
+               f"{f', {phase2_skipped} edges lacked geometry' if phase2_skipped else ''}")
+    logger.info(f"Created {len(vertices) - n_orig_verts} collar vertices total")
 
     # =========================================================================
     # STEP 4b: Snap-to-surface validation for collar vertices
@@ -4993,43 +4934,43 @@ def create_robust_collar_extension(
     # inward surface normal.  This catches cases where the hint-based
     # direction was tangential to the part and the collar vertex ended up
     # just outside the surface.
-    _n_collar_verts = len(vertices) - n_orig_verts
-    if _n_collar_verts > 0:
-        _collar_indices = list(range(n_orig_verts, len(vertices)))
-        _collar_positions = np.array([vertices[ci] for ci in _collar_indices], dtype=np.float64)
+    n_collar_verts = len(vertices) - n_orig_verts
+    if n_collar_verts > 0:
+        collar_indices = list(range(n_orig_verts, len(vertices)))
+        collar_positions = np.array([vertices[ci] for ci in collar_indices], dtype=np.float64)
         try:
-            _collar_inside = part_mesh.contains(_collar_positions)
-            _collar_outside_count = int(np.sum(~_collar_inside))
-            if _collar_outside_count > 0:
-                _outside_local = np.where(~_collar_inside)[0]
-                _outside_positions = _collar_positions[_outside_local]
-                _cp_pts, _, _cp_faces = trimesh.proximity.closest_point(
-                    part_mesh, _outside_positions)
-                _snap_push = collar_depth * 0.5  # push half collar_depth inward
-                _n_snapped = 0
-                for _oi, _li in enumerate(_outside_local):
-                    _ci = _collar_indices[_li]
-                    _pfi = _cp_faces[_oi]
-                    if _pfi < len(part_face_normals):
-                        _pn = part_face_normals[_pfi]
-                        _pn_len = np.linalg.norm(_pn)
-                        if _pn_len > 1e-10:
-                            _into = -_pn / _pn_len
-                            vertices[_ci] = (_cp_pts[_oi] + _snap_push * _into).copy()
+            collar_inside = part_mesh.contains(collar_positions)
+            n_outside = int(np.sum(~collar_inside))
+            if n_outside > 0:
+                outside_local = np.where(~collar_inside)[0]
+                outside_positions = collar_positions[outside_local]
+                cp_pts, _, cp_faces = trimesh.proximity.closest_point(
+                    part_mesh, outside_positions)
+                snap_push = collar_depth * 0.5  # push half collar_depth inward
+                n_snapped = 0
+                for oi, li in enumerate(outside_local):
+                    ci = collar_indices[li]
+                    pfi = cp_faces[oi]
+                    if pfi < len(part_face_normals):
+                        pn = part_face_normals[pfi]
+                        pn_len = np.linalg.norm(pn)
+                        if pn_len > 1e-10:
+                            into = -pn / pn_len
+                            vertices[ci] = (cp_pts[oi] + snap_push * into).copy()
                         else:
-                            vertices[_ci] = _cp_pts[_oi].copy()
+                            vertices[ci] = cp_pts[oi].copy()
                     else:
-                        vertices[_ci] = _cp_pts[_oi].copy()
-                    _n_snapped += 1
+                        vertices[ci] = cp_pts[oi].copy()
+                    n_snapped += 1
                 logger.info(
-                    f"Step 4b: snapped {_n_snapped}/{_n_collar_verts} outside "
+                    f"Step 4b: snapped {n_snapped}/{n_collar_verts} outside "
                     "collar vertices to part surface + inward push")
             else:
                 logger.info(
-                    f"Step 4b: all {_n_collar_verts} collar vertices "
+                    f"Step 4b: all {n_collar_verts} collar vertices "
                     "already inside part mesh")
-        except Exception as _ex:
-            logger.warning(f"Step 4b: containment check failed ({_ex}), "
+        except Exception as ex:
+            logger.warning(f"Step 4b: containment check failed ({ex}), "
                           "skipping snap-to-surface")
 
     # =========================================================================
@@ -5041,14 +4982,12 @@ def create_robust_collar_extension(
     # These are complementary, not overlapping — quads and fans share an edge
     # at the fan vertex ([vi, c_vi]) but create triangles on opposite sides.
     
-    all_fan_vertices_set = set(boundary_info.get_all_fan_vertices())
-    
     quads_created = 0
     both_fan_skipped = 0
     
     for v0, v1 in inner_boundary_edges:
-        v0_is_fan = v0 in all_fan_vertices_set
-        v1_is_fan = v1 in all_fan_vertices_set
+        v0_is_fan = v0 in all_fan_verts_set
+        v1_is_fan = v1 in all_fan_verts_set
         
         edge_key = (min(v0, v1), max(v0, v1))
         collar_data = edge_endpoint_collar.get(edge_key, {})
@@ -5114,66 +5053,9 @@ def create_robust_collar_extension(
     
     edges_without_quads = len(inner_boundary_edges) - quads_created
     if edges_without_quads > 0:
-        logger.warning(f"{edges_without_quads} inner boundary edges did not receive quad collars "
-                      f"(likely missing collar vertices)")
-    
-    # =========================================================================
-    # STEP 5b: COLLAR VALIDATION — ensure every inner edge got a collar
-    # =========================================================================
-    # This is a comprehensive debugging step that checks every inner boundary
-    # edge and reports exactly why any edge failed to get a collar quad.
-    _edges_with_collar = 0
-    _edges_missing_collar = 0
-    _missing_reasons: Dict[str, int] = {}
-    _missing_edge_details: List[str] = []
-    
-    for v0, v1 in inner_boundary_edges:
-        edge_key = (min(v0, v1), max(v0, v1))
-        collar_data = edge_endpoint_collar.get(edge_key, {})
-        c0, c1 = collar_data.get(v0), collar_data.get(v1)
-        
-        if c0 is not None and c1 is not None:
-            _edges_with_collar += 1
-            continue
-        
-        _edges_missing_collar += 1
-        
-        # Diagnose WHY
-        reasons = []
-        for vi, ci, label in [(v0, c0, 'v0'), (v1, c1, 'v1')]:
-            if ci is not None:
-                continue
-            
-            # Check if vertex is endpoint (1 boundary edge only)
-            is_endpoint = vi in boundary_info.endpoints
-            is_fan = vi in all_fan_vertices_set
-            has_shared = vi in quad_vertex_collar
-            has_face = edge_to_face.get(edge_key) is not None
-            edge_len = np.linalg.norm(vertices_arr[v1] - vertices_arr[v0])
-            bt = vertex_boundary_type[vi] if vertex_boundary_type is not None and vi < len(vertex_boundary_type) else None
-            d_part = vert_to_part_dist.get(vi, -1)
-            
-            detail = (f"{label}={vi}(bt={bt},d_part={d_part:.4f},"
-                     f"endpoint={is_endpoint},fan={is_fan},"
-                     f"shared_collar={has_shared},face_exists={has_face},"
-                     f"edge_len={edge_len:.6f})")
-            reasons.append(detail)
-        
-        reason_key = "no_collar_data" if not collar_data else f"partial(c0={'ok' if c0 else 'MISSING'},c1={'ok' if c1 else 'MISSING'})"
-        _missing_reasons[reason_key] = _missing_reasons.get(reason_key, 0) + 1
-        _missing_edge_details.append(f"  Edge ({v0},{v1}): {'; '.join(reasons)}")
-    
-    logger.info(f"COLLAR VALIDATION: {_edges_with_collar}/{len(inner_boundary_edges)} inner "
-               f"boundary edges have complete collar quads")
-    
-    if _edges_missing_collar > 0:
-        logger.warning(f"COLLAR VALIDATION: {_edges_missing_collar} inner edges MISSING collars. "
-                      f"Reason breakdown: {_missing_reasons}")
-        # Log individual edge details (up to 30)
-        for detail in _missing_edge_details[:30]:
-            logger.warning(f"COLLAR MISSING:{detail}")
-        if len(_missing_edge_details) > 30:
-            logger.warning(f"  ... and {len(_missing_edge_details) - 30} more")
+        logger.warning(
+            f"{edges_without_quads}/{len(inner_boundary_edges)} inner boundary "
+            "edges did not receive collar quads (missing collar vertices)")
     
     # =========================================================================
     # STEP 6: Create fan triangles at all fan vertices
@@ -5183,7 +5065,7 @@ def create_robust_collar_extension(
     total_fan_tris = 0
     
     # Use the pre-computed fan vertices
-    all_fan_vertices = list(all_fan_vertices_set)
+    all_fan_vertices = list(all_fan_verts_set)
     
     # Detailed breakdown for logging
     n_angle_based = (len(boundary_info.isolated_tips) +

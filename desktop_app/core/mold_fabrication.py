@@ -1028,6 +1028,98 @@ def create_shell_with_cavity(
         return None, elapsed_ms, False
 
 
+# ============================================================================
+# SURFACE THICKENING CORE
+# ============================================================================
+
+def _orient_normals_to_direction(
+    vertex_normals: np.ndarray,
+    direction: np.ndarray,
+) -> np.ndarray:
+    """
+    Flip per-vertex normals so they all point into the same half-space
+    as *direction*, then re-normalise.
+
+    Args:
+        vertex_normals: (N, 3) per-vertex unit normals (modified in-place).
+        direction: (3,) reference direction.
+
+    Returns:
+        The (possibly flipped) normals array.
+    """
+    dots = np.dot(vertex_normals, direction)
+    vertex_normals[dots < 0] *= -1
+    norms = np.linalg.norm(vertex_normals, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-10, 1.0, norms)
+    vertex_normals /= norms
+    return vertex_normals
+
+
+def _thicken_surface_along_normals(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    vertex_normals: np.ndarray,
+    half_thickness: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Thicken a triangle surface into a closed shell by offsetting each
+    vertex along its normal in both directions and stitching side walls
+    at boundary edges.
+
+    This is the shared geometric kernel used by every blade / volume /
+    thicken function in this module.
+
+    Args:
+        vertices: (N, 3) surface vertex positions.
+        faces: (F, 3) triangle indices into *vertices*.
+        vertex_normals: (N, 3) unit normals (already oriented).
+        half_thickness: Offset distance on each side of the surface.
+
+    Returns:
+        ``(all_vertices, all_faces)`` ready for ``trimesh.Trimesh``.
+        Vertex layout is ``[bottom_copy, top_copy]``.
+    """
+    n_verts = len(vertices)
+
+    top_vertices = vertices + vertex_normals * half_thickness
+    bottom_vertices = vertices - vertex_normals * half_thickness
+    all_vertices = np.vstack([bottom_vertices, top_vertices])
+
+    # Bottom cap (reversed winding) + top cap (offset indices)
+    bottom_faces = faces[:, ::-1]
+    top_faces = faces + n_verts
+
+    # Side walls along boundary edges (edge_face_count == 1)
+    edge_count: Dict[Tuple[int, int], int] = {}
+    edge_to_face: Dict[Tuple[int, int], Tuple[int, int, int]] = {}
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            ek = (min(v0, v1), max(v0, v1))
+            edge_count[ek] = edge_count.get(ek, 0) + 1
+            if ek not in edge_to_face:
+                edge_to_face[ek] = (fi, v0, v1)
+
+    side_faces = []
+    for ek, cnt in edge_count.items():
+        if cnt != 1:
+            continue
+        _, a, b = edge_to_face[ek]
+        side_faces.append([a, b, b + n_verts])
+        side_faces.append([a, b + n_verts, a + n_verts])
+
+    parts = [bottom_faces, top_faces]
+    if side_faces:
+        parts.append(np.array(side_faces, dtype=np.int64))
+    all_faces = np.vstack(parts)
+
+    return all_vertices, all_faces
+
+
+# ============================================================================
+# CUTTING VOLUME / BLADE CONSTRUCTORS
+# ============================================================================
+
 def _create_cutting_volume_from_surface(
     parting_surface: trimesh.Trimesh,
     pouring_direction: np.ndarray,
@@ -1036,370 +1128,123 @@ def _create_cutting_volume_from_surface(
     """
     Create a thick volume from the parting surface for CSG splitting.
     
-    The volume is created by extruding the parting surface along the pouring direction
-    in both directions, creating a "slab" that can be used for CSG operations.
+    The volume is created by offsetting the parting surface along each
+    vertex's surface normal in both directions, creating a uniformly
+    thick slab that can be used for CSG operations.  This ensures the
+    gap thickness is constant across the membrane regardless of its
+    orientation relative to the pouring direction.
     
     Args:
         parting_surface: The parting surface mesh (with extended collar)
-        pouring_direction: The pouring direction (extrusion axis)
-        thickness: Total thickness of the slab (extends thickness/2 in each direction)
+        pouring_direction: The pouring direction (used to orient normals
+            consistently so "top" faces the positive direction)
+        thickness: Total thickness of the slab (extends thickness/2 in
+            each direction along the surface normal)
         
     Returns:
         A watertight volume mesh for CSG operations
     """
-    # Normalize direction
     direction = np.array(pouring_direction, dtype=np.float64)
     direction = direction / (np.linalg.norm(direction) + 1e-10)
-    
-    # Get surface vertices and faces
+
     vertices = np.asarray(parting_surface.vertices, dtype=np.float64)
     faces = np.asarray(parting_surface.faces, dtype=np.int64)
-    n_verts = len(vertices)
-    n_faces = len(faces)
-    
-    half_thickness = thickness / 2.0
-    
-    # Create top and bottom surfaces by offsetting along the direction
-    top_vertices = vertices + direction * half_thickness
-    bottom_vertices = vertices - direction * half_thickness
-    
-    # Combined vertices: [bottom, top]
-    all_vertices = np.vstack([bottom_vertices, top_vertices])
-    
-    # Faces for bottom surface (reverse winding for outward normals)
-    bottom_faces = faces[:, ::-1]  # Reverse winding
-    
-    # Faces for top surface (offset indices)
-    top_faces = faces + n_verts
-    
-    # Side faces: find boundary edges and create quads
-    edge_count = {}
-    edge_to_face = {}
-    
-    for fi, face in enumerate(faces):
-        for i in range(3):
-            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-            edge_key = (min(v0, v1), max(v0, v1))
-            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
-            # Store oriented edge info for winding determination
-            if edge_key not in edge_to_face:
-                edge_to_face[edge_key] = (fi, v0, v1)
-    
-    # Boundary edges have count == 1
-    boundary_edges = [e for e, c in edge_count.items() if c == 1]
-    
-    side_faces = []
-    for v0, v1 in boundary_edges:
-        # Get the original edge orientation from the face
-        _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
-        
-        # Use face traversal order (orig_v0 → orig_v1) to determine winding.
-        # For boundary edge A→B in CCW face order, outward side normal = cross(B-A, dir).
-        # CCW from outside: A_bottom → B_bottom → B_top  and  A_bottom → B_top → A_top
-        a = orig_v0
-        b = orig_v1
-        side_faces.append([a, b, b + n_verts])
-        side_faces.append([a, b + n_verts, a + n_verts])
-    
-    # Combine all faces
-    all_faces = np.vstack([
-        bottom_faces,
-        top_faces,
-        np.array(side_faces, dtype=np.int64) if side_faces else np.zeros((0, 3), dtype=np.int64)
-    ])
-    
-    volume_mesh = trimesh.Trimesh(
-        vertices=all_vertices,
-        faces=all_faces,
-        process=False
+
+    temp_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    vnormals = _orient_normals_to_direction(
+        np.array(temp_mesh.vertex_normals, dtype=np.float64), direction
     )
+
+    all_verts, all_faces = _thicken_surface_along_normals(
+        vertices, faces, vnormals, thickness / 2.0
+    )
+
+    volume_mesh = trimesh.Trimesh(vertices=all_verts, faces=all_faces, process=False)
     volume_mesh.fix_normals()
     volume_mesh = _repair_mesh_for_csg(volume_mesh, 'cutting_volume')
 
-    logger.debug(f"Created cutting volume: {len(volume_mesh.vertices)} verts, {len(volume_mesh.faces)} faces, "
-                f"from {n_verts} surface verts, {len(boundary_edges)} boundary edges")
-
+    logger.debug("Created cutting volume: %dv, %df, thickness=%.1fmm",
+                 len(volume_mesh.vertices), len(volume_mesh.faces), thickness)
     return volume_mesh
 
 
 def _create_cutting_blade_from_membrane(
     membrane: trimesh.Trimesh,
     direction: np.ndarray,
-    thickness: float = 0.0001
+    thickness: float = 0.001
 ) -> trimesh.Trimesh:
     """
     Create a thin watertight "blade" volume from the membrane for cutting.
-    
-    The blade is created by extruding the membrane slightly in both directions
-    (+thickness/2 and -thickness/2) to create a thin solid volume that can be
-    subtracted from the shell to create a gap.
-    
+
+    The blade is created by offsetting the membrane along each vertex's
+    surface normal in both directions (±thickness/2) to create a thin
+    solid volume that can be subtracted from the shell to produce a
+    uniform-width gap.
+
+    Before thickening the membrane is pre-cleaned (vertex merge +
+    meshlib round-trip) to fix triangle-soup connectivity and
+    non-manifold T-junctions.
+
     Args:
-        membrane: The membrane mesh (e.g., outer collar)
-        direction: Unit vector perpendicular to the membrane (pouring direction)
-        thickness: Total thickness of the blade (default: 0.0001mm = 0.1 micron)
-        
+        membrane: The membrane mesh (e.g., outer collar).
+        direction: Pouring direction (used to orient normals consistently).
+        thickness: Total blade thickness (default: 0.001 mm = 1 micron).
+
     Returns:
-        A watertight blade volume mesh
+        A watertight blade volume mesh.
     """
-    # Normalize direction
     direction = np.array(direction, dtype=np.float64)
     direction = direction / (np.linalg.norm(direction) + 1e-10)
 
-    # Export raw membrane to the debug directory so it can be inspected
-    # independently of the rest of the pipeline.
     save_debug_mesh(membrane, 'blade_input_membrane')
     logger.debug("Blade input membrane: %dv, %df, watertight=%s",
                  len(membrane.vertices), len(membrane.faces), membrane.is_watertight)
 
-    # Pre-clean membrane topology BEFORE extrusion.
-    #
-    # The membrane that arrives here is frequently a "triangle soup" — every
-    # face has its own three unique vertices (typical STL/marching-tets output).
-    # That means every edge looks like a boundary edge, which breaks boundary-
-    # loop detection and produces a blade that is all side-walls with no caps.
-    #
-    # Two-step fix:
-    #   1. trimesh merge_vertices (process=True) — welds coincident vertices so
-    #      the mesh has proper shared-edge connectivity.
-    #   2. meshlib round-trip — meshlib's half-edge structure cannot represent
-    #      non-manifold edges (T-junctions from marching tets). The round-trip
-    #      auto-splits them by vertex duplication so every edge is shared by at
-    #      most 2 faces WITHOUT triggering the 29× fixMeshDegeneracies explosion.
+    # ------------------------------------------------------------------
+    # Pre-clean membrane topology
+    # ------------------------------------------------------------------
+    # 1. trimesh merge_vertices  → weld coincident verts (triangle soup fix)
+    # 2. meshlib round-trip      → split non-manifold T-junction edges
     try:
-        import meshlib.mrmeshnumpy as _mrn_blade
-        import numpy as _np_blade
-
-        # Step 1: merge coincident vertices (fix triangle soup → connected mesh)
-        _merged = trimesh.Trimesh(
-            vertices=membrane.vertices,
-            faces=membrane.faces,
-            process=True,   # merges vertices, removes degenerate faces
-        )
-        logger.debug("Blade pre-clean step1 (merge): %dv/%df → %dv/%df",
+        import meshlib.mrmeshnumpy as _mrn
+        merged = trimesh.Trimesh(
+            vertices=membrane.vertices, faces=membrane.faces, process=True)
+        logger.debug("Blade pre-clean merge: %dv/%df → %dv/%df",
                      len(membrane.vertices), len(membrane.faces),
-                     len(_merged.vertices), len(_merged.faces))
+                     len(merged.vertices), len(merged.faces))
 
-        # Step 2: meshlib round-trip (fix non-manifold T-junction edges)
-        _mesh_mr = _mrn_blade.meshFromFacesVerts(
-            _merged.faces.astype(_np_blade.int32),
-            _merged.vertices.astype(_np_blade.float32),
-        )
-        vertices = _mrn_blade.getNumpyVerts(_mesh_mr).astype(np.float64)
-        faces = _mrn_blade.getNumpyFaces(_mesh_mr.topology).astype(np.int64)
-        logger.debug("Blade pre-clean step2 (meshlib): %dv/%df → %dv/%df",
-                     len(_merged.vertices), len(_merged.faces), len(vertices), len(faces))
+        mr_mesh = _mrn.meshFromFacesVerts(
+            merged.faces.astype(np.int32), merged.vertices.astype(np.float32))
+        vertices = _mrn.getNumpyVerts(mr_mesh).astype(np.float64)
+        faces = _mrn.getNumpyFaces(mr_mesh.topology).astype(np.int64)
+        logger.debug("Blade pre-clean meshlib: %dv/%df → %dv/%df",
+                     len(merged.vertices), len(merged.faces),
+                     len(vertices), len(faces))
 
-        # Export the pre-cleaned membrane so we can compare against the raw one
-        _cleaned = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-        save_debug_mesh(_cleaned, 'blade_input_membrane_precleaned')
-    except Exception as _exc:
-        logger.debug("meshlib blade pre-clean skipped (%s), using raw membrane", _exc)
+        save_debug_mesh(
+            trimesh.Trimesh(vertices=vertices, faces=faces, process=False),
+            'blade_input_membrane_precleaned')
+    except Exception as exc:
+        logger.debug("meshlib blade pre-clean skipped (%s), using raw membrane", exc)
         vertices = np.asarray(membrane.vertices, dtype=np.float64)
         faces = np.asarray(membrane.faces, dtype=np.int64)
-    n_verts = len(vertices)
 
-    half_thickness = thickness / 2.0
+    # ------------------------------------------------------------------
+    # Thicken along per-vertex normals
+    # ------------------------------------------------------------------
+    temp_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    vnormals = _orient_normals_to_direction(
+        np.array(temp_mesh.vertex_normals, dtype=np.float64), direction)
 
-    # Create vertices for both sides of the blade
-    # Bottom side: membrane shifted in -direction
-    bottom_vertices = vertices - direction * half_thickness
-    # Top side: membrane shifted in +direction
-    top_vertices = vertices + direction * half_thickness
-    
-    # Combined vertices: [bottom, top]
-    all_vertices = np.vstack([bottom_vertices, top_vertices])
-    
-    # Faces:
-    # 1. Bottom faces - reverse winding so normals point outward (downward)
-    bottom_faces = faces[:, ::-1]  # Reversed winding
-    
-    # 2. Top faces - keep original winding, offset indices
-    top_faces = faces + n_verts
-    
-    # 3. Side faces connecting boundary edges
-    edge_count = {}
-    edge_to_face = {}
-    
-    for fi, face in enumerate(faces):
-        for i in range(3):
-            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-            edge_key = (min(v0, v1), max(v0, v1))
-            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
-            if edge_key not in edge_to_face:
-                edge_to_face[edge_key] = (fi, v0, v1)
-    
-    # Boundary edges have count == 1
-    boundary_edges = [e for e, c in edge_count.items() if c == 1]
-    
-    side_faces = []
-    for v0, v1 in boundary_edges:
-        _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
-        
-        # Use the face's traversal order (orig_v0 → orig_v1) to determine winding.
-        # For boundary edge traversed A→B in the face's CCW order, the outward side
-        # normal is cross(B-A, extrusion_dir), so CCW from outside:
-        #   A_bottom → B_bottom → B_top → A_bottom  (first tri)
-        #   A_bottom → B_top    → A_top → A_bottom  (second tri)
-        # This is correct for BOTH outer and inner (hole) boundary loops.
-        a = orig_v0
-        b = orig_v1
-        side_faces.append([a, b, b + n_verts])
-        side_faces.append([a, b + n_verts, a + n_verts])
-    
-    # Combine all faces
-    all_faces_list = [bottom_faces, top_faces]
-    if side_faces:
-        all_faces_list.append(np.array(side_faces, dtype=np.int64))
-    all_faces = np.vstack(all_faces_list)
-    
-    blade_mesh = trimesh.Trimesh(
-        vertices=all_vertices,
-        faces=all_faces,
-        process=False
-    )
+    all_verts, all_faces = _thicken_surface_along_normals(
+        vertices, faces, vnormals, thickness / 2.0)
+
+    blade_mesh = trimesh.Trimesh(vertices=all_verts, faces=all_faces, process=False)
     blade_mesh.fix_normals()
     blade_mesh = _repair_mesh_for_csg(blade_mesh, 'cutting_blade')
 
-    logger.debug(f"Created cutting blade: {len(blade_mesh.vertices)} verts, {len(blade_mesh.faces)} faces, "
-                f"thickness={thickness:.6f}mm")
-
-    return blade_mesh
-
-
-def _create_tall_cutting_blade(
-    membrane: trimesh.Trimesh,
-    direction: np.ndarray,
-    extrusion_distance: float = 100.0,
-    blade_thickness: float = 0.0001
-) -> trimesh.Trimesh:
-    """
-    Create a tall cutting blade by extruding the membrane far in both directions.
-    
-    Unlike `_create_cutting_blade_from_membrane` which creates a thin blade at the
-    membrane's position, this creates a blade that extends significantly above and
-    below the membrane to ensure it cuts through any shell regardless of height bounds.
-    
-    The blade is essentially the membrane extruded into a prism shape along the
-    pouring direction, then made slightly thick to create a gap when subtracted.
-    
-    Args:
-        membrane: The membrane mesh (parting surface + outer collar)
-        direction: Pouring direction (extrusion axis)
-        extrusion_distance: How far to extrude above and below (default: 100mm each way)
-        blade_thickness: Gap thickness for CSG subtraction (default: 0.1 micron)
-        
-    Returns:
-        A tall prism-shaped blade mesh
-    """
-    # Normalize direction
-    direction = np.array(direction, dtype=np.float64)
-    direction = direction / (np.linalg.norm(direction) + 1e-10)
-    
-    # Pre-clean membrane topology BEFORE extrusion.
-    # Same two-step process as _create_cutting_blade_from_membrane:
-    #   1. Merge coincident vertices (fix triangle soup → connected mesh).
-    #   2. meshlib round-trip (fix non-manifold T-junction edges).
-    try:
-        import meshlib.mrmeshnumpy as _mrn_blade
-        import numpy as _np_blade
-
-        # Step 1: merge coincident vertices
-        _merged = trimesh.Trimesh(
-            vertices=membrane.vertices,
-            faces=membrane.faces,
-            process=True,
-        )
-        logger.debug("Tall blade pre-clean step1 (merge): %dv/%df → %dv/%df",
-                     len(membrane.vertices), len(membrane.faces),
-                     len(_merged.vertices), len(_merged.faces))
-
-        # Step 2: meshlib round-trip
-        _mesh_mr = _mrn_blade.meshFromFacesVerts(
-            _merged.faces.astype(_np_blade.int32),
-            _merged.vertices.astype(_np_blade.float32),
-        )
-        vertices = _mrn_blade.getNumpyVerts(_mesh_mr).astype(np.float64)
-        faces = _mrn_blade.getNumpyFaces(_mesh_mr.topology).astype(np.int64)
-        logger.debug("Tall blade pre-clean step2 (meshlib): %dv/%df → %dv/%df",
-                     len(_merged.vertices), len(_merged.faces), len(vertices), len(faces))
-    except Exception as _exc:
-        logger.debug("meshlib tall blade pre-clean skipped (%s), using raw membrane", _exc)
-        vertices = np.asarray(membrane.vertices, dtype=np.float64)
-        faces = np.asarray(membrane.faces, dtype=np.int64)
-    n_verts = len(vertices)
-
-    # The blade extends far in both directions along the pouring axis
-    # We add a tiny offset (blade_thickness/2) to create a gap
-    half_gap = blade_thickness / 2.0
-    
-    # Bottom vertices: membrane projected far down along pouring direction
-    # We find the membrane's center to project from
-    membrane_heights = np.dot(vertices, direction)
-    membrane_center_height = (membrane_heights.min() + membrane_heights.max()) / 2.0
-    
-    # Create vertices at the bottom plane (membrane height - extrusion_distance - half_gap)
-    bottom_vertices = vertices - direction * (extrusion_distance + half_gap)
-    # Create vertices at the top plane (membrane height + extrusion_distance + half_gap)
-    top_vertices = vertices + direction * (extrusion_distance + half_gap)
-    
-    # Combined vertices: [bottom, top]
-    all_vertices = np.vstack([bottom_vertices, top_vertices])
-    
-    # Faces:
-    # 1. Bottom faces - reverse winding so normals point outward (downward)
-    bottom_faces = faces[:, ::-1]  # Reversed winding
-    
-    # 2. Top faces - keep original winding, offset indices
-    top_faces = faces + n_verts
-    
-    # 3. Side faces connecting boundary edges
-    edge_count = {}
-    edge_to_face = {}
-    
-    for fi, face in enumerate(faces):
-        for i in range(3):
-            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-            edge_key = (min(v0, v1), max(v0, v1))
-            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
-            if edge_key not in edge_to_face:
-                edge_to_face[edge_key] = (fi, v0, v1)
-    
-    # Boundary edges have count == 1
-    boundary_edges = [e for e, c in edge_count.items() if c == 1]
-    
-    side_faces = []
-    for v0, v1 in boundary_edges:
-        _, orig_v0, orig_v1 = edge_to_face[(v0, v1)]
-        
-        # Use the face's traversal order (orig_v0 → orig_v1) to determine winding.
-        # For boundary edge traversed A→B in the face's CCW order, the outward side
-        # normal is cross(B-A, extrusion_dir), so CCW from outside:
-        #   A_bottom → B_bottom → B_top  (first tri)
-        #   A_bottom → B_top    → A_top  (second tri)
-        # This is correct for BOTH outer and inner (hole) boundary loops.
-        a = orig_v0
-        b = orig_v1
-        side_faces.append([a, b, b + n_verts])
-        side_faces.append([a, b + n_verts, a + n_verts])
-    
-    # Combine all faces
-    all_faces_list = [bottom_faces, top_faces]
-    if side_faces:
-        all_faces_list.append(np.array(side_faces, dtype=np.int64))
-    all_faces = np.vstack(all_faces_list)
-    
-    blade_mesh = trimesh.Trimesh(
-        vertices=all_vertices,
-        faces=all_faces,
-        process=False
-    )
-    blade_mesh.fix_normals()
-    blade_mesh = _repair_mesh_for_csg(blade_mesh, 'tall_cutting_blade')
-
-    logger.info(f"Created tall cutting blade: {len(blade_mesh.vertices)} verts, {len(blade_mesh.faces)} faces, "
-               f"extrusion={extrusion_distance:.1f}mm each direction")
-
+    logger.debug("Created cutting blade: %dv, %df, thickness=%.6fmm",
+                 len(blade_mesh.vertices), len(blade_mesh.faces), thickness)
     return blade_mesh
 
 
@@ -1585,10 +1430,10 @@ def split_shell_with_membrane(
     shell_with_cavity: trimesh.Trimesh,
     membrane: trimesh.Trimesh,
     pouring_direction: np.ndarray,
-    blade_thickness: float = 0.0001,
+    blade_thickness: float = 0.001,
     prism_mesh: Optional[trimesh.Trimesh] = None,
     subtractor_mesh: Optional[trimesh.Trimesh] = None,
-) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool]:
+) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool]:
     """
     Split the shell into two manifold halves using the membrane as a cutting blade.
 
@@ -1605,7 +1450,7 @@ def split_shell_with_membrane(
                            and as the fallback CSG operand.
         membrane: The cutting membrane (outer collar extended parting surface).
         pouring_direction: Unit vector defining the "upper" direction.
-        blade_thickness: Thickness of the cutting blade (default: 0.0001 mm).
+        blade_thickness: Thickness of the cutting blade (default: 0.001 mm).
         prism_mesh: Optional raw prism trimesh.  When provided together with
                     ``subtractor_mesh`` the full chain is computed in one
                     manifold3d session.
@@ -1613,15 +1458,16 @@ def split_shell_with_membrane(
                          prism to form the shell cavity.
 
     Returns:
-        Tuple of (shell_half_1, shell_half_2, computation_time_ms, success)
+        Tuple of (shell_half_1, shell_half_2, blade_mesh, computation_time_ms, success)
         shell_half_1 is the half in the positive pouring direction (upper)
         shell_half_2 is the half in the negative pouring direction (lower)
+        blade_mesh is the thin cutting blade used for the split
     """
     start_time = time.time()
     
     if not MANIFOLD_AVAILABLE:
         logger.error("manifold3d not available - cannot perform CSG operations")
-        return None, None, 0.0, False
+        return None, None, None, 0.0, False
     
     try:
         logger.info(f"Splitting shell using thin blade subtraction (thickness={blade_thickness:.6f}mm)...")
@@ -1723,8 +1569,8 @@ def split_shell_with_membrane(
             logger.warning("Failed to split shell into two components - blade may not have cut through")
             elapsed_ms = (time.time() - start_time) * 1000
             if len(components) == 1:
-                return components[0], None, elapsed_ms, False
-            return None, None, elapsed_ms, False
+                return components[0], None, blade, elapsed_ms, False
+            return None, None, blade, elapsed_ms, False
 
         # Step 6: Sort by size and take the two largest
         components = sorted(components, key=lambda m: len(m.faces), reverse=True)
@@ -1755,14 +1601,14 @@ def split_shell_with_membrane(
         if len(components) > 2:
             logger.warning(f"  Note: {len(components) - 2} additional small fragments were discarded")
 
-        return shell_half_1, shell_half_2, elapsed_ms, True
+        return shell_half_1, shell_half_2, blade, elapsed_ms, True
 
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000
         logger.error(f"Failed to split shell with membrane: {e}")
         import traceback
         traceback.print_exc()
-        return None, None, elapsed_ms, False
+        return None, None, None, elapsed_ms, False
 
 
 def split_shell_along_parting_surface(
@@ -1903,130 +1749,67 @@ def thicken_surface_symmetric(
     thickness: float = 0.2
 ) -> Tuple[Optional[trimesh.Trimesh], float, bool]:
     """
-    Thicken a surface mesh symmetrically by offsetting it in both normal directions.
-    
+    Thicken a surface mesh symmetrically by offsetting along per-vertex normals.
+
     Creates a watertight solid by:
     1. Computing per-vertex normals from the surface
-    2. Offsetting vertices by +thickness/2 and -thickness/2 along normals
+    2. Offsetting vertices by ±thickness/2 along normals
     3. Creating side faces to close the boundary
-    
-    The result is a manifold solid "slab" centered on the original surface.
-    
+
+    The result is a manifold solid "slab" centred on the original surface.
+
     Args:
-        surface_mesh: The input surface mesh to thicken
-        thickness: Total thickness (will extend thickness/2 on each side)
-        
+        surface_mesh: The input surface mesh to thicken.
+        thickness: Total thickness (extends thickness/2 on each side).
+
     Returns:
-        Tuple of (thickened_mesh, computation_time_ms, success)
+        Tuple of (thickened_mesh, computation_time_ms, success).
     """
     start_time = time.time()
-    
+
     if surface_mesh is None or len(surface_mesh.vertices) == 0:
         logger.error("Surface mesh is empty or None")
         return None, 0.0, False
-    
+
     if thickness <= 0:
         logger.error("Thickness must be positive")
         return None, 0.0, False
-    
+
     try:
-        logger.info(f"Thickening surface symmetrically by {thickness}mm...")
-        logger.info(f"  Input: {len(surface_mesh.vertices)} verts, {len(surface_mesh.faces)} faces")
-        
+        logger.info("Thickening surface symmetrically by %smm...", thickness)
+        logger.info("  Input: %d verts, %d faces",
+                     len(surface_mesh.vertices), len(surface_mesh.faces))
+
         vertices = np.asarray(surface_mesh.vertices, dtype=np.float64)
         faces = np.asarray(surface_mesh.faces, dtype=np.int64)
-        n_verts = len(vertices)
-        n_faces = len(faces)
-        
-        # Compute per-vertex normals
-        # Use trimesh's vertex normals (weighted by face area)
-        vertex_normals = np.asarray(surface_mesh.vertex_normals, dtype=np.float64)
-        
-        # Normalize the vertex normals
-        norms = np.linalg.norm(vertex_normals, axis=1, keepdims=True)
-        norms[norms < 1e-10] = 1.0  # Avoid division by zero
-        vertex_normals = vertex_normals / norms
-        
-        half_thickness = thickness / 2.0
-        
-        # Create offset vertices
-        # Top surface: offset in positive normal direction
-        top_vertices = vertices + vertex_normals * half_thickness
-        # Bottom surface: offset in negative normal direction
-        bottom_vertices = vertices - vertex_normals * half_thickness
-        
-        # Combined vertices: [bottom, top]
-        all_vertices = np.vstack([bottom_vertices, top_vertices])
-        
-        # Create faces:
-        # 1. Bottom faces - reversed winding (normals point away from slab in -normal direction)
-        bottom_faces = faces[:, ::-1].copy()
-        
-        # 2. Top faces - original winding (normals point away from slab in +normal direction), offset by n_verts
-        top_faces = faces + n_verts
-        
-        # 3. Side faces connecting boundary edges
-        # Find boundary edges
-        edge_count = {}
-        edge_to_winding = {}  # Track original winding for consistent side face orientation
-        
-        for fi, face in enumerate(faces):
-            for i in range(3):
-                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
-                edge_key = (min(v0, v1), max(v0, v1))
-                edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
-                if edge_key not in edge_to_winding:
-                    # Store the original edge direction based on face winding
-                    edge_to_winding[edge_key] = (v0, v1)
-        
-        # Boundary edges appear only once
-        boundary_edges = [e for e, c in edge_count.items() if c == 1]
-        
-        side_faces = []
-        for edge_key in boundary_edges:
-            v0_orig, v1_orig = edge_to_winding[edge_key]
-            
-            # Bottom vertices
-            b0, b1 = v0_orig, v1_orig
-            # Top vertices (offset by n_verts)
-            t0, t1 = v0_orig + n_verts, v1_orig + n_verts
-            
-            # Create quad (2 triangles) with outward-facing normals
-            # Winding consistent with reversed bottom (boundary b1->b0) and original top (t0->t1)
-            side_faces.append([b0, b1, t1])
-            side_faces.append([b0, t1, t0])
-        
-        # Combine all faces
-        all_faces = np.vstack([
-            bottom_faces,
-            top_faces,
-            np.array(side_faces, dtype=np.int64) if side_faces else np.empty((0, 3), dtype=np.int64)
-        ])
-        
-        # Create the thickened mesh
+
+        # Per-vertex normals (no orientation step — normals used as-is)
+        vnormals = np.asarray(surface_mesh.vertex_normals, dtype=np.float64)
+        norms = np.linalg.norm(vnormals, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1.0
+        vnormals = vnormals / norms
+
+        all_verts, all_faces = _thicken_surface_along_normals(
+            vertices, faces, vnormals, thickness / 2.0)
+
         thickened_mesh = trimesh.Trimesh(
-            vertices=all_vertices,
-            faces=all_faces,
-            process=True
-        )
-        
-        # Try to fix any winding issues
+            vertices=all_verts, faces=all_faces, process=True)
         thickened_mesh.fix_normals()
-        
+
         elapsed_ms = (time.time() - start_time) * 1000
-        
+
         if thickened_mesh.is_watertight:
-            logger.info(f"Surface thickened: {len(thickened_mesh.vertices)} verts, "
-                       f"{len(thickened_mesh.faces)} faces (watertight) in {elapsed_ms:.1f}ms")
+            logger.info("Surface thickened: %d verts, %d faces (watertight) in %.1fms",
+                        len(thickened_mesh.vertices), len(thickened_mesh.faces), elapsed_ms)
         else:
-            logger.warning(f"Surface thickened: {len(thickened_mesh.vertices)} verts, "
-                          f"{len(thickened_mesh.faces)} faces (NOT watertight) in {elapsed_ms:.1f}ms")
-        
+            logger.warning("Surface thickened: %d verts, %d faces (NOT watertight) in %.1fms",
+                           len(thickened_mesh.vertices), len(thickened_mesh.faces), elapsed_ms)
+
         return thickened_mesh, elapsed_ms, True
-        
+
     except Exception as e:
         elapsed_ms = (time.time() - start_time) * 1000
-        logger.error(f"Failed to thicken surface: {e}")
+        logger.error("Failed to thicken surface: %s", e)
         import traceback
         traceback.print_exc()
         return None, elapsed_ms, False
