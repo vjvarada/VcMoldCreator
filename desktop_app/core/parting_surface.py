@@ -3182,7 +3182,7 @@ def _classify_boundary_edge(
     vert_to_part_dist: Dict[int, float],
     vert_to_hull_dist: Dict[int, float],
     part_proximity_threshold: float = 0.1  # Reduced from 0.5 to be more conservative
-) -> bool:
+) -> Tuple[bool, str]:
     """
     Classify a boundary edge as inner (part) or outer (hull).
     
@@ -3203,7 +3203,8 @@ def _classify_boundary_edge(
         part_proximity_threshold: Distance threshold for fallback classification (conservative)
     
     Returns:
-        True if edge is inner (part) boundary, False if outer (hull) boundary
+        Tuple of (is_inner, reason) where is_inner is True if edge is inner
+        (part) boundary, and reason is a string describing the classification.
     """
     has_boundary_type = vertex_boundary_type is not None and len(vertex_boundary_type) > 0
     has_hull_dist = len(vert_to_hull_dist) > 0
@@ -3217,20 +3218,66 @@ def _classify_boundary_edge(
     # =========================================================================
     
     if has_boundary_type:
-        # REJECT: Either vertex is explicitly on hull → NOT inner
+        # -----------------------------------------------------------------
+        # STALE LABEL OVERRIDE: After smoothing + re-projection, vertices
+        # originally labeled hull (bt=1/2) may have been moved directly
+        # ONTO the part surface.  Their boundary_type is stale.  Detect
+        # this by checking actual distances: if BOTH vertices are very
+        # close to the part surface (and significantly closer to part
+        # than to hull when hull distances are available), override the
+        # hull label and treat the edge as inner.
+        #
+        # Threshold: 10% of part_proximity_threshold gives a tight
+        # "on-surface" band (typically < 0.5 mm).  We cap at 1.0 mm
+        # to avoid false positives on large models.
+        # -----------------------------------------------------------------
         if bt0 in (1, 2) or bt1 in (1, 2):
-            return False
+            d0_p = vert_to_part_dist.get(v0, 999)
+            d1_p = vert_to_part_dist.get(v1, 999)
+            on_surface_thresh = min(part_proximity_threshold, 1.0)
+
+            both_on_part = d0_p < on_surface_thresh and d1_p < on_surface_thresh
+
+            if both_on_part:
+                # Extra check when hull distances available: vertices must
+                # be at least as close to part as to hull.  Use <= with a
+                # small epsilon so that vertices sitting exactly at the
+                # part/hull intersection (d_part ≈ 0, d_hull ≈ 0) are
+                # accepted rather than rejected.
+                if has_hull_dist:
+                    d0_h = vert_to_hull_dist.get(v0, 999)
+                    d1_h = vert_to_hull_dist.get(v1, 999)
+                    _eps = 1e-6
+                    if d0_p <= d0_h + _eps and d1_p <= d1_h + _eps:
+                        return True, (
+                            f"stale_hull_override(bt0={bt0},bt1={bt1},"
+                            f"d_part=[{d0_p:.4f},{d1_p:.4f}],"
+                            f"d_hull=[{d0_h:.4f},{d1_h:.4f}])")
+                    # Hull distances don't confirm → still reject
+                    return False, (
+                        f"hull_vertex_confirmed(bt0={bt0},bt1={bt1},"
+                        f"d_part=[{d0_p:.4f},{d1_p:.4f}],"
+                        f"d_hull=[{d0_h:.4f},{d1_h:.4f}])")
+                else:
+                    # No hull distances available — trust the distance-
+                    # to-part measurement as ground truth.
+                    return True, (
+                        f"stale_hull_override_no_hull(bt0={bt0},bt1={bt1},"
+                        f"d_part=[{d0_p:.4f},{d1_p:.4f}])")
+
+            # Not on part surface → genuinely hull
+            return False, f"hull_vertex(bt0={bt0},bt1={bt1})"
         
         # ACCEPT: Both vertices explicitly on part → inner
         if bt0 == -1 and bt1 == -1:
-            return True
+            return True, "both_part(bt=-1,-1)"
         
         # MIXED: One on part, one interior (0) or unknown.
         # Since this is a MESH BOUNDARY edge and one vertex is confirmed
         # on the part surface, the other vertex is almost certainly also
         # on the inner boundary (boundary_type may be 0 after smoothing).
         if bt0 == -1 or bt1 == -1:
-            return True
+            return True, f"mixed_part_interior(bt0={bt0},bt1={bt1})"
         
         # Both interior (0) or unknown — after smoothing, inner boundary
         # vertices may have boundary_type 0.  Fall through to distance-
@@ -3256,15 +3303,19 @@ def _classify_boundary_edge(
         v1_clearly_part = d1_part < (d1_hull * margin)
         
         if v0_clearly_part and v1_clearly_part:
-            return True
+            return True, f"distance_closer_to_part(d_part=[{d0_part:.4f},{d1_part:.4f}],d_hull=[{d0_hull:.4f},{d1_hull:.4f}])"
         
         # If either vertex is closer to hull, it's an outer edge
         if d0_part > d0_hull or d1_part > d1_hull:
-            return False
+            return False, f"closer_to_hull(d_part=[{d0_part:.4f},{d1_part:.4f}],d_hull=[{d0_hull:.4f},{d1_hull:.4f}])"
     
     # FALLBACK: Pure distance heuristic (very conservative)
     # Only classify as inner if BOTH vertices are very close to part
-    return d0_part < part_proximity_threshold and d1_part < part_proximity_threshold
+    is_inner = d0_part < part_proximity_threshold and d1_part < part_proximity_threshold
+    if is_inner:
+        return True, f"proximity_fallback(d_part=[{d0_part:.4f},{d1_part:.4f}],thresh={part_proximity_threshold:.4f})"
+    else:
+        return False, f"too_far_from_part(bt0={bt0},bt1={bt1},d_part=[{d0_part:.4f},{d1_part:.4f}],thresh={part_proximity_threshold:.4f})"
 
 
 # =============================================================================
@@ -4472,18 +4523,116 @@ def create_robust_collar_extension(
     mesh_scale = np.linalg.norm(np.ptp(vertices_arr, axis=0))
     relative_proximity_threshold = max(mesh_scale * 0.05, 0.05)
     
+    # Track classification reasons for debugging
+    classification_reasons: Dict[str, int] = {}
+    outer_edge_reasons: List[Tuple[Tuple[int, int], str]] = []
+    
     for v0, v1 in boundary_edges:
-        is_inner = _classify_boundary_edge(
+        is_inner, reason = _classify_boundary_edge(
             v0, v1, vertex_boundary_type, vert_to_part_dist, vert_to_hull_dist,
             part_proximity_threshold=relative_proximity_threshold
         )
+        # Bin by reason category (first word before '(')
+        reason_key = reason.split('(')[0] if '(' in reason else reason
+        classification_reasons[reason_key] = classification_reasons.get(reason_key, 0) + 1
+        
         if is_inner:
             inner_boundary_edges.append((v0, v1))
         else:
             outer_count += 1
+            outer_edge_reasons.append(((v0, v1), reason))
     
     logger.info(f"Inner boundary edges: {len(inner_boundary_edges)}, outer (hull): {outer_count} "
                f"(proximity threshold: {relative_proximity_threshold:.4f})")
+    logger.info(f"Classification breakdown: {classification_reasons}")
+    
+    # Log details of outer edges that might be misclassified (both bt==0)
+    suspicious_outer = [(edge, reason) for edge, reason in outer_edge_reasons
+                        if 'too_far_from_part' in reason]
+    if suspicious_outer:
+        logger.warning(f"COLLAR DEBUG: {len(suspicious_outer)} boundary edges classified OUTER "
+                      f"via 'too_far_from_part' — these may be inner edges that lost "
+                      f"boundary_type during smoothing:")
+        for (v0, v1), reason in suspicious_outer[:20]:  # Log first 20
+            d0 = vert_to_part_dist.get(v0, -1)
+            d1 = vert_to_part_dist.get(v1, -1)
+            bt0 = vertex_boundary_type[v0] if vertex_boundary_type is not None and v0 < len(vertex_boundary_type) else None
+            bt1 = vertex_boundary_type[v1] if vertex_boundary_type is not None and v1 < len(vertex_boundary_type) else None
+            logger.warning(f"  Edge ({v0},{v1}): bt=({bt0},{bt1}), "
+                          f"d_part=({d0:.4f},{d1:.4f}), reason={reason}")
+    
+    # =========================================================================
+    # STEP 2b: Proximity-based inner edge rescue
+    # =========================================================================
+    # After label-based classification, rescue any OUTER-classified mesh
+    # boundary edges where both vertices are genuinely close to the part
+    # surface.  This catches edges at the part/hull intersection where
+    # boundary_type labels are stale after smoothing and the hull distance
+    # nearly equals the part distance (making the label check ambiguous).
+    #
+    # Criteria — promote an outer edge to inner if:
+    #   1. BOTH vertices are within `rescue_threshold` of the part surface
+    #   2. The edge midpoint is also within `rescue_threshold` of the part
+    # This double-check avoids promoting edges that just graze the part.
+    
+    # Threshold: generous but bounded.  Use the same proximity threshold
+    # that drives fallback classification, capped at 2.0 mm to avoid
+    # rescuing edges that happen to be far above the part.
+    rescue_threshold = min(relative_proximity_threshold, 2.0)
+    
+    _rescued_edges: List[Tuple[int, int]] = []
+    _remaining_outer: List[Tuple[Tuple[int, int], str]] = []
+    
+    if outer_edge_reasons:
+        # Compute midpoint distances for all outer edges in one batch
+        _outer_edge_list = [edge for edge, _ in outer_edge_reasons]
+        _outer_midpoints = np.array([
+            (vertices_arr[v0] + vertices_arr[v1]) / 2.0
+            for v0, v1 in _outer_edge_list
+        ], dtype=np.float64)
+        
+        try:
+            _, _mid_dists, _ = trimesh.proximity.closest_point(
+                part_mesh, _outer_midpoints)
+        except Exception:
+            _mid_dists = np.full(len(_outer_edge_list), 999.0)
+        
+        for i, ((v0, v1), reason) in enumerate(outer_edge_reasons):
+            d0 = vert_to_part_dist.get(v0, 999)
+            d1 = vert_to_part_dist.get(v1, 999)
+            d_mid = _mid_dists[i]
+            
+            if (d0 < rescue_threshold and
+                    d1 < rescue_threshold and
+                    d_mid < rescue_threshold):
+                _rescued_edges.append((v0, v1))
+            else:
+                _remaining_outer.append(((v0, v1), reason))
+        
+        if _rescued_edges:
+            inner_boundary_edges.extend(_rescued_edges)
+            outer_count -= len(_rescued_edges)
+            outer_edge_reasons = _remaining_outer
+            
+            logger.info(
+                f"STEP 2b: Rescued {len(_rescued_edges)} outer edges as "
+                f"inner (proximity to part < {rescue_threshold:.3f} mm). "
+                f"Inner now: {len(inner_boundary_edges)}, "
+                f"outer now: {outer_count}")
+            
+            # Log a sample of rescued edges for debugging
+            for v0, v1 in _rescued_edges[:10]:
+                d0 = vert_to_part_dist.get(v0, -1)
+                d1 = vert_to_part_dist.get(v1, -1)
+                bt0 = vertex_boundary_type[v0] if vertex_boundary_type is not None and v0 < len(vertex_boundary_type) else None
+                bt1 = vertex_boundary_type[v1] if vertex_boundary_type is not None and v1 < len(vertex_boundary_type) else None
+                logger.info(
+                    f"  Rescued edge ({v0},{v1}): bt=({bt0},{bt1}), "
+                    f"d_part=({d0:.4f},{d1:.4f})")
+            if len(_rescued_edges) > 10:
+                logger.info(f"  ... and {len(_rescued_edges) - 10} more")
+        else:
+            logger.info("STEP 2b: No outer edges eligible for proximity rescue")
     
     if len(inner_boundary_edges) == 0:
         logger.info("No inner boundary edges to collar")
@@ -4677,12 +4826,25 @@ def create_robust_collar_extension(
                 avg_dir = collar_dirs[0]  # Fallback to first direction
             
             collar_pt = _create_collar_vertex(vi_pos, part_mesh, part_face_normals, collar_depth, avg_dir)
-            collar_idx = len(vertices)
-            vertices.append(collar_pt.copy())
-            quad_vertex_collar[vi] = collar_idx
+        else:
+            # Fallback: no valid perpendicular direction found for any
+            # adjacent edge (all degenerate or parallel to vertex normal).
+            # Use closest-point-on-part + inward push fallback.
+            logger.debug("Phase 1: vertex %d has no valid collar direction, "
+                         "using closest-point fallback", vi)
+            collar_pt = _create_collar_vertex(vi_pos, part_mesh, part_face_normals, collar_depth, None)
+        
+        collar_idx = len(vertices)
+        vertices.append(collar_pt.copy())
+        quad_vertex_collar[vi] = collar_idx
     
     # PHASE 2: Create per-edge collar vertices for FAN vertices
     # (Fan vertices need separate collars per edge for the fan triangle arcs)
+    _phase2_no_face = 0
+    _phase2_degenerate = 0
+    _phase2_linked_quad = 0
+    _phase2_created_fan = 0
+    
     for v0, v1 in inner_boundary_edges:
         edge_key = (min(v0, v1), max(v0, v1))
         
@@ -4691,6 +4853,13 @@ def create_robust_collar_extension(
         
         face_info = edge_to_face.get(edge_key)
         if face_info is None:
+            _phase2_no_face += 1
+            # NOTE: Don't skip entirely — link quad vertices first
+            # (Recovery step below will handle remaining gaps)
+            for vi in [v0, v1]:
+                if vi not in edge_endpoint_collar[edge_key] and vi in quad_vertex_collar:
+                    edge_endpoint_collar[edge_key][vi] = quad_vertex_collar[vi]
+                    _phase2_linked_quad += 1
             continue
         
         fi, _ = face_info
@@ -4699,6 +4868,12 @@ def create_robust_collar_extension(
         edge_vec = v1_pos - v0_pos
         edge_len = np.linalg.norm(edge_vec)
         if edge_len < 1e-8:
+            _phase2_degenerate += 1
+            # NOTE: Don't skip entirely — link quad vertices first
+            for vi in [v0, v1]:
+                if vi not in edge_endpoint_collar[edge_key] and vi in quad_vertex_collar:
+                    edge_endpoint_collar[edge_key][vi] = quad_vertex_collar[vi]
+                    _phase2_linked_quad += 1
             continue
         edge_dir = edge_vec / edge_len
         
@@ -4709,6 +4884,7 @@ def create_robust_collar_extension(
             # For QUAD vertices: use the shared collar from Phase 1
             if vi in quad_vertex_collar:
                 edge_endpoint_collar[edge_key][vi] = quad_vertex_collar[vi]
+                _phase2_linked_quad += 1
                 continue
             
             # For FAN vertices: create per-edge collar vertex using
@@ -4743,6 +4919,68 @@ def create_robust_collar_extension(
             collar_idx = len(vertices)
             vertices.append(collar_pt.copy())
             edge_endpoint_collar[edge_key][vi] = collar_idx
+            _phase2_created_fan += 1
+    
+    logger.info(f"Phase 2 summary: linked {_phase2_linked_quad} quad collars, "
+               f"created {_phase2_created_fan} fan collars, "
+               f"skipped {_phase2_no_face} edges (no face), "
+               f"{_phase2_degenerate} edges (degenerate)")
+    
+    # =========================================================================
+    # PHASE 2b RECOVERY: Fill missing collar vertices for inner boundary edges
+    # =========================================================================
+    # Phase 2 skips edges early when face_info is None or edge_len < 1e-8,
+    # before linking quad vertices from Phase 1. This recovery step ensures
+    # that every inner boundary edge vertex has a collar vertex entry.
+    
+    _recovery_linked = 0
+    _recovery_created = 0
+    _recovery_skipped_degenerate = 0
+    _edges_missing_before = 0
+    
+    for v0, v1 in inner_boundary_edges:
+        edge_key = (min(v0, v1), max(v0, v1))
+        
+        if edge_key not in edge_endpoint_collar:
+            edge_endpoint_collar[edge_key] = {}
+        
+        collar_data = edge_endpoint_collar[edge_key]
+        
+        for vi in [v0, v1]:
+            if vi in collar_data:
+                continue  # Already has collar vertex for this edge
+            
+            _edges_missing_before += 1
+            
+            # Try to link from Phase 1 shared collar
+            if vi in quad_vertex_collar:
+                collar_data[vi] = quad_vertex_collar[vi]
+                _recovery_linked += 1
+                continue
+            
+            # Vertex is a fan vertex or otherwise has no collar at all.
+            # Create a fallback collar vertex using closest-point-on-part.
+            vi_pos = vertices_arr[vi]
+            collar_pt = _create_collar_vertex(
+                vi_pos, part_mesh, part_face_normals, collar_depth, None
+            )
+            # Safety: skip if collar point is coincident with vertex
+            if np.linalg.norm(collar_pt - vi_pos) < 1e-8:
+                _recovery_skipped_degenerate += 1
+                continue
+            collar_idx = len(vertices)
+            vertices.append(collar_pt.copy())
+            collar_data[vi] = collar_idx
+            _recovery_created += 1
+    
+    if _edges_missing_before > 0:
+        logger.info(
+            f"COLLAR RECOVERY: {_edges_missing_before} vertex-edge pairs "
+            f"were missing collar vertices after Phase 2. "
+            f"Linked {_recovery_linked} from Phase 1 shared collars, "
+            f"created {_recovery_created} fallback collars, "
+            f"skipped {_recovery_skipped_degenerate} degenerate."
+        )
     
     logger.info(f"Created {len(vertices) - n_orig_verts} collar vertices")
 
@@ -4878,6 +5116,64 @@ def create_robust_collar_extension(
     if edges_without_quads > 0:
         logger.warning(f"{edges_without_quads} inner boundary edges did not receive quad collars "
                       f"(likely missing collar vertices)")
+    
+    # =========================================================================
+    # STEP 5b: COLLAR VALIDATION — ensure every inner edge got a collar
+    # =========================================================================
+    # This is a comprehensive debugging step that checks every inner boundary
+    # edge and reports exactly why any edge failed to get a collar quad.
+    _edges_with_collar = 0
+    _edges_missing_collar = 0
+    _missing_reasons: Dict[str, int] = {}
+    _missing_edge_details: List[str] = []
+    
+    for v0, v1 in inner_boundary_edges:
+        edge_key = (min(v0, v1), max(v0, v1))
+        collar_data = edge_endpoint_collar.get(edge_key, {})
+        c0, c1 = collar_data.get(v0), collar_data.get(v1)
+        
+        if c0 is not None and c1 is not None:
+            _edges_with_collar += 1
+            continue
+        
+        _edges_missing_collar += 1
+        
+        # Diagnose WHY
+        reasons = []
+        for vi, ci, label in [(v0, c0, 'v0'), (v1, c1, 'v1')]:
+            if ci is not None:
+                continue
+            
+            # Check if vertex is endpoint (1 boundary edge only)
+            is_endpoint = vi in boundary_info.endpoints
+            is_fan = vi in all_fan_vertices_set
+            has_shared = vi in quad_vertex_collar
+            has_face = edge_to_face.get(edge_key) is not None
+            edge_len = np.linalg.norm(vertices_arr[v1] - vertices_arr[v0])
+            bt = vertex_boundary_type[vi] if vertex_boundary_type is not None and vi < len(vertex_boundary_type) else None
+            d_part = vert_to_part_dist.get(vi, -1)
+            
+            detail = (f"{label}={vi}(bt={bt},d_part={d_part:.4f},"
+                     f"endpoint={is_endpoint},fan={is_fan},"
+                     f"shared_collar={has_shared},face_exists={has_face},"
+                     f"edge_len={edge_len:.6f})")
+            reasons.append(detail)
+        
+        reason_key = "no_collar_data" if not collar_data else f"partial(c0={'ok' if c0 else 'MISSING'},c1={'ok' if c1 else 'MISSING'})"
+        _missing_reasons[reason_key] = _missing_reasons.get(reason_key, 0) + 1
+        _missing_edge_details.append(f"  Edge ({v0},{v1}): {'; '.join(reasons)}")
+    
+    logger.info(f"COLLAR VALIDATION: {_edges_with_collar}/{len(inner_boundary_edges)} inner "
+               f"boundary edges have complete collar quads")
+    
+    if _edges_missing_collar > 0:
+        logger.warning(f"COLLAR VALIDATION: {_edges_missing_collar} inner edges MISSING collars. "
+                      f"Reason breakdown: {_missing_reasons}")
+        # Log individual edge details (up to 30)
+        for detail in _missing_edge_details[:30]:
+            logger.warning(f"COLLAR MISSING:{detail}")
+        if len(_missing_edge_details) > 30:
+            logger.warning(f"  ... and {len(_missing_edge_details) - 30} more")
     
     # =========================================================================
     # STEP 6: Create fan triangles at all fan vertices
@@ -5137,6 +5433,41 @@ def create_robust_collar_extension(
 
             _edge_ext_info[_ek] = (_perp, _fn)
 
+        # Fallback for edges whose geometry computation failed (degenerate
+        # face, zero-length edge, or edge parallel to face normal).  Use
+        # the inward part-surface normal at the edge midpoint so the
+        # extension still makes progress into the part volume.
+        _n_geom_fallback = 0
+        for _va, _vb in _outside_edges:
+            _ek = (min(_va, _vb), max(_va, _vb))
+            if _ek in _edge_ext_info:
+                continue
+            _mid = (_verts_arr[_va] + _verts_arr[_vb]) / 2.0
+            try:
+                _, _, _fb_faces = trimesh.proximity.closest_point(
+                    part_mesh, [_mid])
+                _fb_fi = _fb_faces[0]
+                if _fb_fi < len(part_mesh.face_normals):
+                    _into = -part_mesh.face_normals[_fb_fi]
+                    _into_len = np.linalg.norm(_into)
+                    if _into_len > 1e-10:
+                        _into = _into / _into_len
+                        _edge_ext_info[_ek] = (_into, _into)
+                        _n_geom_fallback += 1
+                        continue
+            except Exception:
+                pass
+            # Absolute last resort — straight down
+            _fb_dir = np.array([0.0, 0.0, -1.0])
+            _edge_ext_info[_ek] = (_fb_dir, _fb_dir)
+            _n_geom_fallback += 1
+
+        if _n_geom_fallback > 0:
+            logger.info(
+                f"Collar extension iter {_ext_iter + 1}: "
+                f"{_n_geom_fallback} edges used inward-normal "
+                "fallback direction (degenerate geometry)")
+
         # Build adjacency: vertex -> list of outside edge keys that use it
         _vert_to_outside_edges: Dict[int, List[Tuple[int, int]]] = {}
         for _va, _vb in _outside_edges:
@@ -5155,12 +5486,10 @@ def create_robust_collar_extension(
         # Skip creating vertices that would be nearly coincident with
         # their source (degenerate after re-projection).
         #
-        # ADAPTIVE EXTENSION LENGTH: Instead of using a fixed collar_depth
-        # for every iteration, raycast from each frontier vertex along the
-        # extension direction to find where the ray re-enters the part
-        # mesh.  Use that distance (+ a small overshoot) so the extension
-        # spans the full gap in one step.  Falls back to collar_depth if
-        # the raycast fails or the gap is very small.
+        # FIXED INCREMENT EXTENSION: Each iteration extends by exactly
+        # collar_depth (mm).  Up to MAX_COLLAR_EXTENSION_ITERATIONS (5)
+        # iterations ensures the collar reaches the part interior in
+        # small, controlled steps without overshooting.
         #
         # ROBUSTNESS: Blend edge-perpendicular with the inward part
         # surface normal at each frontier vertex.  This ensures the
@@ -5184,14 +5513,7 @@ def create_robust_collar_extension(
             except Exception:
                 logger.debug("Part normal blending failed, using edge perp only", exc_info=True)
 
-        # Maximum extension distance cap — prevent runaway extensions
-        # that would overshoot the part entirely.  Use 10x collar_depth
-        # or 5% of mesh diagonal (whichever is larger).
-        _mesh_diag = np.linalg.norm(np.ptp(_verts_arr[:n_orig_verts], axis=0))
-        _max_ext_dist = max(collar_depth * 10.0, _mesh_diag * 0.05)
-
-        # Pre-compute blended directions for all frontier vertices FIRST,
-        # so we can batch-raycast afterwards.
+        # Pre-compute blended directions for all frontier vertices.
         _vi_directions: Dict[int, np.ndarray] = {}  # vi -> unit direction
         for _vi, _ek_list in _vert_to_outside_edges.items():
             if _vi in _vert_new_idx:
@@ -5205,6 +5527,12 @@ def create_robust_collar_extension(
                     _perp_sum += _edge_ext_info[_ek][0]
                     _count += 1
             if _count == 0:
+                # No edge has valid extension geometry at this vertex.
+                # Fall back to inward part-surface normal so the
+                # extension still progresses into the part volume.
+                _into_dir = _frontier_into_part.get(_vi)
+                if _into_dir is not None:
+                    _vi_directions[_vi] = _into_dir
                 continue
 
             if _count == 1:
@@ -5232,71 +5560,17 @@ def create_robust_collar_extension(
             _vi_directions[_vi] = _avg_perp
 
         # -----------------------------------------------------------------
-        # Batch raycast to compute adaptive extension distances.
-        # Cast a ray from each frontier vertex along _avg_perp.  The first
-        # intersection with the part mesh tells us where the extension
-        # will re-enter the part volume.  Extension distance = hit distance
-        # + collar_depth (overshoot to ensure the new vertex is inside).
+        # Create new vertex positions using fixed collar_depth increments.
+        # Each iteration extends by exactly collar_depth — small steps
+        # repeated up to MAX_COLLAR_EXTENSION_ITERATIONS (5) times.
         # -----------------------------------------------------------------
-        _vi_ext_dist: Dict[int, float] = {}  # vi -> adaptive distance
         _ray_vi_list = [vi for vi in _vi_directions if vi not in _vert_new_idx]
-        if _ray_vi_list:
-            _ray_origins = np.array([_verts_arr[vi] for vi in _ray_vi_list],
-                                    dtype=np.float64)
-            _ray_dirs = np.array([_vi_directions[vi] for vi in _ray_vi_list],
-                                 dtype=np.float64)
-            try:
-                _hit_locs, _hit_ray_idx, _ = part_mesh.ray.intersects_location(
-                    _ray_origins, _ray_dirs, multiple_hits=True)
-                # For each ray, find the NEAREST hit along the positive direction
-                _ray_min_t: Dict[int, float] = {}
-                for _hi in range(len(_hit_locs)):
-                    _ri = int(_hit_ray_idx[_hi])
-                    _t = np.dot(_hit_locs[_hi] - _ray_origins[_ri],
-                                _ray_dirs[_ri])
-                    if _t > 1e-6:  # positive direction only, skip surface-grazing
-                        if _ri not in _ray_min_t or _t < _ray_min_t[_ri]:
-                            _ray_min_t[_ri] = _t
-
-                _n_adaptive = 0
-                for _ri, _vi in enumerate(_ray_vi_list):
-                    if _ri in _ray_min_t:
-                        _hit_t = _ray_min_t[_ri]
-                        # Overshoot by collar_depth to land inside the part
-                        _ext = min(_hit_t + collar_depth, _max_ext_dist)
-                        # Floor: at least collar_depth so we always make progress
-                        _ext = max(_ext, collar_depth)
-                        _vi_ext_dist[_vi] = _ext
-                        _n_adaptive += 1
-                    else:
-                        _vi_ext_dist[_vi] = collar_depth  # no hit → default
-
-                if _n_adaptive > 0:
-                    _dists = [_vi_ext_dist[vi] for vi in _ray_vi_list
-                              if _vi_ext_dist.get(vi, collar_depth) != collar_depth]
-                    if _dists:
-                        logger.info(
-                            f"Collar extension iter {_ext_iter + 1}: "
-                            f"adaptive distances for {_n_adaptive} vertices "
-                            f"(min={min(_dists):.4f}, max={max(_dists):.4f}, "
-                            f"median={np.median(_dists):.4f} mm)")
-            except Exception as _ray_ex:
-                logger.debug(
-                    f"Raycast for adaptive distances failed ({_ray_ex}), "
-                    "using fixed collar_depth", exc_info=True)
-                for _vi in _ray_vi_list:
-                    _vi_ext_dist[_vi] = collar_depth
-
-        # -----------------------------------------------------------------
-        # Create new vertex positions using adaptive distances
-        # -----------------------------------------------------------------
         for _vi in _ray_vi_list:
             if _vi in _vert_new_idx:
                 continue
             _vi_pos = _verts_arr[_vi]
             _dir = _vi_directions[_vi]
-            _dist = _vi_ext_dist.get(_vi, collar_depth)
-            _new_pos = _vi_pos + _dist * _dir
+            _new_pos = _vi_pos + collar_depth * _dir
 
             # Skip if new position is coincident with source (post re-proj)
             if np.linalg.norm(_new_pos - _vi_pos) < 1e-6:

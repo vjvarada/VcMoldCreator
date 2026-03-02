@@ -2127,8 +2127,12 @@ def _remove_coplanar_shard_components(
     fragments are individually watertight but have face counts orders of magnitude
     smaller than the main body.
 
-    Strategy: split into components, keep only those with face count >= 1% of the
-    largest component.  In practice all shards are <0.1% of the main body.
+    Strategy: split into components, keep those that pass BOTH a face-count
+    threshold AND an area threshold.  A component is kept if it has either:
+      - face_count >= 1% of the largest component (min 100), OR
+      - surface area >= 1% of the total mesh area.
+    The area check prevents removing legitimate geometry (e.g. prism base caps)
+    that may have few but large triangles after trim_by_plane().
 
     Args:
         mesh: The raw union result from manifold3d (process=False).
@@ -2148,22 +2152,40 @@ def _remove_coplanar_shard_components(
 
     components_sorted = sorted(components, key=lambda c: -len(c.faces))
     main_faces = len(components_sorted[0].faces)
-    threshold = max(main_faces * 0.01, 100)  # 1% of main, minimum 100 faces
+    face_threshold = max(main_faces * 0.01, 100)  # 1% of main, minimum 100 faces
 
-    kept = [c for c in components_sorted if len(c.faces) >= threshold]
+    # Area-based threshold: protect components with meaningful surface area
+    # even if they have few faces (e.g. prism base cap after trim_by_plane).
+    total_area = float(mesh.area)
+    area_threshold = total_area * 0.01  # 1% of total surface area
+
+    kept = []
+    for c in components_sorted:
+        c_area = float(c.area)
+        if len(c.faces) >= face_threshold or c_area >= area_threshold:
+            kept.append(c)
+
     removed_count = len(components) - len(kept)
-    removed_faces = sum(len(c.faces) for c in components_sorted if len(c.faces) < threshold)
+    removed_faces = sum(
+        len(c.faces) for c in components_sorted
+        if c not in kept
+    )
 
     if removed_count == 0:
         return mesh
 
     logger.info(
         "  [Shard cleanup] '%s': removed %d small components (%d faces, %.1f%% of total). "
-        "Kept %d component(s) with %d+ faces.",
+        "Kept %d component(s) (face_threshold=%d, area_threshold=%.2f mm²).",
         label, removed_count, removed_faces,
-        100.0 * removed_faces / len(mesh.faces),
-        len(kept), int(threshold),
+        100.0 * removed_faces / max(len(mesh.faces), 1),
+        len(kept), int(face_threshold), area_threshold,
     )
+
+    if len(kept) == 0:
+        # Safety: never return empty — keep original
+        logger.warning("  [Shard cleanup] '%s': all components below threshold — keeping original.", label)
+        return mesh
 
     if len(kept) == 1:
         result = kept[0]
@@ -2235,6 +2257,15 @@ def _collapse_needle_edges(
         if bad.sum() == 0:
             break
 
+        # Compute per-vertex valence (number of adjacent faces).
+        # The vertex with higher valence is a "structural" vertex (wall
+        # corner, base perimeter, etc.) and must keep its position.
+        # Moving it to the midpoint systematically pulls outer vertices
+        # inward, shrinking the base — which is the bug we're fixing.
+        valence = np.zeros(len(verts), dtype=np.int32)
+        for vi in faces.ravel():
+            valence[vi] += 1
+
         # Build a union-find merge map: for each bad face, merge the
         # shortest-edge vertex pair.
         merge_map = np.arange(len(verts), dtype=np.intp)
@@ -2261,9 +2292,17 @@ def _collapse_needle_edges(
                 b = merge_map[b]
 
             if a != b:
-                keep, drop = (a, b) if a < b else (b, a)
+                # Keep the vertex with higher valence (more structural
+                # connectivity) so that base perimeter / wall corners
+                # stay in place.  Fall back to lower-index tie-breaking.
+                if valence[a] >= valence[b]:
+                    keep, drop = a, b
+                else:
+                    keep, drop = b, a
                 merge_map[drop] = keep
-                verts[keep] = (verts[keep] + verts[drop]) / 2.0
+                # Do NOT average to midpoint — keep structural vertex
+                # position intact.  The dropped vertex is from a
+                # degenerate sliver; its position is not meaningful.
                 merges += 1
 
         # Flatten merge chains
@@ -2289,7 +2328,11 @@ def _collapse_needle_edges(
     if total_merges > 0:
         result = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
         result.remove_unreferenced_vertices()
-        result.merge_vertices()
+        # NOTE: Do NOT call merge_vertices() here — the union-find collapse
+        # already handled the merges precisely.  An additional merge_vertices()
+        # with trimesh's distance-based tolerance can incorrectly merge nearby
+        # but distinct vertices (e.g. base cap vs. wall vertices), breaking
+        # connectivity and distorting the base outline.
         # Shard cleanup — collapse can disconnect tiny fragments
         result = _remove_coplanar_shard_components(result, f'{label}_collapsed')
         logger.info(
@@ -2372,7 +2415,12 @@ def cleanup_csg_mesh(
             faces=np.array(out.tri_verts),
             process=False,
         )
-        result.merge_vertices()
+        # NOTE: Do NOT call merge_vertices() here.  manifold3d's output has
+        # intentionally split vertices at seam edges (see _manifold_to_trimesh
+        # which also uses process=False for this reason).  Merging them can
+        # create T-junctions that break manifold topology and cause face
+        # connectivity issues — in particular, base-cap vertices can get merged
+        # with nearby wall vertices, distorting the prism base outline.
 
         # Shard cleanup (simplify may split off tiny regions)
         result = _remove_coplanar_shard_components(result, f'{label}_simplified')
@@ -2901,10 +2949,14 @@ def _extrude_polygon_to_prism(
     
     faces = np.array(faces, dtype=np.int64)
     
+    # Use process=False to prevent trimesh from modifying the carefully
+    # constructed prism geometry (merge_vertices / remove_degenerate_faces
+    # can collapse fan-center vertices or thin cap triangles, shrinking the
+    # base outline).  fix_normals() is sufficient for a clean extrusion.
     prism_mesh = trimesh.Trimesh(
         vertices=all_vertices,
         faces=faces,
-        process=True
+        process=False
     )
     prism_mesh.fix_normals()
     
