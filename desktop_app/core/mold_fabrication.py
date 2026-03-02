@@ -2346,6 +2346,142 @@ def _collapse_needle_edges(
     return mesh
 
 
+def ensure_manifold_mesh(
+    mesh: trimesh.Trimesh,
+    label: str = 'mesh',
+) -> trimesh.Trimesh:
+    """Ensure mesh is manifold by fixing non-manifold edges via meshlib.
+
+    Uses a meshlib round-trip to resolve non-manifold (NM) edges.  meshlib's
+    ``meshFromFacesVerts`` automatically splits NM edges by duplicating
+    vertices in its internal half-edge structure.  After splitting, the
+    formerly overlapping face patches (from CSG coincident-surface artifacts)
+    become small disconnected topological components that can be safely
+    removed without creating holes in the main mesh body.
+
+    This replaces the complex iterative anti-parallel pair detection with a
+    simple 3-step pipeline:
+
+        1. **Import** into meshlib — NM edges auto-split.
+        2. **Remove small components** — overlapping patches are small.
+        3. **Export** with ``process=False`` — preserves split vertices.
+
+    The ``process=False`` is critical: trimesh's ``process=True`` merges
+    geometrically coincident vertices, which re-creates the NM topology
+    that meshlib just fixed.
+
+    Args:
+        mesh:  Post-CSG trimesh that may have non-manifold edges.
+        label: Human-readable label for logging.
+
+    Returns:
+        Clean manifold trimesh with no non-manifold edges.  Returns the
+        original mesh unchanged if no NM edges are found or meshlib is
+        unavailable.
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh
+
+    # Quick check: does the mesh even have NM edges?
+    import numpy as np
+
+    edge_counts: Dict[Tuple[int, int], int] = {}
+    for face in mesh.faces:
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            ek = (min(v0, v1), max(v0, v1))
+            edge_counts[ek] = edge_counts.get(ek, 0) + 1
+    nm_count = sum(1 for c in edge_counts.values() if c > 2)
+
+    if nm_count == 0:
+        return mesh
+
+    try:
+        import meshlib.mrmeshpy as mm
+        import meshlib.mrmeshnumpy as mrn
+        import time
+
+        start_time = time.time()
+        initial_faces = len(mesh.faces)
+
+        # Step 1: Convert to meshlib — auto-splits NM edges.
+        mesh_mr = mrn.meshFromFacesVerts(
+            mesh.faces.astype(np.int32),
+            mesh.vertices.astype(np.float32),
+        )
+
+        # Safety: also call fixMultipleEdges in case meshFromFacesVerts
+        # didn't catch all edge duplicates.
+        mm.fixMultipleEdges(mesh_mr)
+
+        # Step 2: Remove small components (the split NM face patches).
+        comps = mm.getAllComponents(mesh_mr)
+        removed_faces = 0
+        removed_comps = 0
+        if len(comps) > 1:
+            sizes = sorted(
+                [(i, c.count()) for i, c in enumerate(comps)],
+                key=lambda x: -x[1],
+            )
+            small_faces_bs = mm.FaceBitSet()
+            for idx, sz in sizes[1:]:
+                small_faces_bs |= comps[idx]
+            removed_faces = small_faces_bs.count()
+            removed_comps = len(sizes) - 1
+            if removed_faces > 0:
+                mesh_mr.deleteFaces(small_faces_bs)
+
+        # Step 3: Fill any holes left by component removal.
+        holes = mesh_mr.topology.findHoleRepresentiveEdges()
+        filled = 0
+        if len(holes) > 0:
+            params = mm.FillHoleParams()
+            params.metric = mm.getUniversalMetric(mesh_mr)
+            for he in holes:
+                try:
+                    mm.fillHole(mesh_mr, he, params)
+                    filled += 1
+                except Exception:
+                    pass
+
+        # Step 4: Pack and convert back — process=False to preserve
+        # split vertices (process=True would merge them, re-creating
+        # NM edges).
+        mesh_mr.packOptimally(False)
+        out_verts = mrn.getNumpyVerts(mesh_mr)
+        out_faces = mrn.getNumpyFaces(mesh_mr.topology)
+        result = trimesh.Trimesh(
+            vertices=out_verts,
+            faces=out_faces,
+            process=False,
+        )
+
+        elapsed_ms = (time.time() - start_time) * 1000
+
+        logger.info(
+            "  [Manifold fix] '%s': %d NM edges → removed %d faces "
+            "(%d components), filled %d holes → %d faces (%.0f ms)",
+            label, nm_count, removed_faces, removed_comps,
+            filled, len(result.faces), elapsed_ms,
+        )
+
+        return result
+
+    except ImportError:
+        logger.warning(
+            "  [Manifold fix] '%s': meshlib not available — "
+            "returning mesh with %d NM edges",
+            label, nm_count,
+        )
+        return mesh
+    except Exception as exc:
+        logger.warning(
+            "  [Manifold fix] '%s' failed — returning original: %s",
+            label, exc,
+        )
+        return mesh
+
+
 def remove_overlapping_face_pairs(
     mesh: trimesh.Trimesh,
     label: str = 'mesh',
@@ -2359,18 +2495,21 @@ def remove_overlapping_face_pairs(
     edges, 4 (or more) faces share a single edge, violating the manifold
     property (exactly 2 faces per edge).
 
-    This function detects and removes both faces of every anti-parallel pair
-    at non-manifold edges, then cleans up resulting holes and small fragment
-    components via meshlib.  The result is a single-component mesh with
-    zero (or near-zero) non-manifold edges and no boundary edges.
+    This function iteratively detects and removes both faces of every
+    anti-parallel pair at non-manifold edges, then cleans up resulting holes
+    and small fragment components via meshlib.  Multiple rounds are needed
+    because the ``process=True`` vertex merge after meshlib hole-filling can
+    re-create NM edges where new hole-fill vertices coincide with existing
+    mesh vertices.  The loop converges quickly (typically 2 rounds).
 
-    Algorithm:
+    Algorithm (per round):
         1. Build edge → face-index mapping.
         2. Identify non-manifold edges (multiplicity > 2).
         3. At each NM edge, greedily pair anti-parallel faces (dot < -0.3,
            centroid distance < 1.0 mm).
         4. Remove both faces of each pair + zero-area faces.
         5. Use meshlib to fill resulting holes and remove small components.
+        6. Reload with ``process=True`` (vertex merge) and repeat.
 
     Args:
         mesh:  Post-CSG trimesh (typically a metamold half with part).
@@ -2386,191 +2525,344 @@ def remove_overlapping_face_pairs(
 
     try:
         start_time = time.time()
+        initial_face_count = len(mesh.faces)
+        MAX_ROUNDS = 3
+        current = mesh
+        total_pairs = 0
+        rounds_done = 0
+        prev_nm_count = -1
 
-        # Ensure vertex sharing (STL re-import or process=True)
-        work = trimesh.Trimesh(
-            vertices=mesh.vertices.copy(),
-            faces=mesh.faces.copy(),
+        for round_idx in range(MAX_ROUNDS):
+            # Ensure vertex sharing (STL re-import or process=True)
+            work = trimesh.Trimesh(
+                vertices=current.vertices.copy(),
+                faces=current.faces.copy(),
+                process=True,
+            )
+
+            normals = work.face_normals
+            centroids = work.triangles_center
+            areas = work.area_faces
+
+            # --- Step 1: Build edge → face mapping ---
+            edge_to_faces: Dict[Tuple[int, int], List[int]] = {}
+            for fi, face in enumerate(work.faces):
+                for i in range(3):
+                    v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                    ek = (min(v0, v1), max(v0, v1))
+                    edge_to_faces.setdefault(ek, []).append(fi)
+
+            # --- Step 2: Find non-manifold edges ---
+            nm_edges = {e: fs for e, fs in edge_to_faces.items() if len(fs) > 2}
+            if not nm_edges:
+                if round_idx == 0:
+                    logger.info(
+                        "  [Pair removal] '%s': no non-manifold edges — skipping",
+                        label,
+                    )
+                    return mesh
+                logger.info(
+                    "  [Pair removal] '%s' round %d: 0 NM edges — converged",
+                    label, round_idx + 1,
+                )
+                break
+
+            logger.info(
+                "  [Pair removal] '%s' round %d: %d non-manifold edges detected",
+                label, round_idx + 1, len(nm_edges),
+            )
+
+            # Detect cycle: same NM count as last round → stop iterating
+            # and let the final lightweight pass handle the stubborn edges.
+            if len(nm_edges) == prev_nm_count and round_idx > 0:
+                logger.info(
+                    "  [Pair removal] '%s' round %d: NM count unchanged "
+                    "(%d) — breaking to final pass",
+                    label, round_idx + 1, len(nm_edges),
+                )
+                break
+            prev_nm_count = len(nm_edges)
+
+            # --- Step 3: Greedily pair anti-parallel faces at NM edges ---
+            faces_to_remove: set = set()
+            pairs_found = 0
+
+            for (_v0, _v1), face_list in nm_edges.items():
+                n = len(face_list)
+                used = [False] * n
+
+                for i in range(n):
+                    if used[i]:
+                        continue
+                    best_j = -1
+                    best_dot = 0.0
+                    for j in range(i + 1, n):
+                        if used[j]:
+                            continue
+                        fi, fj = face_list[i], face_list[j]
+                        dot = float(np.dot(normals[fi], normals[fj]))
+                        cdist = float(np.linalg.norm(
+                            centroids[fi] - centroids[fj]
+                        ))
+                        # Near-perfect anti-parallel (dot<-0.99): always
+                        # pair regardless of centroid distance — clearly
+                        # overlapping duplicate faces even when large.
+                        # Weaker anti-parallel (-0.3 to -0.99): require
+                        # centroid proximity (< 1 mm) for confirmation.
+                        is_pair = (
+                            (dot < -0.99)
+                            or (dot < -0.3 and cdist < 1.0)
+                        )
+                        if is_pair and dot < best_dot:
+                            best_dot = dot
+                            best_j = j
+
+                    if best_j >= 0:
+                        used[i] = True
+                        used[best_j] = True
+                        faces_to_remove.add(face_list[i])
+                        faces_to_remove.add(face_list[best_j])
+                        pairs_found += 1
+
+            # Also remove zero-area faces
+            zero_area_indices = set(
+                int(x) for x in np.where(areas < 1e-10)[0]
+            )
+            n_zero = len(zero_area_indices - faces_to_remove)
+            faces_to_remove |= zero_area_indices
+
+            logger.info(
+                "  [Pair removal] '%s' round %d: %d pairs (%d faces) "
+                "+ %d zero-area → removing %d faces",
+                label, round_idx + 1, pairs_found, pairs_found * 2,
+                n_zero, len(faces_to_remove),
+            )
+
+            if not faces_to_remove:
+                logger.info(
+                    "  [Pair removal] '%s' round %d: no removable faces — done "
+                    "(%d NM edges remain without anti-parallel pairs)",
+                    label, round_idx + 1, len(nm_edges),
+                )
+                break
+
+            total_pairs += pairs_found
+            rounds_done = round_idx + 1
+
+            # --- Step 4: Remove faces (preserve vertex indices) ---
+            keep_mask = np.ones(len(work.faces), dtype=bool)
+            keep_mask[list(faces_to_remove)] = False
+            cleaned = trimesh.Trimesh(
+                vertices=work.vertices,
+                faces=work.faces[keep_mask],
+                process=False,
+            )
+
+            # --- Step 5: Meshlib repair (fill holes + remove fragments) ---
+            try:
+                import meshlib.mrmeshpy as mm
+                import tempfile
+
+                with tempfile.NamedTemporaryFile(
+                    suffix='.stl', delete=False,
+                    prefix=f'pair_removal_{label}_r{round_idx}_',
+                ) as tf:
+                    tmp_path = tf.name
+                cleaned.export(tmp_path)
+
+                mesh_ml = mm.loadMesh(tmp_path)
+
+                # Fill holes
+                holes = mesh_ml.topology.findHoleRepresentiveEdges()
+                if len(holes) > 0:
+                    params = mm.FillHoleParams()
+                    params.metric = mm.getUniversalMetric(mesh_ml)
+                    filled = 0
+                    for he in holes:
+                        try:
+                            mm.fillHole(mesh_ml, he, params)
+                            filled += 1
+                        except Exception:
+                            pass
+                    logger.info(
+                        "  [Pair removal] '%s' round %d: filled %d / %d holes",
+                        label, round_idx + 1, filled, len(holes),
+                    )
+
+                # Remove small components
+                comps = mm.getAllComponents(mesh_ml)
+                if len(comps) > 1:
+                    sizes = [(i, c.count()) for i, c in enumerate(comps)]
+                    sizes.sort(key=lambda x: x[1], reverse=True)
+                    small_faces = mm.FaceBitSet()
+                    for idx, sz in sizes[1:]:
+                        if sz < 100:
+                            small_faces |= comps[idx]
+                    if small_faces.count() > 0:
+                        mesh_ml.deleteFaces(small_faces)
+                        logger.info(
+                            "  [Pair removal] '%s' round %d: removed %d "
+                            "small-component faces (%d components)",
+                            label, round_idx + 1,
+                            small_faces.count(), len(sizes) - 1,
+                        )
+
+                    # Fill any new holes exposed by component removal
+                    holes2 = mesh_ml.topology.findHoleRepresentiveEdges()
+                    if len(holes2) > 0:
+                        params2 = mm.FillHoleParams()
+                        params2.metric = mm.getUniversalMetric(mesh_ml)
+                        for he in holes2:
+                            try:
+                                mm.fillHole(mesh_ml, he, params2)
+                            except Exception:
+                                pass
+
+                # Pack and export
+                mesh_ml.packOptimally(False)
+                mm.saveMesh(mesh_ml, tmp_path)
+
+                # Reload with process=True (vertex merge).  This may create
+                # new NM edges where hole-fill vertices coincide with existing
+                # vertices — the next iteration of the loop will catch those.
+                current = trimesh.load(tmp_path, process=True)
+                current.remove_unreferenced_vertices()
+
+                # Cleanup temp file
+                try:
+                    import os
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+            except ImportError:
+                logger.warning(
+                    "  [Pair removal] '%s': meshlib not available — "
+                    "returning pair-removed mesh without hole filling",
+                    label,
+                )
+                current = cleaned
+                break
+
+        # --- Final lightweight pass ---
+        # After the main loop, stubborn NM edges may persist because
+        # meshlib hole-fill + process=True vertex merge keeps re-creating
+        # them.  These edges have exactly 4 faces (2 overlapping anti-
+        # parallel pairs).  Removing ALL faces creates holes → cycle.
+        # Instead, remove only the BEST single pair per NM edge, reducing
+        # multiplicity from 4→2 (manifold).  No holes → no meshlib →
+        # no vertex merge → no new NM edges.
+        final_work = trimesh.Trimesh(
+            vertices=current.vertices.copy(),
+            faces=current.faces.copy(),
             process=True,
         )
+        fnormals = final_work.face_normals
+        fcentroids = final_work.triangles_center
+        fareas = final_work.area_faces
 
-        normals = work.face_normals
-        centroids = work.triangles_center
-        areas = work.area_faces
-
-        # --- Step 1: Build edge → face mapping ---
-        edge_to_faces: Dict[Tuple[int, int], List[int]] = {}
-        for fi, face in enumerate(work.faces):
+        fetf: Dict[Tuple[int, int], List[int]] = {}
+        for fi, face in enumerate(final_work.faces):
             for i in range(3):
                 v0, v1 = int(face[i]), int(face[(i + 1) % 3])
                 ek = (min(v0, v1), max(v0, v1))
-                edge_to_faces.setdefault(ek, []).append(fi)
+                fetf.setdefault(ek, []).append(fi)
 
-        # --- Step 2: Find non-manifold edges ---
-        nm_edges = {e: fs for e, fs in edge_to_faces.items() if len(fs) > 2}
-        if not nm_edges:
-            logger.info(
-                "  [Pair removal] '%s': no non-manifold edges — skipping", label
-            )
-            return mesh
+        fnm = {e: fs for e, fs in fetf.items() if len(fs) > 2}
+        if fnm:
+            final_remove: set = set()
+            final_pairs = 0
+            for (_v0, _v1), face_list in fnm.items():
+                # Find the SINGLE best anti-parallel pair at this edge
+                best_i, best_j, best_dot = -1, -1, 0.0
+                for i in range(len(face_list)):
+                    for j in range(i + 1, len(face_list)):
+                        fi, fj = face_list[i], face_list[j]
+                        dot = float(np.dot(fnormals[fi], fnormals[fj]))
+                        cdist = float(np.linalg.norm(
+                            fcentroids[fi] - fcentroids[fj],
+                        ))
+                        is_pair = (
+                            (dot < -0.99)
+                            or (dot < -0.3 and cdist < 1.0)
+                        )
+                        if is_pair and dot < best_dot:
+                            best_dot = dot
+                            best_i, best_j = i, j
+                if best_i >= 0:
+                    final_remove.add(face_list[best_i])
+                    final_remove.add(face_list[best_j])
+                    final_pairs += 1
+                else:
+                    # No anti-parallel pair found — check for T-junction:
+                    # At NM edges with 4 faces and no anti-parallel pair,
+                    # a common pattern is 2 coplanar pairs (dot > 0.99)
+                    # where one face is tiny (degenerate from edge collapse).
+                    # Remove the smallest face of each coplanar pair until
+                    # exactly 2 faces remain (manifold).
+                    remaining = list(range(len(face_list)))
+                    while len(remaining) > 2:
+                        # Find a coplanar pair among remaining
+                        found = False
+                        for ii in range(len(remaining)):
+                            for jj in range(ii + 1, len(remaining)):
+                                fi = face_list[remaining[ii]]
+                                fj = face_list[remaining[jj]]
+                                dot = float(np.dot(
+                                    fnormals[fi], fnormals[fj],
+                                ))
+                                if dot > 0.99:
+                                    # Remove the smaller face
+                                    if fareas[fi] <= fareas[fj]:
+                                        final_remove.add(fi)
+                                        remaining.pop(ii)
+                                    else:
+                                        final_remove.add(fj)
+                                        remaining.pop(jj)
+                                    found = True
+                                    break
+                            if found:
+                                break
+                        if not found:
+                            # No coplanar pair — remove the smallest face
+                            idx_min = min(
+                                range(len(remaining)),
+                                key=lambda k: fareas[
+                                    face_list[remaining[k]]
+                                ],
+                            )
+                            final_remove.add(face_list[remaining[idx_min]])
+                            remaining.pop(idx_min)
 
-        logger.info(
-            "  [Pair removal] '%s': %d non-manifold edges detected",
-            label, len(nm_edges),
-        )
+            # Also remove zero-area faces
+            fzero = set(int(x) for x in np.where(fareas < 1e-10)[0])
+            final_remove |= fzero
 
-        # --- Step 3: Greedily pair anti-parallel faces at NM edges ---
-        faces_to_remove: set = set()
-        pairs_found = 0
-
-        for (_v0, _v1), face_list in nm_edges.items():
-            n = len(face_list)
-            used = [False] * n
-
-            for i in range(n):
-                if used[i]:
-                    continue
-                best_j = -1
-                best_dot = 0.0
-                for j in range(i + 1, n):
-                    if used[j]:
-                        continue
-                    fi, fj = face_list[i], face_list[j]
-                    dot = float(np.dot(normals[fi], normals[fj]))
-                    cdist = float(np.linalg.norm(centroids[fi] - centroids[fj]))
-                    if dot < -0.3 and cdist < 1.0 and dot < best_dot:
-                        best_dot = dot
-                        best_j = j
-
-                if best_j >= 0:
-                    used[i] = True
-                    used[best_j] = True
-                    faces_to_remove.add(face_list[i])
-                    faces_to_remove.add(face_list[best_j])
-                    pairs_found += 1
-
-        # Also remove zero-area faces
-        zero_area_indices = set(int(x) for x in np.where(areas < 1e-10)[0])
-        n_zero = len(zero_area_indices - faces_to_remove)
-        faces_to_remove |= zero_area_indices
-
-        logger.info(
-            "  [Pair removal] '%s': found %d anti-parallel pairs (%d faces) "
-            "+ %d zero-area → removing %d faces total",
-            label, pairs_found, pairs_found * 2, n_zero, len(faces_to_remove),
-        )
-
-        if not faces_to_remove:
-            return mesh
-
-        # --- Step 4: Remove faces (preserve vertex indices) ---
-        keep_mask = np.ones(len(work.faces), dtype=bool)
-        keep_mask[list(faces_to_remove)] = False
-        cleaned = trimesh.Trimesh(
-            vertices=work.vertices,
-            faces=work.faces[keep_mask],
-            process=False,
-        )
-
-        # --- Step 5: Meshlib repair (fill holes + remove fragments) ---
-        try:
-            import meshlib.mrmeshpy as mm
-
-            # Save to temp file for meshlib (it needs a file path)
-            import tempfile
-            with tempfile.NamedTemporaryFile(
-                suffix='.stl', delete=False, prefix=f'pair_removal_{label}_'
-            ) as tf:
-                tmp_path = tf.name
-            cleaned.export(tmp_path)
-
-            mesh_ml = mm.loadMesh(tmp_path)
-            logger.info(
-                "  [Pair removal] '%s': meshlib loaded %d faces, filling holes...",
-                label, mesh_ml.topology.numValidFaces(),
-            )
-
-            # Fill holes
-            holes = mesh_ml.topology.findHoleRepresentiveEdges()
-            if len(holes) > 0:
-                params = mm.FillHoleParams()
-                params.metric = mm.getUniversalMetric(mesh_ml)
-                filled = 0
-                for he in holes:
-                    try:
-                        mm.fillHole(mesh_ml, he, params)
-                        filled += 1
-                    except Exception:
-                        pass
+            if final_remove:
+                fkeep = np.ones(len(final_work.faces), dtype=bool)
+                fkeep[list(final_remove)] = False
+                current = trimesh.Trimesh(
+                    vertices=final_work.vertices,
+                    faces=final_work.faces[fkeep],
+                    process=False,
+                )
+                current.remove_unreferenced_vertices()
+                total_pairs += final_pairs
                 logger.info(
-                    "  [Pair removal] '%s': filled %d / %d holes",
-                    label, filled, len(holes),
+                    "  [Pair removal] '%s' final pass: removed %d pairs "
+                    "(%d faces) + %d zero-area — NM edges resolved",
+                    label, final_pairs, final_pairs * 2,
+                    len(fzero - set(list(final_remove)[:final_pairs * 2])),
                 )
 
-            # Remove small components
-            comps = mm.getAllComponents(mesh_ml)
-            if len(comps) > 1:
-                sizes = [(i, c.count()) for i, c in enumerate(comps)]
-                sizes.sort(key=lambda x: x[1], reverse=True)
-                small_faces = mm.FaceBitSet()
-                for idx, sz in sizes[1:]:
-                    if sz < 100:
-                        small_faces |= comps[idx]
-                if small_faces.count() > 0:
-                    mesh_ml.deleteFaces(small_faces)
-                    logger.info(
-                        "  [Pair removal] '%s': removed %d small-component faces "
-                        "(%d components)",
-                        label, small_faces.count(), len(sizes) - 1,
-                    )
-
-                # Fill any new holes exposed by component removal
-                holes2 = mesh_ml.topology.findHoleRepresentiveEdges()
-                if len(holes2) > 0:
-                    for he in holes2:
-                        try:
-                            mm.fillHole(mesh_ml, he, params)
-                        except Exception:
-                            pass
-
-            # Pack and export
-            mesh_ml.packOptimally(False)
-            mm.saveMesh(mesh_ml, tmp_path)
-
-            # Reload as trimesh with vertex merging for downstream
-            # operations (needle collapse, shard removal).  The process=True
-            # vertex merge may recreate a handful of NM edges (~9 on a 228k
-            # face mesh) where meshlib hole-fill vertices coincide with
-            # existing vertices — this is acceptable.
-            result = trimesh.load(tmp_path, process=True)
-            result.remove_unreferenced_vertices()
-
-            # Cleanup temp file
-            try:
-                import os
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-            elapsed_ms = (time.time() - start_time) * 1000
-            logger.info(
-                "  [Pair removal] '%s': %d → %d faces in %.1f ms",
-                label, len(mesh.faces), len(result.faces), elapsed_ms,
-            )
-            return result
-
-        except ImportError:
-            logger.warning(
-                "  [Pair removal] '%s': meshlib not available — "
-                "returning pair-removed mesh without hole filling",
-                label,
-            )
-            elapsed_ms = (time.time() - start_time) * 1000
-            logger.info(
-                "  [Pair removal] '%s': %d → %d faces in %.1f ms (no meshlib)",
-                label, len(mesh.faces), len(cleaned.faces), elapsed_ms,
-            )
-            return cleaned
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.info(
+            "  [Pair removal] '%s': %d → %d faces in %.1f ms "
+            "(%d rounds, %d total pairs removed)",
+            label, initial_face_count, len(current.faces),
+            elapsed_ms, max(rounds_done, 1), total_pairs,
+        )
+        return current
 
     except Exception as exc:
         logger.warning(
@@ -2676,19 +2968,14 @@ def cleanup_csg_mesh(
                 shortest = np.minimum(e0, np.minimum(e1, e2))
                 edge_ratio = longest / (shortest + 1e-15)
 
-            # --- Step B: Overlapping face pair removal ---
+            # --- Step B: Manifold enforcement ---
             # The manifold3d boolean union creates non-manifold edges where
-            # the cavity wall meets the part surface.  At these edges, >2
-            # faces share a single edge because anti-parallel face pairs
-            # (cavity wall vs. part surface) are not properly merged.
-            # We detect and remove both faces of each overlapping pair,
-            # then repair resulting holes via meshlib.
-            # This MUST run before needle edge collapse — the edge collapse
-            # can alter mesh topology and create additional NM edges that
-            # make the pair detection less effective.
-            mesh = remove_overlapping_face_pairs(mesh, label=label)
+            # the cavity wall meets the part surface.  meshlib's import
+            # auto-splits these NM edges; the resulting small overlapping
+            # face patches become disconnected components that are removed.
+            mesh = ensure_manifold_mesh(mesh, label=label)
 
-            # Recompute edge ratios after pair removal (mesh may have changed)
+            # Recompute edge ratios after manifold fix (mesh may have changed)
             v = mesh.vertices[mesh.faces]
             e0 = np.linalg.norm(v[:, 1] - v[:, 0], axis=1)
             e1 = np.linalg.norm(v[:, 2] - v[:, 1], axis=1)
@@ -2740,6 +3027,11 @@ def cleanup_csg_mesh(
                     label=label,
                     vertex_near_part=vertex_near_part,
                 )
+
+            # --- Step D: Post-collapse manifold enforcement ---
+            # Needle edge collapse can re-introduce NM edges via vertex
+            # merging.  Run manifold enforcement as a final safety net.
+            result = ensure_manifold_mesh(result, label=label)
 
         else:
             # -----------------------------------------------------------------

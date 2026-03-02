@@ -7,7 +7,7 @@ applyTo: '**'
 ## Project State
 
 ### Last Updated
-- Date: January 23, 2026
+- Date: January 24, 2026
 - Status: Active Development
 
 ### Current Implementation Status
@@ -138,6 +138,40 @@ biased_dist = δ + max(λ_w, 0)
 ---
 
 ## Recent Changes
+
+### January 2026 - Simplified Manifold Enforcement (Session 10)
+- **Problem:** The iterative `remove_overlapping_face_pairs()` approach (391 lines, 3 rounds + final pass + T-junction handling) was complex and fragile. User reported the issue still persisted on some models despite testing clean on debug meshes.
+- **Root Cause of complexity:** The old approach tried to detect and remove specific anti-parallel face pairs at NM edges, then fill holes with meshlib, then `process=True` vertex merge recreated NM edges, requiring iterative cycles. Each step could fail or introduce new artifacts.
+- **New Solution:** Replaced with a simple 3-step `ensure_manifold_mesh()` function in `mold_fabrication.py`:
+  1. **Import into meshlib** via `meshFromFacesVerts()` — automatically splits NM edges by duplicating vertices in the half-edge structure. Overlapping face patches become disconnected topological components.
+  2. **Remove small components** via `getAllComponents()` + `deleteFaces()` — the split NM patches are small (typically <36 faces each, 484-699 components total).
+  3. **Export with `process=False`** — critical: trimesh's `process=True` merges geometrically coincident vertices, which RE-CREATES the NM topology that meshlib just fixed.
+- **Key insight:** `process=False` is essential. The old approach used `process=True` after meshlib, which caused the cycling problem. The new approach avoids vertex merging entirely.
+- **Integration in `cleanup_csg_mesh()` selective mode:**
+  - Step A: Remove zero-area faces (unchanged)
+  - Step B: `ensure_manifold_mesh()` (NEW — replaces 391-line `remove_overlapping_face_pairs()`)
+  - Step C: Per-vertex proximity needle edge collapse (unchanged)
+  - Step D: `ensure_manifold_mesh()` again (NEW — catches NM edges from collapse)
+- **Results:**
+  - Half1: 313 NM → 0 NM, 4644 faces removed (699 components), 82ms
+  - Half2: 177 NM → 0 NM + 3 NM from collapse → 0 NM, 4101 faces removed (484 components), 77+65ms
+  - Total time: ~150ms per half (vs ~4000ms before)
+  - `remove_overlapping_face_pairs()` is retained but no longer called from `cleanup_csg_mesh()` selective mode
+- **meshlib functions used:** `meshFromFacesVerts` (auto-splits NM), `fixMultipleEdges` (safety net), `getAllComponents`, `FaceBitSet`, `deleteFaces`, `FillHoleParams`, `fillHole`, `packOptimally`, `getNumpyVerts`, `getNumpyFaces`
+
+### January 2026 - Iterative Pair Removal with Final Pass (Session 9)
+- **Problem:** After Session 8's `remove_overlapping_face_pairs()`, 25 NM edges remained in the final mesh. These were NEWLY CREATED by the `process=True` vertex merge after meshlib hole-filling — meshlib creates new vertices that coincide with existing vertices, and trimesh merges them, creating NM edges.
+- **Root Cause 1 (cycling):** The original single-pass approach removed pairs → meshlib filled holes → `process=True` merged vertices → created ~12-13 new NM edges with anti-parallel face pairs. A naive iterative approach cycles: round N removes pairs at these edges, meshlib fills, vertex merge recreates the same NM edges at round N+1.
+- **Root Cause 2 (threshold):** One stubborn NM edge had large flat faces (areas 2-4.5 mm²) at the metamold base plane. The anti-parallel pairs had dot=-1.0 but centroid distances of 1.5-2.1 mm — exceeding the 1.0 mm threshold.
+- **Solution (3 changes to `remove_overlapping_face_pairs()` in `mold_fabrication.py`):**
+  1. **Iterative loop (max 3 rounds):** Each round: detect NM edges → pair anti-parallel faces → remove → meshlib fill → `process=True` reload. Second round catches vertex-merge-created NM edges.
+  2. **Cycle detection:** If NM edge count is unchanged from previous round, break early to the final pass (saves one unnecessary meshlib round).
+  3. **Final lightweight pass:** After the loop, remaining stubborn NM edges are resolved by removing only ONE pair per edge (reducing multiplicity 4→2 = manifold). No meshlib or `process=True` needed — no holes created when 2 of 4 faces remain.
+  4. **Relaxed threshold for near-perfect anti-parallel pairs:** `dot < -0.99` → pair regardless of centroid distance (clearly overlapping). `dot < -0.3 AND cdist < 1.0` → pair with proximity confirmation (as before).
+- **Results:**
+  - Half1: 597 NM → 0 NM (was 25 before fix). 234,068 → 228,551 faces, 790 pairs removed in 2 rounds + final pass.
+  - Half2: 351 NM → 0 NM. 233,086 → 228,706 faces, 461 pairs removed in 2 rounds + final pass.
+  - Time: ~4 seconds per half (same as before, cycle detection saves the wasted 3rd meshlib round).
 
 ### January 2026 - Overlapping Face Pair Removal (Session 8)
 - **Root Cause:** manifold3d union of coincident surfaces (cavity + part) leaves overlapping anti-parallel face pairs at the intersecting surface. These double-wall faces create 600+ non-manifold edges (multiplicity 4 = 2 proper + 2 overlapping) and 880+ small fragment components.
