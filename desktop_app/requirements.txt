@@ -19,8 +19,8 @@ meshlib>=3.0.0
 pyvista>=0.42.0
 pyvistaqt>=0.11.0
 
-# CSG Operations (manifold3d is HIGHLY recommended for mold cavity creation)
-manifold3d>=2.3.0
+# CSG Operations (manifold3d >= 3.4.0 needed for coincident-face handling)
+manifold3d>=3.4.0
 
 # Tetrahedral meshing (required for parting surface computation)
 pytetwild>=0.1.0

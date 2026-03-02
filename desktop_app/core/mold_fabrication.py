@@ -1445,6 +1445,187 @@ def extend_membrane_height(
     return extended_mesh
 
 
+# ============================================================================
+# MANIFOLD-SPACE METAMOLD PIPELINE
+# ============================================================================
+
+def build_metamold_halves_manifold_space(
+    prism_mesh: trimesh.Trimesh,
+    part_mesh: trimesh.Trimesh,
+    membrane_mesh: trimesh.Trimesh,
+    pouring_direction: np.ndarray,
+    blade_thickness: float = 0.001,
+    combined_part_mesh: Optional[trimesh.Trimesh] = None,
+) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh],
+           Optional[trimesh.Trimesh], float, bool]:
+    """Build both metamold halves in a single manifold3d session.
+
+    Performs the entire CSG chain — cavity creation, blade split, and part
+    union — without leaving manifold3d space.  This is critical because
+    manifold3d 3.4.0's symbolic perturbation can only eliminate coincident
+    faces when the *exact same* manifold python object is used for both the
+    subtraction and the subsequent union.  Round-tripping through trimesh
+    creates a new manifold object with fresh internal IDs, breaking the
+    provenance tracking that enables perfect coincident-face merging.
+
+    Pipeline executed in manifold3d space:
+        1. ``cavity = prism - part``
+        2. ``cut_cavity = cavity - blade``
+        3. ``components = cut_cavity.decompose()``
+        4. Classify upper / lower halves by pouring-direction centroid
+        5. ``half_with_part = component + part``   (same ``part`` object!)
+
+    When *combined_part_mesh* is provided (part + thickened secondary), the
+    union uses that instead of the bare part mesh.  The cavity subtraction
+    always uses the bare part so the cavity shape matches the original part.
+
+    Args:
+        prism_mesh:          Raw prism trimesh.
+        part_mesh:           Original part trimesh (used for cavity *and*
+                             for the union when combined_part_mesh is None).
+        membrane_mesh:       Parting surface / outer collar mesh.
+        pouring_direction:   Unit vector defining "upper" direction.
+        blade_thickness:     Cutting blade thickness in mm (default 0.001).
+        combined_part_mesh:  Optional part + thickened secondary surface.
+                             When None, ``part_mesh`` is used for the union.
+
+    Returns:
+        (half_1_with_part, half_2_with_part, blade_trimesh, elapsed_ms, success)
+        half_1 is the upper half (positive pouring direction).
+    """
+    start_time = time.time()
+
+    if not MANIFOLD_AVAILABLE:
+        logger.error("manifold3d not available — cannot build metamold halves")
+        return None, None, None, 0.0, False
+
+    direction = np.asarray(pouring_direction, dtype=np.float64)
+    direction = direction / (np.linalg.norm(direction) + 1e-10)
+
+    try:
+        # ---- 0. Create the cutting blade (trimesh, then manifold) ----
+        logger.info("[manifold-space] Creating cutting blade (thickness=%.6f mm)...",
+                    blade_thickness)
+        blade_trimesh = _create_cutting_blade_from_membrane(
+            membrane_mesh, direction, blade_thickness)
+        save_debug_mesh(blade_trimesh, 'msp_cutting_blade')
+
+        # ---- 1. Convert all inputs to manifold3d ONCE ----
+        logger.info("[manifold-space] Converting inputs to manifold...")
+        prism_m = _trimesh_to_manifold(prism_mesh, 'msp_prism')
+        part_m = _trimesh_to_manifold(part_mesh, 'msp_part')
+        blade_m = _trimesh_to_manifold(blade_trimesh, 'msp_blade')
+
+        # The mesh we union back into each half.  When there is a secondary
+        # surface, we build the combined manifold in this session so its
+        # part-surface faces share provenance with part_m.
+        if combined_part_mesh is not None and combined_part_mesh is not part_mesh:
+            # Combined = part + thickened secondary (done in manifold space)
+            # We convert *only* the thickened secondary, then union with the
+            # already-converted part_m so part faces keep their IDs.
+            # However, if the caller already unioned externally and handed us
+            # a completely different trimesh, we just convert that.
+            logger.info("[manifold-space] Building combined part manifold...")
+            combined_m = _trimesh_to_manifold(combined_part_mesh, 'msp_combined_part')
+        else:
+            combined_m = part_m  # same object — provenance preserved
+
+        # ---- 2. Cavity: prism - part  (manifold space) ----
+        logger.info("[manifold-space] CSG: cavity = prism - part ...")
+        cavity_m = prism_m - part_m
+        logger.info("[manifold-space]   cavity: %d verts, %d tris",
+                    cavity_m.num_vert(), cavity_m.num_tri())
+
+        # ---- 3. Blade split: cavity - blade  (manifold space) ----
+        logger.info("[manifold-space] CSG: cut = cavity - blade ...")
+        cut_m = cavity_m - blade_m
+        logger.info("[manifold-space]   cut: %d verts, %d tris",
+                    cut_m.num_vert(), cut_m.num_tri())
+
+        # ---- 4. Decompose into connected components (stays in manifold
+        #         space — this is the key difference from trimesh.split()) ----
+        components = cut_m.decompose()
+        logger.info("[manifold-space] decompose → %d component(s)", len(components))
+        for i, c in enumerate(components):
+            logger.info("[manifold-space]   component %d: %d verts, %d tris, "
+                        "vol=%.2f", i, c.num_vert(), c.num_tri(), c.volume())
+
+        if len(components) < 2:
+            logger.warning("[manifold-space] Blade did not produce 2 components")
+            elapsed_ms = (time.time() - start_time) * 1000
+            if len(components) == 1:
+                mesh_out = _manifold_to_trimesh(components[0], 'msp_single_component')
+                return mesh_out, None, blade_trimesh, elapsed_ms, False
+            return None, None, blade_trimesh, elapsed_ms, False
+
+        # Keep only the two largest by volume
+        components = sorted(components, key=lambda c: c.volume(), reverse=True)
+        comp_a, comp_b = components[0], components[1]
+        if len(components) > 2:
+            logger.warning("[manifold-space]   discarding %d small fragments",
+                           len(components) - 2)
+
+        # ---- 5. Classify upper / lower by pouring direction ----
+        def _manifold_centroid(m: 'manifold3d.Manifold') -> np.ndarray:
+            md = m.to_mesh()
+            vp = np.asarray(md.vert_properties, dtype=np.float64)
+            return vp.mean(axis=0)
+
+        cent_a = _manifold_centroid(comp_a)
+        cent_b = _manifold_centroid(comp_b)
+        proj_a = float(np.dot(cent_a, direction))
+        proj_b = float(np.dot(cent_b, direction))
+
+        if proj_a >= proj_b:
+            upper_m, lower_m = comp_a, comp_b
+        else:
+            upper_m, lower_m = comp_b, comp_a
+
+        logger.info("[manifold-space]   upper: %d tris (proj=%.2f), "
+                    "lower: %d tris (proj=%.2f)",
+                    upper_m.num_tri(), max(proj_a, proj_b),
+                    lower_m.num_tri(), min(proj_a, proj_b))
+
+        # ---- 6. Union each half with the part (manifold space, same
+        #         part object → coincident faces eliminated) ----
+        logger.info("[manifold-space] CSG: upper + part ...")
+        upper_result_m = upper_m + combined_m
+        logger.info("[manifold-space]   upper+part: %d verts, %d tris, vol=%.2f",
+                    upper_result_m.num_vert(), upper_result_m.num_tri(),
+                    upper_result_m.volume())
+
+        logger.info("[manifold-space] CSG: lower + part ...")
+        lower_result_m = lower_m + combined_m
+        logger.info("[manifold-space]   lower+part: %d verts, %d tris, vol=%.2f",
+                    lower_result_m.num_vert(), lower_result_m.num_tri(),
+                    lower_result_m.volume())
+
+        # ---- 7. Convert final results to trimesh ----
+        upper_trimesh = _manifold_to_trimesh(upper_result_m, 'msp_upper_with_part')
+        lower_trimesh = _manifold_to_trimesh(lower_result_m, 'msp_lower_with_part')
+
+        save_debug_mesh(upper_trimesh, 'msp_half1_with_part')
+        save_debug_mesh(lower_trimesh, 'msp_half2_with_part')
+
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.info("[manifold-space] Complete in %.1f ms", elapsed_ms)
+        logger.info("  Half 1 (upper): %d verts, %d faces, watertight=%s",
+                    len(upper_trimesh.vertices), len(upper_trimesh.faces),
+                    upper_trimesh.is_watertight)
+        logger.info("  Half 2 (lower): %d verts, %d faces, watertight=%s",
+                    len(lower_trimesh.vertices), len(lower_trimesh.faces),
+                    lower_trimesh.is_watertight)
+
+        return upper_trimesh, lower_trimesh, blade_trimesh, elapsed_ms, True
+
+    except Exception as exc:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error("[manifold-space] Failed: %s", exc)
+        import traceback
+        traceback.print_exc()
+        return None, None, None, elapsed_ms, False
+
+
 def split_shell_with_membrane(
     shell_with_cavity: trimesh.Trimesh,
     membrane: trimesh.Trimesh,
@@ -2165,6 +2346,239 @@ def _collapse_needle_edges(
     return mesh
 
 
+def remove_overlapping_face_pairs(
+    mesh: trimesh.Trimesh,
+    label: str = 'mesh',
+) -> trimesh.Trimesh:
+    """Remove overlapping coplanar anti-parallel face pairs at non-manifold edges.
+
+    After CSG union of coincident surfaces (e.g. ``cavity + part``), manifold3d
+    may leave overlapping face pairs along the part surface.  These are
+    face-pairs sharing an edge where each face has an anti-parallel normal
+    relative to its pair partner, effectively forming a double-wall.  At such
+    edges, 4 (or more) faces share a single edge, violating the manifold
+    property (exactly 2 faces per edge).
+
+    This function detects and removes both faces of every anti-parallel pair
+    at non-manifold edges, then cleans up resulting holes and small fragment
+    components via meshlib.  The result is a single-component mesh with
+    zero (or near-zero) non-manifold edges and no boundary edges.
+
+    Algorithm:
+        1. Build edge → face-index mapping.
+        2. Identify non-manifold edges (multiplicity > 2).
+        3. At each NM edge, greedily pair anti-parallel faces (dot < -0.3,
+           centroid distance < 1.0 mm).
+        4. Remove both faces of each pair + zero-area faces.
+        5. Use meshlib to fill resulting holes and remove small components.
+
+    Args:
+        mesh:  Post-CSG trimesh (typically a metamold half with part).
+        label: Human-readable label for logging.
+
+    Returns:
+        Cleaned trimesh with overlapping faces removed and holes filled.
+        Returns the original mesh unchanged if no non-manifold edges are found
+        or if cleanup fails.
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh
+
+    try:
+        start_time = time.time()
+
+        # Ensure vertex sharing (STL re-import or process=True)
+        work = trimesh.Trimesh(
+            vertices=mesh.vertices.copy(),
+            faces=mesh.faces.copy(),
+            process=True,
+        )
+
+        normals = work.face_normals
+        centroids = work.triangles_center
+        areas = work.area_faces
+
+        # --- Step 1: Build edge → face mapping ---
+        edge_to_faces: Dict[Tuple[int, int], List[int]] = {}
+        for fi, face in enumerate(work.faces):
+            for i in range(3):
+                v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+                ek = (min(v0, v1), max(v0, v1))
+                edge_to_faces.setdefault(ek, []).append(fi)
+
+        # --- Step 2: Find non-manifold edges ---
+        nm_edges = {e: fs for e, fs in edge_to_faces.items() if len(fs) > 2}
+        if not nm_edges:
+            logger.info(
+                "  [Pair removal] '%s': no non-manifold edges — skipping", label
+            )
+            return mesh
+
+        logger.info(
+            "  [Pair removal] '%s': %d non-manifold edges detected",
+            label, len(nm_edges),
+        )
+
+        # --- Step 3: Greedily pair anti-parallel faces at NM edges ---
+        faces_to_remove: set = set()
+        pairs_found = 0
+
+        for (_v0, _v1), face_list in nm_edges.items():
+            n = len(face_list)
+            used = [False] * n
+
+            for i in range(n):
+                if used[i]:
+                    continue
+                best_j = -1
+                best_dot = 0.0
+                for j in range(i + 1, n):
+                    if used[j]:
+                        continue
+                    fi, fj = face_list[i], face_list[j]
+                    dot = float(np.dot(normals[fi], normals[fj]))
+                    cdist = float(np.linalg.norm(centroids[fi] - centroids[fj]))
+                    if dot < -0.3 and cdist < 1.0 and dot < best_dot:
+                        best_dot = dot
+                        best_j = j
+
+                if best_j >= 0:
+                    used[i] = True
+                    used[best_j] = True
+                    faces_to_remove.add(face_list[i])
+                    faces_to_remove.add(face_list[best_j])
+                    pairs_found += 1
+
+        # Also remove zero-area faces
+        zero_area_indices = set(int(x) for x in np.where(areas < 1e-10)[0])
+        n_zero = len(zero_area_indices - faces_to_remove)
+        faces_to_remove |= zero_area_indices
+
+        logger.info(
+            "  [Pair removal] '%s': found %d anti-parallel pairs (%d faces) "
+            "+ %d zero-area → removing %d faces total",
+            label, pairs_found, pairs_found * 2, n_zero, len(faces_to_remove),
+        )
+
+        if not faces_to_remove:
+            return mesh
+
+        # --- Step 4: Remove faces (preserve vertex indices) ---
+        keep_mask = np.ones(len(work.faces), dtype=bool)
+        keep_mask[list(faces_to_remove)] = False
+        cleaned = trimesh.Trimesh(
+            vertices=work.vertices,
+            faces=work.faces[keep_mask],
+            process=False,
+        )
+
+        # --- Step 5: Meshlib repair (fill holes + remove fragments) ---
+        try:
+            import meshlib.mrmeshpy as mm
+
+            # Save to temp file for meshlib (it needs a file path)
+            import tempfile
+            with tempfile.NamedTemporaryFile(
+                suffix='.stl', delete=False, prefix=f'pair_removal_{label}_'
+            ) as tf:
+                tmp_path = tf.name
+            cleaned.export(tmp_path)
+
+            mesh_ml = mm.loadMesh(tmp_path)
+            logger.info(
+                "  [Pair removal] '%s': meshlib loaded %d faces, filling holes...",
+                label, mesh_ml.topology.numValidFaces(),
+            )
+
+            # Fill holes
+            holes = mesh_ml.topology.findHoleRepresentiveEdges()
+            if len(holes) > 0:
+                params = mm.FillHoleParams()
+                params.metric = mm.getUniversalMetric(mesh_ml)
+                filled = 0
+                for he in holes:
+                    try:
+                        mm.fillHole(mesh_ml, he, params)
+                        filled += 1
+                    except Exception:
+                        pass
+                logger.info(
+                    "  [Pair removal] '%s': filled %d / %d holes",
+                    label, filled, len(holes),
+                )
+
+            # Remove small components
+            comps = mm.getAllComponents(mesh_ml)
+            if len(comps) > 1:
+                sizes = [(i, c.count()) for i, c in enumerate(comps)]
+                sizes.sort(key=lambda x: x[1], reverse=True)
+                small_faces = mm.FaceBitSet()
+                for idx, sz in sizes[1:]:
+                    if sz < 100:
+                        small_faces |= comps[idx]
+                if small_faces.count() > 0:
+                    mesh_ml.deleteFaces(small_faces)
+                    logger.info(
+                        "  [Pair removal] '%s': removed %d small-component faces "
+                        "(%d components)",
+                        label, small_faces.count(), len(sizes) - 1,
+                    )
+
+                # Fill any new holes exposed by component removal
+                holes2 = mesh_ml.topology.findHoleRepresentiveEdges()
+                if len(holes2) > 0:
+                    for he in holes2:
+                        try:
+                            mm.fillHole(mesh_ml, he, params)
+                        except Exception:
+                            pass
+
+            # Pack and export
+            mesh_ml.packOptimally(False)
+            mm.saveMesh(mesh_ml, tmp_path)
+
+            # Reload as trimesh with vertex merging for downstream
+            # operations (needle collapse, shard removal).  The process=True
+            # vertex merge may recreate a handful of NM edges (~9 on a 228k
+            # face mesh) where meshlib hole-fill vertices coincide with
+            # existing vertices — this is acceptable.
+            result = trimesh.load(tmp_path, process=True)
+            result.remove_unreferenced_vertices()
+
+            # Cleanup temp file
+            try:
+                import os
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+            elapsed_ms = (time.time() - start_time) * 1000
+            logger.info(
+                "  [Pair removal] '%s': %d → %d faces in %.1f ms",
+                label, len(mesh.faces), len(result.faces), elapsed_ms,
+            )
+            return result
+
+        except ImportError:
+            logger.warning(
+                "  [Pair removal] '%s': meshlib not available — "
+                "returning pair-removed mesh without hole filling",
+                label,
+            )
+            elapsed_ms = (time.time() - start_time) * 1000
+            logger.info(
+                "  [Pair removal] '%s': %d → %d faces in %.1f ms (no meshlib)",
+                label, len(mesh.faces), len(cleaned.faces), elapsed_ms,
+            )
+            return cleaned
+
+    except Exception as exc:
+        logger.warning(
+            "  [Pair removal] '%s' failed — returning original: %s", label, exc
+        )
+        return mesh
+
+
 def cleanup_csg_mesh(
     mesh: trimesh.Trimesh,
     label: str = 'mesh',
@@ -2262,7 +2676,29 @@ def cleanup_csg_mesh(
                 shortest = np.minimum(e0, np.minimum(e1, e2))
                 edge_ratio = longest / (shortest + 1e-15)
 
-            # --- Step B: Per-vertex proximity (stable across iterations) ---
+            # --- Step B: Overlapping face pair removal ---
+            # The manifold3d boolean union creates non-manifold edges where
+            # the cavity wall meets the part surface.  At these edges, >2
+            # faces share a single edge because anti-parallel face pairs
+            # (cavity wall vs. part surface) are not properly merged.
+            # We detect and remove both faces of each overlapping pair,
+            # then repair resulting holes via meshlib.
+            # This MUST run before needle edge collapse — the edge collapse
+            # can alter mesh topology and create additional NM edges that
+            # make the pair detection less effective.
+            mesh = remove_overlapping_face_pairs(mesh, label=label)
+
+            # Recompute edge ratios after pair removal (mesh may have changed)
+            v = mesh.vertices[mesh.faces]
+            e0 = np.linalg.norm(v[:, 1] - v[:, 0], axis=1)
+            e1 = np.linalg.norm(v[:, 2] - v[:, 1], axis=1)
+            e2 = np.linalg.norm(v[:, 0] - v[:, 2], axis=1)
+            longest = np.maximum(e0, np.maximum(e1, e2))
+            shortest = np.minimum(e0, np.minimum(e1, e2))
+            edge_ratio = longest / (shortest + 1e-15)
+            areas = mesh.area_faces
+
+            # --- Step C: Per-vertex proximity (stable across iterations) ---
             # Compute once: which vertices are within proximity_radius of
             # the part surface.  Vertex IDs don't change during edge
             # collapse, so this stays valid across all iterations.
@@ -2294,7 +2730,7 @@ def cleanup_csg_mesh(
             )
 
             if near_needles == 0:
-                logger.info("  [CSG cleanup] '%s': no near-part needles — skipping", label)
+                logger.info("  [CSG cleanup] '%s': no near-part needles — skipping edge collapse", label)
                 result = mesh
             else:
                 result = _collapse_needle_edges(

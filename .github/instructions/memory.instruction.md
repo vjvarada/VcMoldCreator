@@ -139,6 +139,32 @@ biased_dist = δ + max(λ_w, 0)
 
 ## Recent Changes
 
+### January 2026 - Overlapping Face Pair Removal (Session 8)
+- **Root Cause:** manifold3d union of coincident surfaces (cavity + part) leaves overlapping anti-parallel face pairs at the intersecting surface. These double-wall faces create 600+ non-manifold edges (multiplicity 4 = 2 proper + 2 overlapping) and 880+ small fragment components.
+- **Solution:** Added `remove_overlapping_face_pairs()` in `mold_fabrication.py`:
+  - Builds edge→face mapping, finds NM edges (multiplicity > 2)
+  - At each NM edge, greedily pairs anti-parallel faces (dot < -0.3, centroid dist < 1.0)
+  - Removes BOTH faces of each pair + zero-area faces
+  - Uses meshlib to fill resulting holes and remove small components (< 100 faces)
+  - Returns mesh with process=True for downstream compatibility
+- **Integration:** Replaced Step C in `cleanup_csg_mesh()` selective mode. Now the order is:
+  - Step A: Remove zero-area faces
+  - Step B: Overlapping pair removal (NEW — runs BEFORE needle collapse)
+  - Step C: Per-vertex proximity needle edge collapse  
+- **Results on real model (233k face metamold half):**
+  - NM edges: 606 → 16 (97.4% reduction)
+  - Components: 882 → 1
+  - Boundary edges: 0 → 0
+  - Faces: 233,388 → 223,382 (4.3% removed)
+  - ~9 residual NM edges from meshlib hole-fill vertex merging (cosmetic, < 0.005% of edges)
+- **Key insight:** Pair removal MUST run before needle edge collapse — the edge collapse alters mesh topology and creates additional NM edges that make pair detection less effective.
+
+### January 2026 - Manifold-Space Pipeline (Session 7)
+- **Problem:** manifold3d union creates 200k+ coincident faces when `cavity + part` is done by converting back to trimesh between operations (breaks provenance tracking).
+- **Solution:** Added `build_metamold_halves_manifold_space()` in `mold_fabrication.py` — performs cavity creation, blade split, decompose, and part union all in one manifold3d session without round-tripping through trimesh.
+- **manifold3d upgrade:** 3.3.2 → 3.4.0 (PR #1445 new symbolic perturbation, PR #1467 coincident face handling). Works perfectly on synthetic tests but real models still have issues due to `_trimesh_to_manifold` / `_repair_mesh_for_csg` breaking internal provenance.
+- **Result:** Synthetic test: perfect (3,206 faces, 0 internal, watertight). Real model: same as before (provenance broken by mesh repair). Fixed by Session 8's pair removal approach.
+
 ### January 2026 - Coplanar Shard Cleanup (Session 6)
 - **Root Cause:** When adding the part back to metamold halves (`half + part` union), 98.3% of part faces are exactly coincident with cavity faces (opposite normals, mean dot = -1.000). This triggers manifold3d's known coplanar face shard artifact (GitHub issues #1430, #1359).
 - **Diagnosis:** Union produces 337/536 components with 4170 tiny degenerate shard triangles. `trim_by_plane()` also produces 3-5 component shards (4-12 faces, zero volume).

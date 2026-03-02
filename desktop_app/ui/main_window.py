@@ -1040,6 +1040,7 @@ class MetamoldWorker(QThread):
                 split_shell_with_membrane,
                 add_part_to_metamold_halves,
                 create_part_with_thickened_secondary,
+                build_metamold_halves_manifold_space,
                 trim_metamold_halves,
                 cleanup_csg_mesh,
                 save_debug_mesh
@@ -1073,123 +1074,104 @@ class MetamoldWorker(QThread):
             save_debug_mesh(self.part_mesh, 'metamold_part_mesh')
             save_debug_mesh(self.outer_collar_mesh, 'metamold_outer_collar')
 
-            # Step 2: CSG subtraction - metamold = prism - part_mesh
-            # The metamold cavity is shaped like the part (different from hard shell which uses hull)
-            self.progress.emit("Performing CSG: subtracting part from prism...")
-            metamold_with_cavity, csg_time_ms, csg_success = create_shell_with_cavity(
-                prism_result.prism_mesh,
-                self.part_mesh  # Use part mesh for metamold cavity
-            )
-            
+            # ── MANIFOLD-SPACE PIPELINE ────────────────────────────────
+            # Steps 2-5 (cavity, blade split, part union) are fused into a
+            # single manifold3d session.  This keeps the part manifold
+            # object identical across the subtraction and union so that
+            # manifold3d 3.4.0's symbolic perturbation perfectly merges
+            # all coincident faces, eliminating the 200k+ internal faces.
+            # ───────────────────────────────────────────────────────────
+
+            # Pre-build the combined part mesh (part + secondary) if needed
+            combined_part_mesh = self.part_mesh
+            if self.secondary_surface is not None and len(self.secondary_surface.vertices) > 0:
+                self.progress.emit(f"Thickening secondary surface ({self.secondary_thickness}mm)...")
+                combined_part_mesh, combine_time_ms, combine_success = create_part_with_thickened_secondary(
+                    self.part_mesh,
+                    self.secondary_surface,
+                    self.secondary_thickness
+                )
+                if not combine_success or combined_part_mesh is None:
+                    logger.warning("Failed to create part with thickened secondary - using part mesh only")
+                    combined_part_mesh = self.part_mesh
+                else:
+                    logger.info(f"Combined part mesh: {len(combined_part_mesh.vertices)} verts, "
+                               f"{len(combined_part_mesh.faces)} faces in {combine_time_ms:.1f}ms")
+            save_debug_mesh(combined_part_mesh, 'metamold_combined_part_mesh')
+
+            self.progress.emit("Building metamold halves (manifold-space pipeline)...")
+            half_1_with_part, half_2_with_part, _blade, msp_time_ms, msp_success = \
+                build_metamold_halves_manifold_space(
+                    prism_mesh=prism_result.prism_mesh,
+                    part_mesh=self.part_mesh,
+                    membrane_mesh=self.outer_collar_mesh,
+                    pouring_direction=self.resin_pouring_direction,
+                    blade_thickness=0.001,
+                    combined_part_mesh=(
+                        combined_part_mesh
+                        if combined_part_mesh is not self.part_mesh
+                        else None
+                    ),
+                )
+
+            # Intermediate results (cavity, bare halves) are not produced by
+            # the fused pipeline — set to None.  The UI shows the final
+            # halves-with-part by default so these are not needed for display.
+            metamold_with_cavity = None
             metamold_half_1 = None
             metamold_half_2 = None
-            half_1_with_part = None
-            half_2_with_part = None
-            
-            if csg_success and metamold_with_cavity is not None:
-                logger.info(f"CSG cavity complete: metamold has {len(metamold_with_cavity.vertices)} vertices, "
-                           f"{len(metamold_with_cavity.faces)} faces in {csg_time_ms:.1f}ms")
-                save_debug_mesh(metamold_with_cavity, 'metamold_cavity_result')
-                
-                # Step 3: Split metamold using the same blade from hard shell
-                # Simple CSG: metamold_halves = metamold - blade
-                self.progress.emit("Splitting metamold into two halves...")
-                metamold_half_1, metamold_half_2, _blade, split_time_ms, split_success = split_shell_with_membrane(
-                    metamold_with_cavity,
-                    self.outer_collar_mesh,  # Same parting surface + collar used in hard shell
+            csg_success = msp_success
+
+            if msp_success and half_1_with_part is not None and half_2_with_part is not None:
+                logger.info(f"Manifold-space pipeline complete in {msp_time_ms:.1f}ms")
+                logger.info(f"  Half 1 with part: {len(half_1_with_part.vertices)} verts, {len(half_1_with_part.faces)} faces")
+                logger.info(f"  Half 2 with part: {len(half_2_with_part.vertices)} verts, {len(half_2_with_part.faces)} faces")
+                save_debug_mesh(half_1_with_part, 'metamold_half1_with_part_pretrim')
+                save_debug_mesh(half_2_with_part, 'metamold_half2_with_part_pretrim')
+
+                # Step 6: Trim both halves to save 3D printing material
+                self.progress.emit("Trimming metamold halves to save material...")
+                half_1_with_part, half_2_with_part, bot_saved, top_saved, trim_ms = trim_metamold_halves(
+                    half_1_with_part,
+                    half_2_with_part,
+                    self.outer_collar_mesh,
                     self.resin_pouring_direction,
-                    prism_mesh=prism_result.prism_mesh,
-                    subtractor_mesh=self.part_mesh,
+                    trim_threshold=4.0
                 )
-                
-                if split_success:
-                    logger.info(f"Metamold split complete in {split_time_ms:.1f}ms")
-                    logger.info(f"  Half 1: {len(metamold_half_1.vertices)} verts, {len(metamold_half_1.faces)} faces")
-                    logger.info(f"  Half 2: {len(metamold_half_2.vertices)} verts, {len(metamold_half_2.faces)} faces")
-                    save_debug_mesh(metamold_half_1, 'metamold_half1_split')
-                    save_debug_mesh(metamold_half_2, 'metamold_half2_split')
-                    
-                    # Step 4: Create combined mesh (part + thickened secondary surface)
-                    # This ensures secondary membrane features are included in the mold
-                    combined_part_mesh = self.part_mesh
-                    if self.secondary_surface is not None and len(self.secondary_surface.vertices) > 0:
-                        self.progress.emit(f"Thickening secondary surface ({self.secondary_thickness}mm)...")
-                        combined_part_mesh, combine_time_ms, combine_success = create_part_with_thickened_secondary(
-                            self.part_mesh,
-                            self.secondary_surface,
-                            self.secondary_thickness
-                        )
-                        if not combine_success or combined_part_mesh is None:
-                            logger.warning("Failed to create part with thickened secondary - using part mesh only")
-                            combined_part_mesh = self.part_mesh
-                        else:
-                            logger.info(f"Combined part mesh: {len(combined_part_mesh.vertices)} verts, "
-                                       f"{len(combined_part_mesh.faces)} faces in {combine_time_ms:.1f}ms")
-                    save_debug_mesh(combined_part_mesh, 'metamold_combined_part_mesh')
-                    
-                    # Step 5: Add combined part mesh back to each metamold half (boolean union)
-                    # This creates halves where the part is solid geometry inside the mold
-                    self.progress.emit("Adding part mesh to metamold halves (boolean union)...")
-                    half_1_with_part, half_2_with_part, add_time_ms, add_success = add_part_to_metamold_halves(
-                        metamold_half_1,
-                        metamold_half_2,
-                        combined_part_mesh
-                    )
-                    
-                    if add_success:
-                        logger.info(f"Part added to metamold halves in {add_time_ms:.1f}ms")
-                        logger.info(f"  Half 1 with part: {len(half_1_with_part.vertices)} verts, {len(half_1_with_part.faces)} faces")
-                        logger.info(f"  Half 2 with part: {len(half_2_with_part.vertices)} verts, {len(half_2_with_part.faces)} faces")
-                        save_debug_mesh(half_1_with_part, 'metamold_half1_with_part_pretrim')
-                        save_debug_mesh(half_2_with_part, 'metamold_half2_with_part_pretrim')
-                        
-                        # Step 6: Trim both halves to save 3D printing material
-                        # This is done AFTER part union so the planar cut clips
-                        # both prism walls and part geometry cleanly.
-                        self.progress.emit("Trimming metamold halves to save material...")
-                        half_1_with_part, half_2_with_part, bot_saved, top_saved, trim_ms = trim_metamold_halves(
-                            half_1_with_part,
-                            half_2_with_part,
-                            self.outer_collar_mesh,
-                            self.resin_pouring_direction,
-                            trim_threshold=4.0
-                        )
-                        if bot_saved > 0 or top_saved > 0:
-                            logger.info(f"Metamold trim: bottom saved {bot_saved:.1f}mm, "
-                                       f"top saved {top_saved:.1f}mm in {trim_ms:.1f}ms")
+                if bot_saved > 0 or top_saved > 0:
+                    logger.info(f"Metamold trim: bottom saved {bot_saved:.1f}mm, "
+                               f"top saved {top_saved:.1f}mm in {trim_ms:.1f}ms")
 
-                        # Step 7: Selective cleanup — only collapse needles near the part
-                        # surface.  The global manifold3d simplify is SKIPPED to protect
-                        # prism base caps and outer walls from distortion.
-                        self.progress.emit("Cleaning up CSG intersection artifacts (selective)...")
-                        save_debug_mesh(half_1_with_part, 'metamold_half1_pre_cleanup')
-                        save_debug_mesh(half_2_with_part, 'metamold_half2_pre_cleanup')
-                        half_1_with_part = cleanup_csg_mesh(
-                            half_1_with_part, 'metamold_half1',
-                            part_mesh=combined_part_mesh,
-                        )
-                        half_2_with_part = cleanup_csg_mesh(
-                            half_2_with_part, 'metamold_half2',
-                            part_mesh=combined_part_mesh,
-                        )
+                # Step 7: Selective cleanup — only collapse needles near the part
+                # surface.  The global manifold3d simplify is SKIPPED to protect
+                # prism base caps and outer walls from distortion.
+                self.progress.emit("Cleaning up CSG intersection artifacts (selective)...")
+                save_debug_mesh(half_1_with_part, 'metamold_half1_pre_cleanup')
+                save_debug_mesh(half_2_with_part, 'metamold_half2_pre_cleanup')
+                half_1_with_part = cleanup_csg_mesh(
+                    half_1_with_part, 'metamold_half1',
+                    part_mesh=combined_part_mesh,
+                )
+                half_2_with_part = cleanup_csg_mesh(
+                    half_2_with_part, 'metamold_half2',
+                    part_mesh=combined_part_mesh,
+                )
 
-                        # Log final diagnostics for each half
-                        for _hlabel, _hmesh in [('Half1', half_1_with_part), ('Half2', half_2_with_part)]:
-                            if _hmesh is not None:
-                                try:
-                                    _ncomps = len(_hmesh.split(only_watertight=False))
-                                except Exception:
-                                    _ncomps = -1
-                                logger.info(f"  {_hlabel} final: {len(_hmesh.faces)}f, "
-                                           f"watertight={_hmesh.is_watertight}, components={_ncomps}")
-                        save_debug_mesh(half_1_with_part, 'metamold_half1_final')
-                        save_debug_mesh(half_2_with_part, 'metamold_half2_final')
-                    else:
-                        logger.warning("Adding part to metamold halves failed")
-                else:
-                    logger.warning("Metamold splitting failed - halves may be incomplete")
+                # Log final diagnostics for each half
+                for _hlabel, _hmesh in [('Half1', half_1_with_part), ('Half2', half_2_with_part)]:
+                    if _hmesh is not None:
+                        try:
+                            _ncomps = len(_hmesh.split(only_watertight=False))
+                        except Exception:
+                            _ncomps = -1
+                        logger.info(f"  {_hlabel} final: {len(_hmesh.faces)}f, "
+                                   f"watertight={_hmesh.is_watertight}, components={_ncomps}")
+                save_debug_mesh(half_1_with_part, 'metamold_half1_final')
+                save_debug_mesh(half_2_with_part, 'metamold_half2_final')
             else:
-                logger.warning("CSG cavity subtraction failed - cannot split metamold")
+                logger.warning("Manifold-space pipeline failed — halves may be incomplete")
+                half_1_with_part = None
+                half_2_with_part = None
             
             self.progress.emit("Metamold generation complete")
             self.complete.emit(prism_result, metamold_with_cavity, metamold_half_1, metamold_half_2, 
@@ -6967,6 +6949,20 @@ class MainWindow(QMainWindow):
             if self._metamold_half_2 is not None:
                 self.metamold_stats.add_row(f'Half 2: {len(self._metamold_half_2.vertices):,} verts, {len(self._metamold_half_2.faces):,} faces')
             
+            # Final halves-with-part info
+            if self._metamold_half_1_with_part is not None:
+                wt1 = '✓' if self._metamold_half_1_with_part.is_watertight else '✗'
+                self.metamold_stats.add_row(
+                    f'Half 1 + part: {len(self._metamold_half_1_with_part.vertices):,} verts, '
+                    f'{len(self._metamold_half_1_with_part.faces):,} faces ({wt1})'
+                )
+            if self._metamold_half_2_with_part is not None:
+                wt2 = '✓' if self._metamold_half_2_with_part.is_watertight else '✗'
+                self.metamold_stats.add_row(
+                    f'Half 2 + part: {len(self._metamold_half_2_with_part.vertices):,} verts, '
+                    f'{len(self._metamold_half_2_with_part.faces):,} faces ({wt2})'
+                )
+
             if not self._metamold_csg_success:
                 self.metamold_stats.add_row('⚠️ CSG operations incomplete', Colors.WARNING)
             
