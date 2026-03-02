@@ -1158,14 +1158,20 @@ class MetamoldWorker(QThread):
                             logger.info(f"Metamold trim: bottom saved {bot_saved:.1f}mm, "
                                        f"top saved {top_saved:.1f}mm in {trim_ms:.1f}ms")
 
-                        # Step 7: Clean up degenerate sliver triangles from CSG
-                        # DISABLED FOR DEBUGGING — investigating base distortion
-                        # self.progress.emit("Cleaning up CSG intersection artifacts...")
-                        # save_debug_mesh(half_1_with_part, 'metamold_half1_pre_cleanup')
-                        # save_debug_mesh(half_2_with_part, 'metamold_half2_pre_cleanup')
-                        # half_1_with_part = cleanup_csg_mesh(half_1_with_part, 'metamold_half1')
-                        # half_2_with_part = cleanup_csg_mesh(half_2_with_part, 'metamold_half2')
-                        logger.info("Metamold cleanup SKIPPED (disabled for debugging)")
+                        # Step 7: Selective cleanup — only collapse needles near the part
+                        # surface.  The global manifold3d simplify is SKIPPED to protect
+                        # prism base caps and outer walls from distortion.
+                        self.progress.emit("Cleaning up CSG intersection artifacts (selective)...")
+                        save_debug_mesh(half_1_with_part, 'metamold_half1_pre_cleanup')
+                        save_debug_mesh(half_2_with_part, 'metamold_half2_pre_cleanup')
+                        half_1_with_part = cleanup_csg_mesh(
+                            half_1_with_part, 'metamold_half1',
+                            part_mesh=combined_part_mesh,
+                        )
+                        half_2_with_part = cleanup_csg_mesh(
+                            half_2_with_part, 'metamold_half2',
+                            part_mesh=combined_part_mesh,
+                        )
 
                         # Log final diagnostics for each half
                         for _hlabel, _hmesh in [('Half1', half_1_with_part), ('Half2', half_2_with_part)]:

@@ -2017,6 +2017,7 @@ def _collapse_needle_edges(
     ratio_threshold: float = CSG_NEEDLE_RATIO_THRESHOLD,
     max_iterations: int = 5,
     label: str = 'mesh',
+    vertex_near_part: Optional[np.ndarray] = None,
 ) -> trimesh.Trimesh:
     """Iteratively collapse the shortest edge of needle triangles.
 
@@ -2035,6 +2036,12 @@ def _collapse_needle_edges(
             a needle and its shortest edge is collapsed.
         max_iterations: Safety limit on collapse rounds.
         label: Human-readable label for logging.
+        vertex_near_part: Optional boolean array (per-vertex, length N).
+            When provided, only faces where ALL THREE vertices are near the
+            part are eligible for collapse.  Faces with any "far" vertex
+            are never touched, protecting outer prism geometry.  This array
+            is indexed by vertex ID, which is stable across iterations
+            (unlike per-face masks that become stale when faces are removed).
 
     Returns:
         Cleaned mesh with needle triangles eliminated.
@@ -2056,6 +2063,17 @@ def _collapse_needle_edges(
         edge_ratio = longest / (shortest + 1e-15)
 
         bad = edge_ratio > ratio_threshold
+        # Apply per-vertex proximity: a face is eligible only if ALL its
+        # vertices are near the part.  Vertex IDs are stable across
+        # iterations so this never goes stale.
+        if vertex_near_part is not None:
+            f = faces  # (F, 3)
+            face_all_near = (
+                vertex_near_part[f[:, 0]]
+                & vertex_near_part[f[:, 1]]
+                & vertex_near_part[f[:, 2]]
+            )
+            bad = bad & face_all_near
         if bad.sum() == 0:
             break
 
@@ -2152,6 +2170,8 @@ def cleanup_csg_mesh(
     label: str = 'mesh',
     tolerance: float = CSG_SIMPLIFY_TOLERANCE,
     needle_threshold: float = CSG_NEEDLE_RATIO_THRESHOLD,
+    part_mesh: Optional[trimesh.Trimesh] = None,
+    proximity_radius: float = 2.0,
 ) -> trimesh.Trimesh:
     """Clean up degenerate sliver triangles produced by manifold3d CSG operations.
 
@@ -2160,12 +2180,17 @@ def cleanup_csg_mesh(
     These slivers have edge ratios in the millions and areas near zero, causing
     visual artifacts and potential slicer issues for 3D printing.
 
-    Two-pass cleanup:
-      1. **manifold3d simplify** — collapses edges shorter than *tolerance*
-         (surface displacement ≤ tolerance), eliminating ~90 % of degenerates.
-      2. **Targeted edge collapse** — for any remaining triangles whose
-         longest/shortest edge ratio exceeds *needle_threshold*, the shortest
-         edge is iteratively collapsed to its midpoint until none remain.
+    Two modes of operation:
+
+    **Global cleanup** (``part_mesh=None``, used for hard-shell):
+      1. manifold3d simplify — collapses edges shorter than *tolerance*.
+      2. Targeted edge collapse — collapses remaining needles.
+
+    **Selective cleanup** (``part_mesh`` provided, used for metamold):
+      Skips the global manifold3d simplify (which distorts prism base caps)
+      and only performs targeted edge collapse on needle triangles whose
+      centroids are within *proximity_radius* mm of the part mesh.  Outer
+      prism geometry (walls, base caps) is left untouched.
 
     Args:
         mesh: Post-CSG trimesh (typically from _manifold_to_trimesh).
@@ -2174,6 +2199,11 @@ def cleanup_csg_mesh(
             Default is CSG_SIMPLIFY_TOLERANCE (0.005 mm / 5 µm).
         needle_threshold: Edge-ratio threshold for the edge-collapse pass.
             Default is CSG_NEEDLE_RATIO_THRESHOLD (50).
+        part_mesh: Optional part mesh.  When provided, enables selective
+            cleanup: the global simplify pass is skipped, and only needle
+            triangles near the part are collapsed.
+        proximity_radius: Distance threshold (mm) from part surface within
+            which faces are eligible for cleanup.  Default 2.0 mm.
 
     Returns:
         Cleaned mesh with degenerate triangles eliminated.  The original mesh
@@ -2203,37 +2233,114 @@ def cleanup_csg_mesh(
             logger.info("  [CSG cleanup] '%s': no degenerate triangles — skipping", label)
             return mesh
 
-        # --- Pass 1: manifold3d simplify ---
-        verts = np.asarray(mesh.vertices, dtype=np.float64)
-        faces_arr = np.asarray(mesh.faces, dtype=np.uint32)
-        import manifold3d
-        m3_mesh = manifold3d.Mesh(vert_properties=verts, tri_verts=faces_arr)
-        m3 = manifold3d.Manifold(m3_mesh)
-        simplified = m3.simplify(tolerance)
+        # -----------------------------------------------------------------
+        # Selective mode: skip global simplify, only collapse near part
+        # -----------------------------------------------------------------
+        if part_mesh is not None:
+            # --- Step A: Remove zero-area degenerate faces ---
+            # These are faces with area ≈ 0 produced at CSG intersection
+            # curves.  Removing them is non-destructive (no vertex movement).
+            zero_area_mask = areas < 1e-10
+            if zero_area_mask.sum() > 0:
+                logger.info(
+                    "  [CSG cleanup] '%s': removing %d zero-area faces",
+                    label, int(zero_area_mask.sum()),
+                )
+                keep_mask = ~zero_area_mask
+                mesh = trimesh.Trimesh(
+                    vertices=mesh.vertices,
+                    faces=mesh.faces[keep_mask],
+                    process=False,
+                )
+                mesh.remove_unreferenced_vertices()
+                # Recompute edge ratios for the filtered mesh
+                v = mesh.vertices[mesh.faces]
+                e0 = np.linalg.norm(v[:, 1] - v[:, 0], axis=1)
+                e1 = np.linalg.norm(v[:, 2] - v[:, 1], axis=1)
+                e2 = np.linalg.norm(v[:, 0] - v[:, 2], axis=1)
+                longest = np.maximum(e0, np.maximum(e1, e2))
+                shortest = np.minimum(e0, np.minimum(e1, e2))
+                edge_ratio = longest / (shortest + 1e-15)
 
-        out = simplified.to_mesh()
-        result = trimesh.Trimesh(
-            vertices=np.array(out.vert_properties[:, :3]),
-            faces=np.array(out.tri_verts),
-            process=False,
-        )
-        # NOTE: Do NOT call merge_vertices() here.  manifold3d's output has
-        # intentionally split vertices at seam edges (see _manifold_to_trimesh
-        # which also uses process=False for this reason).  Merging them can
-        # create T-junctions that break manifold topology and cause face
-        # connectivity issues — in particular, base-cap vertices can get merged
-        # with nearby wall vertices, distorting the prism base outline.
+            # --- Step B: Per-vertex proximity (stable across iterations) ---
+            # Compute once: which vertices are within proximity_radius of
+            # the part surface.  Vertex IDs don't change during edge
+            # collapse, so this stays valid across all iterations.
+            all_verts = np.asarray(mesh.vertices, dtype=np.float64)
+            try:
+                _, vert_dists, _ = part_mesh.nearest.on_surface(all_verts)
+                vertex_near_part = vert_dists < proximity_radius
+            except Exception:
+                # Fallback: bounding-box distance heuristic
+                part_min = part_mesh.bounds[0] - proximity_radius
+                part_max = part_mesh.bounds[1] + proximity_radius
+                vertex_near_part = np.all(
+                    (all_verts >= part_min) & (all_verts <= part_max), axis=1
+                )
 
-        # Shard cleanup (simplify may split off tiny regions)
-        result = _remove_coplanar_shard_components(result, f'{label}_simplified')
+            near_vert_count = int(vertex_near_part.sum())
+            far_vert_count = len(vertex_near_part) - near_vert_count
+            # Face is eligible if ALL 3 vertices are near part
+            face_all_near = (
+                vertex_near_part[mesh.faces[:, 0]]
+                & vertex_near_part[mesh.faces[:, 1]]
+                & vertex_near_part[mesh.faces[:, 2]]
+            )
+            near_needles = int(np.sum((edge_ratio > needle_threshold) & face_all_near))
+            logger.info(
+                "  [CSG cleanup] '%s' (selective): %d/%d verts near part, "
+                "%d needles eligible for collapse",
+                label, near_vert_count, len(vertex_near_part), near_needles,
+            )
 
-        # --- Pass 2: targeted edge collapse for remaining needles ---
-        result = _collapse_needle_edges(
-            result,
-            ratio_threshold=needle_threshold,
-            max_iterations=5,
-            label=label,
-        )
+            if near_needles == 0:
+                logger.info("  [CSG cleanup] '%s': no near-part needles — skipping", label)
+                result = mesh
+            else:
+                result = _collapse_needle_edges(
+                    mesh,
+                    ratio_threshold=needle_threshold,
+                    max_iterations=5,
+                    label=label,
+                    vertex_near_part=vertex_near_part,
+                )
+
+        else:
+            # -----------------------------------------------------------------
+            # Global mode: full simplify + collapse (for hard shell etc.)
+            # -----------------------------------------------------------------
+
+            # --- Pass 1: manifold3d simplify ---
+            verts = np.asarray(mesh.vertices, dtype=np.float64)
+            faces_arr = np.asarray(mesh.faces, dtype=np.uint32)
+            import manifold3d
+            m3_mesh = manifold3d.Mesh(vert_properties=verts, tri_verts=faces_arr)
+            m3 = manifold3d.Manifold(m3_mesh)
+            simplified = m3.simplify(tolerance)
+
+            out = simplified.to_mesh()
+            result = trimesh.Trimesh(
+                vertices=np.array(out.vert_properties[:, :3]),
+                faces=np.array(out.tri_verts),
+                process=False,
+            )
+            # NOTE: Do NOT call merge_vertices() here.  manifold3d's output has
+            # intentionally split vertices at seam edges (see _manifold_to_trimesh
+            # which also uses process=False for this reason).  Merging them can
+            # create T-junctions that break manifold topology and cause face
+            # connectivity issues — in particular, base-cap vertices can get merged
+            # with nearby wall vertices, distorting the prism base outline.
+
+            # Shard cleanup (simplify may split off tiny regions)
+            result = _remove_coplanar_shard_components(result, f'{label}_simplified')
+
+            # --- Pass 2: targeted edge collapse for remaining needles ---
+            result = _collapse_needle_edges(
+                result,
+                ratio_threshold=needle_threshold,
+                max_iterations=5,
+                label=label,
+            )
 
         # --- post-cleanup stats ---
         areas2 = result.area_faces
