@@ -1157,15 +1157,15 @@ class MetamoldWorker(QThread):
                         if bot_saved > 0 or top_saved > 0:
                             logger.info(f"Metamold trim: bottom saved {bot_saved:.1f}mm, "
                                        f"top saved {top_saved:.1f}mm in {trim_ms:.1f}ms")
+
                         # Step 7: Clean up degenerate sliver triangles from CSG
-                        # manifold3d creates very thin needles along intersection
-                        # curves (blade ∩ part surface).  simplify() collapses
-                        # those edges within a tiny tolerance (5 µm).
-                        self.progress.emit("Cleaning up CSG intersection artifacts...")
-                        save_debug_mesh(half_1_with_part, 'metamold_half1_pre_cleanup')
-                        save_debug_mesh(half_2_with_part, 'metamold_half2_pre_cleanup')
-                        half_1_with_part = cleanup_csg_mesh(half_1_with_part, 'metamold_half1')
-                        half_2_with_part = cleanup_csg_mesh(half_2_with_part, 'metamold_half2')
+                        # DISABLED FOR DEBUGGING — investigating base distortion
+                        # self.progress.emit("Cleaning up CSG intersection artifacts...")
+                        # save_debug_mesh(half_1_with_part, 'metamold_half1_pre_cleanup')
+                        # save_debug_mesh(half_2_with_part, 'metamold_half2_pre_cleanup')
+                        # half_1_with_part = cleanup_csg_mesh(half_1_with_part, 'metamold_half1')
+                        # half_2_with_part = cleanup_csg_mesh(half_2_with_part, 'metamold_half2')
+                        logger.info("Metamold cleanup SKIPPED (disabled for debugging)")
 
                         # Log final diagnostics for each half
                         for _hlabel, _hmesh in [('Half1', half_1_with_part), ('Half2', half_2_with_part)]:

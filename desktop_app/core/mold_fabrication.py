@@ -284,10 +284,11 @@ def create_metamold_prism(
                   perpendicular to the RESIN pouring direction (same as hard shell)
     - Extrusion: Along RESIN pouring direction (same as hard shell)
     - Wall offset: wall_thickness + margin (same as hard shell)
-    - Height: From (part_min - height_below) to (part_max + height_above)
-              where min/max are the PART MESH extent along pouring direction
-              IMPORTANT: Also extends to include parting_surface if provided,
-              ensuring the cutting blade can pass through the prism walls.
+    - Height: From (hull_min - total_offset) to (hull_max + total_offset)
+              where min/max are the HULL MESH extent along pouring direction,
+              matching the hard shell prism exactly.  Also extends to include
+              part mesh margins and parting_surface if they exceed the hull
+              bounds (safety check).
     
     This ensures the metamold has the EXACT same footprint as the hard shell and is
     tall enough to enclose the entire part with 2mm margin on each side.
@@ -391,15 +392,35 @@ def create_metamold_prism(
     logger.info(f"Offset silhouette has {len(silhouette_2d_offset)} vertices (offset={total_offset}mm)")
     
     # =========================================================================
-    # Step 5: Determine prism height (based on part mesh + offsets)
-    #         Also extend to include parting surface if provided
+    # Step 5: Determine prism height — MATCH HARD SHELL EXACTLY
+    #
+    # Use HULL heights + total_offset (same as create_hard_shell_prism) so the
+    # metamold prism has the identical footprint AND height as the hard shell
+    # prism.  This guarantees the cast hard-shell halves fit inside the
+    # metamold.  The part-based height_above/height_below and the parting
+    # surface are kept as secondary safety checks.
     # =========================================================================
     
-    min_height = part_min_height - height_below
-    max_height = part_max_height + height_above
+    hull_heights = hull_transformed[:, 2]
+    hull_min_height = float(np.min(hull_heights))
+    hull_max_height = float(np.max(hull_heights))
     
-    # If parting surface is provided, extend bounds to include it
-    # This ensures the cutting blade (at parting surface level) passes through walls
+    # Primary height: hull extents ± total_offset (matches hard shell prism)
+    min_height = hull_min_height - total_offset
+    max_height = hull_max_height + total_offset
+    
+    logger.info(f"Hull height extent: {hull_min_height:.2f} to {hull_max_height:.2f}")
+    logger.info(f"Primary height (hull ± {total_offset}mm): {min_height:.2f} to {max_height:.2f}")
+    
+    # Safety: also cover part extents ± height_above/below
+    part_min_with_margin = part_min_height - height_below
+    part_max_with_margin = part_max_height + height_above
+    if part_min_with_margin < min_height:
+        min_height = part_min_with_margin
+    if part_max_with_margin > max_height:
+        max_height = part_max_with_margin
+    
+    # Safety: also cover parting surface with margin
     if parting_surface is not None:
         ps_vertices = np.array(parting_surface.vertices, dtype=np.float64)
         ps_transformed = ps_vertices @ world_to_2d.T
@@ -408,9 +429,7 @@ def create_metamold_prism(
         ps_max_height = np.max(ps_heights)
         
         logger.info(f"Parting surface height extent: {ps_min_height:.2f} to {ps_max_height:.2f}")
-        logger.info(f"Part mesh height extent: {part_min_height:.2f} to {part_max_height:.2f}")
         
-        # Extend prism bounds to include parting surface with margin
         parting_margin = 2.0  # 2mm margin around parting surface
         if ps_min_height - parting_margin < min_height:
             old_min = min_height
