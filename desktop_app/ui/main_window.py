@@ -1036,9 +1036,6 @@ class MetamoldWorker(QThread):
         try:
             from core.mold_fabrication import (
                 create_metamold_prism,
-                create_shell_with_cavity,
-                split_shell_with_membrane,
-                add_part_to_metamold_halves,
                 create_part_with_thickened_secondary,
                 build_metamold_halves_manifold_space,
                 trim_metamold_halves,

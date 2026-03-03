@@ -139,6 +139,22 @@ biased_dist = δ + max(λ_w, 0)
 
 ## Recent Changes
 
+### January 2026 - Metamold Code Cleanup (Session 11)
+- **Goal:** Review and clean up all metamold creation/cleanup implementations accumulated over Sessions 6–10.
+- **Dead code removed (4 functions, ~398 lines):**
+  - `remove_overlapping_face_pairs()` (~387 lines) — superseded by `ensure_manifold_mesh()` in Session 10
+  - `split_shell_along_parting_surface()` (~132 lines) — superseded by `split_shell_with_membrane()`, was already dead
+  - `add_part_to_metamold_halves()` (~46 lines) — wrapper that called `add_part_to_metamold_half()` for both halves, unused since Session 7's fused pipeline
+  - `add_part_to_metamold_half()` (~88 lines) — individual part union, unused since `build_metamold_halves_manifold_space()` does this in manifold space
+- **Code quality fixes:**
+  - Converted 4 `traceback.print_exc()` → `logger.exception()` in `build_metamold_halves_manifold_space`, `split_shell_with_membrane`, `thicken_surface_symmetric`, `create_part_with_thickened_secondary`
+  - Cleaned MetamoldWorker imports in main_window.py (removed `create_shell_with_cavity`, `split_shell_with_membrane`, `add_part_to_metamold_halves`)
+- **Bug fix during cleanup:** Two botched replacements from multi_replace_string_in_file left orphaned function bodies creating duplicate `def` definitions:
+  - `def cleanup_csg_mesh(` had the orphaned body of `remove_overlapping_face_pairs` underneath it (lines 2477-2860)
+  - `def thicken_surface_symmetric(` had the orphaned body of `split_shell_along_parting_surface` underneath it (lines 1814-1937)
+  - Both repaired: file went from 4292 → 3629 lines (663 lines removed net)
+- **Final state:** `mold_fabrication.py` has 29 functions (down from 33), zero syntax errors, zero IDE errors, all 14 public functions import correctly.
+
 ### January 2026 - Simplified Manifold Enforcement (Session 10)
 - **Problem:** The iterative `remove_overlapping_face_pairs()` approach (391 lines, 3 rounds + final pass + T-junction handling) was complex and fragile. User reported the issue still persisted on some models despite testing clean on debug meshes.
 - **Root Cause of complexity:** The old approach tried to detect and remove specific anti-parallel face pairs at NM edges, then fill holes with meshlib, then `process=True` vertex merge recreated NM edges, requiring iterative cycles. Each step could fail or introduce new artifacts.
@@ -205,7 +221,7 @@ biased_dist = δ + max(λ_w, 0)
 - **Fix Strategy Tested:** 6 approaches compared — inflate centroid (worse), normal offset (worse), keep largest component (BEST), meshlib fixDegeneracies (terrible — 4× face explosion), double manifold3d roundtrip (marginal), inflate+roundtrip (worse).
 - **Solution:** Added `_remove_coplanar_shard_components()` helper in `mold_fabrication.py`:
   - Splits mesh into components, keeps only those with face count ≥ 1% of largest (minimum 100 faces)
-  - Applied after `add_part_to_metamold_half()` union
+  - Applied after part union in `build_metamold_halves_manifold_space()`
   - Applied after both `trim_by_plane()` calls in `trim_metamold_halves()`
 - **meshlib Assessment:** Already correctly used for PRE-CSG repair. NOT suitable for post-CSG cleanup (fixMeshDegeneracies explodes manifold3d output from 134k→536k faces and breaks watertight).
 - **Result:** Both halves now single-component, watertight after union AND trim.
