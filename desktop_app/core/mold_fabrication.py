@@ -2978,6 +2978,129 @@ def hollow_metamold_half(
         return mesh, elapsed_ms, False
 
 
+def open_metamold_base(
+    mesh: trimesh.Trimesh,
+    pouring_direction: np.ndarray,
+    world_to_2d: np.ndarray,
+    hollow_wall_thickness: float,
+    is_upper_half: bool,
+    label: str = 'metamold_half',
+) -> Tuple[Optional[trimesh.Trimesh], float, bool]:
+    """Open the base of a hollowed metamold half.
+
+    After hollowing the flat prism base remains as a thin solid wall of
+    *hollow_wall_thickness*.  This function removes it by subtracting a
+    simple box that fully covers the metamold's 2D bounding box (with a
+    small margin) and spans exactly the base-wall region along the
+    pouring direction.
+
+    Using an oversized rectangle instead of the actual silhouette
+    polygon avoids complex polygon booleans and produces clean
+    triangles at the cut boundary.
+
+    Args:
+        mesh:                  Hollowed metamold half mesh.
+        pouring_direction:     Unit vector for resin pouring direction.
+        world_to_2d:           (3, 3) rotation matrix from
+                               :class:`MetamoldPrismResult`.
+        hollow_wall_thickness: Hollowing wall thickness (mm).
+        is_upper_half:         ``True`` for half 1 (base at max height).
+        label:                 Human-readable label for logging.
+
+    Returns:
+        ``(result_mesh, computation_time_ms, success)``.
+        On failure returns ``(original_mesh, elapsed_ms, False)``.
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh, 0.0, False
+
+    if not MANIFOLD_AVAILABLE:
+        logger.warning(
+            "manifold3d not available — cannot open base of '%s'", label,
+        )
+        return mesh, 0.0, False
+
+    start_time = time.time()
+
+    try:
+        pouring_dir = np.asarray(pouring_direction, dtype=np.float64)
+        pouring_dir = pouring_dir / (np.linalg.norm(pouring_dir) + 1e-10)
+
+        # ── Project mesh vertices into the 2D plane ──────────────────
+        verts = np.asarray(mesh.vertices, dtype=np.float64)
+        transformed = verts @ world_to_2d.T          # (N, 3)
+        uv = transformed[:, :2]                       # 2D coords
+        heights = transformed[:, 2]                   # along pouring dir
+
+        mesh_min_h = float(np.min(heights))
+        mesh_max_h = float(np.max(heights))
+
+        # 2D bounding box of the mesh + 1 mm margin on each side
+        # so the cutting box fully encompasses the metamold footprint.
+        margin_2d = 1.0
+        uv_min = np.min(uv, axis=0) - margin_2d
+        uv_max = np.max(uv, axis=0) + margin_2d
+
+        bbox_2d = np.array([
+            [uv_min[0], uv_min[1]],
+            [uv_max[0], uv_min[1]],
+            [uv_max[0], uv_max[1]],
+            [uv_min[0], uv_max[1]],
+        ], dtype=np.float64)
+
+        # ── Cutting body height ──────────────────────────────────────
+        penetration = 0.5  # mm — ensures clean boolean
+        if is_upper_half:
+            # Base at top — cut from slightly inside to above
+            cut_min_h = mesh_max_h - hollow_wall_thickness - penetration
+            cut_max_h = mesh_max_h + penetration
+        else:
+            # Base at bottom — cut from below to slightly inside
+            cut_min_h = mesh_min_h - penetration
+            cut_max_h = mesh_min_h + hollow_wall_thickness + penetration
+
+        cutting_mesh, _, _ = _extrude_polygon_to_prism(
+            bbox_2d, world_to_2d, cut_min_h, cut_max_h,
+        )
+        save_debug_mesh(
+            cutting_mesh, f'{label}_base_cutting_body',
+        )
+
+        # ── CSG subtract ─────────────────────────────────────────────
+        m_half = _trimesh_to_manifold(mesh, f'{label}_for_base_open')
+        m_cut = _trimesh_to_manifold(
+            cutting_mesh, f'{label}_base_cutter',
+        )
+        m_result = m_half - m_cut
+        result = _manifold_to_trimesh(
+            m_result, f'{label}_base_opened',
+        )
+        result = _remove_coplanar_shard_components(
+            result, f'{label}_base_opened',
+        )
+
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.info(
+            "[BaseOpen] '%s': %d→%d faces, "
+            "cut h=[%.1f, %.1f], wall=%.1f mm (%.0f ms)",
+            label,
+            len(mesh.faces), len(result.faces),
+            cut_min_h, cut_max_h,
+            hollow_wall_thickness,
+            elapsed_ms,
+        )
+        save_debug_mesh(result, f'{label}_base_opened')
+        return result, elapsed_ms, True
+
+    except Exception as exc:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error(
+            "[BaseOpen] '%s' failed (%.0f ms): %s",
+            label, elapsed_ms, exc,
+        )
+        return mesh, elapsed_ms, False
+
+
 def _offset_polygon_2d(polygon: np.ndarray, offset: float) -> np.ndarray:
     """
     Offset a 2D convex polygon outward by a given distance.

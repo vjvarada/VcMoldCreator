@@ -1228,6 +1228,7 @@ class ResinChannelsWorker(QThread):
         enable_hollowing=False,
         hollow_wall_thickness_mm=2.5,
         blade_mesh=None,
+        prism_result=None,
     ):
         super().__init__()
         self.metamold_half_1_with_part = metamold_half_1_with_part
@@ -1250,6 +1251,7 @@ class ResinChannelsWorker(QThread):
         self.enable_hollowing = enable_hollowing
         self.hollow_wall_thickness_mm = hollow_wall_thickness_mm
         self.blade_mesh = blade_mesh
+        self.prism_result = prism_result  # MetamoldPrismResult for base opening
     
     def run(self):
         try:
@@ -1346,6 +1348,54 @@ class ResinChannelsWorker(QThread):
             else:
                 self._hollow_success = False
                 self._hollow_time_ms = 0.0
+
+            # ── Base opening (optional) ───────────────────────────────────
+            # When hollowing is active, the flat prism base is still solid.
+            # Cut an opening through it using an inward-offset silhouette
+            # so the hollow interior is accessible and more material is
+            # saved.  Run AFTER hollowing so the thin base wall is cleanly
+            # removed.
+            self._base_open_success = False
+            self._base_open_time_ms = 0.0
+            if (
+                self.enable_hollowing
+                and self._hollow_success
+                and self.prism_result is not None
+            ):
+                from core.mold_fabrication import open_metamold_base
+                self.progress.emit("Opening metamold bases...")
+                logger.info(
+                    "Opening metamold bases: wall=%.1f mm",
+                    self.hollow_wall_thickness_mm,
+                )
+                o1, o1_ms, o1_ok = open_metamold_base(
+                    self.metamold_half_1_with_part,
+                    self.resin_direction,
+                    self.prism_result.world_to_2d,
+                    hollow_wall_thickness=self.hollow_wall_thickness_mm,
+                    is_upper_half=True,
+                    label='metamold_half1',
+                )
+                o2, o2_ms, o2_ok = open_metamold_base(
+                    self.metamold_half_2_with_part,
+                    self.resin_direction,
+                    self.prism_result.world_to_2d,
+                    hollow_wall_thickness=self.hollow_wall_thickness_mm,
+                    is_upper_half=False,
+                    label='metamold_half2',
+                )
+                if o1_ok:
+                    self.metamold_half_1_with_part = o1
+                if o2_ok:
+                    self.metamold_half_2_with_part = o2
+                self._base_open_success = o1_ok and o2_ok
+                self._base_open_time_ms = o1_ms + o2_ms
+                logger.info(
+                    "Base opening: half1=%s (%.0f ms), "
+                    "half2=%s (%.0f ms)",
+                    'OK' if o1_ok else 'FAIL', o1_ms,
+                    'OK' if o2_ok else 'FAIL', o2_ms,
+                )
 
             self.progress.emit("Determining which half contains maxima...")
             
@@ -1579,6 +1629,8 @@ class ResinChannelsWorker(QThread):
             channel_result.hollowing_applied = self.enable_hollowing and self._hollow_success
             channel_result.hollow_wall_thickness_mm = self.hollow_wall_thickness_mm if self.enable_hollowing else 0.0
             channel_result.hollow_time_ms = self._hollow_time_ms
+            channel_result.base_open_applied = self._base_open_success
+            channel_result.base_open_time_ms = self._base_open_time_ms
 
             self.complete.emit(channel_result, other_half)
             
@@ -7699,6 +7751,15 @@ class MainWindow(QMainWindow):
                     f'Hollowing: {result.hollow_wall_thickness_mm:.1f} mm walls '
                     f'({result.hollow_time_ms:.0f} ms)'
                 )
+                if getattr(result, 'base_open_applied', False):
+                    self.resin_channels_stats.add_row(
+                        f'Base opening: cut through both bases '
+                        f'({result.base_open_time_ms:.0f} ms)'
+                    )
+                else:
+                    self.resin_channels_stats.add_row(
+                        'Base opening: not applied'
+                    )
             elif getattr(result, 'hollow_wall_thickness_mm', 0) > 0:
                 self.resin_channels_stats.add_row('Hollowing: failed (see log)')
             else:
@@ -7765,6 +7826,7 @@ class MainWindow(QMainWindow):
                 if self._outer_collar_result is not None
                 else None
             ),
+            prism_result=self._metamold_prism_result,
         )
         self._resin_channels_worker.progress.connect(self._on_resin_channels_progress)
         self._resin_channels_worker.complete.connect(self._on_resin_channels_complete)
