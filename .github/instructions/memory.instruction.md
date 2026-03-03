@@ -139,6 +139,30 @@ biased_dist = δ + max(λ_w, 0)
 
 ## Recent Changes
 
+### March 2026 - Metamold Hollowing (Session 14)
+- **Goal:** Add optional hollowing of metamold halves to conserve 3D printing material, similar to Meshmixer's Hollow tool.
+- **Research:** Evaluated 3 approaches: MeshLib `thickenMesh` (chosen), MeshLib `offsetMesh` + Boolean, OpenVDB direct (Blender Print3D Toolbox approach). Chose MeshLib since it's already installed and `thickenMesh` with negative offset is purpose-built for hollowing.
+- **New function:** `hollow_metamold_half()` added to `mold_fabrication.py` (lines 2708-2815):
+  - Converts trimesh → meshlib mesh via `mrmeshnumpy.meshFromFacesVerts()`
+  - Auto-detects open vs closed mesh → selects `SignDetectionMode.Unsigned` or `.OpenVDB`
+  - Uses `mm.suggestVoxelSize(mesh, 5000000.0)` for auto voxel sizing
+  - Calls `mm.thickenMesh(mesh, -wall_thickness, params)` — negative offset = hollowing mode
+  - Converts back with `process=False` to preserve topology
+  - Logs volume savings percentage
+  - Returns `(hollowed_mesh, elapsed_ms, success)` tuple
+- **UI integration:** Added "Metamold Hollowing" group box to resin channels panel:
+  - Checkbox: "Hollow out metamold halves" (default: off)
+  - Spinbox: Wall thickness 0.5–10.0 mm (default: 2.5 mm)
+  - Thickness spinbox disabled when checkbox unchecked
+- **Worker integration:** Hollowing runs as first step in `ResinChannelsWorker.run()`, BEFORE channel drilling, so channels correctly penetrate thin walls
+- **Stats display:** Hollowing result shown in resin channels stats box
+- **Test results:**
+  - Synthetic metamold (box with cavity): 16,800 → 3,677 mm³ (78% saved) in 346ms
+  - Real metamold half1 (225K faces, open): 352ms, success
+  - Real metamold half2 (226K faces, open): 341ms, success
+  - Edge cases (empty mesh, tiny box): all pass
+- **Key API:** `mrmeshpy.thickenMesh(mesh, offset, params)` — "in case of negative offset, returns the mesh consisting of inversed offset mesh merged with original mesh (hollowing mode)"
+
 ### January 2026 - Metamold Code Cleanup (Session 11)
 - **Goal:** Review and clean up all metamold creation/cleanup implementations accumulated over Sessions 6–10.
 - **Dead code removed (4 functions, ~398 lines):**

@@ -1207,6 +1207,8 @@ class ResinChannelsWorker(QThread):
         notch_width_mm=4.0,
         notch_depth_mm=0.5,
         merge_plug=False,
+        enable_hollowing=False,
+        hollow_wall_thickness_mm=2.5,
     ):
         super().__init__()
         self.metamold_half_1_with_part = metamold_half_1_with_part
@@ -1226,6 +1228,8 @@ class ResinChannelsWorker(QThread):
         self.notch_width_mm = notch_width_mm
         self.notch_depth_mm = notch_depth_mm
         self.merge_plug = merge_plug
+        self.enable_hollowing = enable_hollowing
+        self.hollow_wall_thickness_mm = hollow_wall_thickness_mm
     
     def run(self):
         try:
@@ -1237,7 +1241,41 @@ class ResinChannelsWorker(QThread):
                 create_resin_plug,
                 merge_plug_into_metamold,
             )
-            
+
+            # ── Hollowing (optional) ──────────────────────────────────────────
+            # Hollow BEFORE drilling channels so holes cut through thin walls.
+            if self.enable_hollowing:
+                from core.mold_fabrication import hollow_metamold_half
+                self.progress.emit(
+                    f"Hollowing metamold halves ({self.hollow_wall_thickness_mm:.1f} mm walls)..."
+                )
+                logger.info(
+                    "Hollowing metamold halves: wall=%.1f mm",
+                    self.hollow_wall_thickness_mm,
+                )
+                h1, h1_ms, h1_ok = hollow_metamold_half(
+                    self.metamold_half_1_with_part,
+                    wall_thickness=self.hollow_wall_thickness_mm,
+                    label='metamold_half1',
+                )
+                h2, h2_ms, h2_ok = hollow_metamold_half(
+                    self.metamold_half_2_with_part,
+                    wall_thickness=self.hollow_wall_thickness_mm,
+                    label='metamold_half2',
+                )
+                self.metamold_half_1_with_part = h1
+                self.metamold_half_2_with_part = h2
+                self._hollow_success = h1_ok and h2_ok
+                self._hollow_time_ms = h1_ms + h2_ms
+                logger.info(
+                    "Hollowing complete: half1=%s (%.0f ms), half2=%s (%.0f ms)",
+                    'OK' if h1_ok else 'FAIL', h1_ms,
+                    'OK' if h2_ok else 'FAIL', h2_ms,
+                )
+            else:
+                self._hollow_success = False
+                self._hollow_time_ms = 0.0
+
             self.progress.emit("Determining which half contains maxima...")
             
             logger.info(f"Creating resin channels: air_depth={self.air_escape_depth_mm}mm, "
@@ -1461,6 +1499,12 @@ class ResinChannelsWorker(QThread):
                     logger.error("Error applying alignment notches: %s", notch_err)
 
             self.progress.emit("Resin channels complete")
+
+            # Attach hollowing metadata to result for stats display
+            channel_result.hollowing_applied = self.enable_hollowing and self._hollow_success
+            channel_result.hollow_wall_thickness_mm = self.hollow_wall_thickness_mm if self.enable_hollowing else 0.0
+            channel_result.hollow_time_ms = self._hollow_time_ms
+
             self.complete.emit(channel_result, other_half)
             
         except Exception as e:
@@ -7402,6 +7446,62 @@ class MainWindow(QMainWindow):
 
         self.context_layout.addWidget(notch_group)
 
+        # ── Hollowing group ───────────────────────────────────────────────
+        hollow_group = QGroupBox("Metamold Hollowing")
+        hollow_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-size: 12px;
+                font-weight: bold;
+                color: {Colors.DARK};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+            QLabel {{ color: {Colors.DARK}; font-size: 12px; }}
+        """)
+        hollow_layout = QFormLayout(hollow_group)
+        hollow_layout.setContentsMargins(8, 16, 8, 8)
+        hollow_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        self.hollow_checkbox = QCheckBox("Hollow out metamold halves")
+        self.hollow_checkbox.setChecked(False)
+        self.hollow_checkbox.setStyleSheet(
+            f"color: {Colors.DARK}; font-size: 12px;"
+        )
+        self.hollow_checkbox.setToolTip(
+            "Create thin-walled metamold halves to save 3D printing material.\n"
+            "The cavity surface (where the part sits) is preserved;\n"
+            "material behind the cavity and inside the walls is removed.\n"
+            "Uses MeshLib voxel-based offset (similar to Meshmixer Hollow)."
+        )
+        hollow_layout.addRow("", self.hollow_checkbox)
+
+        self.hollow_thickness_spin = QDoubleSpinBox()
+        self.hollow_thickness_spin.setRange(0.5, 10.0)
+        self.hollow_thickness_spin.setValue(2.5)
+        self.hollow_thickness_spin.setSuffix(" mm")
+        self.hollow_thickness_spin.setSingleStep(0.5)
+        self.hollow_thickness_spin.setDecimals(1)
+        self.hollow_thickness_spin.setStyleSheet(spin_style)
+        self.hollow_thickness_spin.setToolTip(
+            "Wall thickness of the hollowed metamold shell.\n"
+            "2–3 mm recommended for resin/SLA printers,\n"
+            "3–5 mm recommended for FDM printers."
+        )
+        self.hollow_thickness_spin.setEnabled(False)
+        hollow_layout.addRow("Wall thickness:", self.hollow_thickness_spin)
+
+        # Enable/disable thickness spin when checkbox toggled
+        self.hollow_checkbox.toggled.connect(self.hollow_thickness_spin.setEnabled)
+
+        self.context_layout.addWidget(hollow_group)
+
         # Generate button
         self.resin_channels_btn = QPushButton("Create Resin Channels")
         self.resin_channels_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -7501,6 +7601,16 @@ class MainWindow(QMainWindow):
             else:
                 self.resin_channels_stats.add_row('Alignment notches: not applied')
 
+            if getattr(result, 'hollowing_applied', False):
+                self.resin_channels_stats.add_row(
+                    f'Hollowing: {result.hollow_wall_thickness_mm:.1f} mm walls '
+                    f'({result.hollow_time_ms:.0f} ms)'
+                )
+            elif getattr(result, 'hollow_wall_thickness_mm', 0) > 0:
+                self.resin_channels_stats.add_row('Hollowing: failed (see log)')
+            else:
+                self.resin_channels_stats.add_row('Hollowing: not applied')
+
             if result.mesh is not None:
                 self.resin_channels_stats.add_row(f'Result mesh: {len(result.mesh.vertices):,} verts, {len(result.mesh.faces):,} faces')
 
@@ -7534,6 +7644,8 @@ class MainWindow(QMainWindow):
         do_notches   = self.alignment_notch_checkbox.isChecked()
         notch_width  = self.notch_width_spin.value()
         merge_plug   = self.plug_merged_radio.isChecked()
+        do_hollow    = self.hollow_checkbox.isChecked()
+        hollow_wall  = self.hollow_thickness_spin.value()
 
         self._resin_channels_worker = ResinChannelsWorker(
             self._metamold_half_1_with_part,
@@ -7553,6 +7665,8 @@ class MainWindow(QMainWindow):
             notch_width_mm=notch_width,
             notch_depth_mm=0.5,
             merge_plug=merge_plug,
+            enable_hollowing=do_hollow,
+            hollow_wall_thickness_mm=hollow_wall,
         )
         self._resin_channels_worker.progress.connect(self._on_resin_channels_progress)
         self._resin_channels_worker.complete.connect(self._on_resin_channels_complete)

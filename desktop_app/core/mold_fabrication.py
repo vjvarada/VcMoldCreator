@@ -2705,6 +2705,109 @@ def trim_metamold_halves(
     return trimmed_upper, trimmed_lower, upper_saved, lower_saved, elapsed_ms
 
 
+def hollow_metamold_half(
+    mesh: trimesh.Trimesh,
+    wall_thickness: float = 2.5,
+    voxel_size: float = 0.0,
+    label: str = 'metamold_half',
+) -> Tuple[Optional[trimesh.Trimesh], float, bool]:
+    """Hollow out a metamold half to conserve 3D printing material.
+
+    Uses MeshLib's ``thickenMesh`` with negative offset (hollowing mode)
+    to create a thin-walled shell from a solid metamold half.  The cavity
+    surface (where the part sits) is preserved as part of the outer shell;
+    material behind the cavity floor and inside the exterior walls is
+    removed, leaving a uniform-thickness shell.
+
+    Args:
+        mesh:           Solid metamold half mesh (trimesh.Trimesh).
+        wall_thickness: Shell wall thickness in mm (default 2.5).
+        voxel_size:     Voxel size for the VDB grid.  0.0 = auto-compute
+                        based on mesh size (recommended).
+        label:          Human-readable label for logging / debug meshes.
+
+    Returns:
+        (hollowed_mesh, computation_time_ms, success).
+        On failure returns (original_mesh, elapsed_ms, False).
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh, 0.0, False
+
+    start_time = time.time()
+
+    try:
+        import meshlib.mrmeshpy as mm
+        import meshlib.mrmeshnumpy as mrn
+    except ImportError:
+        logger.warning("meshlib not available — cannot hollow '%s'", label)
+        return mesh, 0.0, False
+
+    try:
+        # --- Convert trimesh → meshlib Mesh ---
+        verts_np = np.asarray(mesh.vertices, dtype=np.float32)
+        faces_np = np.asarray(mesh.faces, dtype=np.int32)
+        mesh_mr = mrn.meshFromFacesVerts(faces_np, verts_np)
+
+        # --- Configure offset parameters ---
+        params = mm.GeneralOffsetParameters()
+        # For closed (watertight) meshes use OpenVDB sign detection;
+        # for open meshes fall back to Unsigned which naturally produces
+        # an open shell.
+        holes = mesh_mr.topology.findHoleRepresentiveEdges()
+        if len(holes) > 0:
+            params.signDetectionMode = mm.SignDetectionMode.Unsigned
+            logger.info("  [Hollow] '%s': open mesh detected — using Unsigned mode", label)
+        else:
+            params.signDetectionMode = mm.SignDetectionMode.OpenVDB
+            logger.info("  [Hollow] '%s': closed mesh — using OpenVDB mode", label)
+
+        if voxel_size > 0:
+            params.voxelSize = float(voxel_size)
+        else:
+            # Auto-compute: target ~5M voxels (MeshLib default heuristic)
+            params.voxelSize = mm.suggestVoxelSize(mesh_mr, 5000000.0)
+        logger.info("  [Hollow] voxelSize=%.4f mm, wall=%.2f mm", params.voxelSize, wall_thickness)
+
+        # --- Hollow (negative offset = hollowing mode) ---
+        result_mr = mm.thickenMesh(mesh_mr, float(-wall_thickness), params)
+
+        # --- Convert back to trimesh (process=False to preserve topology) ---
+        result_mr.packOptimally(False)
+        out_verts = mrn.getNumpyVerts(result_mr)
+        out_faces = mrn.getNumpyFaces(result_mr.topology)
+        hollowed = trimesh.Trimesh(
+            vertices=out_verts,
+            faces=out_faces,
+            process=False,
+        )
+
+        elapsed_ms = (time.time() - start_time) * 1000
+
+        # --- Compute volume savings ---
+        try:
+            orig_vol = abs(float(mesh.volume)) if mesh.is_watertight else 0.0
+            new_vol = abs(float(hollowed.volume)) if hollowed.is_watertight else 0.0
+            saved_pct = (1.0 - new_vol / orig_vol) * 100.0 if orig_vol > 0 else 0.0
+        except Exception:
+            orig_vol = new_vol = saved_pct = 0.0
+
+        logger.info(
+            "  [Hollow] '%s': %d→%d faces, vol %.0f→%.0f mm³ (%.0f%% saved) in %.0f ms",
+            label,
+            len(mesh.faces), len(hollowed.faces),
+            orig_vol, new_vol, saved_pct,
+            elapsed_ms,
+        )
+
+        save_debug_mesh(hollowed, f'{label}_hollowed')
+        return hollowed, elapsed_ms, True
+
+    except Exception as exc:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.error("  [Hollow] '%s' failed (%.0f ms): %s", label, elapsed_ms, exc)
+        return mesh, elapsed_ms, False
+
+
 def _offset_polygon_2d(polygon: np.ndarray, offset: float) -> np.ndarray:
     """
     Offset a 2D convex polygon outward by a given distance.
