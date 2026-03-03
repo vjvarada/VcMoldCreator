@@ -1038,7 +1038,6 @@ class MetamoldWorker(QThread):
                 create_metamold_prism,
                 create_part_with_thickened_secondary,
                 build_metamold_halves_manifold_space,
-                trim_metamold_halves,
                 cleanup_csg_mesh,
                 save_debug_mesh
             )
@@ -1126,33 +1125,52 @@ class MetamoldWorker(QThread):
                 save_debug_mesh(half_1_with_part, 'metamold_half1_with_part_pretrim')
                 save_debug_mesh(half_2_with_part, 'metamold_half2_with_part_pretrim')
 
-                # Step 6: Trim both halves to save 3D printing material
-                self.progress.emit("Trimming metamold halves to save material...")
-                half_1_with_part, half_2_with_part, bot_saved, top_saved, trim_ms = trim_metamold_halves(
-                    half_1_with_part,
-                    half_2_with_part,
-                    self.outer_collar_mesh,
-                    self.resin_pouring_direction,
-                    trim_threshold=4.0
-                )
-                if bot_saved > 0 or top_saved > 0:
-                    logger.info(f"Metamold trim: bottom saved {bot_saved:.1f}mm, "
-                               f"top saved {top_saved:.1f}mm in {trim_ms:.1f}ms")
+                # NOTE: Base-trimming has been moved to ResinChannelsWorker so
+                # that the trim threshold can adapt to the hollowing wall
+                # thickness.  Halves stored here are UNTRIMMED.
 
-                # Step 7: Selective cleanup — only collapse needles near the part
-                # surface.  The global manifold3d simplify is SKIPPED to protect
-                # prism base caps and outer walls from distortion.
-                self.progress.emit("Cleaning up CSG intersection artifacts (selective)...")
-                save_debug_mesh(half_1_with_part, 'metamold_half1_pre_cleanup')
-                save_debug_mesh(half_2_with_part, 'metamold_half2_pre_cleanup')
-                half_1_with_part = cleanup_csg_mesh(
-                    half_1_with_part, 'metamold_half1',
-                    part_mesh=combined_part_mesh,
-                )
-                half_2_with_part = cleanup_csg_mesh(
-                    half_2_with_part, 'metamold_half2',
-                    part_mesh=combined_part_mesh,
-                )
+                # Step 6: Post-CSG cleanup (selective).
+                # With part deflation (CSG_PART_DEFLATION_MM), the cavity is
+                # fractionally larger than the part, so the union produces
+                # clean manifold output with no coincident-face shards or NM
+                # edges.  We still run a lightweight validation pass and only
+                # invoke the full cleanup if problems are detected.
+                def _mesh_needs_cleanup(m):
+                    """Quick check: any zero-area faces or NM edges?"""
+                    a = m.area_faces
+                    if int(np.sum(a < 1e-10)) > 0:
+                        return True
+                    ec = {}
+                    for f in m.faces:
+                        for i in range(3):
+                            v0, v1 = int(f[i]), int(f[(i + 1) % 3])
+                            ek = (min(v0, v1), max(v0, v1))
+                            ec[ek] = ec.get(ek, 0) + 1
+                    if any(c > 2 for c in ec.values()):
+                        return True
+                    return False
+
+                need_cleanup_1 = _mesh_needs_cleanup(half_1_with_part)
+                need_cleanup_2 = _mesh_needs_cleanup(half_2_with_part)
+
+                if need_cleanup_1 or need_cleanup_2:
+                    self.progress.emit("Cleaning up CSG intersection artifacts (selective)...")
+                    save_debug_mesh(half_1_with_part, 'metamold_half1_pre_cleanup')
+                    save_debug_mesh(half_2_with_part, 'metamold_half2_pre_cleanup')
+                    if need_cleanup_1:
+                        half_1_with_part = cleanup_csg_mesh(
+                            half_1_with_part, 'metamold_half1',
+                            part_mesh=combined_part_mesh,
+                        )
+                    if need_cleanup_2:
+                        half_2_with_part = cleanup_csg_mesh(
+                            half_2_with_part, 'metamold_half2',
+                            part_mesh=combined_part_mesh,
+                        )
+                else:
+                    logger.info("[Metamold] Post-CSG output is clean — "
+                                "skipping cleanup (deflation eliminated "
+                                "coplanar-face artifacts)")
 
                 # Log final diagnostics for each half
                 for _hlabel, _hmesh in [('Half1', half_1_with_part), ('Half2', half_2_with_part)]:
@@ -1209,6 +1227,7 @@ class ResinChannelsWorker(QThread):
         merge_plug=False,
         enable_hollowing=False,
         hollow_wall_thickness_mm=2.5,
+        blade_mesh=None,
     ):
         super().__init__()
         self.metamold_half_1_with_part = metamold_half_1_with_part
@@ -1230,6 +1249,7 @@ class ResinChannelsWorker(QThread):
         self.merge_plug = merge_plug
         self.enable_hollowing = enable_hollowing
         self.hollow_wall_thickness_mm = hollow_wall_thickness_mm
+        self.blade_mesh = blade_mesh
     
     def run(self):
         try:
@@ -1241,9 +1261,60 @@ class ResinChannelsWorker(QThread):
                 create_resin_plug,
                 merge_plug_into_metamold,
             )
+            from core.mold_fabrication import (
+                trim_metamold_halves,
+                compute_adaptive_trim_threshold,
+                save_debug_mesh,
+            )
+
+            # ── Base trimming ─────────────────────────────────────────────────
+            # Trim the prism bases to save material.  The cutting blade
+            # (outer collar) is the height reference — its registration
+            # pattern determines the actual metamold height bounds.
+            # When hollowing is enabled, the threshold is raised so that
+            # the hollow cavity from the base never merges with the hollow
+            # cavity from the part-cavity side.
+            if self.blade_mesh is not None:
+                trim_threshold = compute_adaptive_trim_threshold(
+                    wall_thickness=self.hollow_wall_thickness_mm,
+                    enable_hollowing=self.enable_hollowing,
+                )
+                self.progress.emit(
+                    f"Trimming metamold bases (threshold={trim_threshold:.1f} mm)..."
+                )
+                (
+                    self.metamold_half_1_with_part,
+                    self.metamold_half_2_with_part,
+                    upper_saved, lower_saved,
+                    trim_ms,
+                ) = trim_metamold_halves(
+                    self.metamold_half_1_with_part,
+                    self.metamold_half_2_with_part,
+                    self.blade_mesh,          # blade = height reference
+                    self.resin_direction,
+                    trim_threshold=trim_threshold,
+                )
+                self._trim_threshold = trim_threshold
+                self._trim_upper_saved = upper_saved
+                self._trim_lower_saved = lower_saved
+                self._trim_ms = trim_ms
+                logger.info(
+                    "Metamold trim: upper=%.1fmm lower=%.1fmm "
+                    "(threshold=%.1f mm, %.0f ms)",
+                    upper_saved, lower_saved, trim_threshold, trim_ms,
+                )
+            else:
+                logger.warning(
+                    "No blade mesh provided — skipping base trim"
+                )
+                self._trim_threshold = 0.0
+                self._trim_upper_saved = 0.0
+                self._trim_lower_saved = 0.0
+                self._trim_ms = 0.0
 
             # ── Hollowing (optional) ──────────────────────────────────────────
-            # Hollow BEFORE drilling channels so holes cut through thin walls.
+            # Hollow AFTER trimming but BEFORE drilling channels so holes
+            # cut through thin walls.
             if self.enable_hollowing:
                 from core.mold_fabrication import hollow_metamold_half
                 self.progress.emit(
@@ -1500,7 +1571,11 @@ class ResinChannelsWorker(QThread):
 
             self.progress.emit("Resin channels complete")
 
-            # Attach hollowing metadata to result for stats display
+            # Attach trimming + hollowing metadata to result for stats display
+            channel_result.trim_threshold_mm = self._trim_threshold
+            channel_result.trim_upper_saved_mm = self._trim_upper_saved
+            channel_result.trim_lower_saved_mm = self._trim_lower_saved
+            channel_result.trim_time_ms = self._trim_ms
             channel_result.hollowing_applied = self.enable_hollowing and self._hollow_success
             channel_result.hollow_wall_thickness_mm = self.hollow_wall_thickness_mm if self.enable_hollowing else 0.0
             channel_result.hollow_time_ms = self._hollow_time_ms
@@ -5437,7 +5512,12 @@ class MainWindow(QMainWindow):
     def _create_context_panel(self) -> QWidget:
         """Create the context/options panel (middle column)."""
         panel = QFrame()
-        panel.setFixedWidth(280)
+        panel.setMinimumWidth(280)
+        panel.setMaximumWidth(380)
+        panel.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Preferred,
+        )
         panel.setStyleSheet(f"""
             QFrame {{
                 background-color: {Colors.WHITE};
@@ -5496,12 +5576,15 @@ class MainWindow(QMainWindow):
         self.context_content = QWidget()
         self.context_content.setSizePolicy(
             QSizePolicy.Policy.Preferred,
-            QSizePolicy.Policy.Minimum
+            QSizePolicy.Policy.Preferred
         )
         self.context_layout = QVBoxLayout(self.context_content)
         self.context_layout.setContentsMargins(16, 16, 16, 16)
         self.context_layout.setSpacing(12)
-        self.context_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        # NOTE: Do NOT set AlignTop on this layout — it prevents the
+        # QScrollArea from computing the correct content height, causing
+        # later steps' widgets to be clipped.  The addStretch() at the
+        # end of _update_context_panel() provides top-alignment instead.
         scroll.setWidget(self.context_content)
         
         layout.addWidget(scroll, 1)
@@ -7601,6 +7684,16 @@ class MainWindow(QMainWindow):
             else:
                 self.resin_channels_stats.add_row('Alignment notches: not applied')
 
+            # Trim stats
+            _trim_t = getattr(result, 'trim_threshold_mm', 0)
+            _trim_u = getattr(result, 'trim_upper_saved_mm', 0)
+            _trim_l = getattr(result, 'trim_lower_saved_mm', 0)
+            if _trim_t > 0:
+                self.resin_channels_stats.add_row(
+                    f'Base trim: ±{_trim_t:.1f} mm from blade '
+                    f'(upper {_trim_u:.1f}, lower {_trim_l:.1f} mm saved)'
+                )
+
             if getattr(result, 'hollowing_applied', False):
                 self.resin_channels_stats.add_row(
                     f'Hollowing: {result.hollow_wall_thickness_mm:.1f} mm walls '
@@ -7667,6 +7760,11 @@ class MainWindow(QMainWindow):
             merge_plug=merge_plug,
             enable_hollowing=do_hollow,
             hollow_wall_thickness_mm=hollow_wall,
+            blade_mesh=(
+                self._outer_collar_result.mesh
+                if self._outer_collar_result is not None
+                else None
+            ),
         )
         self._resin_channels_worker.progress.connect(self._on_resin_channels_progress)
         self._resin_channels_worker.complete.connect(self._on_resin_channels_complete)

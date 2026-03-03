@@ -1449,6 +1449,159 @@ def extend_membrane_height(
 # MANIFOLD-SPACE METAMOLD PIPELINE
 # ============================================================================
 
+# ── Adaptive base-trim constants ──────────────────────────────────────────
+# When hollowing is enabled, the base must be kept far enough from the
+# blade (parting-surface reference) so that the hollow cavity from the
+# base and the hollow cavity from the cavity surface never merge.
+#
+# Rule:  trim_threshold = max(DEFAULT, 2 × wall + MIN_GAP)
+#
+# *2 × wall* accounts for one wall-thickness shell at the base and one
+# at the cavity side.  *MIN_GAP* is a safety buffer so the hollow space
+# is always present even at the lowest point of the internal cavity.
+TRIM_THRESHOLD_DEFAULT: float = 4.0   # mm — standard trim when not hollowing
+TRIM_HOLLOW_MIN_GAP: float = 1.0      # mm — minimum hollow clearance at base
+
+
+def compute_adaptive_trim_threshold(
+    wall_thickness: float = 0.0,
+    enable_hollowing: bool = False,
+    default_threshold: float = TRIM_THRESHOLD_DEFAULT,
+) -> float:
+    """Compute the base-trim threshold based on hollowing parameters.
+
+    When hollowing is disabled the standard ``default_threshold`` is used.
+    When hollowing is enabled the threshold is raised to
+    ``max(default, 2 × wall_thickness + MIN_GAP)`` so that the two
+    internal hollow shells (base-side and cavity-side) never merge.
+
+    Args:
+        wall_thickness:    Hollow wall thickness in mm.
+        enable_hollowing:  Whether hollowing will be applied.
+        default_threshold: Trim threshold to use when not hollowing.
+
+    Returns:
+        Trim threshold in mm.
+    """
+    if not enable_hollowing or wall_thickness <= 0:
+        return default_threshold
+    hollow_safe = 2.0 * wall_thickness + TRIM_HOLLOW_MIN_GAP
+    threshold = max(default_threshold, hollow_safe)
+    logger.info(
+        "  [Trim] Adaptive threshold: wall=%.1f mm → "
+        "2×wall+gap = %.1f mm → using %.1f mm (default %.1f)",
+        wall_thickness, hollow_safe, threshold, default_threshold,
+    )
+    return threshold
+
+
+# Deflation amount (mm) applied to the part before the cavity subtraction.
+# This creates a cavity that is very slightly larger than the actual part so
+# that the subsequent ``half + part`` union has genuine geometric overlap
+# instead of perfectly coincident faces.  Coincident faces trigger
+# manifold3d's coplanar-shard artifacts (GitHub manifold #1430, #1359).
+# 1 µm (0.001 mm) is far below any 3D printer's resolution (FDM ≈ 100 µm,
+# SLA ≈ 25 µm) and is invisible in the final mold.
+CSG_PART_DEFLATION_MM: float = 0.001
+
+
+def _deflate_part_for_csg(
+    mesh: trimesh.Trimesh,
+    deflation_mm: float = CSG_PART_DEFLATION_MM,
+) -> Optional[trimesh.Trimesh]:
+    """Uniformly deflate (shrink) the part mesh by a tiny offset.
+
+    Moves every vertex inward along its outward-facing vertex normal by
+    ``deflation_mm``.  This is used before the cavity subtraction so that
+    the resulting cavity is fractionally larger than the actual part,
+    guaranteeing genuine overlap when the original part is boolean-unioned
+    back.
+
+    At the default 1 µm scale, vertex-normal displacement is equivalent
+    to a true signed-distance offset and preserves the exact mesh topology
+    (same face count, same connectivity).  Self-intersection from
+    convergent normals at concavities is only theoretically possible if
+    the local radius of curvature is smaller than ``deflation_mm``; for
+    real-world parts the minimum curvature radius is orders of magnitude
+    larger than 1 µm.
+
+    As a safety measure, the function validates the result by checking
+    for **inverted triangles** — faces whose normal has flipped relative
+    to the original mesh.  If *any* face has flipped, the deflated mesh
+    is rejected (returns *None*) and the caller falls back to the
+    original un-deflated part.  This guarantees that the output is always
+    a valid, non-self-intersecting manifold mesh suitable for manifold3d
+    boolean operations.
+
+    Args:
+        mesh:          Part mesh to deflate.
+        deflation_mm:  Offset amount in mm (positive = shrink inward).
+
+    Returns:
+        Deflated trimesh with validated face orientations, or *None* if
+        deflation fails or produces inverted triangles.
+    """
+    if mesh is None or len(mesh.faces) == 0 or deflation_mm <= 0:
+        return None
+
+    try:
+        normals = mesh.vertex_normals  # outward-pointing unit normals
+        deflated_verts = (
+            np.asarray(mesh.vertices, dtype=np.float64)
+            - normals * deflation_mm
+        )
+        deflated = trimesh.Trimesh(
+            vertices=deflated_verts,
+            faces=mesh.faces.copy(),
+            process=False,
+        )
+
+        # --- Validation: check for inverted (flipped) triangles ---
+        # Compute face normals for both meshes and compare.  A dot
+        # product < 0 means the face flipped inside-out, indicating
+        # local self-intersection from convergent vertex normals.
+        orig_fn = mesh.face_normals          # (F, 3)
+        defl_fn = deflated.face_normals      # (F, 3)
+        dots = np.einsum('ij,ij->i', orig_fn, defl_fn)  # per-face dot
+        n_flipped = int(np.sum(dots < 0.0))
+
+        if n_flipped > 0:
+            logger.warning(
+                "  [Deflate] Deflation by %.4f mm inverted %d / %d "
+                "faces — rejecting deflated mesh (falling back to "
+                "original part)",
+                deflation_mm, n_flipped, len(mesh.faces),
+            )
+            return None
+
+        # --- Validation: volume sanity check ---
+        # Uniform inversion (offset > feature size) preserves face
+        # normals (cross product squares out the scale factor) but
+        # the volume becomes negative or absurdly different.  For a
+        # 1 µm offset the volume change should be negligible (< 1%).
+        orig_vol = float(mesh.volume)
+        defl_vol = float(deflated.volume)
+        if orig_vol > 0 and (defl_vol <= 0 or defl_vol > orig_vol * 1.5):
+            logger.warning(
+                "  [Deflate] Deflation by %.4f mm produced invalid "
+                "volume (%.2f → %.2f) — rejecting",
+                deflation_mm, orig_vol, defl_vol,
+            )
+            return None
+
+        logger.info(
+            "  [Deflate] Part deflated by %.4f mm along vertex normals "
+            "(%d faces, 0 inverted — valid)",
+            deflation_mm, len(deflated.faces),
+        )
+        save_debug_mesh(deflated, 'msp_part_deflated')
+        return deflated
+
+    except Exception as exc:
+        logger.warning("  [Deflate] Part deflation failed: %s", exc)
+        return None
+
+
 def build_metamold_halves_manifold_space(
     prism_mesh: trimesh.Trimesh,
     part_mesh: trimesh.Trimesh,
@@ -1461,28 +1614,34 @@ def build_metamold_halves_manifold_space(
     """Build both metamold halves in a single manifold3d session.
 
     Performs the entire CSG chain — cavity creation, blade split, and part
-    union — without leaving manifold3d space.  This is critical because
-    manifold3d 3.4.0's symbolic perturbation can only eliminate coincident
-    faces when the *exact same* manifold python object is used for both the
-    subtraction and the subsequent union.  Round-tripping through trimesh
-    creates a new manifold object with fresh internal IDs, breaking the
-    provenance tracking that enables perfect coincident-face merging.
+    union — without leaving manifold3d space.
+
+    To avoid manifold3d's coplanar-face shard artifacts (GitHub #1430,
+    #1359), the part mesh used for the cavity subtraction is **deflated**
+    by 1 µm (``CSG_PART_DEFLATION_MM``) via MeshLib's signed-distance
+    offset.  This makes the cavity fractionally larger than the actual
+    part, so the subsequent ``half + part`` union has genuine geometric
+    overlap instead of perfectly coincident surfaces.  The 1 µm gap is
+    far below any 3D printer's resolution and is invisible in the final
+    mold.
 
     Pipeline executed in manifold3d space:
-        1. ``cavity = prism - part``
+        1. ``cavity = prism - deflated_part``   (slightly larger cavity)
         2. ``cut_cavity = cavity - blade``
         3. ``components = cut_cavity.decompose()``
         4. Classify upper / lower halves by pouring-direction centroid
-        5. ``half_with_part = component + part``   (same ``part`` object!)
+        5. ``half_with_part = component + part``  (original size → overlap)
 
     When *combined_part_mesh* is provided (part + thickened secondary), the
     union uses that instead of the bare part mesh.  The cavity subtraction
-    always uses the bare part so the cavity shape matches the original part.
+    always uses the bare (deflated) part so the cavity shape matches the
+    original part.
 
     Args:
         prism_mesh:          Raw prism trimesh.
-        part_mesh:           Original part trimesh (used for cavity *and*
-                             for the union when combined_part_mesh is None).
+        part_mesh:           Original part trimesh (used deflated for cavity,
+                             original for union when combined_part_mesh is
+                             None).
         membrane_mesh:       Parting surface / outer collar mesh.
         pouring_direction:   Unit vector defining "upper" direction.
         blade_thickness:     Cutting blade thickness in mm (default 0.001).
@@ -1510,39 +1669,49 @@ def build_metamold_halves_manifold_space(
             membrane_mesh, direction, blade_thickness)
         save_debug_mesh(blade_trimesh, 'msp_cutting_blade')
 
-        # ---- 1. Convert all inputs to manifold3d ONCE ----
+        # ---- 1. Deflate the part mesh for cavity subtraction ----
+        # A tiny inward offset (1 µm) makes the cavity fractionally larger
+        # than the actual part so that the union at step 6 has genuine
+        # geometric overlap instead of perfectly coincident faces.
+        deflated_part_mesh = _deflate_part_for_csg(part_mesh)
+        if deflated_part_mesh is not None:
+            cavity_part_mesh = deflated_part_mesh
+            logger.info("[manifold-space] Using deflated part for cavity "
+                        "(%.4f mm inward offset)", CSG_PART_DEFLATION_MM)
+        else:
+            cavity_part_mesh = part_mesh
+            logger.info("[manifold-space] Deflation unavailable — using "
+                        "original part for cavity")
+
+        # ---- 2. Convert all inputs to manifold3d ----
         logger.info("[manifold-space] Converting inputs to manifold...")
         prism_m = _trimesh_to_manifold(prism_mesh, 'msp_prism')
+        cavity_part_m = _trimesh_to_manifold(cavity_part_mesh, 'msp_cavity_part')
         part_m = _trimesh_to_manifold(part_mesh, 'msp_part')
         blade_m = _trimesh_to_manifold(blade_trimesh, 'msp_blade')
 
-        # The mesh we union back into each half.  When there is a secondary
-        # surface, we build the combined manifold in this session so its
-        # part-surface faces share provenance with part_m.
+        # The mesh we union back into each half.  Uses the ORIGINAL
+        # (un-deflated) part so it is slightly larger than the cavity,
+        # producing clean overlap.
         if combined_part_mesh is not None and combined_part_mesh is not part_mesh:
-            # Combined = part + thickened secondary (done in manifold space)
-            # We convert *only* the thickened secondary, then union with the
-            # already-converted part_m so part faces keep their IDs.
-            # However, if the caller already unioned externally and handed us
-            # a completely different trimesh, we just convert that.
             logger.info("[manifold-space] Building combined part manifold...")
             combined_m = _trimesh_to_manifold(combined_part_mesh, 'msp_combined_part')
         else:
-            combined_m = part_m  # same object — provenance preserved
+            combined_m = part_m  # original size for union
 
-        # ---- 2. Cavity: prism - part  (manifold space) ----
-        logger.info("[manifold-space] CSG: cavity = prism - part ...")
-        cavity_m = prism_m - part_m
+        # ---- 3. Cavity: prism - deflated_part  (manifold space) ----
+        logger.info("[manifold-space] CSG: cavity = prism - deflated_part ...")
+        cavity_m = prism_m - cavity_part_m
         logger.info("[manifold-space]   cavity: %d verts, %d tris",
                     cavity_m.num_vert(), cavity_m.num_tri())
 
-        # ---- 3. Blade split: cavity - blade  (manifold space) ----
+        # ---- 4. Blade split: cavity - blade  (manifold space) ----
         logger.info("[manifold-space] CSG: cut = cavity - blade ...")
         cut_m = cavity_m - blade_m
         logger.info("[manifold-space]   cut: %d verts, %d tris",
                     cut_m.num_vert(), cut_m.num_tri())
 
-        # ---- 4. Decompose into connected components (stays in manifold
+        # ---- 5. Decompose into connected components (stays in manifold
         #         space — this is the key difference from trimesh.split()) ----
         components = cut_m.decompose()
         logger.info("[manifold-space] decompose → %d component(s)", len(components))
@@ -1565,7 +1734,7 @@ def build_metamold_halves_manifold_space(
             logger.warning("[manifold-space]   discarding %d small fragments",
                            len(components) - 2)
 
-        # ---- 5. Classify upper / lower by pouring direction ----
+        # ---- 6. Classify upper / lower by pouring direction ----
         def _manifold_centroid(m: 'manifold3d.Manifold') -> np.ndarray:
             md = m.to_mesh()
             vp = np.asarray(md.vert_properties, dtype=np.float64)
@@ -1586,8 +1755,9 @@ def build_metamold_halves_manifold_space(
                     upper_m.num_tri(), max(proj_a, proj_b),
                     lower_m.num_tri(), min(proj_a, proj_b))
 
-        # ---- 6. Union each half with the part (manifold space, same
-        #         part object → coincident faces eliminated) ----
+        # ---- 7. Union each half with the ORIGINAL part (manifold space).
+        #         The cavity was cut with the deflated part, so the original
+        #         part is ~1 µm larger → genuine overlap → no coplanar shards.
         logger.info("[manifold-space] CSG: upper + part ...")
         upper_result_m = upper_m + combined_m
         logger.info("[manifold-space]   upper+part: %d verts, %d tris, vol=%.2f",

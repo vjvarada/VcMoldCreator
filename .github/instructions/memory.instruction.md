@@ -35,11 +35,10 @@ applyTo: '**'
 - Secondary membrane extraction
 - Session save/load
 - Shell halves export for 3D printing
+- Metamold hollowing + adaptive trim (implemented, needs real-model validation)
 
 #### Not Started ❌
 - Air vent placement
-- Registration marks on shell halves
-- Metamold geometry
 - Multi-piece molds
 - GPU acceleration for Dijkstra
 
@@ -100,7 +99,7 @@ The virtual environment is located at:
 - `desktop_app/core/pouring_direction.py` - Bubble optimization
 
 ### UI
-- `desktop_app/ui/main_window.py` - Main application window (9400+ lines)
+- `desktop_app/ui/main_window.py` - Main application window (13,000+ lines)
 - `desktop_app/viewer/mesh_viewer.py` - 3D visualization
 
 ### Documentation
@@ -138,6 +137,47 @@ biased_dist = δ + max(λ_w, 0)
 ---
 
 ## Recent Changes
+
+### March 2026 - Adaptive Base Trim Moved to Resin Step (Session 14, Phase 4)
+- **Problem:** When hollowing metamold halves, the hollow cavity from the base and the hollow cavity from the part-cavity side could merge at the lowest points of internal geometry. The original 4mm trim threshold was too aggressive for thicker walls.
+- **Solution:** Moved base trimming from `MetamoldWorker` (metamold step) to `ResinChannelsWorker` (resin channels step). The trim threshold adapts to hollowing parameters:
+  - No hollowing: `TRIM_THRESHOLD_DEFAULT = 4.0` mm (unchanged behavior)
+  - With hollowing: `max(4.0, 2 × wall_thickness + TRIM_HOLLOW_MIN_GAP)` where `TRIM_HOLLOW_MIN_GAP = 1.0` mm
+  - Formula ensures two wall-thickness shells (base-side + cavity-side) never merge
+- **Changes:**
+  - `mold_fabrication.py`: Added `TRIM_THRESHOLD_DEFAULT = 4.0`, `TRIM_HOLLOW_MIN_GAP = 1.0`, `compute_adaptive_trim_threshold()` helper
+  - `main_window.py` — MetamoldWorker: Removed `trim_metamold_halves` import and call. Halves emitted are now UNTRIMMED. Added comment explaining the move.
+  - `main_window.py` — ResinChannelsWorker: Added `blade_mesh=None` parameter. Added trim step BEFORE hollowing using blade mesh (outer collar) as height reference. Stores `_trim_threshold`, `_trim_upper_saved`, `_trim_lower_saved`, `_trim_ms` for stats.
+  - `main_window.py` — `_on_create_resin_channels()`: Passes `self._outer_collar_result.mesh` as `blade_mesh`
+  - `main_window.py` — `_update_resin_channels_step_ui()`: Shows trim stats row + attaches trim metadata to `channel_result`
+- **Execution order in ResinChannelsWorker:** Trim → Hollow → Drill channels
+- **Adaptive threshold examples:** wall=2.5mm → 6.0mm, wall=5.0mm → 11.0mm, wall=1.0mm → 4.0mm
+
+### March 2026 - Cleanup Validation Gate (Session 14, Phase 3)
+- **Change:** With part deflation eliminating coplanar artifacts, the full `cleanup_csg_mesh()` is now gated behind a `_mesh_needs_cleanup()` validation check in MetamoldWorker Step 6. If the mesh has 0 NM edges and 0 zero-area faces, cleanup is skipped entirely.
+- **File:** `main_window.py` — MetamoldWorker.run(), `_mesh_needs_cleanup()` helper function
+
+### March 2026 - Part Deflation for CSG Overlap (Session 14, Phase 2)
+- **Problem:** In `build_metamold_halves_manifold_space()`, the `half + part` union creates coplanar face shards because the cavity surface (from `prism - part`) is geometrically identical to the part surface. manifold3d's symbolic perturbation cannot always resolve exact coincident faces (GitHub manifold #1430, #1359).
+- **Previous mitigations:** `_remove_coplanar_shard_components()` (Session 6), `ensure_manifold_mesh()` (Session 10). These are band-aids that remove artifacts after the fact.
+- **Root-cause fix:** Deflate the part mesh by 1 µm (0.001 mm) before the cavity subtraction, then use the original (un-deflated) part for the union. This creates genuine geometric overlap at the cavity boundary, eliminating coincident faces entirely.
+- **Implementation:** 
+  - Added `CSG_PART_DEFLATION_MM = 0.001` constant in `mold_fabrication.py`
+  - Added `_deflate_part_for_csg()` helper: moves each vertex inward along its vertex normal by `deflation_mm`. Preserves exact mesh topology (same face count, same connectivity). ~6ms for 1K faces, ~64ms for 20K faces.
+  - Modified `build_metamold_halves_manifold_space()` pipeline:
+    - Step 1: Deflate part via `_deflate_part_for_csg(part_mesh)`
+    - Step 2: Convert deflated part AND original part to manifold3d separately
+    - Step 3: `cavity = prism - deflated_part` (cavity is 1 µm larger)
+    - Step 7: `half + original_part` (original is 1 µm larger than cavity → overlap)
+  - Falls back to original part if deflation fails (graceful degradation)
+- **Why vertex-normal offset, not MeshLib voxelization:** MeshLib `generalOffsetMesh` works but causes face-count explosion (1,280 → 274,088 for a sphere) due to marching cubes remeshing. Vertex-normal displacement preserves exact topology and is orders of magnitude faster. At 1 µm scale, self-intersection from convergent normals is completely negligible.
+- **Why deflation not scaling:** Scaling from centroid would not affect concavities uniformly — holes and internal cavities might get no overlap. Vertex-normal offset shrinks every surface point inward by exactly the same amount.
+- **Test results:**
+  - Sphere (r=10): extent shrink = 0.002mm/axis (0.001 from each side) ✓
+  - Cube (20mm): bounds shrunk correctly ✓  
+  - Torus (R=15, r=5): concavity handled, volume reduction 0.04% ✓
+  - All meshes: face count preserved exactly ✓
+  - CSG integration: clean output, no shard artifacts ✓
 
 ### March 2026 - Metamold Hollowing (Session 14)
 - **Goal:** Add optional hollowing of metamold halves to conserve 3D printing material, similar to Meshmixer's Hollow tool.
