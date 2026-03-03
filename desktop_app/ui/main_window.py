@@ -18,7 +18,7 @@ import trimesh
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
-    QFrame, QLabel, QProgressBar, QPushButton, 
+    QFrame, QLabel, QProgressBar, QPushButton, QLayout,
     QMessageBox, QFileDialog, QScrollArea, QCheckBox,
     QPlainTextEdit, QSplitter, QDialog, QSlider, QSpinBox,
     QRadioButton, QButtonGroup, QGroupBox, QSizePolicy,
@@ -5633,10 +5633,13 @@ class MainWindow(QMainWindow):
         self.context_layout = QVBoxLayout(self.context_content)
         self.context_layout.setContentsMargins(16, 16, 16, 16)
         self.context_layout.setSpacing(12)
-        # NOTE: Do NOT set AlignTop on this layout — it prevents the
-        # QScrollArea from computing the correct content height, causing
-        # later steps' widgets to be clipped.  The addStretch() at the
-        # end of _update_context_panel() provides top-alignment instead.
+        # Force the content widget's minimum size to match its layout's
+        # minimum size.  This ensures the QScrollArea sees the true
+        # content height and shows a scroll-bar when widgets overflow
+        # instead of clipping them.
+        self.context_layout.setSizeConstraint(
+            QLayout.SizeConstraint.SetMinimumSize
+        )
         scroll.setWidget(self.context_content)
         
         layout.addWidget(scroll, 1)
@@ -5936,11 +5939,13 @@ class MainWindow(QMainWindow):
             logger.info("Feature debug visualization disabled")
     
     def _clear_context_layout(self):
-        """Clear all widgets from context layout."""
+        """Clear all widgets and spacer items from context layout."""
         while self.context_layout.count():
             child = self.context_layout.takeAt(0)
             if child.widget():
                 child.widget().deleteLater()
+            # Spacer items (e.g. from addStretch) have no widget;
+            # they are freed when the layout item goes out of scope.
     
     def _update_context_panel(self):
         """Update context panel based on active step."""
@@ -6006,6 +6011,10 @@ class MainWindow(QMainWindow):
             self._setup_export_step()
         
         self.context_layout.addStretch()
+
+        # Force the content widget to recompute its geometry so the
+        # scroll-area picks up the true content height immediately.
+        self.context_content.updateGeometry()
     
     def _setup_import_step(self):
         """Setup the import step UI."""
@@ -7508,7 +7517,6 @@ class MainWindow(QMainWindow):
         self.plug_separate_radio = QRadioButton(
             "Separate plug  (printed separately, inserted before casting)"
         )
-        self.plug_separate_radio.setChecked(True)
         self.plug_separate_radio.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
         self.plug_separate_radio.setToolTip(
             "The resin pour spout is a standalone part.\n"
@@ -7520,6 +7528,7 @@ class MainWindow(QMainWindow):
         self.plug_merged_radio = QRadioButton(
             "Merge plug into metamold  (integrated — no separate plug piece)"
         )
+        self.plug_merged_radio.setChecked(True)
         self.plug_merged_radio.setStyleSheet(f"color: {Colors.DARK}; font-size: 12px;")
         self.plug_merged_radio.setToolTip(
             "The plug geometry is boolean-unioned into the metamold mesh.\n"
@@ -7605,7 +7614,7 @@ class MainWindow(QMainWindow):
         hollow_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         self.hollow_checkbox = QCheckBox("Hollow out metamold halves")
-        self.hollow_checkbox.setChecked(False)
+        self.hollow_checkbox.setChecked(True)
         self.hollow_checkbox.setStyleSheet(
             f"color: {Colors.DARK}; font-size: 12px;"
         )
@@ -7619,7 +7628,7 @@ class MainWindow(QMainWindow):
 
         self.hollow_thickness_spin = QDoubleSpinBox()
         self.hollow_thickness_spin.setRange(0.5, 10.0)
-        self.hollow_thickness_spin.setValue(2.5)
+        self.hollow_thickness_spin.setValue(4.0)
         self.hollow_thickness_spin.setSuffix(" mm")
         self.hollow_thickness_spin.setSingleStep(0.5)
         self.hollow_thickness_spin.setDecimals(1)
@@ -7629,7 +7638,7 @@ class MainWindow(QMainWindow):
             "2–3 mm recommended for resin/SLA printers,\n"
             "3–5 mm recommended for FDM printers."
         )
-        self.hollow_thickness_spin.setEnabled(False)
+        self.hollow_thickness_spin.setEnabled(True)
         hollow_layout.addRow("Wall thickness:", self.hollow_thickness_spin)
 
         # Enable/disable thickness spin when checkbox toggled
