@@ -998,13 +998,42 @@ class HardShellWorker(QThread):
             self.error.emit(str(e))
 
 
+def _mesh_needs_cleanup(mesh: trimesh.Trimesh) -> bool:
+    """Quick check: any zero-area faces or non-manifold edges?
+
+    Used after CSG to decide whether the expensive full cleanup pass
+    is necessary.
+    """
+    areas = mesh.area_faces
+    if int(np.sum(areas < 1e-10)) > 0:
+        return True
+    edge_counts: dict = {}
+    for face in mesh.faces:
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            key = (min(v0, v1), max(v0, v1))
+            edge_counts[key] = edge_counts.get(key, 0) + 1
+    return any(c > 2 for c in edge_counts.values())
+
+
+@dataclass
+class MetamoldWorkerResult:
+    """Aggregated output of MetamoldWorker for a cleaner signal."""
+    prism_result: object          # MetamoldPrismResult
+    half_1_with_part: Optional[trimesh.Trimesh] = None
+    half_2_with_part: Optional[trimesh.Trimesh] = None
+    success: bool = False
+
+
 class MetamoldWorker(QThread):
-    """Background worker for generating metamold geometry (prism + CSG cavity + split into halves + add part)."""
+    """Background worker for generating metamold geometry.
+
+    Pipeline: prism creation → manifold-space cavity + blade split + part
+    union → optional CSG cleanup.
+    """
     
     progress = pyqtSignal(str)
-    # (MetamoldPrismResult, metamold_with_cavity, metamold_half_1, metamold_half_2, 
-    #  half_1_with_part, half_2_with_part, success)
-    complete = pyqtSignal(object, object, object, object, object, object, bool)
+    complete = pyqtSignal(object)  # MetamoldWorkerResult
     error = pyqtSignal(str)
     
     def __init__(
@@ -1014,16 +1043,16 @@ class MetamoldWorker(QThread):
         outer_collar_mesh,
         resin_pouring_direction,
         wall_thickness=5.0,
-        margin=0.0,  # Same as hard shell (0.0)
+        margin=0.0,
         height_above=2.0,
         height_below=2.0,
-        secondary_surface=None,  # Smoothed secondary parting surface
-        secondary_thickness=0.2  # Thickness for secondary surface (mm)
+        secondary_surface=None,
+        secondary_thickness=0.2,
     ):
         super().__init__()
         self.hull_mesh = hull_mesh
         self.part_mesh = part_mesh
-        self.outer_collar_mesh = outer_collar_mesh  # Reused from hard shell step
+        self.outer_collar_mesh = outer_collar_mesh
         self.resin_pouring_direction = resin_pouring_direction
         self.wall_thickness = wall_thickness
         self.margin = margin
@@ -1032,6 +1061,62 @@ class MetamoldWorker(QThread):
         self.secondary_surface = secondary_surface
         self.secondary_thickness = secondary_thickness
     
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_combined_part(self, create_part_with_thickened_secondary, save_debug_mesh):
+        """Build combined part mesh (part + thickened secondary surface).
+
+        Returns the combined mesh, or self.part_mesh if no secondary
+        surface is available or the combination fails.
+        """
+        if self.secondary_surface is None or len(self.secondary_surface.vertices) == 0:
+            return self.part_mesh
+
+        self.progress.emit(
+            f"Thickening secondary surface ({self.secondary_thickness}mm)..."
+        )
+        combined, combine_time_ms, ok = create_part_with_thickened_secondary(
+            self.part_mesh, self.secondary_surface, self.secondary_thickness,
+        )
+        if not ok or combined is None:
+            logger.warning("Failed to create part with thickened secondary — using part mesh only")
+            return self.part_mesh
+
+        logger.info(
+            "Combined part mesh: %d verts, %d faces in %.1f ms",
+            len(combined.vertices), len(combined.faces), combine_time_ms,
+        )
+        save_debug_mesh(combined, 'metamold_combined_part_mesh')
+        return combined
+
+    def _run_cleanup_if_needed(self, half_1, half_2, combined_part_mesh, cleanup_csg_mesh, save_debug_mesh):
+        """Run CSG cleanup on halves only when artifacts are detected."""
+        need_1 = _mesh_needs_cleanup(half_1)
+        need_2 = _mesh_needs_cleanup(half_2)
+
+        if not (need_1 or need_2):
+            logger.info(
+                "[Metamold] Post-CSG output is clean — skipping cleanup "
+                "(deflation eliminated coplanar-face artifacts)"
+            )
+            return half_1, half_2
+
+        self.progress.emit("Cleaning up CSG intersection artifacts (selective)...")
+        save_debug_mesh(half_1, 'metamold_half1_pre_cleanup')
+        save_debug_mesh(half_2, 'metamold_half2_pre_cleanup')
+
+        if need_1:
+            half_1 = cleanup_csg_mesh(half_1, 'metamold_half1', part_mesh=combined_part_mesh)
+        if need_2:
+            half_2 = cleanup_csg_mesh(half_2, 'metamold_half2', part_mesh=combined_part_mesh)
+        return half_1, half_2
+
+    # ------------------------------------------------------------------
+    # Main pipeline
+    # ------------------------------------------------------------------
+
     def run(self):
         try:
             from core.mold_fabrication import (
@@ -1042,16 +1127,15 @@ class MetamoldWorker(QThread):
                 save_debug_mesh
             )
             
-            logger.info(f"Generating metamold with wall_thickness={self.wall_thickness}mm, "
-                       f"margin={self.margin}mm, height_above={self.height_above}mm, height_below={self.height_below}mm")
+            logger.info(
+                "Generating metamold: wall=%.1f mm, margin=%.1f mm, "
+                "height_above=%.1f mm, height_below=%.1f mm",
+                self.wall_thickness, self.margin,
+                self.height_above, self.height_below,
+            )
             
-            if self.secondary_surface is not None:
-                logger.info(f"  Secondary surface: {len(self.secondary_surface.vertices)} verts, "
-                           f"thickness={self.secondary_thickness}mm")
-            
-            # Step 1: Create the prism (same silhouette as hard shell, height from part mesh)
-            # Pass the outer collar (parting surface) so the prism extends to include it
-            self.progress.emit("Creating metamold prism (same silhouette as hard shell)...")
+            # Step 1: Create the prism
+            self.progress.emit("Creating metamold prism...")
             prism_result = create_metamold_prism(
                 self.hull_mesh,
                 self.part_mesh,
@@ -1060,43 +1144,28 @@ class MetamoldWorker(QThread):
                 margin=self.margin,
                 height_above=self.height_above,
                 height_below=self.height_below,
-                parting_surface=self.outer_collar_mesh  # Ensures prism includes parting surface level
+                parting_surface=self.outer_collar_mesh,
             )
-            logger.info(f"Metamold prism: {prism_result.vertex_count} vertices, {prism_result.face_count} faces")
+            logger.info(
+                "Metamold prism: %d verts, %d faces",
+                prism_result.vertex_count, prism_result.face_count,
+            )
+            for label, mesh in [
+                ('metamold_prism', prism_result.prism_mesh),
+                ('metamold_hull', self.hull_mesh),
+                ('metamold_part_mesh', self.part_mesh),
+                ('metamold_outer_collar', self.outer_collar_mesh),
+            ]:
+                save_debug_mesh(mesh, label)
 
-            # Export all CSG ingredients for offline debugging
-            save_debug_mesh(prism_result.prism_mesh, 'metamold_prism')
-            save_debug_mesh(self.hull_mesh, 'metamold_hull')
-            save_debug_mesh(self.part_mesh, 'metamold_part_mesh')
-            save_debug_mesh(self.outer_collar_mesh, 'metamold_outer_collar')
+            # Step 2: Build combined part mesh (part + thickened secondary)
+            combined_part_mesh = self._build_combined_part(
+                create_part_with_thickened_secondary, save_debug_mesh,
+            )
 
-            # ── MANIFOLD-SPACE PIPELINE ────────────────────────────────
-            # Steps 2-5 (cavity, blade split, part union) are fused into a
-            # single manifold3d session.  This keeps the part manifold
-            # object identical across the subtraction and union so that
-            # manifold3d 3.4.0's symbolic perturbation perfectly merges
-            # all coincident faces, eliminating the 200k+ internal faces.
-            # ───────────────────────────────────────────────────────────
-
-            # Pre-build the combined part mesh (part + secondary) if needed
-            combined_part_mesh = self.part_mesh
-            if self.secondary_surface is not None and len(self.secondary_surface.vertices) > 0:
-                self.progress.emit(f"Thickening secondary surface ({self.secondary_thickness}mm)...")
-                combined_part_mesh, combine_time_ms, combine_success = create_part_with_thickened_secondary(
-                    self.part_mesh,
-                    self.secondary_surface,
-                    self.secondary_thickness
-                )
-                if not combine_success or combined_part_mesh is None:
-                    logger.warning("Failed to create part with thickened secondary - using part mesh only")
-                    combined_part_mesh = self.part_mesh
-                else:
-                    logger.info(f"Combined part mesh: {len(combined_part_mesh.vertices)} verts, "
-                               f"{len(combined_part_mesh.faces)} faces in {combine_time_ms:.1f}ms")
-            save_debug_mesh(combined_part_mesh, 'metamold_combined_part_mesh')
-
+            # Step 3: Manifold-space pipeline (cavity + blade split + part union)
             self.progress.emit("Building metamold halves (manifold-space pipeline)...")
-            half_1_with_part, half_2_with_part, _blade, msp_time_ms, msp_success = \
+            half_1, half_2, _blade, msp_time_ms, msp_ok = \
                 build_metamold_halves_manifold_space(
                     prism_mesh=prism_result.prism_mesh,
                     part_mesh=self.part_mesh,
@@ -1110,87 +1179,46 @@ class MetamoldWorker(QThread):
                     ),
                 )
 
-            # Intermediate results (cavity, bare halves) are not produced by
-            # the fused pipeline — set to None.  The UI shows the final
-            # halves-with-part by default so these are not needed for display.
-            metamold_with_cavity = None
-            metamold_half_1 = None
-            metamold_half_2 = None
-            csg_success = msp_success
+            if not msp_ok or half_1 is None or half_2 is None:
+                logger.warning("Manifold-space pipeline failed — halves incomplete")
+                self.progress.emit("Metamold generation complete (with warnings)")
+                self.complete.emit(MetamoldWorkerResult(
+                    prism_result=prism_result, success=False,
+                ))
+                return
 
-            if msp_success and half_1_with_part is not None and half_2_with_part is not None:
-                logger.info(f"Manifold-space pipeline complete in {msp_time_ms:.1f}ms")
-                logger.info(f"  Half 1 with part: {len(half_1_with_part.vertices)} verts, {len(half_1_with_part.faces)} faces")
-                logger.info(f"  Half 2 with part: {len(half_2_with_part.vertices)} verts, {len(half_2_with_part.faces)} faces")
-                save_debug_mesh(half_1_with_part, 'metamold_half1_with_part_pretrim')
-                save_debug_mesh(half_2_with_part, 'metamold_half2_with_part_pretrim')
+            logger.info("Manifold-space pipeline: %.1f ms", msp_time_ms)
+            for lbl, h in [('Half1', half_1), ('Half2', half_2)]:
+                logger.info("  %s: %d verts, %d faces", lbl, len(h.vertices), len(h.faces))
+            save_debug_mesh(half_1, 'metamold_half1_with_part_pretrim')
+            save_debug_mesh(half_2, 'metamold_half2_with_part_pretrim')
 
-                # NOTE: Base-trimming has been moved to ResinChannelsWorker so
-                # that the trim threshold can adapt to the hollowing wall
-                # thickness.  Halves stored here are UNTRIMMED.
+            # Step 4: Selective post-CSG cleanup
+            half_1, half_2 = self._run_cleanup_if_needed(
+                half_1, half_2, combined_part_mesh, cleanup_csg_mesh, save_debug_mesh,
+            )
 
-                # Step 6: Post-CSG cleanup (selective).
-                # With part deflation (CSG_PART_DEFLATION_MM), the cavity is
-                # fractionally larger than the part, so the union produces
-                # clean manifold output with no coincident-face shards or NM
-                # edges.  We still run a lightweight validation pass and only
-                # invoke the full cleanup if problems are detected.
-                def _mesh_needs_cleanup(m):
-                    """Quick check: any zero-area faces or NM edges?"""
-                    a = m.area_faces
-                    if int(np.sum(a < 1e-10)) > 0:
-                        return True
-                    ec = {}
-                    for f in m.faces:
-                        for i in range(3):
-                            v0, v1 = int(f[i]), int(f[(i + 1) % 3])
-                            ek = (min(v0, v1), max(v0, v1))
-                            ec[ek] = ec.get(ek, 0) + 1
-                    if any(c > 2 for c in ec.values()):
-                        return True
-                    return False
+            # Log final diagnostics
+            for lbl, h in [('Half1', half_1), ('Half2', half_2)]:
+                if h is not None:
+                    try:
+                        n_comp = len(h.split(only_watertight=False))
+                    except Exception:
+                        n_comp = -1
+                    logger.info(
+                        "  %s final: %df, watertight=%s, components=%d",
+                        lbl, len(h.faces), h.is_watertight, n_comp,
+                    )
+            save_debug_mesh(half_1, 'metamold_half1_final')
+            save_debug_mesh(half_2, 'metamold_half2_final')
 
-                need_cleanup_1 = _mesh_needs_cleanup(half_1_with_part)
-                need_cleanup_2 = _mesh_needs_cleanup(half_2_with_part)
-
-                if need_cleanup_1 or need_cleanup_2:
-                    self.progress.emit("Cleaning up CSG intersection artifacts (selective)...")
-                    save_debug_mesh(half_1_with_part, 'metamold_half1_pre_cleanup')
-                    save_debug_mesh(half_2_with_part, 'metamold_half2_pre_cleanup')
-                    if need_cleanup_1:
-                        half_1_with_part = cleanup_csg_mesh(
-                            half_1_with_part, 'metamold_half1',
-                            part_mesh=combined_part_mesh,
-                        )
-                    if need_cleanup_2:
-                        half_2_with_part = cleanup_csg_mesh(
-                            half_2_with_part, 'metamold_half2',
-                            part_mesh=combined_part_mesh,
-                        )
-                else:
-                    logger.info("[Metamold] Post-CSG output is clean — "
-                                "skipping cleanup (deflation eliminated "
-                                "coplanar-face artifacts)")
-
-                # Log final diagnostics for each half
-                for _hlabel, _hmesh in [('Half1', half_1_with_part), ('Half2', half_2_with_part)]:
-                    if _hmesh is not None:
-                        try:
-                            _ncomps = len(_hmesh.split(only_watertight=False))
-                        except Exception:
-                            _ncomps = -1
-                        logger.info(f"  {_hlabel} final: {len(_hmesh.faces)}f, "
-                                   f"watertight={_hmesh.is_watertight}, components={_ncomps}")
-                save_debug_mesh(half_1_with_part, 'metamold_half1_final')
-                save_debug_mesh(half_2_with_part, 'metamold_half2_final')
-            else:
-                logger.warning("Manifold-space pipeline failed — halves may be incomplete")
-                half_1_with_part = None
-                half_2_with_part = None
-            
             self.progress.emit("Metamold generation complete")
-            self.complete.emit(prism_result, metamold_with_cavity, metamold_half_1, metamold_half_2, 
-                             half_1_with_part, half_2_with_part, csg_success)
+            self.complete.emit(MetamoldWorkerResult(
+                prism_result=prism_result,
+                half_1_with_part=half_1,
+                half_2_with_part=half_2,
+                success=True,
+            ))
             
         except Exception as e:
             logger.exception("Error generating metamold: %s", e)
@@ -1198,12 +1226,22 @@ class MetamoldWorker(QThread):
 
 
 class ResinChannelsWorker(QThread):
-    """Background worker for creating resin pouring inlets and air escape holes in metamold,
-    and a through-hole in the corresponding hard shell half."""
+    """Background worker for post-processing metamold halves and drilling
+    resin channels.
+
+    Pipeline order:
+      1. Base trimming (adaptive threshold)
+      2. Hollowing (optional)
+      3. Base opening (optional, requires hollowing)
+      4. Resin channel drilling
+      5. Hard-shell through-holes (inlet + air escape)
+      6. Resin plug creation / merge
+      7. Silicone pour holes
+      8. Alignment notches
+    """
     
     progress = pyqtSignal(str)
-    # (ResinChannelResult, other_half_mesh)
-    complete = pyqtSignal(object, object)
+    complete = pyqtSignal(object, object)   # (ResinChannelResult, other_half_mesh)
     error = pyqtSignal(str)
     
     def __init__(
@@ -1213,6 +1251,7 @@ class ResinChannelsWorker(QThread):
         resin_direction,
         local_maxima_positions,
         global_maximum_position,
+        *,
         part_mesh=None,
         shell_half_1=None,
         shell_half_2=None,
@@ -1226,11 +1265,12 @@ class ResinChannelsWorker(QThread):
         notch_depth_mm=0.5,
         merge_plug=False,
         enable_hollowing=False,
-        hollow_wall_thickness_mm=2.5,
+        hollow_wall_thickness_mm=4.0,
         blade_mesh=None,
         prism_result=None,
     ):
         super().__init__()
+        # Core input meshes
         self.metamold_half_1_with_part = metamold_half_1_with_part
         self.metamold_half_2_with_part = metamold_half_2_with_part
         self.resin_direction = resin_direction
@@ -1239,11 +1279,13 @@ class ResinChannelsWorker(QThread):
         self.part_mesh = part_mesh
         self.shell_half_1 = shell_half_1
         self.shell_half_2 = shell_half_2
+        # Channel parameters
         self.air_escape_depth_mm = air_escape_depth_mm
         self.inlet_min_depth_mm = inlet_min_depth_mm
         self.local_diameter_mm = local_diameter_mm
         self.global_diameter_mm = global_diameter_mm
         self.shell_inlet_diameter_mm = shell_inlet_diameter_mm
+        # Post-processing options
         self.add_alignment_notches_flag = add_alignment_notches
         self.notch_width_mm = notch_width_mm
         self.notch_depth_mm = notch_depth_mm
@@ -1251,160 +1293,336 @@ class ResinChannelsWorker(QThread):
         self.enable_hollowing = enable_hollowing
         self.hollow_wall_thickness_mm = hollow_wall_thickness_mm
         self.blade_mesh = blade_mesh
-        self.prism_result = prism_result  # MetamoldPrismResult for base opening
-    
+        self.prism_result = prism_result
+
+        # Accumulated stats (written by sub-steps, attached to result later)
+        self._trim_threshold = 0.0
+        self._trim_upper_saved = 0.0
+        self._trim_lower_saved = 0.0
+        self._trim_ms = 0.0
+        self._hollow_success = False
+        self._hollow_time_ms = 0.0
+        self._base_open_success = False
+        self._base_open_time_ms = 0.0
+
+    # ------------------------------------------------------------------
+    # Sub-steps (each mutates self.metamold_half_*_with_part in place)
+    # ------------------------------------------------------------------
+
+    def _step_trim(self):
+        """Trim extraneous prism material above/below the blade."""
+        from core.mold_fabrication import (
+            trim_metamold_halves,
+            compute_adaptive_trim_threshold,
+        )
+        if self.blade_mesh is None:
+            logger.warning("No blade mesh provided — skipping base trim")
+            return
+
+        threshold = compute_adaptive_trim_threshold(
+            wall_thickness=self.hollow_wall_thickness_mm,
+            enable_hollowing=self.enable_hollowing,
+        )
+        self.progress.emit(f"Trimming metamold bases (threshold={threshold:.1f} mm)...")
+        (
+            self.metamold_half_1_with_part,
+            self.metamold_half_2_with_part,
+            upper_saved, lower_saved,
+            trim_ms,
+        ) = trim_metamold_halves(
+            self.metamold_half_1_with_part,
+            self.metamold_half_2_with_part,
+            self.blade_mesh,
+            self.resin_direction,
+            trim_threshold=threshold,
+        )
+        self._trim_threshold = threshold
+        self._trim_upper_saved = upper_saved
+        self._trim_lower_saved = lower_saved
+        self._trim_ms = trim_ms
+        logger.info(
+            "Trim: upper=%.1f mm, lower=%.1f mm (threshold=%.1f mm, %.0f ms)",
+            upper_saved, lower_saved, threshold, trim_ms,
+        )
+
+    def _step_hollow(self):
+        """Hollow both halves to save print material."""
+        if not self.enable_hollowing:
+            return
+        from core.mold_fabrication import hollow_metamold_half
+
+        wall = self.hollow_wall_thickness_mm
+        self.progress.emit(f"Hollowing metamold halves ({wall:.1f} mm walls)...")
+        h1, h1_ms, h1_ok = hollow_metamold_half(
+            self.metamold_half_1_with_part, wall_thickness=wall, label='metamold_half1',
+        )
+        h2, h2_ms, h2_ok = hollow_metamold_half(
+            self.metamold_half_2_with_part, wall_thickness=wall, label='metamold_half2',
+        )
+        self.metamold_half_1_with_part = h1
+        self.metamold_half_2_with_part = h2
+        self._hollow_success = h1_ok and h2_ok
+        self._hollow_time_ms = h1_ms + h2_ms
+        logger.info(
+            "Hollow: half1=%s (%.0f ms), half2=%s (%.0f ms)",
+            'OK' if h1_ok else 'FAIL', h1_ms,
+            'OK' if h2_ok else 'FAIL', h2_ms,
+        )
+
+    def _step_open_base(self):
+        """Cut open the flat prism bases so the hollow interior is accessible."""
+        if not (self.enable_hollowing and self._hollow_success and self.prism_result is not None):
+            return
+        from core.mold_fabrication import open_metamold_base
+
+        self.progress.emit("Opening metamold bases...")
+        o1, o1_ms, o1_ok = open_metamold_base(
+            self.metamold_half_1_with_part,
+            self.resin_direction, self.prism_result.world_to_2d,
+            hollow_wall_thickness=self.hollow_wall_thickness_mm,
+            is_upper_half=True, label='metamold_half1',
+        )
+        o2, o2_ms, o2_ok = open_metamold_base(
+            self.metamold_half_2_with_part,
+            self.resin_direction, self.prism_result.world_to_2d,
+            hollow_wall_thickness=self.hollow_wall_thickness_mm,
+            is_upper_half=False, label='metamold_half2',
+        )
+        if o1_ok:
+            self.metamold_half_1_with_part = o1
+        if o2_ok:
+            self.metamold_half_2_with_part = o2
+        self._base_open_success = o1_ok and o2_ok
+        self._base_open_time_ms = o1_ms + o2_ms
+        logger.info(
+            "Base opening: half1=%s (%.0f ms), half2=%s (%.0f ms)",
+            'OK' if o1_ok else 'FAIL', o1_ms,
+            'OK' if o2_ok else 'FAIL', o2_ms,
+        )
+
+    def _step_drill_shell_holes(self, channel_result):
+        """Drill resin inlet + air escape through-holes in the hard shell."""
+        from core.resin_channels import (
+            determine_shell_half_for_inlet,
+            create_hard_shell_inlet,
+            create_hard_shell_air_escapes,
+        )
+        if not (channel_result.success
+                and channel_result.inlet_cylinder_center is not None
+                and self.shell_half_1 is not None
+                and self.shell_half_2 is not None):
+            return
+
+        self.progress.emit("Drilling through-hole in hard shell...")
+        target = determine_shell_half_for_inlet(
+            self.shell_half_1, self.shell_half_2, self.resin_direction,
+        )
+        shell = self.shell_half_1 if target == 1 else self.shell_half_2
+
+        modified = create_hard_shell_inlet(
+            shell_half=shell,
+            inlet_cylinder_center=channel_result.inlet_cylinder_center,
+            resin_direction=self.resin_direction,
+            inlet_diameter_mm=self.shell_inlet_diameter_mm,
+        )
+        if modified is None:
+            logger.warning("Failed to drill hard shell inlet")
+            return
+
+        channel_result.shell_half_modified = target
+        channel_result.shell_inlet_diameter_mm = self.shell_inlet_diameter_mm
+        channel_result.modified_shell_mesh = modified
+        logger.info("Hard shell inlet drilled in half %d", target)
+
+        # Air escape through-holes
+        if (channel_result.local_channel_positions is not None
+                and len(channel_result.local_channel_positions) > 0):
+            self.progress.emit("Drilling air escape holes in hard shell...")
+            modified = create_hard_shell_air_escapes(
+                shell_half=modified,
+                local_channel_positions=channel_result.local_channel_positions,
+                resin_direction=self.resin_direction,
+                air_escape_diameter_mm=channel_result.local_diameter_mm,
+            )
+            if modified is not None:
+                channel_result.modified_shell_mesh = modified
+                channel_result.n_shell_air_escapes = len(channel_result.local_channel_positions)
+                logger.info("Air escape shell holes: %d", channel_result.n_shell_air_escapes)
+            else:
+                logger.warning("Failed to drill air escape holes in shell")
+
+    def _step_create_plug(self, channel_result):
+        """Create (and optionally merge) the resin pouring plug."""
+        from core.resin_channels import create_resin_plug, merge_plug_into_metamold
+
+        if not (channel_result.success
+                and channel_result.inlet_cylinder_center is not None
+                and channel_result.modified_shell_mesh is not None):
+            return
+
+        self.progress.emit("Creating resin pouring plug...")
+        plug = create_resin_plug(
+            inlet_cylinder_center=channel_result.inlet_cylinder_center,
+            resin_direction=self.resin_direction,
+            part_mesh=self.part_mesh,
+            shell_half=channel_result.modified_shell_mesh,
+            inlet_diameter_mm=self.global_diameter_mm,
+            shell_inlet_diameter_mm=self.shell_inlet_diameter_mm,
+            inlet_depth_mm=channel_result.inlet_depth_mm,
+            into_part_direction=channel_result.into_part_direction,
+            inlet_entry_point=channel_result.inlet_entry_point,
+            inlet_angled_depth_mm=channel_result.inlet_angled_depth_mm,
+        )
+        if plug is None:
+            logger.warning("Failed to create resin plug")
+            return
+
+        if self.merge_plug:
+            self.progress.emit("Merging plug into metamold...")
+            merged = merge_plug_into_metamold(channel_result.mesh, plug)
+            if merged is not None:
+                channel_result.mesh = merged
+                channel_result.plug_merged_into_metamold = True
+                logger.info(
+                    "Plug merged into metamold half %d: %d verts, %d faces",
+                    channel_result.mold_half, len(merged.vertices), len(merged.faces),
+                )
+            else:
+                logger.warning("Plug merge failed — falling back to separate plug")
+                channel_result.plug_mesh = plug
+        else:
+            channel_result.plug_mesh = plug
+            logger.info("Resin plug created: %d verts", len(plug.vertices))
+
+    def _step_silicone_pour_holes(self, channel_result):
+        """Drill silicone pour holes through both shell halves."""
+        if self.shell_half_1 is None and self.shell_half_2 is None:
+            return
+        self.progress.emit("Drilling silicone pouring holes in both hard shell halves...")
+        try:
+            from core.resin_channels import create_silicone_pour_holes
+
+            cur_sh1 = (channel_result.modified_shell_mesh
+                       if channel_result.shell_half_modified == 1
+                       else self.shell_half_1)
+            cur_sh2 = (channel_result.modified_shell_mesh
+                       if channel_result.shell_half_modified == 2
+                       else self.shell_half_2)
+
+            sh1_final, sh2_final, sil_pos = create_silicone_pour_holes(
+                shell_half_1=cur_sh1,
+                shell_half_2=cur_sh2,
+                resin_direction=self.resin_direction,
+                inlet_cylinder_center=channel_result.inlet_cylinder_center,
+                inlet_shell_diameter_mm=self.shell_inlet_diameter_mm,
+                air_escape_positions=channel_result.local_channel_positions,
+                air_escape_diameter_mm=channel_result.local_diameter_mm,
+                part_mesh=self.part_mesh,
+                part_hull_inset_mm=5.0,
+            )
+
+            channel_result.shell_half_1_final = sh1_final
+            channel_result.shell_half_2_final = sh2_final
+            channel_result.silicone_pour_hole_position = sil_pos
+            channel_result.silicone_pour_hole_diameter_mm = 17.0
+
+            # Keep modified_shell_mesh in sync
+            if channel_result.shell_half_modified == 1 and sh1_final is not None:
+                channel_result.modified_shell_mesh = sh1_final
+            elif channel_result.shell_half_modified == 2 and sh2_final is not None:
+                channel_result.modified_shell_mesh = sh2_final
+
+            if sil_pos is not None:
+                logger.info("Silicone pour holes at (%.1f, %.1f, %.1f)", *sil_pos)
+            else:
+                logger.warning("Silicone pour hole placement failed")
+        except Exception as e:
+            logger.error("Error drilling silicone pour holes: %s", e)
+
+    def _step_alignment_notches(self, channel_result, other_half):
+        """Cut alignment notches into all four mold pieces."""
+        if not self.add_alignment_notches_flag:
+            return
+        self.progress.emit("Cutting alignment notches into all mold pieces...")
+        try:
+            from core.alignment_notches import add_alignment_notches as _add_notches
+
+            if channel_result.mold_half == 1:
+                mm1, mm2 = channel_result.mesh, other_half
+            else:
+                mm1, mm2 = other_half, channel_result.mesh
+
+            sh1 = self._resolve_shell_half(channel_result, half=1)
+            sh2 = self._resolve_shell_half(channel_result, half=2)
+
+            notch_result = _add_notches(
+                shell_half_1=sh1, shell_half_2=sh2,
+                metamold_half_1=mm1, metamold_half_2=mm2,
+                resin_direction=self.resin_direction,
+                n_notches=1,
+                notch_width_mm=self.notch_width_mm,
+                notch_depth_mm=self.notch_depth_mm,
+            )
+
+            if notch_result.success:
+                channel_result.alignment_notches_applied = True
+                channel_result.notched_metamold_half_1 = notch_result.metamold_half_1
+                channel_result.notched_metamold_half_2 = notch_result.metamold_half_2
+                channel_result.notched_shell_half_1 = notch_result.shell_half_1
+                channel_result.notched_shell_half_2 = notch_result.shell_half_2
+                channel_result.notch_width_mm = self.notch_width_mm
+                channel_result.notch_depth_mm = self.notch_depth_mm
+                logger.info(
+                    "Notches: %d pieces in %.0f ms",
+                    notch_result.n_pieces_notched, notch_result.computation_time_ms,
+                )
+            else:
+                logger.warning("Alignment notches failed: %s", notch_result.error_message)
+        except Exception as e:
+            logger.error("Error applying alignment notches: %s", e)
+
+    def _resolve_shell_half(self, channel_result, *, half: int):
+        """Return the most up-to-date version of a shell half.
+
+        Priority: silicone-hole final > resin-inlet modified > original.
+        """
+        final = (channel_result.shell_half_1_final if half == 1
+                 else channel_result.shell_half_2_final)
+        if final is not None:
+            return final
+        if channel_result.shell_half_modified == half:
+            return channel_result.modified_shell_mesh
+        return self.shell_half_1 if half == 1 else self.shell_half_2
+
+    def _attach_stats(self, channel_result):
+        """Write accumulated post-processing stats onto the result object."""
+        channel_result.trim_threshold_mm = self._trim_threshold
+        channel_result.trim_upper_saved_mm = self._trim_upper_saved
+        channel_result.trim_lower_saved_mm = self._trim_lower_saved
+        channel_result.trim_time_ms = self._trim_ms
+        channel_result.hollowing_applied = self.enable_hollowing and self._hollow_success
+        channel_result.hollow_wall_thickness_mm = (
+            self.hollow_wall_thickness_mm if self.enable_hollowing else 0.0
+        )
+        channel_result.hollow_time_ms = self._hollow_time_ms
+        channel_result.base_open_applied = self._base_open_success
+        channel_result.base_open_time_ms = self._base_open_time_ms
+
+    # ------------------------------------------------------------------
+    # Main pipeline
+    # ------------------------------------------------------------------
+
     def run(self):
         try:
-            from core.resin_channels import (
-                create_resin_channels_on_both_halves,
-                determine_shell_half_for_inlet,
-                create_hard_shell_inlet,
-                create_hard_shell_air_escapes,
-                create_resin_plug,
-                merge_plug_into_metamold,
-            )
-            from core.mold_fabrication import (
-                trim_metamold_halves,
-                compute_adaptive_trim_threshold,
-                save_debug_mesh,
-            )
+            from core.resin_channels import create_resin_channels_on_both_halves
 
-            # ── Base trimming ─────────────────────────────────────────────────
-            # Trim the prism bases to save material.  The cutting blade
-            # (outer collar) is the height reference — its registration
-            # pattern determines the actual metamold height bounds.
-            # When hollowing is enabled, the threshold is raised so that
-            # the hollow cavity from the base never merges with the hollow
-            # cavity from the part-cavity side.
-            if self.blade_mesh is not None:
-                trim_threshold = compute_adaptive_trim_threshold(
-                    wall_thickness=self.hollow_wall_thickness_mm,
-                    enable_hollowing=self.enable_hollowing,
-                )
-                self.progress.emit(
-                    f"Trimming metamold bases (threshold={trim_threshold:.1f} mm)..."
-                )
-                (
-                    self.metamold_half_1_with_part,
-                    self.metamold_half_2_with_part,
-                    upper_saved, lower_saved,
-                    trim_ms,
-                ) = trim_metamold_halves(
-                    self.metamold_half_1_with_part,
-                    self.metamold_half_2_with_part,
-                    self.blade_mesh,          # blade = height reference
-                    self.resin_direction,
-                    trim_threshold=trim_threshold,
-                )
-                self._trim_threshold = trim_threshold
-                self._trim_upper_saved = upper_saved
-                self._trim_lower_saved = lower_saved
-                self._trim_ms = trim_ms
-                logger.info(
-                    "Metamold trim: upper=%.1fmm lower=%.1fmm "
-                    "(threshold=%.1f mm, %.0f ms)",
-                    upper_saved, lower_saved, trim_threshold, trim_ms,
-                )
-            else:
-                logger.warning(
-                    "No blade mesh provided — skipping base trim"
-                )
-                self._trim_threshold = 0.0
-                self._trim_upper_saved = 0.0
-                self._trim_lower_saved = 0.0
-                self._trim_ms = 0.0
+            # Pre-processing: trim → hollow → open
+            self._step_trim()
+            self._step_hollow()
+            self._step_open_base()
 
-            # ── Hollowing (optional) ──────────────────────────────────────────
-            # Hollow AFTER trimming but BEFORE drilling channels so holes
-            # cut through thin walls.
-            if self.enable_hollowing:
-                from core.mold_fabrication import hollow_metamold_half
-                self.progress.emit(
-                    f"Hollowing metamold halves ({self.hollow_wall_thickness_mm:.1f} mm walls)..."
-                )
-                logger.info(
-                    "Hollowing metamold halves: wall=%.1f mm",
-                    self.hollow_wall_thickness_mm,
-                )
-                h1, h1_ms, h1_ok = hollow_metamold_half(
-                    self.metamold_half_1_with_part,
-                    wall_thickness=self.hollow_wall_thickness_mm,
-                    label='metamold_half1',
-                )
-                h2, h2_ms, h2_ok = hollow_metamold_half(
-                    self.metamold_half_2_with_part,
-                    wall_thickness=self.hollow_wall_thickness_mm,
-                    label='metamold_half2',
-                )
-                self.metamold_half_1_with_part = h1
-                self.metamold_half_2_with_part = h2
-                self._hollow_success = h1_ok and h2_ok
-                self._hollow_time_ms = h1_ms + h2_ms
-                logger.info(
-                    "Hollowing complete: half1=%s (%.0f ms), half2=%s (%.0f ms)",
-                    'OK' if h1_ok else 'FAIL', h1_ms,
-                    'OK' if h2_ok else 'FAIL', h2_ms,
-                )
-            else:
-                self._hollow_success = False
-                self._hollow_time_ms = 0.0
-
-            # ── Base opening (optional) ───────────────────────────────────
-            # When hollowing is active, the flat prism base is still solid.
-            # Cut an opening through it using an inward-offset silhouette
-            # so the hollow interior is accessible and more material is
-            # saved.  Run AFTER hollowing so the thin base wall is cleanly
-            # removed.
-            self._base_open_success = False
-            self._base_open_time_ms = 0.0
-            if (
-                self.enable_hollowing
-                and self._hollow_success
-                and self.prism_result is not None
-            ):
-                from core.mold_fabrication import open_metamold_base
-                self.progress.emit("Opening metamold bases...")
-                logger.info(
-                    "Opening metamold bases: wall=%.1f mm",
-                    self.hollow_wall_thickness_mm,
-                )
-                o1, o1_ms, o1_ok = open_metamold_base(
-                    self.metamold_half_1_with_part,
-                    self.resin_direction,
-                    self.prism_result.world_to_2d,
-                    hollow_wall_thickness=self.hollow_wall_thickness_mm,
-                    is_upper_half=True,
-                    label='metamold_half1',
-                )
-                o2, o2_ms, o2_ok = open_metamold_base(
-                    self.metamold_half_2_with_part,
-                    self.resin_direction,
-                    self.prism_result.world_to_2d,
-                    hollow_wall_thickness=self.hollow_wall_thickness_mm,
-                    is_upper_half=False,
-                    label='metamold_half2',
-                )
-                if o1_ok:
-                    self.metamold_half_1_with_part = o1
-                if o2_ok:
-                    self.metamold_half_2_with_part = o2
-                self._base_open_success = o1_ok and o2_ok
-                self._base_open_time_ms = o1_ms + o2_ms
-                logger.info(
-                    "Base opening: half1=%s (%.0f ms), "
-                    "half2=%s (%.0f ms)",
-                    'OK' if o1_ok else 'FAIL', o1_ms,
-                    'OK' if o2_ok else 'FAIL', o2_ms,
-                )
-
-            self.progress.emit("Determining which half contains maxima...")
-            
-            logger.info(f"Creating resin channels: air_depth={self.air_escape_depth_mm}mm, "
-                       f"inlet_min_depth={self.inlet_min_depth_mm}mm, "
-                       f"local_diam={self.local_diameter_mm}mm, global_diam={self.global_diameter_mm}mm")
-            
+            # Drill resin channels
             self.progress.emit("Drilling resin channels into metamold half...")
-            
             channel_result, other_half = create_resin_channels_on_both_halves(
                 self.metamold_half_1_with_part,
                 self.metamold_half_2_with_part,
@@ -1418,220 +1636,16 @@ class ResinChannelsWorker(QThread):
                 global_diameter_mm=self.global_diameter_mm,
                 skip_inlet_hole=self.merge_plug,
             )
-            
-            # Drill hard shell through-hole if we have shell halves and a global inlet
-            if (channel_result.success and
-                channel_result.inlet_cylinder_center is not None and
-                self.shell_half_1 is not None and
-                self.shell_half_2 is not None):
-                
-                self.progress.emit("Drilling through-hole in hard shell...")
-                
-                target_shell = determine_shell_half_for_inlet(
-                    self.shell_half_1,
-                    self.shell_half_2,
-                    self.resin_direction
-                )
-                
-                shell_to_drill = (self.shell_half_1 if target_shell == 1
-                                  else self.shell_half_2)
-                
-                modified_shell = create_hard_shell_inlet(
-                    shell_half=shell_to_drill,
-                    inlet_cylinder_center=channel_result.inlet_cylinder_center,
-                    resin_direction=self.resin_direction,
-                    inlet_diameter_mm=self.shell_inlet_diameter_mm
-                )
-                
-                if modified_shell is not None:
-                    channel_result.shell_half_modified = target_shell
-                    channel_result.shell_inlet_diameter_mm = self.shell_inlet_diameter_mm
-                    channel_result.modified_shell_mesh = modified_shell
-                    logger.info(f"Hard shell inlet drilled in shell half {target_shell}")
-                    
-                    # Also drill air escape through-holes in the same shell half
-                    if (channel_result.local_channel_positions is not None and
-                        len(channel_result.local_channel_positions) > 0):
-                        self.progress.emit("Drilling air escape holes in hard shell...")
-                        modified_shell = create_hard_shell_air_escapes(
-                            shell_half=modified_shell,
-                            local_channel_positions=channel_result.local_channel_positions,
-                            resin_direction=self.resin_direction,
-                            air_escape_diameter_mm=channel_result.local_diameter_mm
-                        )
-                        if modified_shell is not None:
-                            channel_result.modified_shell_mesh = modified_shell
-                            channel_result.n_shell_air_escapes = len(channel_result.local_channel_positions)
-                            logger.info(f"Air escape shell holes drilled: {channel_result.n_shell_air_escapes}")
-                        else:
-                            logger.warning("Failed to drill air escape holes in shell")
-                else:
-                    logger.warning("Failed to drill hard shell inlet")
-            
-            # Create the resin pouring plug
-            if (channel_result.success and
-                channel_result.inlet_cylinder_center is not None and
-                channel_result.modified_shell_mesh is not None):
-                
-                self.progress.emit("Creating resin pouring plug...")
-                
-                plug = create_resin_plug(
-                    inlet_cylinder_center=channel_result.inlet_cylinder_center,
-                    resin_direction=self.resin_direction,
-                    part_mesh=self.part_mesh,
-                    shell_half=channel_result.modified_shell_mesh,
-                    inlet_diameter_mm=self.global_diameter_mm,
-                    shell_inlet_diameter_mm=self.shell_inlet_diameter_mm,
-                    inlet_depth_mm=channel_result.inlet_depth_mm,
-                    into_part_direction=channel_result.into_part_direction,
-                    inlet_entry_point=channel_result.inlet_entry_point,
-                    inlet_angled_depth_mm=channel_result.inlet_angled_depth_mm,
-                )
-                
-                if plug is not None:
-                    if self.merge_plug:
-                        # Union plug into the metamold mesh (integrated pour spout)
-                        self.progress.emit("Merging plug into metamold...")
-                        merged = merge_plug_into_metamold(channel_result.mesh, plug)
-                        if merged is not None:
-                            channel_result.mesh = merged
-                            channel_result.plug_merged_into_metamold = True
-                            logger.info(
-                                "Resin plug merged into metamold half %d: "
-                                "%d verts, %d faces",
-                                channel_result.mold_half,
-                                len(merged.vertices), len(merged.faces),
-                            )
-                        else:
-                            logger.warning(
-                                "Plug merge failed — falling back to separate plug"
-                            )
-                            channel_result.plug_mesh = plug
-                    else:
-                        channel_result.plug_mesh = plug
-                        logger.info("Resin plug created: %d verts", len(plug.vertices))
-                else:
-                    logger.warning("Failed to create resin plug")
 
-            # ── Silicone mold pouring holes (through BOTH shell halves) ───────────
-            if self.shell_half_1 is not None or self.shell_half_2 is not None:
-                self.progress.emit("Drilling silicone pouring holes in both hard shell halves...")
-                try:
-                    from core.resin_channels import create_silicone_pour_holes
+            # Post-processing: shell holes → plug → silicone holes → notches
+            self._step_drill_shell_holes(channel_result)
+            self._step_create_plug(channel_result)
+            self._step_silicone_pour_holes(channel_result)
+            self._step_alignment_notches(channel_result, other_half)
 
-                    # Start from the latest state of each shell half
-                    cur_sh1 = (channel_result.modified_shell_mesh
-                               if channel_result.shell_half_modified == 1
-                               else self.shell_half_1)
-                    cur_sh2 = (channel_result.modified_shell_mesh
-                               if channel_result.shell_half_modified == 2
-                               else self.shell_half_2)
-
-                    sh1_final, sh2_final, sil_pos = create_silicone_pour_holes(
-                        shell_half_1           = cur_sh1,
-                        shell_half_2           = cur_sh2,
-                        resin_direction        = self.resin_direction,
-                        inlet_cylinder_center  = channel_result.inlet_cylinder_center,
-                        inlet_shell_diameter_mm= self.shell_inlet_diameter_mm,
-                        air_escape_positions   = channel_result.local_channel_positions,
-                        air_escape_diameter_mm = channel_result.local_diameter_mm,
-                        part_mesh              = self.part_mesh,
-                        part_hull_inset_mm     = 5.0,
-                    )
-
-                    channel_result.shell_half_1_final          = sh1_final
-                    channel_result.shell_half_2_final          = sh2_final
-                    channel_result.silicone_pour_hole_position = sil_pos
-                    channel_result.silicone_pour_hole_diameter_mm = 17.0  # shell hole (pin ⌀12 + 5mm tolerance)
-
-                    # Keep modified_shell_mesh in sync (the half that already had
-                    # the resin inlet now also has the silicone hole)
-                    if channel_result.shell_half_modified == 1 and sh1_final is not None:
-                        channel_result.modified_shell_mesh = sh1_final
-                    elif channel_result.shell_half_modified == 2 and sh2_final is not None:
-                        channel_result.modified_shell_mesh = sh2_final
-
-                    if sil_pos is not None:
-                        logger.info(
-                            "Silicone pour holes drilled in both shell halves at "
-                            "(%.1f, %.1f, %.1f)", *sil_pos
-                        )
-                    else:
-                        logger.warning("Silicone pour hole placement failed: no valid position")
-                except Exception as sil_err:
-                    logger.error("Error drilling silicone pour holes: %s", sil_err)
-
-            # ── Alignment notches ─────────────────────────────────────────────────
-            if self.add_alignment_notches_flag:
-                self.progress.emit("Cutting alignment notches into all mold pieces...")
-                try:
-                    from core.alignment_notches import add_alignment_notches as _add_notches
-
-                    # Metamold halves
-                    if channel_result.mold_half == 1:
-                        mm1 = channel_result.mesh
-                        mm2 = other_half
-                    else:
-                        mm1 = other_half
-                        mm2 = channel_result.mesh
-
-                    # Use the fully-processed shell halves (with silicone holes)
-                    # if available; otherwise fall back to the resin-inlet state.
-                    sh1 = (channel_result.shell_half_1_final
-                           if channel_result.shell_half_1_final is not None
-                           else (channel_result.modified_shell_mesh
-                                 if channel_result.shell_half_modified == 1
-                                 else self.shell_half_1))
-                    sh2 = (channel_result.shell_half_2_final
-                           if channel_result.shell_half_2_final is not None
-                           else (channel_result.modified_shell_mesh
-                                 if channel_result.shell_half_modified == 2
-                                 else self.shell_half_2))
-
-                    notch_result = _add_notches(
-                        shell_half_1    = sh1,
-                        shell_half_2    = sh2,
-                        metamold_half_1 = mm1,
-                        metamold_half_2 = mm2,
-                        resin_direction = self.resin_direction,
-                        n_notches       = 1,
-                        notch_width_mm  = self.notch_width_mm,
-                        notch_depth_mm  = self.notch_depth_mm,
-                    )
-
-                    if notch_result.success:
-                        channel_result.alignment_notches_applied = True
-                        channel_result.notched_metamold_half_1   = notch_result.metamold_half_1
-                        channel_result.notched_metamold_half_2   = notch_result.metamold_half_2
-                        channel_result.notched_shell_half_1      = notch_result.shell_half_1
-                        channel_result.notched_shell_half_2      = notch_result.shell_half_2
-                        channel_result.notch_width_mm            = self.notch_width_mm
-                        channel_result.notch_depth_mm            = self.notch_depth_mm
-                        logger.info(
-                            "Alignment notches applied to %d pieces in %.0f ms",
-                            notch_result.n_pieces_notched,
-                            notch_result.computation_time_ms,
-                        )
-                    else:
-                        logger.warning(
-                            "Alignment notches failed: %s", notch_result.error_message
-                        )
-                except Exception as notch_err:
-                    logger.error("Error applying alignment notches: %s", notch_err)
-
+            # Finalise
+            self._attach_stats(channel_result)
             self.progress.emit("Resin channels complete")
-
-            # Attach trimming + hollowing metadata to result for stats display
-            channel_result.trim_threshold_mm = self._trim_threshold
-            channel_result.trim_upper_saved_mm = self._trim_upper_saved
-            channel_result.trim_lower_saved_mm = self._trim_lower_saved
-            channel_result.trim_time_ms = self._trim_ms
-            channel_result.hollowing_applied = self.enable_hollowing and self._hollow_success
-            channel_result.hollow_wall_thickness_mm = self.hollow_wall_thickness_mm if self.enable_hollowing else 0.0
-            channel_result.hollow_time_ms = self._hollow_time_ms
-            channel_result.base_open_applied = self._base_open_success
-            channel_result.base_open_time_ms = self._base_open_time_ms
-
             self.complete.emit(channel_result, other_half)
             
         except Exception as e:
@@ -5326,9 +5340,6 @@ class MainWindow(QMainWindow):
         # Metamold state
         self._metamold_worker = None
         self._metamold_prism_result = None  # MetamoldPrismResult
-        self._metamold_with_cavity = None  # trimesh after CSG subtraction (prism - part)
-        self._metamold_half_1 = None  # Upper half of split metamold (manifold)
-        self._metamold_half_2 = None  # Lower half of split metamold (manifold)
         self._metamold_half_1_with_part = None  # Upper half with part added back (manifold)
         self._metamold_half_2_with_part = None  # Lower half with part added back (manifold)
         self._metamold_csg_success = False
@@ -7108,50 +7119,35 @@ class MainWindow(QMainWindow):
         if not hasattr(self, 'metamold_stats'):
             return
         
-        has_metamold = self._metamold_prism_result is not None
+        if self._metamold_prism_result is None:
+            return
         
-        if has_metamold:
-            result = self._metamold_prism_result
-            
-            self.metamold_stats.clear()
-            self.metamold_stats.show()
-            
-            self.metamold_stats.add_header('Metamold Generated', Colors.SUCCESS)
-            
-            # Prism info
-            self.metamold_stats.add_row(f'Prism: {result.vertex_count:,} verts, {result.face_count:,} faces')
-            self.metamold_stats.add_row(f'Silhouette: {len(result.silhouette_2d)} points')
-            self.metamold_stats.add_row(f'Prism height: {result.prism_height:.2f} mm')
-            self.metamold_stats.add_row(f'Part mesh range: {result.part_mesh_min_height:.2f} to {result.part_mesh_max_height:.2f}')
-            
-            # CSG cavity info
-            if self._metamold_with_cavity is not None:
-                self.metamold_stats.add_row(f'With cavity: {len(self._metamold_with_cavity.vertices):,} verts, {len(self._metamold_with_cavity.faces):,} faces')
-            
-            # Split halves info
-            if self._metamold_half_1 is not None:
-                self.metamold_stats.add_row(f'Half 1: {len(self._metamold_half_1.vertices):,} verts, {len(self._metamold_half_1.faces):,} faces')
-            if self._metamold_half_2 is not None:
-                self.metamold_stats.add_row(f'Half 2: {len(self._metamold_half_2.vertices):,} verts, {len(self._metamold_half_2.faces):,} faces')
-            
-            # Final halves-with-part info
-            if self._metamold_half_1_with_part is not None:
-                wt1 = '✓' if self._metamold_half_1_with_part.is_watertight else '✗'
+        result = self._metamold_prism_result
+        
+        self.metamold_stats.clear()
+        self.metamold_stats.show()
+        self.metamold_stats.add_header('Metamold Generated', Colors.SUCCESS)
+        
+        # Prism info
+        self.metamold_stats.add_row(f'Prism: {result.vertex_count:,} verts, {result.face_count:,} faces')
+        self.metamold_stats.add_row(f'Silhouette: {len(result.silhouette_2d)} points')
+        self.metamold_stats.add_row(f'Prism height: {result.prism_height:.2f} mm')
+        self.metamold_stats.add_row(f'Part mesh range: {result.part_mesh_min_height:.2f} to {result.part_mesh_max_height:.2f}')
+        
+        # Final halves-with-part info
+        for label, half in [("Half 1", self._metamold_half_1_with_part),
+                            ("Half 2", self._metamold_half_2_with_part)]:
+            if half is not None:
+                wt = '✓' if half.is_watertight else '✗'
                 self.metamold_stats.add_row(
-                    f'Half 1 + part: {len(self._metamold_half_1_with_part.vertices):,} verts, '
-                    f'{len(self._metamold_half_1_with_part.faces):,} faces ({wt1})'
+                    f'{label} + part: {len(half.vertices):,} verts, '
+                    f'{len(half.faces):,} faces ({wt})'
                 )
-            if self._metamold_half_2_with_part is not None:
-                wt2 = '✓' if self._metamold_half_2_with_part.is_watertight else '✗'
-                self.metamold_stats.add_row(
-                    f'Half 2 + part: {len(self._metamold_half_2_with_part.vertices):,} verts, '
-                    f'{len(self._metamold_half_2_with_part.faces):,} faces ({wt2})'
-                )
-
-            if not self._metamold_csg_success:
-                self.metamold_stats.add_row('⚠️ CSG operations incomplete', Colors.WARNING)
-            
-            self.metamold_stats.add_row(f'Time: {result.computation_time_ms:.0f}ms')
+        
+        if not self._metamold_csg_success:
+            self.metamold_stats.add_row('⚠️ CSG operations incomplete', Colors.WARNING)
+        
+        self.metamold_stats.add_row(f'Time: {result.computation_time_ms:.0f}ms')
 
     def _on_generate_metamold(self):
         """Start metamold generation."""
@@ -7174,12 +7170,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Missing Data", "Outer collar mesh not available from hard shell step.")
             return
         
-        # Use the same wall_thickness as the hard shell
-        wall_thickness = self._hard_shell_prism_result.wall_thickness
-        height_above = 2.0  # Fixed 2mm above part mesh
-        height_below = 2.0  # Fixed 2mm below part mesh
-        
-        # Use part mesh for height reference (not parting surface)
         if self._current_mesh is None:
             QMessageBox.warning(self, "Missing Data", "Part mesh not available.")
             return
@@ -7189,10 +7179,8 @@ class MainWindow(QMainWindow):
         self.metamold_progress_label.setText("Generating metamold...")
         self.metamold_progress_label.show()
         
+        # Reset state
         self._metamold_prism_result = None
-        self._metamold_with_cavity = None
-        self._metamold_half_1 = None
-        self._metamold_half_2 = None
         self._metamold_half_1_with_part = None
         self._metamold_half_2_with_part = None
         self._metamold_csg_success = False
@@ -7203,29 +7191,27 @@ class MainWindow(QMainWindow):
         self.mesh_viewer.remove_metamold_half_1_with_part()
         self.mesh_viewer.remove_metamold_half_2_with_part()
         
-        # Get secondary surface and thickness if available
+        # Gather secondary surface if available
         secondary_surface = None
-        secondary_thickness = 0.2  # Default
+        secondary_thickness = 0.2
         if (self._combined_smooth_result is not None and 
             self._combined_smooth_result.secondary_mesh is not None and
             len(self._combined_smooth_result.secondary_mesh.vertices) > 0):
             secondary_surface = self._combined_smooth_result.secondary_mesh
-        
-        # Get thickness from spin box if available
         if hasattr(self, 'metamold_secondary_thickness_spin'):
             secondary_thickness = self.metamold_secondary_thickness_spin.value()
         
         self._metamold_worker = MetamoldWorker(
-            self._hull_result.mesh,  # Hull for silhouette (same as hard shell)
-            self._current_mesh,  # Part mesh for height and cavity subtraction
-            self._outer_collar_result.mesh,  # Outer collar for splitting (reused from hard shell)
-            self._mold_aware_pouring_result.resin_direction,  # Resin direction (same as hard shell)
-            wall_thickness=wall_thickness,  # Same wall_thickness as hard shell
-            margin=0.0,  # Same margin as hard shell (0.0)
-            height_above=height_above,
-            height_below=height_below,
-            secondary_surface=secondary_surface,  # Smoothed secondary surface
-            secondary_thickness=secondary_thickness  # Thickness for secondary surface
+            self._hull_result.mesh,
+            self._current_mesh,
+            self._outer_collar_result.mesh,
+            self._mold_aware_pouring_result.resin_direction,
+            wall_thickness=self._hard_shell_prism_result.wall_thickness,
+            margin=0.0,
+            height_above=2.0,
+            height_below=2.0,
+            secondary_surface=secondary_surface,
+            secondary_thickness=secondary_thickness,
         )
         self._metamold_worker.progress.connect(self._on_metamold_progress)
         self._metamold_worker.complete.connect(self._on_metamold_complete)
@@ -7237,17 +7223,14 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'metamold_progress_label'):
             self.metamold_progress_label.setText(message)
 
-    def _on_metamold_complete(self, prism_result, metamold_with_cavity, metamold_half_1, metamold_half_2, 
-                               half_1_with_part, half_2_with_part, csg_success):
-        self._metamold_prism_result = prism_result
-        self._metamold_with_cavity = metamold_with_cavity
-        self._metamold_half_1 = metamold_half_1
-        self._metamold_half_2 = metamold_half_2
-        self._metamold_half_1_with_part = half_1_with_part
-        self._metamold_half_2_with_part = half_2_with_part
-        self._metamold_csg_success = csg_success
+    def _on_metamold_complete(self, result: MetamoldWorkerResult):
+        """Handle MetamoldWorker completion."""
+        self._metamold_prism_result = result.prism_result
+        self._metamold_half_1_with_part = result.half_1_with_part
+        self._metamold_half_2_with_part = result.half_2_with_part
+        self._metamold_csg_success = result.success
         
-        # Clear any previous metamold displays
+        # Clear previous displays
         self.mesh_viewer.remove_metamold_prism()
         self.mesh_viewer.remove_metamold_with_cavity()
         self.mesh_viewer.remove_metamold_half_1()
@@ -7255,65 +7238,40 @@ class MainWindow(QMainWindow):
         self.mesh_viewer.remove_metamold_half_1_with_part()
         self.mesh_viewer.remove_metamold_half_2_with_part()
         
-        # Determine what to show based on results
-        has_prism = prism_result is not None and prism_result.prism_mesh is not None
-        has_cavity = metamold_with_cavity is not None and len(metamold_with_cavity.vertices) > 0
-        has_half_1 = metamold_half_1 is not None and len(metamold_half_1.vertices) > 4  # More than a single tet
-        has_half_2 = metamold_half_2 is not None and len(metamold_half_2.vertices) > 4  # More than a single tet
-        has_valid_halves = has_half_1 and has_half_2
-        has_half_1_with_part = half_1_with_part is not None and len(half_1_with_part.vertices) > 4
-        has_half_2_with_part = half_2_with_part is not None and len(half_2_with_part.vertices) > 4
-        has_valid_halves_with_part = has_half_1_with_part and has_half_2_with_part
-        
-        # Show display options
-        self.display_options.show_metamold_options(
-            show_prism=has_prism,
-            show_cavity=has_cavity,
-            show_halves=has_valid_halves,
-            show_halves_with_part=has_valid_halves_with_part
+        has_prism = result.prism_result is not None and result.prism_result.prism_mesh is not None
+        has_halves = (
+            result.half_1_with_part is not None
+            and result.half_2_with_part is not None
+            and len(result.half_1_with_part.vertices) > 4
+            and len(result.half_2_with_part.vertices) > 4
         )
         
-        # Show the metamold halves with part by default if available
-        if has_valid_halves_with_part:
-            self.mesh_viewer.show_metamold_half_1_with_part(half_1_with_part)
-            self.mesh_viewer.show_metamold_half_2_with_part(half_2_with_part)
-            logger.info("Showing metamold halves with part in viewer")
-        elif has_valid_halves:
-            self.mesh_viewer.show_metamold_half_1(metamold_half_1)
-            self.mesh_viewer.show_metamold_half_2(metamold_half_2)
-            logger.info("Showing metamold halves in viewer")
-        elif has_cavity:
-            # Show cavity if halves not available
-            self.mesh_viewer.show_metamold_with_cavity(metamold_with_cavity)
-            logger.info("Showing metamold with cavity in viewer (halves not valid)")
+        # Display options (cavity/bare-halves no longer produced by fused pipeline)
+        self.display_options.show_metamold_options(
+            show_prism=has_prism,
+            show_cavity=False,
+            show_halves=False,
+            show_halves_with_part=has_halves,
+        )
+        
+        if has_halves:
+            self.mesh_viewer.show_metamold_half_1_with_part(result.half_1_with_part)
+            self.mesh_viewer.show_metamold_half_2_with_part(result.half_2_with_part)
         elif has_prism:
-            # Fall back to prism
-            self.mesh_viewer.show_metamold_prism(prism_result.prism_mesh)
-            logger.info("Showing metamold prism in viewer (no cavity or halves)")
+            self.mesh_viewer.show_metamold_prism(result.prism_result.prism_mesh)
         
         self._update_metamold_step_ui()
-        if csg_success and (has_valid_halves_with_part or has_valid_halves):
+
+        if result.success and has_halves:
             self.step_buttons[Step.METAMOLD].set_status('completed')
+            self.step_buttons[Step.RESIN_CHANNELS].set_status('available')
         else:
             self.step_buttons[Step.METAMOLD].set_status('needs-recalc')
-        
-        # Unlock resin channels step if metamold halves with part are available
-        if half_1_with_part is not None and half_2_with_part is not None:
-            self.step_buttons[Step.RESIN_CHANNELS].set_status('available')
-        
-        logger.info(f"Metamold generated in {prism_result.computation_time_ms:.0f}ms ")
-        if csg_success:
-            logger.info(f"  CSG cavity subtraction successful")
-            if metamold_half_1 is not None:
-                logger.info(f"  Half 1: {len(metamold_half_1.vertices)} verts, {len(metamold_half_1.faces)} faces")
-            if metamold_half_2 is not None:
-                logger.info(f"  Half 2: {len(metamold_half_2.vertices)} verts, {len(metamold_half_2.faces)} faces")
-            if half_1_with_part is not None:
-                logger.info(f"  Half 1 with part: {len(half_1_with_part.vertices)} verts, {len(half_1_with_part.faces)} faces")
-            if half_2_with_part is not None:
-                logger.info(f"  Half 2 with part: {len(half_2_with_part.vertices)} verts, {len(half_2_with_part.faces)} faces")
-        else:
-            logger.warning("  CSG operations did not complete successfully")
+
+        logger.info(
+            "Metamold generated in %.0f ms (success=%s)",
+            result.prism_result.computation_time_ms, result.success,
+        )
 
     def _on_metamold_error(self, message: str):
         if hasattr(self, 'metamold_progress_label'):
@@ -8581,9 +8539,6 @@ class MainWindow(QMainWindow):
         
         # Clear metamold results
         self._metamold_prism_result = None
-        self._metamold_with_cavity = None
-        self._metamold_half_1 = None
-        self._metamold_half_2 = None
         self._metamold_half_1_with_part = None
         self._metamold_half_2_with_part = None
         self._metamold_csg_success = False
@@ -8856,9 +8811,6 @@ class MainWindow(QMainWindow):
             
             # Metamold state
             'metamold_prism_result': result_to_dict(self._metamold_prism_result),
-            'metamold_with_cavity': mesh_to_dict(self._metamold_with_cavity),
-            'metamold_half_1': mesh_to_dict(self._metamold_half_1),
-            'metamold_half_2': mesh_to_dict(self._metamold_half_2),
             'metamold_half_1_with_part': mesh_to_dict(self._metamold_half_1_with_part),
             'metamold_half_2_with_part': mesh_to_dict(self._metamold_half_2_with_part),
             'metamold_csg_success': self._metamold_csg_success,
@@ -9280,15 +9232,6 @@ class MainWindow(QMainWindow):
             from core.mold_fabrication import MetamoldPrismResult
             self._metamold_prism_result = dict_to_result(session['metamold_prism_result'], MetamoldPrismResult)
         
-        if session.get('metamold_with_cavity'):
-            self._metamold_with_cavity = dict_to_mesh(session['metamold_with_cavity'])
-        
-        if session.get('metamold_half_1'):
-            self._metamold_half_1 = dict_to_mesh(session['metamold_half_1'])
-        
-        if session.get('metamold_half_2'):
-            self._metamold_half_2 = dict_to_mesh(session['metamold_half_2'])
-        
         if session.get('metamold_half_1_with_part'):
             self._metamold_half_1_with_part = dict_to_mesh(session['metamold_half_1_with_part'])
         
@@ -9301,32 +9244,23 @@ class MainWindow(QMainWindow):
         if self._metamold_prism_result is not None:
             has_prism = (hasattr(self._metamold_prism_result, 'prism_mesh') and 
                         self._metamold_prism_result.prism_mesh is not None)
-            has_cavity = self._metamold_with_cavity is not None and self._metamold_csg_success
-            has_half_1 = self._metamold_half_1 is not None
-            has_half_2 = self._metamold_half_2 is not None
-            has_valid_halves = has_half_1 and has_half_2
-            has_half_1_with_part = self._metamold_half_1_with_part is not None
-            has_half_2_with_part = self._metamold_half_2_with_part is not None
-            has_valid_halves_with_part = has_half_1_with_part and has_half_2_with_part
+            has_halves = (
+                self._metamold_half_1_with_part is not None
+                and self._metamold_half_2_with_part is not None
+            )
             
             try:
-                # Show the best available visualization
-                if has_valid_halves_with_part:
+                if has_halves:
                     self.mesh_viewer.show_metamold_half_1_with_part(self._metamold_half_1_with_part)
                     self.mesh_viewer.show_metamold_half_2_with_part(self._metamold_half_2_with_part)
-                elif has_valid_halves:
-                    self.mesh_viewer.show_metamold_half_1(self._metamold_half_1)
-                    self.mesh_viewer.show_metamold_half_2(self._metamold_half_2)
-                elif has_cavity:
-                    self.mesh_viewer.show_metamold_with_cavity(self._metamold_with_cavity)
                 elif has_prism:
                     self.mesh_viewer.show_metamold_prism(self._metamold_prism_result.prism_mesh)
                 
                 self.display_options.show_metamold_options(
                     show_prism=has_prism,
-                    show_cavity=has_cavity,
-                    show_halves=has_valid_halves,
-                    show_halves_with_part=has_valid_halves_with_part
+                    show_cavity=False,
+                    show_halves=False,
+                    show_halves_with_part=has_halves,
                 )
             except Exception as e:
                 logger.warning(f"Could not restore metamold visualization: {e}")
