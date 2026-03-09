@@ -37,6 +37,7 @@ from core.mesh_decimation import (
 )
 from core.parting_direction import (
     find_parting_directions,
+    find_parting_directions_iterative,
     compute_visibility_paint,
     get_face_colors,
     PartingDirectionResult,
@@ -570,12 +571,20 @@ class MeshDecimationDialog(QDialog):
 # ============================================================================
 
 class MeshLoadWorker(QThread):
-    """Background worker for loading and processing meshes."""
+    """Background worker for loading and processing meshes.
+    
+    Performs STL loading, mesh analysis, repair, and PyVista conversion
+    entirely in a background thread to keep the UI responsive.
+    
+    The final_mesh_ready signal provides both the trimesh and a pre-built
+    PyVista PolyData so the main thread only needs to do the fast GPU upload.
+    """
     
     progress = pyqtSignal(str)
-    load_complete = pyqtSignal(object)
-    analysis_complete = pyqtSignal(object)
-    repair_complete = pyqtSignal(object)
+    load_complete = pyqtSignal(object)        # LoadResult (lightweight — no rendering)
+    analysis_complete = pyqtSignal(object)    # MeshDiagnostics
+    repair_complete = pyqtSignal(object)      # MeshRepairResult (lightweight — no rendering)
+    final_mesh_ready = pyqtSignal(object, object, str)  # (trimesh, pv.PolyData, color_hex)
     error = pyqtSignal(str)
     
     def __init__(self, file_path: str, scale_factor: float = 1.0):
@@ -603,69 +612,116 @@ class MeshLoadWorker(QThread):
                 result.mesh.vertices *= self.scale_factor
             
             logger.info(f"STL loaded: {result.mesh.vertices.shape[0]} vertices, {result.mesh.faces.shape[0]} faces")
+            # Emit load_complete for metadata only (no viewer rendering here)
             self.load_complete.emit(result)
             self.progress.emit(f"Loaded in {result.load_time_ms:.1f}ms")
             
             # === PHASE 1: Initial analysis ===
+            import time as _t
+            _t0 = _t.perf_counter()
             logger.info("Analyzing mesh...")
             self.progress.emit("Analyzing mesh quality...")
             analyzer = MeshAnalyzer(result.mesh)
             diagnostics = analyzer.analyze()
-            logger.info(f"Analysis complete: manifold={diagnostics.is_manifold}, watertight={diagnostics.is_watertight}")
+            logger.info(f"Analysis complete ({(_t.perf_counter()-_t0)*1000:.0f}ms): manifold={diagnostics.is_manifold}, watertight={diagnostics.is_watertight}")
             
-            # === PHASE 2: Always run mesh cleanup (even on watertight meshes) ===
-            # This ensures consistent mesh quality for downstream operations
+            # Track the final mesh and its display color
+            final_mesh = result.mesh
+            display_color = ''  # empty = default viewer color
+            
+            # === PHASE 2: Smart mesh cleanup ===
+            # Use initial diagnostics to choose fast vs full repair path.
+            # Self-intersection fixing is always skipped — fTetWild handles it.
+            _t1 = _t.perf_counter()
             if self._should_repair:
-                logger.info("Running mesh cleanup...")
-                self.progress.emit("Cleaning up mesh (merging vertices, removing degenerates)...")
+                is_clean = (diagnostics.is_watertight
+                            and not diagnostics.has_degenerate_faces
+                            and not diagnostics.has_duplicate_faces)
                 
-                repairer = MeshRepairer(result.mesh)
-                # Always run cleanup operations but don't use convex hull fallback
-                repair_result = repairer.repair(
-                    merge_vertices=True,
-                    remove_degenerate=True,
-                    remove_duplicates=True,
-                    fix_normals=True,
-                    fill_holes=not diagnostics.is_watertight,  # Only fill holes if needed
-                    use_convex_hull_fallback=False  # Never destroy original geometry
-                )
-                
-                # Log what was done
-                if repair_result.was_repaired:
-                    logger.info(f"Mesh cleaned: {repair_result.repair_method}")
-                    for step in repair_result.repair_steps:
-                        logger.info(f"  - {step}")
+                if is_clean:
+                    # Fast path: topology is fine — just ensure correct normals
+                    logger.info("Mesh is clean — fast normal fix only")
+                    self.progress.emit("Quick mesh validation...")
                     
-                    # Build summary message
-                    summary_parts = []
-                    for step in repair_result.repair_steps:
-                        if "Merged" in step:
-                            summary_parts.append(step)
-                        elif "Removed" in step:
-                            summary_parts.append(step)
-                        elif "Filled" in step:
-                            summary_parts.append(step)
-                        elif "Fixed" in step and "normal" in step.lower():
-                            summary_parts.append("Fixed normals")
+                    if final_mesh.is_watertight and final_mesh.volume < 0:
+                        final_mesh.invert()
+                    final_mesh.fix_normals()
                     
-                    if summary_parts:
-                        self.progress.emit(f"Cleanup: {'; '.join(summary_parts[:3])}")
-                    else:
-                        self.progress.emit("Mesh cleanup complete")
-                else:
-                    logger.info("Mesh is clean, no repairs needed")
+                    repair_result = MeshRepairResult(
+                        mesh=final_mesh,
+                        diagnostics=diagnostics,  # reuse initial (topology unchanged)
+                        was_repaired=False,
+                        repair_method='none',
+                        repair_steps=['Mesh is clean, normals verified'],
+                        original_vertex_count=len(result.mesh.vertices),
+                        original_face_count=len(result.mesh.faces)
+                    )
                     self.progress.emit("Mesh is clean, no repairs needed")
+                else:
+                    # Full repair path (self-intersection fix skipped — fTetWild handles it)
+                    logger.info("Running mesh cleanup (self-intersect fix skipped)...")
+                    self.progress.emit("Cleaning up mesh...")
+                    
+                    repairer = MeshRepairer(result.mesh)
+                    repair_result = repairer.repair(
+                        merge_vertices=True,
+                        remove_degenerate=True,
+                        remove_duplicates=True,
+                        fix_normals=True,
+                        fill_holes=not diagnostics.is_watertight,
+                        fix_self_intersections=False,  # fTetWild handles this
+                        use_convex_hull_fallback=False
+                    )
+                    
+                    # Log what was done
+                    if repair_result.was_repaired:
+                        logger.info(f"Mesh cleaned: {repair_result.repair_method}")
+                        for step in repair_result.repair_steps:
+                            logger.info(f"  - {step}")
+                        
+                        summary_parts = []
+                        for step in repair_result.repair_steps:
+                            if "Merged" in step:
+                                summary_parts.append(step)
+                            elif "Removed" in step:
+                                summary_parts.append(step)
+                            elif "Filled" in step:
+                                summary_parts.append(step)
+                            elif "Fixed" in step and "normal" in step.lower():
+                                summary_parts.append("Fixed normals")
+                        
+                        if summary_parts:
+                            self.progress.emit(f"Cleanup: {'; '.join(summary_parts[:3])}")
+                        else:
+                            self.progress.emit("Mesh cleanup complete")
+                        
+                        final_mesh = repair_result.mesh
+                        display_color = '#66ff99'  # green tint for repaired
+                        # Use post-repair diagnostics from _build_result (no re-analysis)
+                        diagnostics = repair_result.diagnostics
+                    else:
+                        logger.info("Mesh is clean, no repairs needed")
+                        self.progress.emit("Mesh is clean, no repairs needed")
                 
-                # Emit repair complete (updates mesh in viewer if needed)
+                # Emit repair_complete for metadata (no viewer rendering here)
                 self.repair_complete.emit(repair_result)
-                
-                # Re-analyze after repair
-                if repair_result.was_repaired:
-                    analyzer = MeshAnalyzer(repair_result.mesh)
-                    diagnostics = analyzer.analyze()
+                logger.info(f"Repair phase took {(_t.perf_counter()-_t1)*1000:.0f}ms")
+            
+            # === PHASE 3: Pre-build PyVista mesh in this worker thread ===
+            # This is the expensive part (array conversion + normal computation)
+            # that previously blocked the main thread inside set_mesh().
+            _t2 = _t.perf_counter()
+            self.progress.emit("Preparing 3D view...")
+            from viewer import MeshViewer as _MV
+            pv_mesh = _MV.prepare_pyvista_mesh(final_mesh)
+            logger.info(f"PyVista prep took {(_t.perf_counter()-_t2)*1000:.0f}ms")
+            
+            # Emit the pre-built mesh so main thread only does fast GPU upload
+            self.final_mesh_ready.emit(final_mesh, pv_mesh, display_color)
             
             # Emit analysis complete (with potentially updated diagnostics)
             self.analysis_complete.emit(diagnostics)
+            logger.info(f"Total mesh processing took {(_t.perf_counter()-_t0)*1000:.0f}ms")
             self.progress.emit("Mesh processing complete")
                 
         except Exception as e:
@@ -674,46 +730,62 @@ class MeshLoadWorker(QThread):
 
 
 class PartingDirectionWorker(QThread):
-    """Background worker for computing parting directions."""
-    
+    """Background worker for computing parting directions.
+
+    Supports iterative multi-resolution refinement (default) that
+    concentrates sampling budget around promising regions and targets
+    uncovered surface gaps.
+    """
+
     progress = pyqtSignal(str)
     progress_value = pyqtSignal(int, int)  # current, total
     complete = pyqtSignal(object)  # PartingDirectionResult
     error = pyqtSignal(str)
-    
-    def __init__(self, mesh, k: int = 128, num_workers: int = None):
+
+    def __init__(self, mesh, k: int = 128, num_workers: int = None,
+                 refine: bool = True):
         """
         Initialize parting direction worker.
-        
+
         Args:
             mesh: The trimesh mesh to analyze
-            k: Number of candidate directions to sample (default: 128)
+            k: Number of candidate directions for coarse scan (default: 128)
             num_workers: Number of parallel workers (default: auto)
+            refine: Whether to run iterative refinement phases (default: True)
         """
         super().__init__()
         self.mesh = mesh
         self.k = k
         self.num_workers = num_workers
-    
+        self.refine = refine
+
     def run(self):
         try:
-            logger.info(f"Computing parting directions with k={self.k}...")
+            logger.info("Computing parting directions: k=%d, refine=%s",
+                        self.k, self.refine)
             self.progress.emit(f"Sampling {self.k} candidate directions...")
-            
+
             def progress_callback(current, total):
                 self.progress_value.emit(current, total)
                 if current % 10 == 0 or current == total:
-                    self.progress.emit(f"Testing direction {current}/{total}...")
-            
-            result = find_parting_directions(
+                    self.progress.emit(f"Evaluating direction {current}/{total}...")
+
+            def text_callback(msg):
+                self.progress.emit(msg)
+
+            result = find_parting_directions_iterative(
                 self.mesh,
                 k=self.k,
+                refine=self.refine,
                 num_workers=self.num_workers,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                text_callback=text_callback,
             )
-            
-            self.progress.emit(f"Found optimal parting directions in {result.computation_time_ms:.0f}ms")
-            self.complete.emit(result)
+
+            self.progress.emit(
+                f"Found optimal directions in {result.computation_time_ms:.0f}ms "
+                f"({result.total_candidates_evaluated} candidates evaluated)"
+            )
             
         except Exception as e:
             logger.exception("Error computing parting directions: %s", e)
@@ -6237,6 +6309,14 @@ class MainWindow(QMainWindow):
             self.parting_stats.add_row(f'Coverage: {result.total_coverage:.1f}%')
             self.parting_stats.add_row(f'Angle: {result.angle_degrees:.1f}°')
             self.parting_stats.add_row(f'Time: {result.computation_time_ms:.0f}ms')
+            if result.total_candidates_evaluated > 0:
+                self.parting_stats.add_row(
+                    f'Candidates: {result.total_candidates_evaluated}'
+                    f' ({result.refinement_rounds} refine pass)'
+                )
+            if result.uncovered_area_pct > 0:
+                self.parting_stats.add_row(
+                    f'Uncovered: {result.uncovered_area_pct:.1f}%')
             
             # Show color legend
             self.color_legend.show()
@@ -6269,8 +6349,10 @@ class MainWindow(QMainWindow):
         # Hide display options parting toggle
         self.display_options.show_parting_option(False)
         
-        # Start worker
-        self._parting_worker = PartingDirectionWorker(self._current_mesh, k=128)
+        # Start worker (iterative refinement enabled by default)
+        self._parting_worker = PartingDirectionWorker(
+            self._current_mesh, k=128, refine=True
+        )
         self._parting_worker.progress.connect(self._on_parting_progress)
         self._parting_worker.progress_value.connect(self._on_parting_progress_value)
         self._parting_worker.complete.connect(self._on_parting_complete)
@@ -13023,6 +13105,7 @@ class MainWindow(QMainWindow):
         self._worker.load_complete.connect(self._on_load_complete)
         self._worker.analysis_complete.connect(self._on_analysis_complete)
         self._worker.repair_complete.connect(self._on_repair_complete)
+        self._worker.final_mesh_ready.connect(self._on_final_mesh_ready)
         self._worker.error.connect(self._on_error)
         self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
@@ -13031,8 +13114,13 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(message)
     
     def _on_load_complete(self, result: LoadResult):
+        # Store a preliminary reference (may be replaced by repaired mesh later)
         self._current_mesh = result.mesh
-        self.mesh_viewer.set_mesh(result.mesh)
+        
+        # Do NOT call set_mesh() here — the worker will emit final_mesh_ready
+        # with a pre-built PyVista mesh after repair is done. This avoids
+        # rendering the mesh twice (once raw, once repaired) which blocks
+        # the main thread for large meshes.
         
         # Update title bar with file info
         if self._loaded_filename:
@@ -13068,22 +13156,40 @@ class MainWindow(QMainWindow):
         self._current_mesh = result.mesh
         self._current_diagnostics = result.diagnostics
         
-        # Only change mesh color if actual repairs were made
-        if result.was_repaired:
-            # Update viewer with repaired mesh (green tint to indicate changes)
-            self.mesh_viewer.set_mesh(result.mesh, color='#66ff99')
-            
-            # Update title bar with new triangle count
-            if self._loaded_filename:
-                filename = Path(self._loaded_filename).name
-                triangle_count = len(result.mesh.faces)
-                try:
-                    file_size = Path(self._loaded_filename).stat().st_size
-                except Exception:
-                    file_size = 0
-                self.title_bar.set_file_info(filename, triangle_count, file_size)
+        # Do NOT call set_mesh() here — the worker will emit final_mesh_ready
+        # with a pre-built PyVista mesh. This avoids a second blocking render.
+        
+        # Update title bar with new triangle count if repairs were made
+        if result.was_repaired and self._loaded_filename:
+            filename = Path(self._loaded_filename).name
+            triangle_count = len(result.mesh.faces)
+            try:
+                file_size = Path(self._loaded_filename).stat().st_size
+            except Exception:
+                file_size = 0
+            self.title_bar.set_file_info(filename, triangle_count, file_size)
         
         self._update_mesh_stats()
+    
+    def _on_final_mesh_ready(self, mesh, pv_mesh, color: str):
+        """Handle final mesh ready from worker — single fast render.
+        
+        The worker pre-built the PyVista PolyData in its thread, so
+        this handler only does the GPU upload + scene setup (fast).
+        This replaces the previous pattern of calling set_mesh() twice
+        (once on load, once on repair) which blocked the main thread.
+        """
+        self._current_mesh = mesh
+        
+        # Use set_prepared_mesh for fast rendering (skip conversion)
+        if pv_mesh is not None:
+            self.mesh_viewer.set_prepared_mesh(
+                mesh, pv_mesh,
+                color=color if color else None
+            )
+        else:
+            # Fallback: pyvista not available or conversion failed
+            self.mesh_viewer.set_mesh(mesh, color=color if color else None)
     
     def _on_error(self, message: str):
         self.progress_label.setText(f'Error: {message}')

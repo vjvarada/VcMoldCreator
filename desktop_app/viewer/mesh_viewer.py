@@ -632,6 +632,73 @@ class MeshViewer(QWidget):
             fill_shape=False,
         )
     
+    @staticmethod
+    def prepare_pyvista_mesh(mesh: trimesh.Trimesh) -> 'pv.PolyData':
+        """
+        Pre-build a PyVista PolyData from a trimesh mesh.
+        
+        This is THREAD-SAFE — it only does numpy array manipulation and
+        VTK data construction, no OpenGL calls. Call this in a worker
+        thread to avoid blocking the GUI.
+        
+        Args:
+            mesh: The trimesh mesh to convert
+            
+        Returns:
+            PyVista PolyData ready for rendering, or None if pyvista unavailable
+        """
+        if not PYVISTA_AVAILABLE:
+            return None
+        
+        import time
+        start = time.perf_counter()
+        
+        vertices = np.asarray(mesh.vertices, dtype=np.float32)
+        faces = np.asarray(mesh.faces, dtype=np.int32)
+        
+        n_faces = len(faces)
+        pv_faces = np.column_stack([
+            np.full(n_faces, 3, dtype=np.int32),
+            faces
+        ]).ravel()
+        
+        pv_mesh = pv.PolyData(vertices, pv_faces)
+        pv_mesh.compute_normals(inplace=True, cell_normals=True, point_normals=True)
+        
+        elapsed = (time.perf_counter() - start) * 1000
+        logger.debug(f"prepare_pyvista_mesh: {len(vertices)} verts, {n_faces} faces in {elapsed:.1f}ms")
+        
+        return pv_mesh
+
+    def set_prepared_mesh(self, mesh: trimesh.Trimesh, pv_mesh: 'pv.PolyData',
+                          color: Optional[str] = None):
+        """
+        Set a mesh with a pre-built PyVista PolyData for fast rendering.
+        
+        Use this instead of set_mesh() when the PyVista conversion was
+        done in a background thread via prepare_pyvista_mesh().
+        Only the GPU upload + scene setup runs on the main thread.
+        
+        Args:
+            mesh: The original trimesh (stored for reference)
+            pv_mesh: Pre-built PyVista PolyData from prepare_pyvista_mesh()
+            color: Optional color for the mesh (hex string)
+        """
+        if not PYVISTA_AVAILABLE or pv_mesh is None:
+            return
+        
+        self._mesh = mesh
+        self._current_color = color or self.MESH_COLOR
+        self._pv_mesh = pv_mesh
+        
+        logger.info(f"Setting prepared mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+        
+        # Only GPU upload + scene setup on main thread
+        self._render_mesh()
+        self._fit_camera_to_mesh()
+        
+        logger.info("Mesh rendered successfully")
+
     def set_mesh(self, mesh: trimesh.Trimesh, color: Optional[str] = None):
         """
         Set the mesh to display.
