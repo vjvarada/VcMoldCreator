@@ -67,6 +67,13 @@ COVERAGE_EPSILON = COVERAGE_TOLERANCE  # Alias for backward compatibility
 # Ray tracing parameters
 RAY_OFFSET_FACTOR = 2.0  # Multiplier on bounding box extent for ray offset
 
+# Perpendicular tolerance: faces whose normals are within this many degrees
+# of being perpendicular to the direction are considered visible without
+# raycasting.  These faces run parallel to the mold pull and do not create
+# undercuts, so they can always be extracted.
+PERPENDICULAR_TOLERANCE_DEG = 0.1
+PERPENDICULAR_TOLERANCE_COS = np.cos(np.radians(90.0 - PERPENDICULAR_TOLERANCE_DEG))
+
 # Parallel processing parameters
 MIN_DIRECTIONS_FOR_PARALLEL = 8  # Below this, process sequentially
 BATCH_DIVISOR = 4  # Divide work into (num_workers * BATCH_DIVISOR) batches
@@ -641,32 +648,45 @@ def compute_visibility_for_direction(
     front_facing_mask = dots > 0
     front_facing_indices = np.where(front_facing_mask)[0]
     
-    if len(front_facing_indices) == 0:
+    # Step 1b: Near-perpendicular faces (within PERPENDICULAR_TOLERANCE_DEG of 90°)
+    # are inherently extractable — they run parallel to the pull direction.
+    perp_mask = (~front_facing_mask) & (np.abs(dots) <= PERPENDICULAR_TOLERANCE_COS)
+    perp_indices = np.where(perp_mask)[0]
+    
+    if len(front_facing_indices) == 0 and len(perp_indices) == 0:
         return [], 0.0
     
-    # Step 2: Cast rays from face centroids
-    n_rays = len(front_facing_indices)
-    ray_origins = centroids[front_facing_indices] + direction * ray_offset
-    ray_directions = np.tile(-direction, (n_rays, 1))
+    # Step 2: Cast rays from front-facing face centroids
+    if len(front_facing_indices) > 0:
+        n_rays = len(front_facing_indices)
+        ray_origins = centroids[front_facing_indices] + direction * ray_offset
+        ray_directions = np.tile(-direction, (n_rays, 1))
+        
+        try:
+            # Use trimesh's ray intersection (Embree-accelerated when available)
+            hit_indices = mesh.ray.intersects_first(
+                ray_origins=ray_origins,
+                ray_directions=ray_directions
+            )
+        except Exception as e:
+            logger.warning("Ray intersection failed: %s", e)
+            # Fallback: assume all front-facing triangles are visible
+            hit_indices = front_facing_indices
+        
+        # Step 3: Self-hit check - ray hits its source triangle = visible
+        self_hit_mask = hit_indices == front_facing_indices
+        raycast_visible = front_facing_indices[self_hit_mask]
+    else:
+        raycast_visible = np.array([], dtype=np.intp)
     
-    try:
-        # Use trimesh's ray intersection (Embree-accelerated when available)
-        hit_indices = mesh.ray.intersects_first(
-            ray_origins=ray_origins,
-            ray_directions=ray_directions
-        )
-    except Exception as e:
-        logger.warning("Ray intersection failed: %s", e)
-        # Fallback: assume all front-facing triangles are visible
-        return front_facing_indices.tolist(), float(areas[front_facing_indices].sum())
+    # Combine raycast-visible and perpendicular faces
+    if len(perp_indices) > 0:
+        all_visible = np.union1d(raycast_visible, perp_indices)
+    else:
+        all_visible = raycast_visible
     
-    # Step 3: Self-hit check - ray hits its source triangle = visible
-    self_hit_mask = hit_indices == front_facing_indices
-    
-    visible_indices = front_facing_indices[self_hit_mask].tolist()
-    visible_area = float(areas[front_facing_indices[self_hit_mask]].sum())
-    
-    return visible_indices, visible_area
+    visible_area = float(areas[all_visible].sum())
+    return all_visible.tolist(), visible_area
 
 
 def _compute_visibility_for_direction_fast(
@@ -905,19 +925,32 @@ def _compute_visibility_matrix(
     def _process_direction(d_idx: int) -> Tuple[int, np.ndarray]:
         """Raycast a single direction.  Returns (index, visible_face_indices)."""
         direction = directions[d_idx]
-        front_indices = np.where(all_dots[:, d_idx] > 0)[0]
-        if len(front_indices) == 0:
+        col_dots = all_dots[:, d_idx]
+        front_indices = np.where(col_dots > 0)[0]
+
+        # Near-perpendicular faces: extractable without raycasting
+        perp_indices = np.where((col_dots <= 0) & (np.abs(col_dots) <= PERPENDICULAR_TOLERANCE_COS))[0]
+
+        if len(front_indices) == 0 and len(perp_indices) == 0:
             return d_idx, np.array([], dtype=np.intp)
 
-        ray_origins = (triangle_data.centroids[front_indices]
-                       + direction * triangle_data.ray_offset)
-        ray_dirs = np.tile(-direction, (len(front_indices), 1))
+        if len(front_indices) > 0:
+            ray_origins = (triangle_data.centroids[front_indices]
+                           + direction * triangle_data.ray_offset)
+            ray_dirs = np.tile(-direction, (len(front_indices), 1))
 
-        try:
-            hits = mesh.ray.intersects_first(ray_origins, ray_dirs)
-            visible = front_indices[hits == front_indices]
-        except Exception:
-            visible = front_indices  # fallback: treat all front-facing as visible
+            try:
+                hits = mesh.ray.intersects_first(ray_origins, ray_dirs)
+                raycast_visible = front_indices[hits == front_indices]
+            except Exception:
+                raycast_visible = front_indices  # fallback
+        else:
+            raycast_visible = np.array([], dtype=np.intp)
+
+        if len(perp_indices) > 0:
+            visible = np.union1d(raycast_visible, perp_indices)
+        else:
+            visible = raycast_visible
         return d_idx, visible
 
     # --- Sequential path for small k ---

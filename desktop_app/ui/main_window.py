@@ -786,6 +786,7 @@ class PartingDirectionWorker(QThread):
                 f"Found optimal directions in {result.computation_time_ms:.0f}ms "
                 f"({result.total_candidates_evaluated} candidates evaluated)"
             )
+            self.complete.emit(result)
             
         except Exception as e:
             logger.exception("Error computing parting directions: %s", e)
