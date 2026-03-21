@@ -127,6 +127,10 @@ class ResinChannelResult:
     notch_width_mm: float = 4.0
     notch_depth_mm: float = 0.5
 
+    # Metamold clamp
+    clamp_mesh: Optional[trimesh.Trimesh] = None
+    clamp_created: bool = False
+
     # Success flag
     success: bool = False
     

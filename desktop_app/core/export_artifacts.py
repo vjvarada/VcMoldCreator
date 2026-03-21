@@ -346,10 +346,11 @@ def export_artifacts(
     hull_mesh: Optional[trimesh.Trimesh] = None,
     part_mesh: Optional[trimesh.Trimesh] = None,
     model_name: str = "Unknown",
+    clamp_mesh: Optional[trimesh.Trimesh] = None,
 ) -> ExportResult:
     """Export all fabrication artifacts to the specified directory.
 
-    Exports 5 STL files (hard shells, metamolds, pouring plug) and a
+    Exports STL files (hard shells, metamolds, pouring plug, clamp) and a
     metadata.txt with volume estimates.
 
     Args:
@@ -362,6 +363,7 @@ def export_artifacts(
         hull_mesh: Inflated hull mesh (for volume computation).
         part_mesh: Input part mesh (for volume computation).
         model_name: Name of the input model for metadata.
+        clamp_mesh: Metamold clamp mesh.
 
     Returns:
         ExportResult with status and file listing.
@@ -382,6 +384,7 @@ def export_artifacts(
             ExportArtifact("metamold_half_1.stl", metamold_half_1, "Upper metamold half"),
             ExportArtifact("metamold_half_2.stl", metamold_half_2, "Lower metamold half"),
             ExportArtifact("pouring_plug.stl", plug_mesh, "Resin pouring plug"),
+            ExportArtifact("metamold_clamp.stl", clamp_mesh, "Metamold clamp"),
         ]
 
         # Export each artifact

@@ -45,6 +45,13 @@ except ImportError:
 DEFAULT_WALL_THICKNESS_MM = 5.0  # Default hard shell wall thickness
 DEFAULT_COLLAR_SUBDIVISIONS = 4  # Fan subdivisions at corners
 
+# Metamold clamp defaults
+CLAMP_WALL_THICKNESS_MM = 3.0     # Clamp shell wall thickness
+CLAMP_CLEARANCE_MM = 0.1          # Gap between clamp inner surface and metamold outer surface
+CLAMP_MIN_HEIGHT_MM = 10.0        # Minimum clamp height
+CLAMP_SLIT_WIDTH_MM = 5.0         # Width of the slit gap in the clamp wall
+CLAMP_TAB_LENGTH_MM = 20.0        # How far tabs extend outward from the clamp wall
+
 
 # ============================================================================
 # DATA CLASSES
@@ -256,6 +263,40 @@ class MetamoldPrismResult:
     vertex_count: int = 0
     face_count: int = 0
     
+    # Computation time
+    computation_time_ms: float = 0.0
+
+
+@dataclass
+class MetamoldClampResult:
+    """Result of creating the metamold clamp.
+
+    The clamp is a single-piece open-ended sleeve that wraps around the
+    assembled metamold.  It follows the metamold's outer silhouette with a
+    small clearance gap, has a vertical slit so it can flex open, and two
+    outward-facing tabs on either side of the slit for a binder clip.
+    """
+
+    # The clamp mesh
+    mesh: Optional[trimesh.Trimesh] = None
+
+    # Clamp parameters
+    wall_thickness: float = CLAMP_WALL_THICKNESS_MM
+    clearance: float = CLAMP_CLEARANCE_MM
+    height: float = 0.0
+    slit_width: float = CLAMP_SLIT_WIDTH_MM
+    tab_length: float = CLAMP_TAB_LENGTH_MM
+
+    # Pouring direction used (clamp extruded along this axis)
+    pouring_direction: Optional[np.ndarray] = None
+
+    # Statistics
+    vertex_count: int = 0
+    face_count: int = 0
+
+    # Success flag
+    success: bool = False
+
     # Computation time
     computation_time_ms: float = 0.0
 
@@ -483,6 +524,210 @@ def create_metamold_prism(
     logger.info(f"Metamold prism created: {result.vertex_count} vertices, "
                 f"{result.face_count} faces in {elapsed_ms:.1f}ms")
     
+    return result
+
+
+# ============================================================================
+# METAMOLD CLAMP CREATION
+# ============================================================================
+
+def create_metamold_clamp(
+    prism_result: MetamoldPrismResult,
+    parting_surface: trimesh.Trimesh,
+    wall_thickness: float = CLAMP_WALL_THICKNESS_MM,
+    clearance: float = CLAMP_CLEARANCE_MM,
+    min_height: float = CLAMP_MIN_HEIGHT_MM,
+    slit_width: float = CLAMP_SLIT_WIDTH_MM,
+    tab_length: float = CLAMP_TAB_LENGTH_MM,
+) -> MetamoldClampResult:
+    """Create a single-piece clamp that wraps around the assembled metamold.
+
+    The clamp is an open-ended sleeve (no top/bottom caps) whose inner
+    profile follows the metamold's offset silhouette with a clearance gap.
+    One vertical slit allows the clamp to flex open so it can slide over
+    the metamold.  Two outward tabs on either side of the slit accept a
+    binder clip to hold the metamold halves together.
+
+    Args:
+        prism_result: The MetamoldPrismResult (silhouette, pouring dir, etc.).
+        parting_surface: The parting surface mesh (used to compute height).
+        wall_thickness: Clamp wall thickness in mm.
+        clearance: Gap between clamp inner surface and metamold outer surface.
+        min_height: Minimum clamp height in mm.
+        slit_width: Width of the vertical slit in mm.
+        tab_length: How far each tab extends outward from the clamp wall in mm.
+
+    Returns:
+        MetamoldClampResult with the clamp mesh.
+    """
+    start_time = time.time()
+    logger.info("Creating metamold clamp...")
+
+    pouring_dir = np.asarray(prism_result.pouring_direction, dtype=np.float64)
+    pouring_dir = pouring_dir / (np.linalg.norm(pouring_dir) + 1e-10)
+    world_to_2d = prism_result.world_to_2d
+
+    # ------------------------------------------------------------------
+    # 1. Determine clamp height — max(2 × parting surface height, min_height)
+    #    centred on the parting surface midpoint along pouring direction.
+    # ------------------------------------------------------------------
+    ps_verts = np.asarray(parting_surface.vertices, dtype=np.float64)
+    ps_transformed = ps_verts @ world_to_2d.T
+    ps_heights = ps_transformed[:, 2]
+    ps_min_h = float(np.min(ps_heights))
+    ps_max_h = float(np.max(ps_heights))
+    ps_extent = ps_max_h - ps_min_h
+    clamp_height = max(2.0 * ps_extent, min_height)
+
+    ps_mid_h = (ps_min_h + ps_max_h) / 2.0
+    clamp_bottom = ps_mid_h - clamp_height / 2.0
+    clamp_top = ps_mid_h + clamp_height / 2.0
+
+    logger.info(
+        "Clamp height=%.2f mm (parting extent=%.2f mm), range=[%.2f, %.2f]",
+        clamp_height, ps_extent, clamp_bottom, clamp_top,
+    )
+
+    # ------------------------------------------------------------------
+    # 2. Build inner and outer 2D silhouettes.
+    #    Inner = metamold silhouette + clearance
+    #    Outer = inner + wall_thickness
+    # ------------------------------------------------------------------
+    metamold_silhouette_2d = prism_result.silhouette_2d
+    inner_2d = _offset_polygon_2d(metamold_silhouette_2d, clearance)
+    outer_2d = _offset_polygon_2d(inner_2d, wall_thickness)
+
+    n_inner = len(inner_2d)
+    n_outer = len(outer_2d)
+    logger.info(
+        "Silhouette vertices: inner=%d, outer=%d", n_inner, n_outer,
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Choose slit location — pick the longest flat edge of outer_2d.
+    # ------------------------------------------------------------------
+    edge_lengths_outer = np.array([
+        np.linalg.norm(outer_2d[(i + 1) % n_outer] - outer_2d[i])
+        for i in range(n_outer)
+    ])
+    slit_edge_idx = int(np.argmax(edge_lengths_outer))
+    slit_edge_start_2d = outer_2d[slit_edge_idx]
+    slit_edge_end_2d = outer_2d[(slit_edge_idx + 1) % n_outer]
+    slit_edge_dir = slit_edge_end_2d - slit_edge_start_2d
+    slit_edge_len = np.linalg.norm(slit_edge_dir)
+    slit_edge_unit = slit_edge_dir / (slit_edge_len + 1e-10)
+    slit_midpoint_2d = (slit_edge_start_2d + slit_edge_end_2d) / 2.0
+    # Outward normal of the slit edge (perpendicular, pointing away from centroid)
+    centroid_2d = np.mean(outer_2d, axis=0)
+    slit_normal_candidate = np.array([slit_edge_unit[1], -slit_edge_unit[0]])
+    if np.dot(slit_normal_candidate, slit_midpoint_2d - centroid_2d) < 0:
+        slit_normal_candidate = -slit_normal_candidate
+    slit_outward_normal_2d = slit_normal_candidate
+
+    logger.info(
+        "Slit on edge %d (length=%.2f mm), midpoint=(%.2f, %.2f)",
+        slit_edge_idx, slit_edge_len, slit_midpoint_2d[0], slit_midpoint_2d[1],
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Build the clamp cross-section as a single closed 2D polygon with
+    #    a slit gap.
+    #
+    #    Strategy: create the sleeve as a manifold trimesh by extruding
+    #    the outer polygon, extruding the inner polygon, then doing a
+    #    boolean subtraction (outer - inner) to hollow it out.  Then cut
+    #    the slit as another boolean subtraction.  Finally, union the two
+    #    tabs.
+    # ------------------------------------------------------------------
+    two_d_to_world = world_to_2d.T  # inverse since orthonormal
+
+    # 4a. Outer solid prism (with caps — they'll be removed by inner sub)
+    outer_prism, _, _ = _extrude_polygon_to_prism(
+        outer_2d, world_to_2d, clamp_bottom, clamp_top)
+
+    # 4b. Inner cavity prism (extends slightly beyond to ensure clean CSG)
+    margin_h = 1.0  # 1 mm overshoot top/bottom for clean subtraction
+    inner_prism, _, _ = _extrude_polygon_to_prism(
+        inner_2d, world_to_2d, clamp_bottom - margin_h, clamp_top + margin_h)
+
+    # 4c. Slit cutter — a thin box centred on the slit location, spanning
+    #     full height, wide = slit_width, deep enough to cut through
+    #     inner+outer.
+    slit_half_w = slit_width / 2.0
+    slit_depth = wall_thickness + clearance + 5.0  # generous depth
+    inner_edge_start_2d = inner_2d[slit_edge_idx % n_inner]
+    inner_edge_end_2d = inner_2d[(slit_edge_idx + 1) % n_inner]
+    inner_mid_2d = (inner_edge_start_2d + inner_edge_end_2d) / 2.0
+    slit_start_2d = inner_mid_2d - slit_outward_normal_2d * 1.0  # 1 mm inside inner wall
+    slit_box_corners_2d = np.array([
+        slit_start_2d - slit_edge_unit * slit_half_w,
+        slit_start_2d + slit_edge_unit * slit_half_w,
+        slit_start_2d + slit_edge_unit * slit_half_w + slit_outward_normal_2d * slit_depth,
+        slit_start_2d - slit_edge_unit * slit_half_w + slit_outward_normal_2d * slit_depth,
+    ], dtype=np.float64)
+    slit_prism, _, _ = _extrude_polygon_to_prism(
+        slit_box_corners_2d, world_to_2d,
+        clamp_bottom - margin_h, clamp_top + margin_h)
+
+    # 4d. Tab geometry — two rectangular prisms on each side of the slit.
+    tab_thickness = wall_thickness  # same as clamp wall
+    tab_half_t = tab_thickness / 2.0
+    tab_meshes = []
+    for sign in (-1, 1):
+        tab_anchor_2d = slit_midpoint_2d + slit_edge_unit * sign * (slit_half_w + tab_half_t)
+        tab_corners_2d = np.array([
+            tab_anchor_2d - slit_edge_unit * tab_half_t,
+            tab_anchor_2d + slit_edge_unit * tab_half_t,
+            tab_anchor_2d + slit_edge_unit * tab_half_t + slit_outward_normal_2d * tab_length,
+            tab_anchor_2d - slit_edge_unit * tab_half_t + slit_outward_normal_2d * tab_length,
+        ], dtype=np.float64)
+        tab_mesh, _, _ = _extrude_polygon_to_prism(
+            tab_corners_2d, world_to_2d, clamp_bottom, clamp_top)
+        tab_meshes.append(tab_mesh)
+
+    # ------------------------------------------------------------------
+    # 5. CSG assembly: (outer - inner - slit) + tab_left + tab_right
+    # ------------------------------------------------------------------
+    if not MANIFOLD_AVAILABLE:
+        logger.error("manifold3d not available — cannot build metamold clamp")
+        return MetamoldClampResult(success=False)
+
+    try:
+        outer_m = _trimesh_to_manifold(outer_prism, 'clamp_outer')
+        inner_m = _trimesh_to_manifold(inner_prism, 'clamp_inner')
+        slit_m = _trimesh_to_manifold(slit_prism, 'clamp_slit')
+
+        sleeve_m = outer_m - inner_m
+        sleeve_m = sleeve_m - slit_m
+
+        for i, tab_tm in enumerate(tab_meshes):
+            tab_m = _trimesh_to_manifold(tab_tm, f'clamp_tab_{i}')
+            sleeve_m = sleeve_m + tab_m
+
+        clamp_trimesh = _manifold_to_trimesh(sleeve_m, 'clamp_final')
+    except Exception as e:
+        logger.error("CSG assembly for clamp failed: %s", e)
+        return MetamoldClampResult(success=False)
+
+    elapsed_ms = (time.time() - start_time) * 1000
+
+    result = MetamoldClampResult(
+        mesh=clamp_trimesh,
+        wall_thickness=wall_thickness,
+        clearance=clearance,
+        height=clamp_height,
+        slit_width=slit_width,
+        tab_length=tab_length,
+        pouring_direction=pouring_dir,
+        vertex_count=len(clamp_trimesh.vertices),
+        face_count=len(clamp_trimesh.faces),
+        success=True,
+        computation_time_ms=elapsed_ms,
+    )
+    logger.info(
+        "Metamold clamp created: %d verts, %d faces in %.1f ms",
+        result.vertex_count, result.face_count, elapsed_ms,
+    )
     return result
 
 

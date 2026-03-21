@@ -1654,6 +1654,33 @@ class ResinChannelsWorker(QThread):
         except Exception as e:
             logger.error("Error applying alignment notches: %s", e)
 
+    def _step_create_clamp(self, channel_result):
+        """Create the metamold clamp sleeve."""
+        if self.prism_result is None or self.blade_mesh is None:
+            logger.info("Skipping clamp — prism_result or blade_mesh not available")
+            return
+        self.progress.emit("Creating metamold clamp...")
+        try:
+            from core.mold_fabrication import create_metamold_clamp
+
+            clamp_result = create_metamold_clamp(
+                prism_result=self.prism_result,
+                parting_surface=self.blade_mesh,
+            )
+            if clamp_result.success and clamp_result.mesh is not None:
+                channel_result.clamp_mesh = clamp_result.mesh
+                channel_result.clamp_created = True
+                logger.info(
+                    "Clamp: %d verts, %d faces in %.0f ms",
+                    clamp_result.vertex_count,
+                    clamp_result.face_count,
+                    clamp_result.computation_time_ms,
+                )
+            else:
+                logger.warning("Clamp creation failed")
+        except Exception as e:
+            logger.error("Error creating metamold clamp: %s", e)
+
     def _resolve_shell_half(self, channel_result, *, half: int):
         """Return the most up-to-date version of a shell half.
 
@@ -1710,11 +1737,12 @@ class ResinChannelsWorker(QThread):
                 skip_inlet_hole=self.merge_plug,
             )
 
-            # Post-processing: shell holes → plug → silicone holes → notches
+            # Post-processing: shell holes → plug → silicone holes → notches → clamp
             self._step_drill_shell_holes(channel_result)
             self._step_create_plug(channel_result)
             self._step_silicone_pour_holes(channel_result)
             self._step_alignment_notches(channel_result, other_half)
+            self._step_create_clamp(channel_result)
 
             # Finalise
             self._attach_stats(channel_result)
@@ -1744,6 +1772,7 @@ class ExportWorker(QThread):
         hull_mesh=None,
         part_mesh=None,
         model_name: str = "Unknown",
+        clamp_mesh=None,
     ):
         super().__init__()
         self.export_dir = export_dir
@@ -1755,6 +1784,7 @@ class ExportWorker(QThread):
         self.hull_mesh = hull_mesh
         self.part_mesh = part_mesh
         self.model_name = model_name
+        self.clamp_mesh = clamp_mesh
     
     def run(self):
         try:
@@ -1771,6 +1801,7 @@ class ExportWorker(QThread):
                 hull_mesh=self.hull_mesh,
                 part_mesh=self.part_mesh,
                 model_name=self.model_name,
+                clamp_mesh=self.clamp_mesh,
             )
             
             self.progress.emit("Export complete")
@@ -4474,6 +4505,7 @@ class DisplayOptionsPanel(QFrame):
     show_metamold_half_1_with_part_changed = pyqtSignal(bool)  # Toggle metamold half 1 with part added
     show_metamold_half_2_with_part_changed = pyqtSignal(bool)  # Toggle metamold half 2 with part added
     show_resin_plug_changed = pyqtSignal(bool)  # Toggle resin pouring plug (yellow)
+    show_metamold_clamp_changed = pyqtSignal(bool)  # Toggle metamold clamp (teal)
 
     # Individual feature type visibility signals
     # Target mesh features:
@@ -5035,7 +5067,14 @@ class DisplayOptionsPanel(QFrame):
         self.show_resin_plug_cb.stateChanged.connect(lambda s: self.show_resin_plug_changed.emit(s == Qt.CheckState.Checked.value))
         self.show_resin_plug_cb.hide()
         layout.addWidget(self.show_resin_plug_cb)
-        
+
+        # Metamold clamp (teal) checkbox
+        self.show_metamold_clamp_cb = QCheckBox('Metamold Clamp (Teal)')
+        self.show_metamold_clamp_cb.setChecked(True)
+        self.show_metamold_clamp_cb.stateChanged.connect(lambda s: self.show_metamold_clamp_changed.emit(s == Qt.CheckState.Checked.value))
+        self.show_metamold_clamp_cb.hide()
+        layout.addWidget(self.show_metamold_clamp_cb)
+
         # Store reference to feature debug data (set externally)
         self._feature_debug_data = None
         self._mesh_viewer = None
@@ -5348,6 +5387,14 @@ class DisplayOptionsPanel(QFrame):
             self.show_resin_plug_cb.setChecked(True)
         else:
             self.show_resin_plug_cb.hide()
+
+    def show_metamold_clamp_option(self, show: bool = True):
+        """Show or hide the metamold clamp checkbox."""
+        if show:
+            self.show_metamold_clamp_cb.show()
+            self.show_metamold_clamp_cb.setChecked(True)
+        else:
+            self.show_metamold_clamp_cb.hide()
 
     def eventFilter(self, watched, event):
         """Resize panel to match parent height when parent resizes."""
@@ -5911,7 +5958,10 @@ class MainWindow(QMainWindow):
         self.display_options.show_resin_plug_changed.connect(
             self._on_toggle_resin_plug
         )
-        
+        self.display_options.show_metamold_clamp_changed.connect(
+            self._on_toggle_metamold_clamp
+        )
+
         return wrapper
     
     def _on_triangle_debug_mode_changed(self, enabled: bool):
@@ -7027,6 +7077,10 @@ class MainWindow(QMainWindow):
         """Toggle visibility of the resin pouring plug."""
         self.mesh_viewer.set_resin_plug_visible(show)
 
+    def _on_toggle_metamold_clamp(self, show: bool):
+        """Toggle visibility of the metamold clamp."""
+        self.mesh_viewer.set_metamold_clamp_visible(show)
+
     # =========================================================================
     # METAMOLD STEP
     # =========================================================================
@@ -7815,6 +7869,14 @@ class MainWindow(QMainWindow):
             else:
                 self.resin_channels_stats.add_row('Hollowing: not applied')
 
+            if result.clamp_created and result.clamp_mesh is not None:
+                self.resin_channels_stats.add_row(
+                    f'Clamp: {len(result.clamp_mesh.vertices):,} verts, '
+                    f'{len(result.clamp_mesh.faces):,} faces'
+                )
+            else:
+                self.resin_channels_stats.add_row('Clamp: not created')
+
             if result.mesh is not None:
                 self.resin_channels_stats.add_row(f'Result mesh: {len(result.mesh.vertices):,} verts, {len(result.mesh.faces):,} faces')
 
@@ -7971,6 +8033,17 @@ class MainWindow(QMainWindow):
                     pass
                 logger.info("Plug merged into metamold — no separate plug actor")
             
+            # Show metamold clamp if created
+            if channel_result.clamp_created and channel_result.clamp_mesh is not None:
+                try:
+                    self.mesh_viewer.show_metamold_clamp(channel_result.clamp_mesh)
+                    self.display_options.show_metamold_clamp_option(True)
+                    logger.info("Metamold clamp displayed in teal")
+                except Exception as e:
+                    logger.warning(f"Could not display metamold clamp: {e}")
+            else:
+                self.display_options.show_metamold_clamp_option(False)
+
             logger.info(f"Resin channels created in half {channel_result.mold_half}: "
                        f"{channel_result.n_local_channels} local + {channel_result.n_global_channels} global channels "
                        f"in {channel_result.computation_time_ms:.0f}ms")
@@ -8234,6 +8307,11 @@ class MainWindow(QMainWindow):
 
         hull_mesh = self._hull_result.mesh if self._hull_result is not None else None
         part_mesh = self._current_mesh
+        clamp_mesh = (
+            self._resin_channel_result.clamp_mesh
+            if self._resin_channel_result is not None
+            else None
+        )
 
         self._export_worker = ExportWorker(
             export_dir=export_dir,
@@ -8245,6 +8323,7 @@ class MainWindow(QMainWindow):
             hull_mesh=hull_mesh,
             part_mesh=part_mesh,
             model_name=model_name,
+            clamp_mesh=clamp_mesh,
         )
         self._export_worker.progress.connect(self._on_export_progress)
         self._export_worker.complete.connect(self._on_export_complete)

@@ -6476,3 +6476,74 @@ class MeshViewer(QWidget):
             self._resin_plug_actor.SetVisibility(visible)
             self.plotter.update()
             logger.debug(f"Resin plug visibility set to {visible}")
+
+    # -----------------------------------------------------------------
+    # METAMOLD CLAMP
+    # -----------------------------------------------------------------
+
+    def show_metamold_clamp(self, mesh: 'trimesh.Trimesh'):
+        """Display the metamold clamp in teal.
+
+        Args:
+            mesh: The clamp mesh.
+        """
+        if not PYVISTA_AVAILABLE:
+            return
+
+        import pyvista as pv
+
+        self.remove_metamold_clamp()
+
+        if mesh is None or len(mesh.vertices) == 0:
+            logger.warning("No valid metamold clamp mesh to display")
+            return
+
+        self._metamold_clamp_mesh = mesh
+
+        try:
+            vertices = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.faces)
+            faces_pv = np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64)
+            pv_mesh = pv.PolyData(vertices, faces_pv.flatten())
+        except Exception as e:
+            logger.error(f"Failed to convert metamold clamp mesh to PyVista: {e}")
+            return
+
+        self._metamold_clamp_actor = self.plotter.add_mesh(
+            pv_mesh,
+            color='#00897B',  # Teal
+            opacity=0.75,
+            show_edges=True,
+            edge_color='#004D40',  # Dark teal
+            line_width=0.5,
+        )
+        self._metamold_clamp_visible = True
+        logger.info(f"Metamold clamp displayed: {len(vertices)} vertices, {len(faces)} faces")
+
+        self.plotter.update()
+
+    def remove_metamold_clamp(self):
+        """Remove metamold clamp from the display."""
+        if hasattr(self, '_metamold_clamp_actor') and self._metamold_clamp_actor is not None:
+            try:
+                self.plotter.remove_actor(self._metamold_clamp_actor)
+            except Exception:
+                pass
+            self._metamold_clamp_actor = None
+
+        if hasattr(self, '_metamold_clamp_mesh'):
+            self._metamold_clamp_mesh = None
+
+        self.plotter.update()
+
+    def set_metamold_clamp_visible(self, visible: bool):
+        """Set visibility of the metamold clamp.
+
+        Args:
+            visible: True to show, False to hide.
+        """
+        self._metamold_clamp_visible = visible
+        if hasattr(self, '_metamold_clamp_actor') and self._metamold_clamp_actor is not None:
+            self._metamold_clamp_actor.SetVisibility(visible)
+            self.plotter.update()
+            logger.debug(f"Metamold clamp visibility set to {visible}")
