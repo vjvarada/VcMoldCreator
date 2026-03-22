@@ -5986,7 +5986,7 @@ class MeshViewer(QWidget):
         self._metamold_prism_actor = self.plotter.add_mesh(
             pv_mesh,
             color='#4CAF50',  # Material Green
-            opacity=0.12,
+            opacity=0.2,
             show_edges=True,
             edge_color='#2E7D32',  # Dark Green
             line_width=1.0,
@@ -6061,7 +6061,7 @@ class MeshViewer(QWidget):
         self._metamold_cavity_actor = self.plotter.add_mesh(
             pv_mesh,
             color='#81C784',  # Light Green
-            opacity=0.12,
+            opacity=0.2,
             show_edges=True,
             edge_color='#388E3C',  # Green
             line_width=0.5,
@@ -6139,7 +6139,7 @@ class MeshViewer(QWidget):
         self._metamold_half_1_actor = self.plotter.add_mesh(
             pv_mesh,
             color='#66BB6A',  # Green 400
-            opacity=0.15,
+            opacity=0.2,
             show_edges=True,
             edge_color='#43A047',  # Green 600
             line_width=0.5,
@@ -6213,7 +6213,7 @@ class MeshViewer(QWidget):
         self._metamold_half_2_actor = self.plotter.add_mesh(
             pv_mesh,
             color='#AB47BC',  # Purple 400
-            opacity=0.15,
+            opacity=0.2,
             show_edges=True,
             edge_color='#8E24AA',  # Purple 600
             line_width=0.5,
@@ -6292,7 +6292,7 @@ class MeshViewer(QWidget):
         self._metamold_half_1_with_part_actor = self.plotter.add_mesh(
             pv_mesh,
             color='#00BCD4',  # Cyan 500
-            opacity=0.15,
+            opacity=0.2,
             show_edges=True,
             edge_color='#0097A7',  # Cyan 700
             line_width=0.5,
@@ -6367,7 +6367,7 @@ class MeshViewer(QWidget):
         self._metamold_half_2_with_part_actor = self.plotter.add_mesh(
             pv_mesh,
             color='#FF9800',  # Orange 500
-            opacity=0.15,
+            opacity=0.2,
             show_edges=True,
             edge_color='#F57C00',  # Orange 700
             line_width=0.5,

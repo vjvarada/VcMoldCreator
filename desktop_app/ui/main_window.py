@@ -3353,6 +3353,12 @@ class CombinedSurfaceSmoothingWorker(QThread):
             if fill_result.fill_triangles_added > 0:
                 self.progress.emit(f"{label}: Created collar: "
                                  f"{fill_result.fill_triangles_added} triangles")
+                # Report self-intersection detection/repair
+                if fill_result.self_intersection_count > 0:
+                    self.progress.emit(
+                        f"{label}: Collar self-intersections detected: "
+                        f"{fill_result.self_intersection_count}, "
+                        f"repaired: {fill_result.self_intersections_repaired}")
                 if fill_result.mesh is not None:
                     current_mesh = fill_result.mesh
                     fill_face_indices = np.arange(

@@ -3168,6 +3168,10 @@ class FloatingEdgeFillingResult:
     # Indices of new vertices that should be constrained to part surface
     part_constrained_vertices: Optional[np.ndarray] = None
     
+    # Self-intersection detection results
+    self_intersection_count: int = 0
+    self_intersections_repaired: int = 0
+    
     processing_time_ms: float = 0.0
 
 
@@ -4157,6 +4161,89 @@ def _test_edges_inside_part(
     return np.all(inside_matrix, axis=0)  # (E,)  True = fully inside
 
 
+def _resolve_degenerate_collar(
+    vi: int,
+    vi_pos: np.ndarray,
+    part_mesh: trimesh.Trimesh,
+    part_face_normals: np.ndarray,
+    collar_depth: float,
+    vertex_normals: Dict[int, np.ndarray],
+    boundary_adj: Dict[int, set],
+    quad_vertex_collar: Dict[int, int],
+    vertices: list,
+    vertices_arr: np.ndarray,
+) -> np.ndarray:
+    """Try several fallback directions when the primary collar vertex is degenerate.
+
+    Called when ``_create_collar_vertex`` returns a position coincident with
+    the source vertex.  Tries, in order:
+
+    1. Negative vertex normal (into the part).
+    2. Direction copied from an adjacent quad collar vertex.
+    3. Closest-point inward surface normal with reduced depth.
+    4. Forced tiny offset (last resort).
+
+    Args:
+        vi: Vertex index.
+        vi_pos: Vertex position on the membrane boundary.
+        part_mesh: The part mesh.
+        part_face_normals: Pre-computed face normals of part_mesh.
+        collar_depth: Desired collar depth (mm).
+        vertex_normals: Pre-computed averaged vertex normals from membrane.
+        boundary_adj: Adjacency map among inner boundary vertices.
+        quad_vertex_collar: Mapping from vertex → collar index (Phase 1).
+        vertices: Mutable list of all vertex positions (collar verts appended here).
+        vertices_arr: Original membrane vertex positions as ndarray.
+
+    Returns:
+        Position for the collar vertex (may still be degenerate in very
+        rare pathological cases — caller should check).
+    """
+    # Fallback 1: push along negative vertex normal (into the part)
+    vtx_normal = vertex_normals.get(vi)
+    if vtx_normal is not None:
+        into_dir = -vtx_normal
+        into_dir = into_dir / (np.linalg.norm(into_dir) + 1e-10)
+        candidate = _create_collar_vertex(
+            vi_pos, part_mesh, part_face_normals, collar_depth, into_dir)
+        if np.linalg.norm(candidate - vi_pos) >= 1e-8:
+            return candidate
+
+    # Fallback 2: borrow direction from an adjacent vertex that already
+    # has a working collar (Phase 1 quad collars).
+    for adj_vi in boundary_adj.get(vi, set()):
+        adj_ci = quad_vertex_collar.get(adj_vi)
+        if adj_ci is not None and adj_ci < len(vertices):
+            adj_collar_pos = np.asarray(vertices[adj_ci], dtype=np.float64)
+            adj_src_pos = vertices_arr[adj_vi] if adj_vi < len(vertices_arr) else vi_pos
+            adj_dir = adj_collar_pos - adj_src_pos
+            adj_dir_len = np.linalg.norm(adj_dir)
+            if adj_dir_len > 1e-8:
+                candidate = _create_collar_vertex(
+                    vi_pos, part_mesh, part_face_normals,
+                    collar_depth, adj_dir / adj_dir_len)
+                if np.linalg.norm(candidate - vi_pos) >= 1e-8:
+                    return candidate
+
+    # Fallback 3: closest-point inward normal with half collar depth
+    try:
+        cp, _, cf = trimesh.proximity.closest_point(part_mesh, [vi_pos])
+        pfi = cf[0]
+        if pfi < len(part_face_normals):
+            into = -part_face_normals[pfi]
+            into = into / (np.linalg.norm(into) + 1e-10)
+            candidate = vi_pos + collar_depth * 0.5 * into
+            if np.linalg.norm(candidate - vi_pos) >= 1e-8:
+                return candidate
+    except Exception:
+        pass
+
+    # Fallback 4 (last resort): forced tiny offset.  Won't be inside the
+    # part in general, but Step 4b snap-to-surface will correct it.
+    logger.warning("Vertex %d: all collar fallbacks exhausted — forced offset", vi)
+    return vi_pos + np.array([0.0, 0.0, -collar_depth * 0.1])
+
+
 def _create_collar_vertex(
     vi_pos: np.ndarray,
     part_mesh: trimesh.Trimesh,
@@ -4407,6 +4494,382 @@ def _create_fan_triangles(
             triangles_created += 1
     
     return arc_verts_created, triangles_created
+
+
+# =============================================================================
+# COLLAR SELF-INTERSECTION DETECTION AND REPAIR
+# =============================================================================
+
+# Maximum repair iterations for self-intersection resolution
+_MAX_SELF_INTERSECTION_REPAIR_ITERATIONS = 5
+
+# After repair, if this many or fewer pairs remain, accept the result
+_ACCEPTABLE_REMAINING_INTERSECTIONS = 0
+
+
+def _detect_collar_self_intersections(
+    mesh: trimesh.Trimesh,
+    collar_face_start: int
+) -> Tuple[int, List[Tuple[int, int]]]:
+    """
+    Detect self-intersections involving collar faces.
+
+    Only checks pairs where at least one face is a collar face
+    (index >= collar_face_start). This is much cheaper than a full
+    mesh self-intersection test since we only care about the collar
+    region.
+
+    Args:
+        mesh: The combined membrane + collar mesh.
+        collar_face_start: Index of the first collar face.
+
+    Returns:
+        (count, pairs) — number of intersecting pairs and the pair list.
+    """
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    n_faces = len(faces)
+
+    if collar_face_start >= n_faces:
+        return 0, []
+
+    # Build vertex → face adjacency for adjacency filtering
+    vertex_to_faces: Dict[int, Set[int]] = {}
+    for fi, face in enumerate(faces):
+        for vi in face:
+            vi_int = int(vi)
+            if vi_int not in vertex_to_faces:
+                vertex_to_faces[vi_int] = set()
+            vertex_to_faces[vi_int].add(fi)
+
+    # Face adjacency: faces sharing a vertex are adjacent (non-intersecting
+    # by definition — they share geometry, they don't cross each other)
+    def are_adjacent(fi: int, fj: int) -> bool:
+        for vi in faces[fi]:
+            if fj in vertex_to_faces.get(int(vi), set()):
+                return True
+        return False
+
+    # Compute per-face bounding boxes
+    tri_verts = vertices[faces]  # (F, 3, 3)
+    bbox_min = tri_verts.min(axis=1)  # (F, 3)
+    bbox_max = tri_verts.max(axis=1)  # (F, 3)
+
+    intersecting_pairs: List[Tuple[int, int]] = []
+
+    # Only test collar faces against ALL other faces
+    collar_range = range(collar_face_start, n_faces)
+
+    for fi in collar_range:
+        fi_min = bbox_min[fi]
+        fi_max = bbox_max[fi]
+
+        # Test against every other face (both membrane and collar)
+        for fj in range(n_faces):
+            if fj == fi:
+                continue
+            # Only record each pair once (fi < fj or fi is the collar face)
+            if fj >= collar_face_start and fj <= fi:
+                continue  # will be tested when fj is the outer loop
+
+            # Quick bbox overlap check
+            if (fi_max[0] < bbox_min[fj][0] or bbox_max[fj][0] < fi_min[0] or
+                fi_max[1] < bbox_min[fj][1] or bbox_max[fj][1] < fi_min[1] or
+                fi_max[2] < bbox_min[fj][2] or bbox_max[fj][2] < fi_min[2]):
+                continue
+
+            # Skip adjacent faces
+            if are_adjacent(fi, fj):
+                continue
+
+            # Full triangle-triangle intersection test
+            tri_i = (vertices[faces[fi, 0]], vertices[faces[fi, 1]], vertices[faces[fi, 2]])
+            tri_j = (vertices[faces[fj, 0]], vertices[faces[fj, 1]], vertices[faces[fj, 2]])
+
+            if _triangles_intersect_fast(tri_i, tri_j):
+                pair = (min(fi, fj), max(fi, fj))
+                intersecting_pairs.append(pair)
+
+    # Deduplicate (shouldn't be needed but defensive)
+    intersecting_pairs = list(set(intersecting_pairs))
+
+    if intersecting_pairs:
+        logger.warning(f"Collar self-intersection: {len(intersecting_pairs)} "
+                      f"intersecting pairs detected among "
+                      f"{n_faces - collar_face_start} collar faces")
+    else:
+        logger.debug(f"Collar self-intersection check: clean "
+                    f"({n_faces - collar_face_start} collar faces)")
+
+    return len(intersecting_pairs), intersecting_pairs
+
+
+def _detect_and_repair_collar_self_intersections(
+    mesh: trimesh.Trimesh,
+    collar_face_start: int,
+    part_mesh: trimesh.Trimesh,
+    collar_depth: float
+) -> Tuple[trimesh.Trimesh, int, int]:
+    """Detect self-intersecting collar triangles and repair them.
+
+    Two-phase repair strategy (preferred order):
+
+    **Phase A — Vertex shrink** (iterated up to
+    ``_MAX_SELF_INTERSECTION_REPAIR_ITERATIONS``):
+      For each collar vertex involved in a self-intersecting face, move it
+      toward the nearest *membrane* vertex it is connected to.  This shrinks
+      the collar triangle(s) at that vertex, reducing overlap.  Each
+      iteration uses a progressively stronger shrink factor so that
+      vertices converge to the membrane boundary.
+
+    **Phase B — Face replacement** (if Phase A doesn't fully resolve):
+      For each remaining self-intersecting collar face, replace it with a
+      single collapsed triangle from the apex vertex (membrane vertex) to
+      the two adjacent membrane-boundary vertices.  This eliminates the
+      complex fan/quad geometry at that face while preserving coverage.
+      Only faces that still self-intersect are replaced; all other collar
+      geometry is kept.
+
+    Args:
+        mesh: The combined membrane + collar mesh.
+        collar_face_start: Index of the first collar face.
+        part_mesh: The part mesh for re-projection.
+        collar_depth: Original collar depth (mm).
+
+    Returns:
+        (repaired_mesh, initial_count, repaired_count)
+    """
+    # Initial detection
+    initial_count, pairs = _detect_collar_self_intersections(mesh, collar_face_start)
+
+    if initial_count == 0:
+        return mesh, 0, 0
+
+    vertices = mesh.vertices.copy()
+    faces = mesh.faces.copy()
+
+    # Identify collar-only vertices (not shared with original membrane)
+    collar_faces_arr = faces[collar_face_start:]
+    if len(collar_faces_arr) == 0:
+        return mesh, initial_count, 0
+
+    all_collar_verts = set(collar_faces_arr.flatten().tolist())
+    orig_verts_in_collar = (
+        set(faces[:collar_face_start].flatten().tolist())
+        if collar_face_start > 0 else set()
+    )
+    collar_only_verts = all_collar_verts - orig_verts_in_collar
+
+    # Build collar-vertex → connected membrane-vertex mapping
+    # A collar-only vertex is connected to a membrane vertex if they share
+    # a collar face.  Among those, pick the original membrane vertex
+    # (index in orig_verts_in_collar) so we know where to shrink toward.
+    collar_to_membrane: Dict[int, int] = {}
+    for fi in range(collar_face_start, len(faces)):
+        face = faces[fi]
+        membrane_vis = [int(v) for v in face if int(v) in orig_verts_in_collar]
+        collar_vis = [int(v) for v in face if int(v) in collar_only_verts]
+        if membrane_vis:
+            for cv in collar_vis:
+                if cv not in collar_to_membrane:
+                    collar_to_membrane[cv] = membrane_vis[0]
+
+    remaining_count = initial_count
+    total_repaired = 0
+
+    # =====================================================================
+    # Phase A: Iterative vertex shrink
+    # =====================================================================
+    for repair_iter in range(_MAX_SELF_INTERSECTION_REPAIR_ITERATIONS):
+        if remaining_count <= _ACCEPTABLE_REMAINING_INTERSECTIONS:
+            break
+
+        bad_collar_faces = set()
+        for fi, fj in pairs:
+            if fi >= collar_face_start:
+                bad_collar_faces.add(fi)
+            if fj >= collar_face_start:
+                bad_collar_faces.add(fj)
+
+        verts_to_fix = set()
+        for fi in bad_collar_faces:
+            if fi < len(faces):
+                for vi in faces[fi]:
+                    vi_int = int(vi)
+                    if vi_int in collar_only_verts:
+                        verts_to_fix.add(vi_int)
+
+        if not verts_to_fix:
+            break
+
+        # Shrink factor increases each iteration: 0.5, 0.7, 0.85, 0.93, 0.98
+        shrink_factors = [0.5, 0.7, 0.85, 0.93, 0.98]
+        shrink_factor = shrink_factors[min(repair_iter, len(shrink_factors) - 1)]
+        fix_list = sorted(verts_to_fix)
+        n_shrunk = 0
+
+        for vi in fix_list:
+            membrane_vi = collar_to_membrane.get(vi)
+            if membrane_vi is not None:
+                # Move collar vertex toward its membrane anchor
+                src_pos = vertices[membrane_vi]
+                collar_pos = vertices[vi]
+                vertices[vi] = src_pos + (1.0 - shrink_factor) * (collar_pos - src_pos)
+                n_shrunk += 1
+            else:
+                # No membrane anchor found — fall back to closest-point
+                # re-projection with reduced depth
+                try:
+                    cp, _, cf = trimesh.proximity.closest_point(
+                        part_mesh, [vertices[vi]])
+                    reduced_depth = collar_depth * (0.3 / (repair_iter + 1))
+                    pfi = cf[0]
+                    if pfi < len(part_mesh.face_normals):
+                        pn = part_mesh.face_normals[pfi]
+                        pn_len = np.linalg.norm(pn)
+                        if pn_len > 1e-10:
+                            into = -pn / pn_len
+                            vertices[vi] = cp[0] + reduced_depth * into
+                        else:
+                            vertices[vi] = cp[0]
+                    else:
+                        vertices[vi] = cp[0]
+                    n_shrunk += 1
+                except Exception:
+                    pass
+
+        repaired_mesh = trimesh.Trimesh(
+            vertices=vertices, faces=faces, process=False)
+        repaired_mesh.fix_normals()
+
+        new_count, pairs = _detect_collar_self_intersections(
+            repaired_mesh, collar_face_start)
+
+        previously_remaining = remaining_count
+        remaining_count = new_count
+        iter_repaired = previously_remaining - remaining_count
+
+        logger.info(
+            f"Collar SI repair iter {repair_iter + 1}: shrunk "
+            f"{n_shrunk} vertices (factor={shrink_factor:.1f}), "
+            f"intersections {previously_remaining} → {remaining_count} "
+            f"(fixed {iter_repaired})")
+
+        if iter_repaired > 0:
+            total_repaired += iter_repaired
+
+        mesh = repaired_mesh
+        vertices = mesh.vertices.copy()
+
+    # =====================================================================
+    # Phase B: Collapse remaining self-intersecting collar faces
+    # =====================================================================
+    # For each remaining self-intersecting collar face, aggressively
+    # collapse collar vertices toward their membrane anchors.  This makes
+    # the faces very small (near-degenerate) so they cannot self-intersect
+    # with distant geometry.  Faces are preserved (not removed) to
+    # avoid creating gaps.
+    if remaining_count > 0:
+        bad_face_set = set()
+        for fi, fj in pairs:
+            if fi >= collar_face_start:
+                bad_face_set.add(fi)
+            if fj >= collar_face_start:
+                bad_face_set.add(fj)
+
+        if bad_face_set:
+            # Phase B-1: Aggressive vertex collapse (99% toward anchor)
+            bad_collar_verts = set()
+            for fi in bad_face_set:
+                if fi < len(faces):
+                    for vi in faces[fi]:
+                        vi_int = int(vi)
+                        if vi_int in collar_only_verts:
+                            bad_collar_verts.add(vi_int)
+
+            collapse_count = 0
+            for vi in sorted(bad_collar_verts):
+                membrane_vi = collar_to_membrane.get(vi)
+                if membrane_vi is not None:
+                    src_pos = vertices[membrane_vi]
+                    collar_pos = vertices[vi]
+                    # Move 99% toward anchor — face becomes tiny but persists
+                    vertices[vi] = src_pos + 0.01 * (collar_pos - src_pos)
+                    collapse_count += 1
+                else:
+                    # No anchor — project to closest point on part surface
+                    try:
+                        cp, _, _ = trimesh.proximity.closest_point(
+                            part_mesh, [vertices[vi]])
+                        vertices[vi] = cp[0]
+                        collapse_count += 1
+                    except Exception:
+                        pass
+
+            if collapse_count > 0:
+                mesh = trimesh.Trimesh(
+                    vertices=vertices,
+                    faces=faces,
+                    process=False)
+                mesh.fix_normals()
+
+                new_count, pairs = _detect_collar_self_intersections(
+                    mesh, collar_face_start)
+
+                resolved_b1 = remaining_count - new_count
+                if resolved_b1 > 0:
+                    total_repaired += resolved_b1
+                remaining_count = new_count
+
+                logger.info(
+                    f"Collar SI Phase B-1: collapsed {collapse_count} "
+                    f"vertices (99%% toward anchor), "
+                    f"intersections → {remaining_count} "
+                    f"(fixed {resolved_b1})")
+
+                vertices = mesh.vertices.copy()
+                faces = mesh.faces.copy()
+
+        # Phase B-2: If still intersecting, remove as last resort
+        if remaining_count > 0:
+            bad_face_set2 = set()
+            for fi, fj in pairs:
+                if fi >= collar_face_start:
+                    bad_face_set2.add(fi)
+                if fj >= collar_face_start:
+                    bad_face_set2.add(fj)
+
+            if bad_face_set2:
+                faces_list = faces.tolist()
+                for fi in sorted(bad_face_set2):
+                    if fi < len(faces_list):
+                        faces_list[fi] = None
+
+                new_faces = [f for f in faces_list if f is not None]
+                n_removed = len(faces_list) - len(new_faces)
+
+                mesh = trimesh.Trimesh(
+                    vertices=vertices,
+                    faces=np.array(new_faces, dtype=np.int64),
+                    process=False)
+                mesh.remove_unreferenced_vertices()
+                mesh.fix_normals()
+
+                total_repaired += remaining_count
+                if n_removed > 0:
+                    logger.warning(
+                        f"Collar SI Phase B-2: removed {n_removed} "
+                        f"unrepairable collar faces as last resort")
+                remaining_count = 0
+            remaining_count = 0
+
+    total_resolved = initial_count - remaining_count
+    if total_resolved > 0:
+        logger.info(
+            f"Collar self-intersection repair: {initial_count} detected, "
+            f"{total_resolved} resolved")
+
+    return mesh, initial_count, total_resolved
 
 
 # =============================================================================
@@ -4847,6 +5310,14 @@ def create_robust_collar_extension(
                          "using closest-point fallback", vi)
             collar_pt = _create_collar_vertex(vi_pos, part_mesh, part_face_normals, collar_depth, None)
         
+        # Guard against degenerate collar (coincident with source vertex).
+        # Phase 1 must always produce a collar vertex for strip continuity.
+        if np.linalg.norm(collar_pt - vi_pos) < 1e-8:
+            collar_pt = _resolve_degenerate_collar(
+                vi, vi_pos, part_mesh, part_face_normals,
+                collar_depth, vertex_normals, boundary_adj,
+                quad_vertex_collar, vertices, vertices_arr)
+        
         collar_idx = len(vertices)
         vertices.append(collar_pt.copy())
         quad_vertex_collar[vi] = collar_idx
@@ -4913,9 +5384,18 @@ def create_robust_collar_extension(
             
             collar_pt = _create_collar_vertex(
                 vi_pos, part_mesh, part_face_normals, collar_depth, collar_hint)
-            # Skip degenerate collar (coincident with source vertex)
+            # If degenerate (coincident with source vertex), try fallbacks
             if np.linalg.norm(collar_pt - vi_pos) < 1e-8:
-                continue
+                collar_pt = _resolve_degenerate_collar(
+                    vi, vi_pos, part_mesh, part_face_normals,
+                    collar_depth, vertex_normals, boundary_adj,
+                    quad_vertex_collar, vertices, vertices_arr)
+                # Final degenerate check — only skip if truly unresolvable
+                if np.linalg.norm(collar_pt - vi_pos) < 1e-8:
+                    logger.warning(
+                        "Phase 2: fan vertex %d still degenerate after "
+                        "all fallbacks — skipping", vi)
+                    continue
             collar_idx = len(vertices)
             vertices.append(collar_pt.copy())
             edge_endpoint_collar[edge_key][vi] = collar_idx
@@ -5056,6 +5536,94 @@ def create_robust_collar_extension(
         logger.warning(
             f"{edges_without_quads}/{len(inner_boundary_edges)} inner boundary "
             "edges did not receive collar quads (missing collar vertices)")
+    
+    # =========================================================================
+    # STEP 5b: Patch edges that didn't receive quads
+    # =========================================================================
+    # When a collar vertex is missing for one endpoint of an edge, the quad
+    # is skipped entirely.  Instead, create the collar vertex on-the-fly
+    # using _resolve_degenerate_collar and add the quad.  This guarantees
+    # every inner boundary edge gets collar geometry.
+    
+    if edges_without_quads > 0:
+        patched_count = 0
+        for v0, v1 in inner_boundary_edges:
+            edge_key = (min(v0, v1), max(v0, v1))
+            collar_data = edge_endpoint_collar.get(edge_key, {})
+            c0, c1 = collar_data.get(v0), collar_data.get(v1)
+            
+            if c0 is not None and c1 is not None:
+                continue  # already has a quad
+            
+            # Create missing collar vertex/vertices
+            for vi, ci in [(v0, c0), (v1, c1)]:
+                if ci is not None:
+                    continue
+                vi_pos = vertices_arr[vi]
+                # Try the phase-1/phase-2 approach first
+                collar_pt = _create_collar_vertex(
+                    vi_pos, part_mesh, part_face_normals, collar_depth, None)
+                if np.linalg.norm(collar_pt - vi_pos) < 1e-8:
+                    collar_pt = _resolve_degenerate_collar(
+                        vi, vi_pos, part_mesh, part_face_normals,
+                        collar_depth, vertex_normals, boundary_adj,
+                        quad_vertex_collar, vertices, vertices_arr)
+                if np.linalg.norm(collar_pt - vi_pos) < 1e-8:
+                    continue  # truly unresolvable (pathological)
+                new_ci = len(vertices)
+                vertices.append(collar_pt.copy())
+                collar_data[vi] = new_ci
+                edge_endpoint_collar[edge_key] = collar_data
+            
+            # Re-check after patching
+            c0, c1 = collar_data.get(v0), collar_data.get(v1)
+            if c0 is None or c1 is None:
+                continue
+            
+            v0_pos, v1_pos = vertices_arr[v0], vertices_arr[v1]
+            c0_pos = np.array(vertices[c0], dtype=np.float64)
+            c1_pos = np.array(vertices[c1], dtype=np.float64)
+            
+            vn0 = vertex_normals.get(v0, np.array([0.0, 0.0, 1.0]))
+            vn1 = vertex_normals.get(v1, np.array([0.0, 0.0, 1.0]))
+            avg_ref = vn0 + vn1
+            avg_ref_len = np.linalg.norm(avg_ref)
+            ref_normal = avg_ref / avg_ref_len if avg_ref_len > 1e-8 else np.array([0.0, 0.0, 1.0])
+            
+            # Create the quad (same logic as Step 5)
+            diag1 = [([v0, v1, c1], v1_pos - v0_pos, c1_pos - v0_pos),
+                     ([v0, c1, c0], c1_pos - v0_pos, c0_pos - v0_pos)]
+            diag2 = [([v0, v1, c0], v1_pos - v0_pos, c0_pos - v0_pos),
+                     ([v1, c1, c0], c1_pos - v1_pos, c0_pos - v1_pos)]
+            
+            best_diag = diag1
+            best_score = -2.0
+            for diag in (diag1, diag2):
+                score = 0.0
+                valid = True
+                for tri_v, e1, e2 in diag:
+                    tn = np.cross(e1, e2)
+                    tn_len = np.linalg.norm(tn)
+                    if tn_len < 1e-10:
+                        valid = False
+                        break
+                    score += abs(np.dot(tn / tn_len, ref_normal))
+                if valid and score > best_score:
+                    best_score = score
+                    best_diag = diag
+            
+            for tri_verts, ref_e1, ref_e2 in best_diag:
+                tri_n = np.cross(ref_e1, ref_e2)
+                if np.linalg.norm(tri_n) > 1e-10:
+                    if np.dot(tri_n, ref_normal) >= 0:
+                        faces.append(tri_verts)
+                    else:
+                        faces.append([tri_verts[0], tri_verts[2], tri_verts[1]])
+            patched_count += 1
+        
+        if patched_count > 0:
+            logger.info(f"Step 5b: patched {patched_count} edges that were "
+                       f"missing collar quads")
     
     # =========================================================================
     # STEP 6: Create fan triangles at all fan vertices
@@ -5698,11 +6266,39 @@ def create_robust_collar_extension(
         result.vertices = np.array(membrane_mesh.vertices)
         result.faces = np.array(membrane_mesh.faces)
     
+    # =========================================================================
+    # STEP 7b: Detect and repair collar self-intersections
+    # =========================================================================
+    # Collar triangles (fans, quads, extension strips) can self-intersect on
+    # complex geometry — especially at sharp corners where fan arcs from
+    # adjacent vertices overlap, or where iterative extension quads twist.
+    #
+    # Strategy:
+    #   1. Detect self-intersecting pairs among collar faces only
+    #      (faces with index >= n_orig_faces).
+    #   2. For each intersecting pair, identify the collar vertices involved
+    #      and re-project them to the closest point on the part surface.
+    #   3. After re-projection, re-check. If self-intersections remain,
+    #      remove the offending faces entirely (safe because collar faces
+    #      are cosmetic extensions, not structural membrane geometry).
+    #   4. Record counts in result for UI reporting.
+    
+    if result.mesh is not None and result.fill_triangles_added > 0:
+        result.mesh, result.self_intersection_count, result.self_intersections_repaired = \
+            _detect_and_repair_collar_self_intersections(
+                result.mesh, n_orig_faces, part_mesh, collar_depth)
+        result.vertices = np.array(result.mesh.vertices)
+        result.faces = np.array(result.mesh.faces)
+        # Update fill count in case faces were removed
+        result.fill_triangles_added = len(result.faces) - n_orig_faces
+    
     result.processing_time_ms = (time.time() - start) * 1000
     
     logger.info(f"Collar extension complete: {len(inner_boundary_edges)} edges, "
                f"{quads_created} quads, {total_fan_tris} fan triangles, "
-               f"{result.new_vertices_added} new vertices in {result.processing_time_ms:.1f}ms")
+               f"{result.new_vertices_added} new vertices"
+               f"{f', {result.self_intersections_repaired} self-intersections repaired' if result.self_intersections_repaired > 0 else ''}"
+               f" in {result.processing_time_ms:.1f}ms")
     
     return result
 

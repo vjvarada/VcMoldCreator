@@ -1858,40 +1858,41 @@ def build_metamold_halves_manifold_space(
            Optional[trimesh.Trimesh], float, bool]:
     """Build both metamold halves in a single manifold3d session.
 
-    Performs the entire CSG chain — cavity creation, blade split, and part
-    union — without leaving manifold3d space.
+    Uses sequential CSG subtraction: first subtract the (deflated) part
+    from the prism to create a cavity, then subtract the cutting blade
+    to split the cavity into two halves.
 
     To avoid manifold3d's coplanar-face shard artifacts (GitHub #1430,
-    #1359), the part mesh used for the cavity subtraction is **deflated**
-    by 1 µm (``CSG_PART_DEFLATION_MM``) via MeshLib's signed-distance
-    offset.  This makes the cavity fractionally larger than the actual
-    part, so the subsequent ``half + part`` union has genuine geometric
-    overlap instead of perfectly coincident surfaces.  The 1 µm gap is
-    far below any 3D printer's resolution and is invisible in the final
-    mold.
+    #1359), the part mesh used for the cavity is **deflated** by
+    1 µm (``CSG_PART_DEFLATION_MM``).  This makes the cavity
+    fractionally larger than the actual part, so the subsequent
+    ``half + part`` union (using the *original* un-deflated part) has
+    genuine geometric overlap.
 
-    Pipeline executed in manifold3d space:
-        1. ``cavity = prism - deflated_part``   (slightly larger cavity)
-        2. ``cut_cavity = cavity - blade``
-        3. ``components = cut_cavity.decompose()``
-        4. Classify upper / lower halves by pouring-direction centroid
-        5. ``half_with_part = component + part``  (original size → overlap)
+    Pipeline executed in manifold3d space::
 
-    When *combined_part_mesh* is provided (part + thickened secondary), the
-    union uses that instead of the bare part mesh.  The cavity subtraction
+        1. ``cavity = prism − deflated_part``
+        2. ``cut    = cavity − blade``
+        3. ``components = cut.decompose()``
+        4. Classify upper / lower by pouring-direction centroid
+        5. ``half_with_part = component + part`` (original size → overlap)
+
+    When *combined_part_mesh* is provided (part + thickened secondary),
+    the final union uses that instead of the bare part mesh.  The cavity
     always uses the bare (deflated) part so the cavity shape matches the
     original part.
 
     Args:
         prism_mesh:          Raw prism trimesh.
-        part_mesh:           Original part trimesh (used deflated for cavity,
-                             original for union when combined_part_mesh is
-                             None).
+        part_mesh:           Original part trimesh (used deflated for the
+                             cavity, original for union when
+                             combined_part_mesh is None).
         membrane_mesh:       Parting surface / outer collar mesh.
         pouring_direction:   Unit vector defining "upper" direction.
         blade_thickness:     Cutting blade thickness in mm (default 0.001).
         combined_part_mesh:  Optional part + thickened secondary surface.
-                             When None, ``part_mesh`` is used for the union.
+                             When None, ``part_mesh`` is used for the
+                             final union.
 
     Returns:
         (half_1_with_part, half_2_with_part, blade_trimesh, elapsed_ms, success)
@@ -1914,10 +1915,12 @@ def build_metamold_halves_manifold_space(
             membrane_mesh, direction, blade_thickness)
         save_debug_mesh(blade_trimesh, 'msp_cutting_blade')
 
-        # ---- 1. Deflate the part mesh for cavity subtraction ----
-        # A tiny inward offset (1 µm) makes the cavity fractionally larger
-        # than the actual part so that the union at step 6 has genuine
-        # geometric overlap instead of perfectly coincident faces.
+        # ---- 1. Deflate the part mesh for the cavity ----
+        # A tiny inward offset (1 µm) makes the cavity fractionally
+        # larger than the original part.  When we union the original
+        # (un-deflated) part back into each half (step 7), there is
+        # genuine geometric overlap instead of perfectly coincident
+        # faces — avoiding manifold3d's coplanar-shard artifacts.
         deflated_part_mesh = _deflate_part_for_csg(part_mesh)
         if deflated_part_mesh is not None:
             cavity_part_mesh = deflated_part_mesh
@@ -1944,16 +1947,18 @@ def build_metamold_halves_manifold_space(
         else:
             combined_m = part_m  # original size for union
 
-        # ---- 3. Cavity: prism - deflated_part  (manifold space) ----
-        logger.info("[manifold-space] CSG: cavity = prism - deflated_part ...")
+        # ---- 3. Create cavity: prism − deflated_part ----
+        logger.info("[manifold-space] CSG: cavity = prism − deflated_part ...")
         cavity_m = prism_m - cavity_part_m
-        logger.info("[manifold-space]   cavity: %d verts, %d tris",
-                    cavity_m.num_vert(), cavity_m.num_tri())
+        logger.info("[manifold-space]   cavity: %d verts, %d tris, vol=%.2f",
+                    cavity_m.num_vert(), cavity_m.num_tri(), cavity_m.volume())
+        save_debug_mesh(
+            _manifold_to_trimesh(cavity_m, 'msp_cavity'), 'msp_cavity')
 
-        # ---- 4. Blade split: cavity - blade  (manifold space) ----
-        logger.info("[manifold-space] CSG: cut = cavity - blade ...")
+        # ---- 4. Split cavity with blade: cavity − blade ----
+        logger.info("[manifold-space] CSG: cut = cavity − blade ...")
         cut_m = cavity_m - blade_m
-        logger.info("[manifold-space]   cut: %d verts, %d tris",
+        logger.info("[manifold-space]   cut result: %d verts, %d tris",
                     cut_m.num_vert(), cut_m.num_tri())
 
         # ---- 5. Decompose into connected components (stays in manifold
@@ -1965,7 +1970,8 @@ def build_metamold_halves_manifold_space(
                         "vol=%.2f", i, c.num_vert(), c.num_tri(), c.volume())
 
         if len(components) < 2:
-            logger.warning("[manifold-space] Blade did not produce 2 components")
+            logger.warning("[manifold-space] Cutter did not split prism into "
+                           "2 components (got %d)", len(components))
             elapsed_ms = (time.time() - start_time) * 1000
             if len(components) == 1:
                 mesh_out = _manifold_to_trimesh(components[0], 'msp_single_component')
@@ -2001,8 +2007,8 @@ def build_metamold_halves_manifold_space(
                     lower_m.num_tri(), min(proj_a, proj_b))
 
         # ---- 7. Union each half with the ORIGINAL part (manifold space).
-        #         The cavity was cut with the deflated part, so the original
-        #         part is ~1 µm larger → genuine overlap → no coplanar shards.
+        #         The cavity used the deflated part, so the original part
+        #         is ~1 µm larger → genuine overlap → no coplanar shards.
         logger.info("[manifold-space] CSG: upper + part ...")
         upper_result_m = upper_m + combined_m
         logger.info("[manifold-space]   upper+part: %d verts, %d tris, vol=%.2f",
@@ -2015,7 +2021,7 @@ def build_metamold_halves_manifold_space(
                     lower_result_m.num_vert(), lower_result_m.num_tri(),
                     lower_result_m.volume())
 
-        # ---- 7. Convert final results to trimesh ----
+        # ---- 8. Convert final results to trimesh ----
         upper_trimesh = _manifold_to_trimesh(upper_result_m, 'msp_upper_with_part')
         lower_trimesh = _manifold_to_trimesh(lower_result_m, 'msp_lower_with_part')
 
@@ -2047,34 +2053,32 @@ def split_shell_with_membrane(
     prism_mesh: Optional[trimesh.Trimesh] = None,
     subtractor_mesh: Optional[trimesh.Trimesh] = None,
 ) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], float, bool]:
-    """
-    Split the shell into two manifold halves using the membrane as a cutting blade.
+    """Split the shell into two manifold halves using the membrane as a
+    cutting blade.
 
-    Performs the full CSG chain  (prism - subtractor) - blade  in a single
-    uninterrupted manifold3d session when ``prism_mesh`` and ``subtractor_mesh``
-    are supplied.  This avoids the manifold3d → trimesh → manifold3d round-trip
-    that rebuilds internal topology and causes different (incorrect) CSG results.
-
-    When the optional meshes are not provided the function falls back to the
-    legacy  shell_with_cavity - blade  path (kept for backward compatibility).
+    Uses sequential CSG subtraction: ``shell_with_cavity − blade``.
+    When ``prism_mesh`` and ``subtractor_mesh`` are supplied, the
+    function can use ``(prism − subtractor) − blade`` for a cleaner
+    manifold3d chain without intermediate trimesh round-trips.
 
     Args:
-        shell_with_cavity: The shell mesh (prism - subtractor), used for display
-                           and as the fallback CSG operand.
-        membrane: The cutting membrane (outer collar extended parting surface).
+        shell_with_cavity: The shell mesh (prism − subtractor), used as
+                           the CSG operand.
+        membrane: The cutting membrane (outer collar extended parting
+                  surface).
         pouring_direction: Unit vector defining the "upper" direction.
-        blade_thickness: Thickness of the cutting blade (default: 0.001 mm).
-        prism_mesh: Optional raw prism trimesh.  When provided together with
-                    ``subtractor_mesh`` the full chain is computed in one
-                    manifold3d session.
-        subtractor_mesh: Optional hull or part mesh that was subtracted from the
-                         prism to form the shell cavity.
+        blade_thickness: Thickness of the cutting blade (default 0.001 mm).
+        prism_mesh: Optional raw prism trimesh.  When provided together
+                    with ``subtractor_mesh`` the full manifold3d chain
+                    ``(prism − subtractor) − blade`` is used.
+        subtractor_mesh: Optional hull or part mesh that was subtracted from
+                         the prism to form the shell cavity.
 
     Returns:
-        Tuple of (shell_half_1, shell_half_2, blade_mesh, computation_time_ms, success)
-        shell_half_1 is the half in the positive pouring direction (upper)
-        shell_half_2 is the half in the negative pouring direction (lower)
-        blade_mesh is the thin cutting blade used for the split
+        (shell_half_1, shell_half_2, blade_mesh, computation_time_ms, success)
+        shell_half_1 is the half in the positive pouring direction (upper).
+        shell_half_2 is the half in the negative pouring direction (lower).
+        blade_mesh is the thin cutting blade used for the split.
     """
     start_time = time.time()
     
@@ -2154,18 +2158,25 @@ def split_shell_with_membrane(
         logger.info("Converting meshes to manifold...")
         blade_manifold = _trimesh_to_manifold(blade, 'cutting_blade')
 
-        # Step 3: CSG subtraction
-        # Preferred: full chain (prism - subtractor) - blade in one manifold3d
-        # session.  This avoids the manifold3d→trimesh→manifold3d round-trip
-        # which rebuilds internal topology and causes incorrect split results.
+        # Step 3: CSG subtraction — sequential approach
+        # When prism + subtractor are supplied, perform the full
+        # manifold3d chain (prism − subtractor) − blade for a cleaner
+        # result without intermediate trimesh round-trips.
         use_chain = prism_mesh is not None and subtractor_mesh is not None
         if use_chain:
-            logger.info("Performing CSG chain: (prism - subtractor) - blade (no round-trip)...")
-            prism_manifold    = _trimesh_to_manifold(prism_mesh,     'prism')
-            subtractor_manifold = _trimesh_to_manifold(subtractor_mesh, 'subtractor')
-            cut_shell_manifold = (prism_manifold - subtractor_manifold) - blade_manifold
+            logger.info("Performing CSG: (prism − subtractor) − blade...")
+            prism_manifold      = _trimesh_to_manifold(prism_mesh,      'prism')
+            subtractor_manifold = _trimesh_to_manifold(subtractor_mesh,  'subtractor')
+
+            # Step 3a: Create cavity by subtracting subtractor from prism
+            cavity_manifold = prism_manifold - subtractor_manifold
+            logger.info("  cavity (prism − subtractor): %d verts, %d tris",
+                        cavity_manifold.num_vert(), cavity_manifold.num_tri())
+
+            # Step 3b: Split cavity with blade
+            cut_shell_manifold = cavity_manifold - blade_manifold
         else:
-            logger.info("Performing CSG subtraction: shell - blade (legacy path)...")
+            logger.info("Performing CSG subtraction: shell − blade...")
             shell_manifold = _trimesh_to_manifold(shell_with_cavity, 'shell_with_cavity')
             cut_shell_manifold = shell_manifold - blade_manifold
 
