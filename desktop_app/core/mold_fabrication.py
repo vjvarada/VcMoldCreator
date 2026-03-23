@@ -48,7 +48,7 @@ DEFAULT_COLLAR_SUBDIVISIONS = 4  # Fan subdivisions at corners
 # Metamold clamp defaults
 CLAMP_WALL_THICKNESS_MM = 3.0     # Clamp shell wall thickness
 CLAMP_CLEARANCE_MM = 0.1          # Gap between clamp inner surface and metamold outer surface
-CLAMP_MIN_HEIGHT_MM = 10.0        # Minimum clamp height
+CLAMP_MIN_HEIGHT_MM = 20.0        # Minimum clamp height
 CLAMP_SLIT_WIDTH_MM = 5.0         # Width of the slit gap in the clamp wall
 CLAMP_TAB_LENGTH_MM = 20.0        # How far tabs extend outward from the clamp wall
 
@@ -544,7 +544,7 @@ def create_metamold_clamp(
     shell_half_2: Optional[trimesh.Trimesh] = None,
     metamold_half_1: Optional[trimesh.Trimesh] = None,
     metamold_half_2: Optional[trimesh.Trimesh] = None,
-    height_inset: float = 1.0,
+    height_inset: float = 10.0,
 ) -> MetamoldClampResult:
     """Create a single-piece clamp that wraps around the assembled metamold.
 
