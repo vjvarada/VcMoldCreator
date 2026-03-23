@@ -1663,9 +1663,25 @@ class ResinChannelsWorker(QThread):
         try:
             from core.mold_fabrication import create_metamold_clamp
 
+            # Resolve the most up-to-date shell halves
+            sh1 = self._resolve_shell_half(channel_result, half=1)
+            sh2 = self._resolve_shell_half(channel_result, half=2)
+
+            # Resolve the most up-to-date metamold halves (post-trim)
+            mm1 = (channel_result.notched_metamold_half_1
+                   if channel_result.notched_metamold_half_1 is not None
+                   else self.metamold_half_1_with_part)
+            mm2 = (channel_result.notched_metamold_half_2
+                   if channel_result.notched_metamold_half_2 is not None
+                   else self.metamold_half_2_with_part)
+
             clamp_result = create_metamold_clamp(
                 prism_result=self.prism_result,
                 parting_surface=self.blade_mesh,
+                shell_half_1=sh1,
+                shell_half_2=sh2,
+                metamold_half_1=mm1,
+                metamold_half_2=mm2,
             )
             if clamp_result.success and clamp_result.mesh is not None:
                 channel_result.clamp_mesh = clamp_result.mesh

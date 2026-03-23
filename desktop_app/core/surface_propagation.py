@@ -1677,18 +1677,6 @@ def smooth_membrane_with_boundary_reprojection(
     # pre-classifying all vertices on target meshes.
     # Hull and primary boundaries are smoothed normally without feature detection.
     
-    # These variables are kept for backward compatibility with visualization
-    # but are no longer used for corner detection during smoothing
-    part_feature_types = None
-    part_sharp_edge_info = None
-    hull_feature_types = None
-    hull_sharp_edge_info = None
-    primary_feature_types = None
-    primary_sharp_edge_info = None
-    
-    # Compute bounded search radius for reprojection
-    search_radius = mesh_scale * MAX_REPROJECT_DISTANCE_FRACTION
-    
     # === Pre-compute corner vertices that should be kept fixed ===
     # Per paper Section 4.4: corners should be "kept fixed" during smoothing
     # 
@@ -2023,39 +2011,30 @@ def smooth_membrane_with_boundary_reprojection(
         
         # Re-project to part mesh M (excluding concave corners)
         if len(part_boundary_indices) > 0 and part_mesh is not None:
-            if part_feature_types is not None:
-                # Use feature-aware reprojection to skip concave corners
-                vertices = reproject_with_feature_awareness(
-                    vertices=vertices,
-                    boundary_indices=part_boundary_indices,
-                    target_mesh=part_mesh,
-                    feature_types=part_feature_types,
-                    sharp_edge_info=part_sharp_edge_info,
-                    search_radius=search_radius
-                )
-            elif part_proximity is not None:
-                # Fallback to standard reprojection
+            if part_proximity is not None:
                 part_positions = vertices[part_boundary_indices]
                 closest_pts, _, _ = part_proximity.on_surface(part_positions)
-                vertices[part_boundary_indices] = closest_pts
+                # Guard against NaN/Inf from degenerate geometry
+                valid_mask = np.all(np.isfinite(closest_pts), axis=1)
+                if np.all(valid_mask):
+                    vertices[part_boundary_indices] = closest_pts
+                else:
+                    n_invalid = int(np.sum(~valid_mask))
+                    logger.warning(f"Part reprojection: {n_invalid} vertices returned NaN/Inf, keeping original positions")
+                    vertices[part_boundary_indices[valid_mask]] = closest_pts[valid_mask]
         
         # Re-project to hull mesh ∂H (excluding concave corners)
         if len(hull_boundary_indices) > 0 and hull_mesh is not None:
-            if hull_feature_types is not None:
-                # Use feature-aware reprojection to skip concave corners
-                vertices = reproject_with_feature_awareness(
-                    vertices=vertices,
-                    boundary_indices=hull_boundary_indices,
-                    target_mesh=hull_mesh,
-                    feature_types=hull_feature_types,
-                    sharp_edge_info=hull_sharp_edge_info,
-                    search_radius=search_radius
-                )
-            elif hull_proximity is not None:
-                # Fallback to standard reprojection
+            if hull_proximity is not None:
                 hull_positions = vertices[hull_boundary_indices]
                 closest_pts, _, _ = hull_proximity.on_surface(hull_positions)
-                vertices[hull_boundary_indices] = closest_pts
+                valid_mask = np.all(np.isfinite(closest_pts), axis=1)
+                if np.all(valid_mask):
+                    vertices[hull_boundary_indices] = closest_pts
+                else:
+                    n_invalid = int(np.sum(~valid_mask))
+                    logger.warning(f"Hull reprojection: {n_invalid} vertices returned NaN/Inf, keeping original positions")
+                    vertices[hull_boundary_indices[valid_mask]] = closest_pts[valid_mask]
         
         # Re-project to primary mesh (for secondary surfaces)
         # bt=3 vertices go to primary only.
@@ -2065,19 +2044,16 @@ def smooth_membrane_with_boundary_reprojection(
             all_primary_indices = np.concatenate([primary_boundary_indices, primary_then_part_indices])
         
         if len(all_primary_indices) > 0 and primary_mesh is not None:
-            if primary_feature_types is not None:
-                vertices = reproject_with_feature_awareness(
-                    vertices=vertices,
-                    boundary_indices=all_primary_indices,
-                    target_mesh=primary_mesh,
-                    feature_types=primary_feature_types,
-                    sharp_edge_info=primary_sharp_edge_info,
-                    search_radius=search_radius
-                )
-            elif primary_proximity is not None:
+            if primary_proximity is not None:
                 primary_positions = vertices[all_primary_indices]
                 closest_pts, _, _ = primary_proximity.on_surface(primary_positions)
-                vertices[all_primary_indices] = closest_pts
+                valid_mask = np.all(np.isfinite(closest_pts), axis=1)
+                if np.all(valid_mask):
+                    vertices[all_primary_indices] = closest_pts
+                else:
+                    n_invalid = int(np.sum(~valid_mask))
+                    logger.warning(f"Primary reprojection: {n_invalid} vertices returned NaN/Inf, keeping original positions")
+                    vertices[all_primary_indices[valid_mask]] = closest_pts[valid_mask]
         
         # Dual re-projection for bt=4 (primary-then-part):
         # After being placed on the primary surface above, now snap to part.
@@ -2086,7 +2062,13 @@ def smooth_membrane_with_boundary_reprojection(
             if part_proximity is not None:
                 ptp_positions = vertices[primary_then_part_indices]
                 closest_pts, _, _ = part_proximity.on_surface(ptp_positions)
-                vertices[primary_then_part_indices] = closest_pts
+                valid_mask = np.all(np.isfinite(closest_pts), axis=1)
+                if np.all(valid_mask):
+                    vertices[primary_then_part_indices] = closest_pts
+                else:
+                    n_invalid = int(np.sum(~valid_mask))
+                    logger.warning(f"Primary→part reprojection: {n_invalid} vertices returned NaN/Inf")
+                    vertices[primary_then_part_indices[valid_mask]] = closest_pts[valid_mask]
         
         # === Step 3: Smooth interior vertices (boundary vertices now fixed) ===
         # Per paper: "Then, we smooth all the interior vertices, keeping the ones 

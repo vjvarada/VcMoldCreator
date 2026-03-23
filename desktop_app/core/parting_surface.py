@@ -4482,8 +4482,15 @@ def _create_fan_triangles(
             
             e1, e2 = c_curr_pos - vi_pos, c_next_pos - vi_pos
             tri_n = np.cross(e1, e2)
+            tri_area_2x = np.linalg.norm(tri_n)
             
-            if np.linalg.norm(tri_n) < 1e-10:
+            # Skip degenerate triangles (near-zero area)
+            if tri_area_2x < 1e-10:
+                continue
+            
+            # Skip extremely thin triangles (area < 1e-8 mm²) that would
+            # cause numerical issues in downstream CSG operations
+            if tri_area_2x * 0.5 < 1e-8:
                 continue
             
             # Use ref_normal for winding consistency with the membrane
@@ -4558,26 +4565,33 @@ def _detect_collar_self_intersections(
     intersecting_pairs: List[Tuple[int, int]] = []
 
     # Only test collar faces against ALL other faces
-    collar_range = range(collar_face_start, n_faces)
+    # Use vectorized bbox overlap pre-filter per collar face to avoid
+    # the O(collar × all) Python inner loop for non-overlapping pairs.
+    collar_indices = np.arange(collar_face_start, n_faces)
 
-    for fi in collar_range:
+    for fi in collar_indices:
         fi_min = bbox_min[fi]
         fi_max = bbox_max[fi]
 
-        # Test against every other face (both membrane and collar)
-        for fj in range(n_faces):
-            if fj == fi:
-                continue
-            # Only record each pair once (fi < fj or fi is the collar face)
-            if fj >= collar_face_start and fj <= fi:
-                continue  # will be tested when fj is the outer loop
+        # Vectorized bbox overlap: test fi against all faces at once
+        # overlap = NOT (separated on any axis)
+        overlap_mask = np.ones(n_faces, dtype=bool)
+        overlap_mask[fi] = False  # skip self
+        # Skip collar faces already tested (fi < fj dedup)
+        if fi > collar_face_start:
+            overlap_mask[collar_face_start:fi] = False
 
-            # Quick bbox overlap check
-            if (fi_max[0] < bbox_min[fj][0] or bbox_max[fj][0] < fi_min[0] or
-                fi_max[1] < bbox_min[fj][1] or bbox_max[fj][1] < fi_min[1] or
-                fi_max[2] < bbox_min[fj][2] or bbox_max[fj][2] < fi_min[2]):
-                continue
+        # Axis-aligned separation test (vectorized)
+        overlap_mask &= ~(fi_max[0] < bbox_min[:, 0])
+        overlap_mask &= ~(bbox_max[:, 0] < fi_min[0])
+        overlap_mask &= ~(fi_max[1] < bbox_min[:, 1])
+        overlap_mask &= ~(bbox_max[:, 1] < fi_min[1])
+        overlap_mask &= ~(fi_max[2] < bbox_min[:, 2])
+        overlap_mask &= ~(bbox_max[:, 2] < fi_min[2])
 
+        candidate_fjs = np.where(overlap_mask)[0]
+
+        for fj in candidate_fjs:
             # Skip adjacent faces
             if are_adjacent(fi, fj):
                 continue
@@ -4954,6 +4968,111 @@ def create_robust_collar_extension(
             )
             # Set to None so downstream code uses distance-based fallback
             vertex_boundary_type = None
+    
+    # =========================================================================
+    # STEP 0: Merge coincident vertices created by smoothing re-projection
+    # =========================================================================
+    # After smoothing, boundary vertices with vertex_boundary_type=-1 (part
+    # boundary) are re-projected to the closest point on the part mesh via
+    # nearest-point queries.  Two topologically separate cut vertices from
+    # different tet edges can converge to the SAME position on the part
+    # surface after re-projection.
+    #
+    # These coincident-but-disconnected vertices create FALSE boundary edges
+    # (edges that appear at mesh boundary because they're not shared between
+    # faces that should be adjacent). The collar then extends into the part
+    # along these false boundaries, producing bad geometry.
+    #
+    # Fix: merge coincident vertices (distance < epsilon) using union-find,
+    # remap faces, update vertex_boundary_type, and remove degenerate faces.
+    # This is the same algorithm used in extract_parting_surface (Step 3b).
+    from scipy.spatial import cKDTree
+    
+    merge_epsilon = 1e-6  # Tight threshold for truly coincident vertices
+    tree = cKDTree(vertices_arr)
+    pairs = tree.query_pairs(merge_epsilon)
+    
+    if pairs:
+        # Build union-find vertex merge mapping
+        vertex_map = np.arange(n_orig_verts)
+        for i, j in pairs:
+            # Find roots
+            root_i = i
+            while vertex_map[root_i] != root_i:
+                root_i = vertex_map[root_i]
+            root_j = j
+            while vertex_map[root_j] != root_j:
+                root_j = vertex_map[root_j]
+            if root_i != root_j:
+                vertex_map[max(root_i, root_j)] = min(root_i, root_j)
+        
+        # Flatten mapping (path compression)
+        for i in range(n_orig_verts):
+            root = i
+            while vertex_map[root] != root:
+                root = vertex_map[root]
+            vertex_map[i] = root
+        
+        unique_roots = np.unique(vertex_map)
+        n_merged = n_orig_verts - len(unique_roots)
+        
+        if n_merged > 0:
+            logger.info(
+                f"Step 0: merging {n_merged} coincident vertices "
+                f"(from smoothing re-projection convergence)")
+            
+            # Build old-to-new index mapping
+            old_to_new = np.full(n_orig_verts, -1, dtype=np.int64)
+            old_to_new[unique_roots] = np.arange(len(unique_roots))
+            
+            # Remap vertices
+            new_vertices_arr = vertices_arr[unique_roots]
+            
+            # Remap vertex_boundary_type: for merged vertices, prefer
+            # the more informative boundary type (part > hull > interior)
+            if vertex_boundary_type is not None:
+                new_vbt = vertex_boundary_type[unique_roots].copy()
+                for i, j in pairs:
+                    root_i = vertex_map[i]
+                    new_idx = old_to_new[root_i]
+                    if new_idx < 0:
+                        continue
+                    bt_i = vertex_boundary_type[i]
+                    bt_j = vertex_boundary_type[j]
+                    # Prefer part (-1) > hull (1,2) > interior (0)
+                    if bt_i == -1 or bt_j == -1:
+                        new_vbt[new_idx] = -1
+                    elif bt_i in (1, 2):
+                        new_vbt[new_idx] = bt_i
+                    elif bt_j in (1, 2):
+                        new_vbt[new_idx] = bt_j
+                vertex_boundary_type = new_vbt
+            
+            # Remap faces through union-find then to new indices
+            new_faces_arr = old_to_new[vertex_map[faces_arr]]
+            
+            # Remove degenerate faces created by merge
+            valid_mask = ((new_faces_arr[:, 0] != new_faces_arr[:, 1]) &
+                          (new_faces_arr[:, 1] != new_faces_arr[:, 2]) &
+                          (new_faces_arr[:, 0] != new_faces_arr[:, 2]))
+            n_degenerate = int(np.sum(~valid_mask))
+            if n_degenerate > 0:
+                logger.info(
+                    f"Step 0: removed {n_degenerate} degenerate faces "
+                    "created by vertex merge")
+            new_faces_arr = new_faces_arr[valid_mask]
+            
+            # Update working arrays
+            vertices = list(new_vertices_arr)
+            faces = list(new_faces_arr)
+            n_orig_verts = len(vertices)
+            n_orig_faces = len(faces)
+            vertices_arr = new_vertices_arr
+            faces_arr = new_faces_arr
+            
+            # Rebuild the membrane mesh for containment queries
+            membrane_mesh = trimesh.Trimesh(
+                vertices=vertices_arr, faces=faces_arr, process=False)
     
     # =========================================================================
     # STEP 1: Build edge-to-face mapping and find boundary edges
@@ -5709,6 +5828,60 @@ def create_robust_collar_extension(
         total_fan_tris += fan_t
     
     logger.info(f"Created {total_fan_tris} fan triangles ({total_arc_verts} arc vertices)")
+    
+    # =========================================================================
+    # STEP 6a: Snap arc vertices outside part mesh back to surface
+    # =========================================================================
+    # Fan arc vertices created via SLERP interpolation in Step 6 may end up
+    # outside the part mesh (e.g., on concave surfaces where the interpolated
+    # position exits the volume).  This mirrors the Step 4b containment check
+    # but covers the arc vertices created during fan triangle generation.
+    
+    if total_arc_verts > 0:
+        # Arc vertices were appended after the Phase 1+2 collar vertices.
+        # Step 4b already checked indices [n_orig_verts, n_orig_verts + n_collar_verts).
+        # New arc vertices start after that range.
+        # To cover all collar + arc vertices safely, check everything from
+        # n_orig_verts onward that hasn't been checked yet.
+        all_collar_indices = list(range(n_orig_verts, len(vertices)))
+        if all_collar_indices:
+            all_collar_positions = np.array(
+                [vertices[ci] for ci in all_collar_indices], dtype=np.float64)
+            try:
+                arc_inside = part_mesh.contains(all_collar_positions)
+                n_arc_outside = int(np.sum(~arc_inside))
+                if n_arc_outside > 0:
+                    outside_local = np.where(~arc_inside)[0]
+                    outside_positions = all_collar_positions[outside_local]
+                    cp_pts, _, cp_faces = trimesh.proximity.closest_point(
+                        part_mesh, outside_positions)
+                    snap_push = collar_depth * 0.5
+                    n_snapped = 0
+                    for oi, li in enumerate(outside_local):
+                        ci = all_collar_indices[li]
+                        pfi = cp_faces[oi]
+                        if pfi < len(part_face_normals):
+                            pn = part_face_normals[pfi]
+                            pn_len = np.linalg.norm(pn)
+                            if pn_len > 1e-10:
+                                into = -pn / pn_len
+                                vertices[ci] = (cp_pts[oi] + snap_push * into).copy()
+                            else:
+                                vertices[ci] = cp_pts[oi].copy()
+                        else:
+                            vertices[ci] = cp_pts[oi].copy()
+                        n_snapped += 1
+                    logger.info(
+                        f"Step 6a: snapped {n_snapped} outside arc/collar "
+                        "vertices to part surface + inward push")
+                else:
+                    logger.debug(
+                        f"Step 6a: all {len(all_collar_indices)} collar+arc "
+                        "vertices already inside part mesh")
+            except Exception as ex:
+                logger.warning(
+                    f"Step 6a: containment check failed ({ex}), "
+                    "skipping arc vertex snap")
     
     # =========================================================================
     # STEP 6b: Iterative collar extension for boundary edges outside part mesh

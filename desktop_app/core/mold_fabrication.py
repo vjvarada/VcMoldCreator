@@ -539,6 +539,12 @@ def create_metamold_clamp(
     min_height: float = CLAMP_MIN_HEIGHT_MM,
     slit_width: float = CLAMP_SLIT_WIDTH_MM,
     tab_length: float = CLAMP_TAB_LENGTH_MM,
+    *,
+    shell_half_1: Optional[trimesh.Trimesh] = None,
+    shell_half_2: Optional[trimesh.Trimesh] = None,
+    metamold_half_1: Optional[trimesh.Trimesh] = None,
+    metamold_half_2: Optional[trimesh.Trimesh] = None,
+    height_inset: float = 1.0,
 ) -> MetamoldClampResult:
     """Create a single-piece clamp that wraps around the assembled metamold.
 
@@ -548,6 +554,14 @@ def create_metamold_clamp(
     the metamold.  Two outward tabs on either side of the slit accept a
     binder clip to hold the metamold halves together.
 
+    Clamp height is derived from the interfacing assembly combos:
+      - Combo A: Hard Shell 1 + Metamold 2
+      - Combo B: Hard Shell 2 + Metamold 1
+    The clamp height is set to ``min(combo_A, combo_B) - height_inset``
+    so that the clamp is slightly shorter than the shorter combo and
+    does not protrude.  Falls back to parting-surface-based height when
+    shell/metamold meshes are not provided.
+
     Args:
         prism_result: The MetamoldPrismResult (silhouette, pouring dir, etc.).
         parting_surface: The parting surface mesh (used to compute height).
@@ -556,6 +570,12 @@ def create_metamold_clamp(
         min_height: Minimum clamp height in mm.
         slit_width: Width of the vertical slit in mm.
         tab_length: How far each tab extends outward from the clamp wall in mm.
+        shell_half_1: Hard shell half 1 mesh (upper, keyword-only).
+        shell_half_2: Hard shell half 2 mesh (lower, keyword-only).
+        metamold_half_1: Trimmed metamold half 1 mesh (upper, keyword-only).
+        metamold_half_2: Trimmed metamold half 2 mesh (lower, keyword-only).
+        height_inset: How far (mm) the clamp should be shorter than the
+            shorter combo height (default 1.0).
 
     Returns:
         MetamoldClampResult with the clamp mesh.
@@ -568,8 +588,13 @@ def create_metamold_clamp(
     world_to_2d = prism_result.world_to_2d
 
     # ------------------------------------------------------------------
-    # 1. Determine clamp height — max(2 × parting surface height, min_height)
-    #    centred on the parting surface midpoint along pouring direction.
+    # 1. Determine clamp height from interfacing assembly combos.
+    #
+    #    Hard Shell 1 interfaces with Metamold 2, and vice versa.
+    #    Combo A = HS1 + MM2,  Combo B = HS2 + MM1
+    #    Clamp height = min(combo_A, combo_B) - height_inset
+    #
+    #    Falls back to 2× parting surface extent when meshes are absent.
     # ------------------------------------------------------------------
     ps_verts = np.asarray(parting_surface.vertices, dtype=np.float64)
     ps_transformed = ps_verts @ world_to_2d.T
@@ -577,15 +602,48 @@ def create_metamold_clamp(
     ps_min_h = float(np.min(ps_heights))
     ps_max_h = float(np.max(ps_heights))
     ps_extent = ps_max_h - ps_min_h
-    clamp_height = max(2.0 * ps_extent, min_height)
-
     ps_mid_h = (ps_min_h + ps_max_h) / 2.0
+
+    def _mesh_height_extent(mesh: trimesh.Trimesh) -> Tuple[float, float]:
+        """Return (min_h, max_h) along the pouring direction."""
+        v = np.asarray(mesh.vertices, dtype=np.float64)
+        h = (v @ world_to_2d.T)[:, 2]
+        return float(np.min(h)), float(np.max(h))
+
+    combo_heights_available = (
+        shell_half_1 is not None and metamold_half_2 is not None
+        and shell_half_2 is not None and metamold_half_1 is not None
+    )
+
+    if combo_heights_available:
+        sh1_min, sh1_max = _mesh_height_extent(shell_half_1)
+        sh2_min, sh2_max = _mesh_height_extent(shell_half_2)
+        mm1_min, mm1_max = _mesh_height_extent(metamold_half_1)
+        mm2_min, mm2_max = _mesh_height_extent(metamold_half_2)
+
+        combo_a = max(sh1_max, mm2_max) - min(sh1_min, mm2_min)  # HS1 + MM2
+        combo_b = max(sh2_max, mm1_max) - min(sh2_min, mm1_min)  # HS2 + MM1
+        shorter_combo = min(combo_a, combo_b)
+        clamp_height = max(shorter_combo - height_inset, min_height)
+
+        logger.info(
+            "Combo heights: HS1+MM2=%.2f, HS2+MM1=%.2f → "
+            "shorter=%.2f, clamp=%.2f (inset=%.1f)",
+            combo_a, combo_b, shorter_combo, clamp_height, height_inset,
+        )
+    else:
+        clamp_height = max(2.0 * ps_extent, min_height)
+        logger.info(
+            "Clamp height=%.2f mm (fallback: 2× parting extent=%.2f mm)",
+            clamp_height, ps_extent,
+        )
+
     clamp_bottom = ps_mid_h - clamp_height / 2.0
     clamp_top = ps_mid_h + clamp_height / 2.0
 
     logger.info(
-        "Clamp height=%.2f mm (parting extent=%.2f mm), range=[%.2f, %.2f]",
-        clamp_height, ps_extent, clamp_bottom, clamp_top,
+        "Clamp range=[%.2f, %.2f], height=%.2f mm",
+        clamp_bottom, clamp_top, clamp_height,
     )
 
     # ------------------------------------------------------------------
