@@ -8,11 +8,10 @@
 
 <br>
 
-<img src="docs/alderighi-2019-composite-molds/images/Volume-Aware%20Design%20of%20Composite%20Molds.pdf-0001-05.png" width="30%" alt="Cut layout with parting surface (blue) and additional membranes (red)">
-<img src="docs/alderighi-2019-composite-molds/images/Volume-Aware%20Design%20of%20Composite%20Molds.pdf-0001-06.png" width="30%" alt="Composite mold assembled">
-<img src="docs/alderighi-2019-composite-molds/images/Volume-Aware%20Design%20of%20Composite%20Molds.pdf-0001-07.png" width="30%" alt="Final cast object">
+<img src="docs/alderighi-2019-composite-molds/images/Volume-Aware%20Design%20of%20Composite%20Molds.pdf-0001-05.png" width="40%" alt="Cut layout with parting surface (blue) and additional membranes (red)">
+<img src="docs/alderighi-2019-composite-molds/images/Volume-Aware%20Design%20of%20Composite%20Molds.pdf-0001-06.png" width="40%" alt="Composite mold assembled">
 
-*Left: Cut layout — parting surface (blue) and additional membranes (red). Center: Assembled composite mold. Right: Cast object.*
+*Left: Cut layout — parting surface (blue) and additional membranes (red). Right: Assembled composite mold.*
 
 <br>
 
@@ -62,10 +61,9 @@ Each mold piece consists of two parts:
 The thin silicone part can flex to release undercuts, while the hard shell prevents deformation under casting pressure.
 
 <div align="center">
-<img src="docs/alderighi-2019-composite-molds/images/Volume-Aware%20Design%20of%20Composite%20Molds.pdf-0004-05.png" width="42%" alt="Mold volume schema">
-<img src="docs/alderighi-2019-composite-molds/images/Volume-Aware%20Design%20of%20Composite%20Molds.pdf-0004-06.png" width="42%" alt="Parting directions">
+<img src="docs/alderighi-2019-composite-molds/images/Volume-Aware%20Design%20of%20Composite%20Molds.pdf-0004-05.png" width="55%" alt="Mold volume schema">
 
-*Left: The mold volume O lies between the object surface M and the exterior hull ∂H. Right: Two parting directions d₁, d₂ split the hull boundary, defining how the mold opens.*
+*The mold volume O lies between the object surface M and the exterior hull ∂H. Two parting directions d₁, d₂ split the hull boundary, defining how the mold opens.*
 </div>
 
 ---
