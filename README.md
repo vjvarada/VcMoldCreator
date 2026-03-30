@@ -8,10 +8,11 @@
 
 <br>
 
-<img src="docs/alderighi-2019-composite-molds/images/Volume-Aware%20Design%20of%20Composite%20Molds.pdf-0001-05.png" width="40%" alt="Cut layout with parting surface (blue) and additional membranes (red)">
-<img src="docs/alderighi-2019-composite-molds/images/Volume-Aware%20Design%20of%20Composite%20Molds.pdf-0001-06.png" width="40%" alt="Composite mold assembled">
+<img src="docs/alderighi-2019-composite-molds/images/Volume-Aware%20Design%20of%20Composite%20Molds.pdf-0001-05.png" width="30%" alt="Cut layout with parting surface (blue) and additional membranes (red)">
+<img src="docs/alderighi-2019-composite-molds/images/Volume-Aware%20Design%20of%20Composite%20Molds.pdf-0001-06.png" width="30%" alt="Composite mold assembled">
 
-*Left: Cut layout — parting surface (blue) and additional membranes (red). Right: Assembled composite mold.*
+
+*Left: Cut layout — parting surface (blue) and additional membranes (red). Center: Assembled composite mold. Right: Cast object.*
 
 <br>
 
