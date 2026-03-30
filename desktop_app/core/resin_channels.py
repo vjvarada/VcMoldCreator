@@ -115,6 +115,7 @@ class ResinChannelResult:
     # Silicone mold pouring holes (through BOTH hard shell halves)
     silicone_pour_hole_position: Optional[np.ndarray] = None  # (3,) 3-D centre of the hole
     silicone_pour_hole_diameter_mm: float = SILICONE_POUR_HOLE_DIAMETER_MM
+    silicone_pour_hole_is_prism: bool = False  # True when prism-shaped cutter was used
     shell_half_1_final: Optional[trimesh.Trimesh] = None  # shell 1 with ALL holes applied
     shell_half_2_final: Optional[trimesh.Trimesh] = None  # shell 2 with ALL holes applied
 
@@ -2134,6 +2135,83 @@ def _find_silicone_pour_hole_position(
     return pos_3d
 
 
+def _create_scaled_prism_cutter(
+    silhouette_2d: np.ndarray,
+    world_to_2d: np.ndarray,
+    scale: float,
+    min_height: float,
+    max_height: float,
+) -> trimesh.Trimesh:
+    """
+    Create a prism-shaped cutter mesh from a 2D silhouette, scaled around its centroid.
+
+    The cutter is extruded along the pouring direction (encoded in *world_to_2d*)
+    from *min_height* to *max_height*.
+
+    Args:
+        silhouette_2d: (N, 2) ordered polygon vertices of the prism base.
+        world_to_2d:   (3, 3) orthonormal rotation matrix (rows = u, v, pouring_dir).
+        scale:         Scale factor applied around the polygon centroid (0.5 = 50%).
+        min_height:    Bottom extrusion height (in the rotated coordinate system).
+        max_height:    Top extrusion height.
+
+    Returns:
+        A watertight trimesh prism suitable for CSG subtraction.
+    """
+    poly = np.asarray(silhouette_2d, dtype=np.float64)
+    centroid_2d = poly.mean(axis=0)
+
+    # Scale around centroid
+    scaled_poly = centroid_2d + (poly - centroid_2d) * scale
+
+    n = len(scaled_poly)
+    two_d_to_world = np.asarray(world_to_2d, dtype=np.float64).T  # inverse (orthonormal)
+
+    # Build bottom and top rings in 3D
+    bottom_verts = np.zeros((n, 3), dtype=np.float64)
+    top_verts = np.zeros((n, 3), dtype=np.float64)
+    for i in range(n):
+        pt_bot = np.array([scaled_poly[i, 0], scaled_poly[i, 1], min_height])
+        pt_top = np.array([scaled_poly[i, 0], scaled_poly[i, 1], max_height])
+        bottom_verts[i] = pt_bot @ two_d_to_world.T
+        top_verts[i] = pt_top @ two_d_to_world.T
+
+    # Assemble vertices: 0..n-1 = bottom, n..2n-1 = top
+    all_verts = np.vstack([bottom_verts, top_verts])
+    faces = []
+
+    # Side quads (two triangles each)
+    for i in range(n):
+        j = (i + 1) % n
+        b0, b1, t0, t1 = i, j, i + n, j + n
+        faces.append([b0, b1, t1])
+        faces.append([b0, t1, t0])
+
+    # Bottom cap (fan from centre vertex)
+    bot_center = bottom_verts.mean(axis=0)
+    bot_center_idx = len(all_verts)
+    all_verts = np.vstack([all_verts, bot_center.reshape(1, 3)])
+    for i in range(n):
+        j = (i + 1) % n
+        faces.append([bot_center_idx, j, i])
+
+    # Top cap (fan from centre vertex)
+    top_center = top_verts.mean(axis=0)
+    top_center_idx = len(all_verts)
+    all_verts = np.vstack([all_verts, top_center.reshape(1, 3)])
+    for i in range(n):
+        j = (i + 1) % n
+        faces.append([top_center_idx, i + n, j + n])
+
+    faces_arr = np.array(faces, dtype=np.int64)
+    mesh = trimesh.Trimesh(vertices=all_verts, faces=faces_arr, process=False)
+    mesh.fix_normals()
+    return mesh
+
+
+SILICONE_POUR_PRISM_SCALE = 0.5  # 50% of the hard-shell prism silhouette
+
+
 def create_silicone_pour_holes(
     shell_half_1: Optional[trimesh.Trimesh],
     shell_half_2: Optional[trimesh.Trimesh],
@@ -2147,20 +2225,22 @@ def create_silicone_pour_holes(
     part_mesh: Optional[trimesh.Trimesh] = None,
     part_hull_inset_mm: float = 5.0,
     shell_hole_diameter_mm: float = SILICONE_POUR_SHELL_HOLE_DIAMETER_MM,
+    prism_silhouette_2d: Optional[np.ndarray] = None,
+    prism_world_to_2d: Optional[np.ndarray] = None,
 ) -> Tuple[Optional[trimesh.Trimesh], Optional[trimesh.Trimesh], Optional[np.ndarray]]:
     """
-    Drill a silicone mold pouring / locating-pin hole through both hard shell halves.
+    Cut a silicone mold pouring hole through both hard shell halves.
 
-    The 12 mm through-hole is intentionally placed off-centre — within the
-    footprint of the *part* mesh (not the outer shell wall) — so that the
-    silicone mold can only be re-inserted into the hard shell in one orientation,
-    functioning as a locating pin.
+    When *prism_silhouette_2d* and *prism_world_to_2d* are provided the hole
+    is shaped like the hard-shell prism base scaled to 50 %, centred on the
+    prism centroid.  This gives the silicone mold a matching key so it can
+    only be re-inserted in one orientation.
 
-    Placement constraints:
-      - Fully inside the part\'s 2-D convex hull with >= *part_hull_inset_mm* inset
-      - >= clearance_mm edge-to-edge from the resin inlet hole
-      - >= clearance_mm edge-to-edge from every air-escape hole
-      - Maximally off-centre (farthest valid position from the part centroid)
+    When no prism data is supplied the function falls back to the legacy
+    behaviour (a cylindrical through-hole placed via grid search).
+
+    All other shell operations (resin inlet, air-escape holes, alignment
+    notches) are unaffected.
 
     Args:
         shell_half_1:            Hard-shell upper half (may be None).
@@ -2177,21 +2257,100 @@ def create_silicone_pour_holes(
                                  the part footprint.
         part_hull_inset_mm:      Extra inset inside part hull boundary (default 5 mm).
         shell_hole_diameter_mm:  Diameter of the through-hole actually drilled into
-                                 the hard shells.  Larger than *hole_diameter_mm* to
-                                 provide assembly clearance (default 17 mm = 12 mm pin
-                                 + 5 mm diametric tolerance).
+                                 the hard shells (legacy cylinder fallback only).
+        prism_silhouette_2d:     (N, 2) ordered vertices of the hard-shell prism
+                                 base polygon.  When provided together with
+                                 *prism_world_to_2d* the prism-shaped cutter is used.
+        prism_world_to_2d:       (3, 3) orthonormal rotation matrix that was used to
+                                 build the hard-shell prism (rows = u, v, pouring_dir).
 
     Returns:
-        Tuple of ``(shell_half_1_modified, shell_half_2_modified, hole_position_3d)``.
+        Tuple of ``(shell_half_1_modified, shell_half_2_modified, hole_centre_3d)``.
     """
     if not MANIFOLD_AVAILABLE:
-        logger.error("manifold3d not available — cannot drill silicone pour holes")
+        logger.error("manifold3d not available — cannot cut silicone pour holes")
         return shell_half_1, shell_half_2, None
 
+    # ------------------------------------------------------------------
+    # Prism-shaped cutter (preferred path)
+    # ------------------------------------------------------------------
+    if prism_silhouette_2d is not None and prism_world_to_2d is not None:
+        silhouette = np.asarray(prism_silhouette_2d, dtype=np.float64)
+        w2d = np.asarray(prism_world_to_2d, dtype=np.float64)
+
+        # Compute centroid in 3-D (for reporting / stats)
+        centroid_2d = silhouette.mean(axis=0)
+        two_d_to_world = w2d.T
+
+        resin_dir = np.asarray(resin_direction, dtype=np.float64)
+        resin_dir = resin_dir / (np.linalg.norm(resin_dir) + 1e-12)
+
+        # Determine height range that safely spans both shell halves
+        pieces = [m for m in [shell_half_1, shell_half_2] if m is not None]
+        if not pieces:
+            logger.warning("No shell halves provided for silicone pour hole")
+            return shell_half_1, shell_half_2, None
+
+        all_verts = np.vstack([m.vertices for m in pieces])
+        heights = all_verts @ resin_dir
+        margin = 5.0  # generous margin so cutter fully penetrates
+        min_h = float(np.min(heights)) - margin
+        max_h = float(np.max(heights)) + margin
+
+        # Project heights into the rotated frame that world_to_2d uses
+        # (the third row of world_to_2d is the pouring direction)
+        all_transformed = all_verts @ w2d.T
+        min_h_local = float(np.min(all_transformed[:, 2])) - margin
+        max_h_local = float(np.max(all_transformed[:, 2])) + margin
+
+        cutter = _create_scaled_prism_cutter(
+            silhouette_2d=silhouette,
+            world_to_2d=w2d,
+            scale=SILICONE_POUR_PRISM_SCALE,
+            min_height=min_h_local,
+            max_height=max_h_local,
+        )
+
+        # Centroid in 3-D for stats/reporting  (mid-height along resin axis)
+        h_centre = (float(np.min(heights)) + float(np.max(heights))) * 0.5
+        centroid_3d = np.array([centroid_2d[0], centroid_2d[1], 0.0]) @ two_d_to_world.T
+        # centroid_3d is on the plane at height 0; shift to mean shell height
+        centroid_3d = centroid_3d + h_centre * resin_dir
+
+        logger.info(
+            "Silicone pour hole: prism-shaped cutter at %.0f%% scale, "
+            "centroid=(%.1f, %.1f, %.1f)",
+            SILICONE_POUR_PRISM_SCALE * 100, *centroid_3d,
+        )
+
+        def _cut_prism_one_shell(
+            shell: Optional[trimesh.Trimesh], label: str
+        ) -> Optional[trimesh.Trimesh]:
+            if shell is None:
+                return None
+            try:
+                result = _manifold_to_trimesh(
+                    _trimesh_to_manifold(shell, f'shell_for_sil_prism_{label}')
+                    - _trimesh_to_manifold(cutter, f'sil_prism_cutter_{label}'),
+                    f'shell_minus_sil_prism_{label}'
+                )
+                logger.info(
+                    "Silicone prism hole cut in %s: %d verts", label, len(result.vertices),
+                )
+                return result
+            except Exception as exc:
+                logger.error("Failed to cut silicone prism hole in %s: %s", label, exc)
+                return shell
+
+        sh1_out = _cut_prism_one_shell(shell_half_1, "shell_half_1")
+        sh2_out = _cut_prism_one_shell(shell_half_2, "shell_half_2")
+        return sh1_out, sh2_out, centroid_3d
+
+    # ------------------------------------------------------------------
+    # Legacy cylindrical hole (fallback when no prism data available)
+    # ------------------------------------------------------------------
     hole_radius = hole_diameter_mm / 2.0
     shell_hole_radius = shell_hole_diameter_mm / 2.0
-    # Clearance / inset are based on the *pin* diameter (12 mm), not the
-    # larger shell hole, so the silicone pin fits snugly without stress.
     pos_3d = _find_silicone_pour_hole_position(
         shell_half_1           = shell_half_1,
         shell_half_2           = shell_half_2,
@@ -2210,10 +2369,9 @@ def create_silicone_pour_holes(
         logger.warning("Silicone pour hole skipped: no valid position found")
         return shell_half_1, shell_half_2, None
 
-    # ── Build a single cutter cylinder (tall enough to pierce any shell half) ─
     resin_dir = np.asarray(resin_direction, dtype=np.float64)
     resin_dir = resin_dir / (np.linalg.norm(resin_dir) + 1e-12)
-    drill_dir = -resin_dir    # drill top-to-bottom (same convention as other holes)
+    drill_dir = -resin_dir
 
     def _drill_one_shell(
         shell: Optional[trimesh.Trimesh], label: str
@@ -2222,7 +2380,6 @@ def create_silicone_pour_holes(
             return None
         bbox_diag = np.linalg.norm(shell.bounds[1] - shell.bounds[0])
         cyl_height = bbox_diag * 2.0
-        # Start well above so the cylinder passes cleanly through
         cyl_start  = pos_3d - drill_dir * (cyl_height / 2.0)
 
         cyl = _create_cylinder(
@@ -2244,7 +2401,7 @@ def create_silicone_pour_holes(
             return result
         except Exception as exc:
             logger.error("Failed to drill silicone pour hole in %s: %s", label, exc)
-            return shell   # return unmodified on failure
+            return shell
 
     sh1_out = _drill_one_shell(shell_half_1, "shell_half_1")
     sh2_out = _drill_one_shell(shell_half_2, "shell_half_2")

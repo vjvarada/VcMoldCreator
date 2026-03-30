@@ -1341,6 +1341,7 @@ class ResinChannelsWorker(QThread):
         hollow_wall_thickness_mm=4.0,
         blade_mesh=None,
         prism_result=None,
+        hard_shell_prism_result=None,
     ):
         super().__init__()
         # Core input meshes
@@ -1367,6 +1368,7 @@ class ResinChannelsWorker(QThread):
         self.hollow_wall_thickness_mm = hollow_wall_thickness_mm
         self.blade_mesh = blade_mesh
         self.prism_result = prism_result
+        self.hard_shell_prism_result = hard_shell_prism_result
 
         # Accumulated stats (written by sub-steps, attached to result later)
         self._trim_threshold = 0.0
@@ -1568,10 +1570,15 @@ class ResinChannelsWorker(QThread):
             logger.info("Resin plug created: %d verts", len(plug.vertices))
 
     def _step_silicone_pour_holes(self, channel_result):
-        """Drill silicone pour holes through both shell halves."""
+        """Cut silicone pour holes through both shell halves.
+
+        When the hard-shell prism result is available the hole is shaped like
+        the prism base at 50 % scale (centred).  Otherwise falls back to the
+        legacy cylindrical hole.
+        """
         if self.shell_half_1 is None and self.shell_half_2 is None:
             return
-        self.progress.emit("Drilling silicone pouring holes in both hard shell halves...")
+        self.progress.emit("Cutting silicone pouring holes in both hard shell halves...")
         try:
             from core.resin_channels import create_silicone_pour_holes
 
@@ -1581,6 +1588,13 @@ class ResinChannelsWorker(QThread):
             cur_sh2 = (channel_result.modified_shell_mesh
                        if channel_result.shell_half_modified == 2
                        else self.shell_half_2)
+
+            # Resolve hard-shell prism silhouette for the prism-shaped cutter
+            hs_sil_2d = None
+            hs_w2d = None
+            if self.hard_shell_prism_result is not None:
+                hs_sil_2d = getattr(self.hard_shell_prism_result, 'silhouette_2d', None)
+                hs_w2d = getattr(self.hard_shell_prism_result, 'world_to_2d', None)
 
             sh1_final, sh2_final, sil_pos = create_silicone_pour_holes(
                 shell_half_1=cur_sh1,
@@ -1592,12 +1606,17 @@ class ResinChannelsWorker(QThread):
                 air_escape_diameter_mm=channel_result.local_diameter_mm,
                 part_mesh=self.part_mesh,
                 part_hull_inset_mm=5.0,
+                prism_silhouette_2d=hs_sil_2d,
+                prism_world_to_2d=hs_w2d,
             )
 
             channel_result.shell_half_1_final = sh1_final
             channel_result.shell_half_2_final = sh2_final
             channel_result.silicone_pour_hole_position = sil_pos
-            channel_result.silicone_pour_hole_diameter_mm = 17.0
+            channel_result.silicone_pour_hole_diameter_mm = (
+                0.0 if hs_sil_2d is not None else 17.0
+            )
+            channel_result.silicone_pour_hole_is_prism = (hs_sil_2d is not None)
 
             # Keep modified_shell_mesh in sync
             if channel_result.shell_half_modified == 1 and sh1_final is not None:
@@ -7847,10 +7866,17 @@ class MainWindow(QMainWindow):
             # Silicone pour hole
             if result.silicone_pour_hole_position is not None:
                 p = result.silicone_pour_hole_position
-                self.resin_channels_stats.add_row(
-                    f'Silicone pour hole: pin ⌀12mm, shell hole ⌀{result.silicone_pour_hole_diameter_mm:.0f}mm '
-                    f'on both shells — ({p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f})'
-                )
+                is_prism = getattr(result, 'silicone_pour_hole_is_prism', False)
+                if is_prism:
+                    self.resin_channels_stats.add_row(
+                        f'Silicone pour hole: 50% prism-shaped cutout (centred) '
+                        f'on both shells — ({p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f})'
+                    )
+                else:
+                    self.resin_channels_stats.add_row(
+                        f'Silicone pour hole: pin ⌀12mm, shell hole ⌀{result.silicone_pour_hole_diameter_mm:.0f}mm '
+                        f'on both shells — ({p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f})'
+                    )
             else:
                 self.resin_channels_stats.add_row('Silicone pour hole: not placed (no valid position)')
 
@@ -7961,6 +7987,7 @@ class MainWindow(QMainWindow):
                 else None
             ),
             prism_result=self._metamold_prism_result,
+            hard_shell_prism_result=self._hard_shell_prism_result,
         )
         self._resin_channels_worker.progress.connect(self._on_resin_channels_progress)
         self._resin_channels_worker.complete.connect(self._on_resin_channels_complete)
