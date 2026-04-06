@@ -927,6 +927,15 @@ class PartingSurfaceResult:
     # This is used during smoothing to correctly re-project boundary vertices
     vertex_boundary_type: Optional[np.ndarray] = None
     
+    # Per-triangle source tet index: triangle_source_tet[f] = tet index that produced face f.
+    # Used by split_combined_surface_into_patches() to separate primary/secondary triangles.
+    triangle_source_tet: Optional[np.ndarray] = None
+    
+    # Per-surface-vertex: the global tet-mesh edge index this cut vertex sits on.
+    # Same length as vertices. Used together with primary/secondary edge classification
+    # to determine which patch a vertex belongs to.
+    surface_vertex_edge_index: Optional[np.ndarray] = None
+    
     # Statistics
     num_vertices: int = 0
     num_faces: int = 0
@@ -1459,6 +1468,7 @@ def extract_parting_surface(
     # For SECONDARY surfaces (use_label_derived_cuts=False): use the pre-computed 
     # cut_edge_flags directly because secondary cuts connect same-label vertices.
     triangles = []
+    triangle_source_tets = []  # Track which tet produced each triangle
     tets_contributing = 0
     
     # Track configuration statistics for debugging
