@@ -54,6 +54,9 @@ applyTo: '**'
 - Very thin features may not generate complete membranes
 - Highly concave regions may have multiple valid parting surfaces
 
+### CSG / Metamold (Fixed)
+- **Deflation offset increased from 1 µm to 50 µm** (April 2026): The original 1 µm deflation was at the edge of numerical precision for manifold3d when mesh coordinates are in the 10s-100s mm range. This caused coplanar-face artifacts (bad triangles) at the part boundary inside the metamold. The 50 µm offset is still invisible in the final mold (below any 3D printer resolution) but provides 50x more numerical margin.
+
 ---
 
 ## User Preferences

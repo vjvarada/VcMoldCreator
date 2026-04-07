@@ -1803,9 +1803,13 @@ def compute_adaptive_trim_threshold(
 # that the subsequent ``half + part`` union has genuine geometric overlap
 # instead of perfectly coincident faces.  Coincident faces trigger
 # manifold3d's coplanar-shard artifacts (GitHub manifold #1430, #1359).
-# 1 µm (0.001 mm) is far below any 3D printer's resolution (FDM ≈ 100 µm,
-# SLA ≈ 25 µm) and is invisible in the final mold.
-CSG_PART_DEFLATION_MM: float = 0.001
+# 50 µm (0.05 mm) is well below any 3D printer's resolution (FDM ≈ 100 µm,
+# SLA ≈ 25 µm) and is invisible in the final mold, while providing enough
+# numerical margin for robust manifold3d operations.
+# NOTE: 1 µm (0.001 mm) was too small and caused coplanar-face artifacts
+# because the offset was at the edge of floating-point precision for
+# meshes with coordinates in the tens/hundreds of mm range.
+CSG_PART_DEFLATION_MM: float = 0.05
 
 
 def _deflate_part_for_csg(
@@ -1820,13 +1824,13 @@ def _deflate_part_for_csg(
     guaranteeing genuine overlap when the original part is boolean-unioned
     back.
 
-    At the default 1 µm scale, vertex-normal displacement is equivalent
+    At the default 50 µm scale, vertex-normal displacement is equivalent
     to a true signed-distance offset and preserves the exact mesh topology
     (same face count, same connectivity).  Self-intersection from
     convergent normals at concavities is only theoretically possible if
     the local radius of curvature is smaller than ``deflation_mm``; for
     real-world parts the minimum curvature radius is orders of magnitude
-    larger than 1 µm.
+    larger than 50 µm.
 
     As a safety measure, the function validates the result by checking
     for **inverted triangles** — faces whose normal has flipped relative
@@ -1878,24 +1882,42 @@ def _deflate_part_for_csg(
             return None
 
         # --- Validation: volume sanity check ---
-        # Uniform inversion (offset > feature size) preserves face
-        # normals (cross product squares out the scale factor) but
-        # the volume becomes negative or absurdly different.  For a
-        # 1 µm offset the volume change should be negligible (< 1%).
+        # After inward deflation, the volume should decrease slightly but
+        # remain positive and close to the original.  For a 50 µm offset
+        # on typical parts (10-100 mm dimensions), volume change should
+        # be < 5%.  Reject if:
+        #   - Volume becomes negative or zero (mesh inverted)
+        #   - Volume increases (impossible for inward deflation)
+        #   - Volume decreases by more than 30% (self-intersection)
         orig_vol = float(mesh.volume)
         defl_vol = float(deflated.volume)
-        if orig_vol > 0 and (defl_vol <= 0 or defl_vol > orig_vol * 1.5):
-            logger.warning(
-                "  [Deflate] Deflation by %.4f mm produced invalid "
-                "volume (%.2f → %.2f) — rejecting",
-                deflation_mm, orig_vol, defl_vol,
-            )
-            return None
+        if orig_vol > 0:
+            if defl_vol <= 0:
+                logger.warning(
+                    "  [Deflate] Deflation by %.4f mm produced non-positive "
+                    "volume (%.2f → %.2f) — rejecting",
+                    deflation_mm, orig_vol, defl_vol,
+                )
+                return None
+            if defl_vol > orig_vol * 1.01:  # Volume should not increase
+                logger.warning(
+                    "  [Deflate] Deflation by %.4f mm increased volume "
+                    "(%.2f → %.2f) — rejecting",
+                    deflation_mm, orig_vol, defl_vol,
+                )
+                return None
+            if defl_vol < orig_vol * 0.7:  # Volume decreased too much
+                logger.warning(
+                    "  [Deflate] Deflation by %.4f mm decreased volume by "
+                    ">30%% (%.2f → %.2f, likely self-intersection) — rejecting",
+                    deflation_mm, orig_vol, defl_vol,
+                )
+                return None
 
         logger.info(
             "  [Deflate] Part deflated by %.4f mm along vertex normals "
-            "(%d faces, 0 inverted — valid)",
-            deflation_mm, len(deflated.faces),
+            "(%d faces, 0 inverted, vol %.2f → %.2f — valid)",
+            deflation_mm, len(deflated.faces), orig_vol, defl_vol,
         )
         save_debug_mesh(deflated, 'msp_part_deflated')
         return deflated
@@ -1922,7 +1944,7 @@ def build_metamold_halves_manifold_space(
 
     To avoid manifold3d's coplanar-face shard artifacts (GitHub #1430,
     #1359), the part mesh used for the cavity is **deflated** by
-    1 µm (``CSG_PART_DEFLATION_MM``).  This makes the cavity
+    50 µm (``CSG_PART_DEFLATION_MM``).  This makes the cavity
     fractionally larger than the actual part, so the subsequent
     ``half + part`` union (using the *original* un-deflated part) has
     genuine geometric overlap.
@@ -1974,7 +1996,7 @@ def build_metamold_halves_manifold_space(
         save_debug_mesh(blade_trimesh, 'msp_cutting_blade')
 
         # ---- 1. Deflate the part mesh for the cavity ----
-        # A tiny inward offset (1 µm) makes the cavity fractionally
+        # A tiny inward offset (50 µm) makes the cavity fractionally
         # larger than the original part.  When we union the original
         # (un-deflated) part back into each half (step 7), there is
         # genuine geometric overlap instead of perfectly coincident
@@ -2066,7 +2088,7 @@ def build_metamold_halves_manifold_space(
 
         # ---- 7. Union each half with the ORIGINAL part (manifold space).
         #         The cavity used the deflated part, so the original part
-        #         is ~1 µm larger → genuine overlap → no coplanar shards.
+        #         is ~50 µm larger → genuine overlap → no coplanar shards.
         logger.info("[manifold-space] CSG: upper + part ...")
         upper_result_m = upper_m + combined_m
         logger.info("[manifold-space]   upper+part: %d verts, %d tris, vol=%.2f",

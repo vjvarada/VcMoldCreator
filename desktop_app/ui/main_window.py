@@ -1492,6 +1492,20 @@ class ResinChannelsWorker(QThread):
         target = determine_shell_half_for_inlet(
             self.shell_half_1, self.shell_half_2, self.resin_direction,
         )
+        
+        # Verify shell and metamold half assignments are OPPOSITE
+        # Shell 1 (upper) covers Metamold 2 (lower), and vice versa
+        # So if shell target is 1, metamold target should be 2
+        expected_metamold = 2 if target == 1 else 1
+        if expected_metamold != channel_result.mold_half:
+            logger.error(
+                "CRITICAL: Shell target %d implies metamold %d, but got %d! "
+                "Shell covers opposite metamold. Forcing shell to match.",
+                target, expected_metamold, channel_result.mold_half,
+            )
+            # If mismatch, adjust shell target to match metamold's opposite
+            target = 2 if channel_result.mold_half == 1 else 1
+        
         shell = self.shell_half_1 if target == 1 else self.shell_half_2
 
         modified = create_hard_shell_inlet(

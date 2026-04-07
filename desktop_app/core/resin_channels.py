@@ -555,6 +555,48 @@ def merge_plug_into_metamold(
 # DETERMINE WHICH HALF CONTAINS MAXIMA
 # ============================================================================
 
+def determine_upper_half(
+    half_1: trimesh.Trimesh,
+    half_2: trimesh.Trimesh,
+    resin_direction: np.ndarray
+) -> int:
+    """
+    Determine which half is the "upper" half (in the resin pouring direction).
+    
+    The resin inlet and plug ALWAYS go on the upper half because:
+    - The global maximum is the highest point on the part
+    - The resin is poured from above (along resin_direction)
+    - The upper half covers the top of the part
+    
+    This function uses a simple, robust centroid comparison: the half whose
+    centroid has the higher projection along the resin direction is the upper
+    half. This matches exactly how the shell half is determined for the inlet
+    hole, ensuring consistency between metamold and shell assignments.
+    
+    Args:
+        half_1: First half mesh
+        half_2: Second half mesh 
+        resin_direction: (3,) resin pouring direction (up)
+        
+    Returns:
+        1 if half_1 is the upper half, 2 if half_2 is the upper half
+    """
+    resin_dir = np.asarray(resin_direction, dtype=np.float64)
+    resin_dir = resin_dir / (np.linalg.norm(resin_dir) + 1e-10)
+    
+    centroid_1 = np.mean(half_1.vertices, axis=0)
+    centroid_2 = np.mean(half_2.vertices, axis=0)
+    
+    proj_1 = float(np.dot(centroid_1, resin_dir))
+    proj_2 = float(np.dot(centroid_2, resin_dir))
+    
+    target = 1 if proj_1 > proj_2 else 2
+    
+    logger.info(f"Upper half determination: proj_1={proj_1:.2f}, proj_2={proj_2:.2f} → half {target}")
+    
+    return target
+
+
 def determine_maxima_half(
     metamold_half_1: trimesh.Trimesh,
     metamold_half_2: trimesh.Trimesh,
@@ -562,47 +604,46 @@ def determine_maxima_half(
     resin_direction: np.ndarray
 ) -> int:
     """
-    Determine which metamold half contains the maxima points.
+    Determine which metamold half should receive the resin inlet and plug.
     
-    The maxima are bubble-trapping points at the TOP of the cavity when
-    oriented for resin pouring. Since half_1 is the "upper" half (positive
-    pouring direction), the maxima should typically be in half_1.
+    IMPORTANT: Shell and metamold are assembled OPPOSITE to each other:
+    - Shell 1 (upper) covers Metamold 2 (lower)
+    - Shell 2 (lower) covers Metamold 1 (upper)
     
-    We verify by projecting the maxima positions onto the pouring direction
-    and comparing with the centroids of each half.
+    The resin flows: Shell hole → Metamold channel → Part cavity
+    
+    Since the shell hole is in the UPPER shell, and the upper shell covers
+    the LOWER metamold, the metamold plug must go on the LOWER metamold half
+    (opposite from the shell).
     
     Args:
-        metamold_half_1: Upper metamold half
-        metamold_half_2: Lower metamold half 
-        maxima_positions: (N, 3) positions of maxima points
+        metamold_half_1: First metamold half
+        metamold_half_2: Second metamold half 
+        maxima_positions: (N, 3) positions of maxima points (used for logging only)
         resin_direction: (3,) resin pouring direction (up)
         
     Returns:
-        1 if maxima belong to half_1, 2 if they belong to half_2
+        1 if half_1 should get the plug, 2 if half_2 should get the plug
     """
+    # Log the global maximum position for debugging
     resin_dir = np.asarray(resin_direction, dtype=np.float64)
     resin_dir = resin_dir / (np.linalg.norm(resin_dir) + 1e-10)
+    maxima_pos = np.asarray(maxima_positions, dtype=np.float64)
+    if len(maxima_pos) > 0:
+        projs = maxima_pos @ resin_dir
+        global_max_proj = float(np.max(projs))
+        logger.info(f"Global maximum projection: {global_max_proj:.2f}")
     
-    # Project the centroid of maxima positions along resin direction
-    maxima_center = np.mean(maxima_positions, axis=0)
-    maxima_proj = np.dot(maxima_center, resin_dir)
+    # Find which half is "upper" (higher centroid along resin direction)
+    upper_half = determine_upper_half(
+        metamold_half_1, metamold_half_2, resin_direction
+    )
     
-    # Project centroids of each half
-    centroid_1 = np.mean(metamold_half_1.vertices, axis=0)
-    centroid_2 = np.mean(metamold_half_2.vertices, axis=0)
-    proj_1 = np.dot(centroid_1, resin_dir)
-    proj_2 = np.dot(centroid_2, resin_dir)
+    # Return the OPPOSITE half - the one that the upper shell covers
+    # Shell hole is in upper shell, which covers the LOWER metamold
+    target_half = 2 if upper_half == 1 else 1
     
-    # Maxima should be on the upper half (higher projection along resin direction)
-    # The "upper" half is the one whose centroid is more aligned with resin direction
-    if abs(maxima_proj - proj_1) < abs(maxima_proj - proj_2):
-        target_half = 1
-    else:
-        target_half = 2
-    
-    logger.info(f"Maxima centroid projection: {maxima_proj:.2f}")
-    logger.info(f"Half 1 centroid projection: {proj_1:.2f}, Half 2: {proj_2:.2f}")
-    logger.info(f"Maxima assigned to half {target_half}")
+    logger.info(f"Metamold plug assigned to half {target_half} (lower half, covered by upper shell)")
     
     return target_half
 
@@ -1937,9 +1978,8 @@ def determine_shell_half_for_inlet(
     Determine which hard shell half should get the resin inlet through-hole.
     
     The correct shell half is the one IN THE DIRECTION of the resin pouring
-    direction. Resin is poured from above (along resin_direction), so the
-    shell half whose centroid has the higher projection along the resin
-    direction is the target.
+    direction (the upper half). This uses the same determine_upper_half logic
+    as the metamold half selection to ensure consistency.
     
     Args:
         shell_half_1: Hard shell half 1
@@ -1949,20 +1989,8 @@ def determine_shell_half_for_inlet(
     Returns:
         1 if shell_half_1 is the target, 2 if shell_half_2
     """
-    resin_dir = np.asarray(resin_direction, dtype=np.float64)
-    resin_dir = resin_dir / (np.linalg.norm(resin_dir) + 1e-10)
-    
-    centroid_1 = np.mean(shell_half_1.vertices, axis=0)
-    centroid_2 = np.mean(shell_half_2.vertices, axis=0)
-    
-    proj_1 = np.dot(centroid_1, resin_dir)
-    proj_2 = np.dot(centroid_2, resin_dir)
-    
-    target = 1 if proj_1 > proj_2 else 2
-    
-    logger.info(f"Shell half selection for inlet: "
-                f"proj_1={proj_1:.2f}, proj_2={proj_2:.2f} → shell half {target}")
-    
+    target = determine_upper_half(shell_half_1, shell_half_2, resin_direction)
+    logger.info(f"Shell half selection for inlet: shell half {target} (upper half)")
     return target
 
 
